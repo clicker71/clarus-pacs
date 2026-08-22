@@ -49,7 +49,9 @@ protocol:
 - **C-FIND** (SCP) from legacy viewers - mapped onto QIDO-RS (13/13 query
   attributes);
 - **C-MOVE** (SCU) toward legacy viewers, served from Clarus WADO-RS;
-- **N-ACTION** and optional **C-PRINT**;
+- **N-ACTION** (request handling; the storage commitment loop closes
+  with N-EVENT-REPORT - in progress);
+- optional **C-PRINT**;
 - **C-ECHO**.
 
 A study sent by a decades-old CT scanner lands in the same content-addressed

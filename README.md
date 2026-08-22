@@ -41,8 +41,8 @@ in Rust.
 ## Legacy DIMSE
 
 Clarus speaks DICOMweb. For the installed base of DIMSE-only modalities and
-viewers, the companion bridge `clbridge` (Python) terminates the legacy
-protocol:
+viewers, the companion bridge `clbridge` (Python, in the same source tree -
+one repo by design) terminates the legacy protocol:
 
 - **C-STORE** (SCP) from modalities - 71 SOP classes in the field build -
   with automatic charset coercion, then STOW-RS into Clarus;

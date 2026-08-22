@@ -38,6 +38,25 @@ in Rust.
 - **Search without a search engine.** Unicode-safe bitap fuzzy matching for
   patient names; no external index service.
 
+## Legacy DIMSE
+
+Clarus speaks DICOMweb. For the installed base of DIMSE-only modalities and
+viewers, the companion bridge `clbridge` (Python) terminates the legacy
+protocol:
+
+- **C-STORE** (SCP) from modalities - 71 SOP classes in the field build -
+  with automatic charset coercion, then STOW-RS into Clarus;
+- **C-FIND** (SCP) from legacy viewers - mapped onto QIDO-RS (13/13 query
+  attributes);
+- **C-MOVE** (SCU) toward legacy viewers, served from Clarus WADO-RS;
+- **N-ACTION** and optional **C-PRINT**;
+- **C-ECHO**.
+
+A study sent by a decades-old CT scanner lands in the same content-addressed
+store as DICOMweb traffic and is immediately searchable through QIDO-RS -
+including Unicode-safe fuzzymatch on patient names. Store-and-forward DIMSE
+traffic is what the bridge was built for.
+
 ## How we work
 
 We report what we measure. When our field testing finds a bug in someone

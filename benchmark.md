@@ -42,6 +42,26 @@ Headlines:
    +78%). In that worst case Clarus+bridge is ~17% SLOWER than Orthanc
    (90.3 s vs 76.9 s) - stated directly, not "within noise".
 
+### 1.1 Two-stream concurrency probe (exploratory, n=1)
+
+Two CT studies (491.4 MB + 521.0 MB = 1012.4 MB) sent concurrently, same
+conditions (AV OFF, fresh stores):
+
+| | Clarus + 2 bridges (8104, 8106) | Orthanc, 2 streams, 1 instance |
+|---|---|---|
+| aggregate wall | 39.8 s | 69.0 s |
+| aggregate MB/s | 25.4 | 14.7 |
+| vs single-stream median | +44% | +9% |
+| per-modality release | 16.5 s / 15.8 s | 66.6 s / 53.6 s |
+
+The bridge side scaled (aggregate +44%; the shared Clarus STOW path is the
+cap, ~50 MB/s in the drain phase on this HDD VM). Orthanc barely scaled:
+its two streams collapsed to 7.4 and 9.7 MB/s each (SQLite commit
+serializes writes). Shape of the curve: our lead widens with the number of
+concurrent modalities; the modality-facing win is even larger (the outbox
+absorbs the backlog, the scanner is released in ~16 s vs ~54-67 s).
+Exploratory n=1 - a formal multi-stream suite would rerun this 3-5 times.
+
 ## 2. Environment (single VMware VM)
 
 - Host: VMware Virtual Platform, Windows 10 Enterprise 22H2 build 19045
@@ -204,26 +224,6 @@ Read throughput medians: 29.7 MB/s (avoff) vs 28.7 MB/s (avon) vs 10.0 MB/s
 vs 13.5 MB/s (Orthanc upload). C-STORE phase throughput medians:
 44.4 MB/s (avoff) vs 42.1 MB/s (avon) vs 13.5 MB/s (Orthanc, synchronous
 C-STORE).
-
-## 8.1 Two-stream concurrency probe (exploratory, n=1)
-
-Two CT studies (491.4 MB + 521.0 MB = 1012.4 MB) sent concurrently, same
-conditions (AV OFF, fresh stores):
-
-| | Clarus + 2 bridges (8104, 8106) | Orthanc, 2 streams, 1 instance |
-|---|---|---|
-| aggregate wall | 39.8 s | 69.0 s |
-| aggregate MB/s | 25.4 | 14.7 |
-| vs single-stream median | +44% | +9% |
-| per-modality release | 16.5 s / 15.8 s | 66.6 s / 53.6 s |
-
-The bridge side scaled (aggregate +44%; the shared Clarus STOW path is the
-cap, ~50 MB/s in the drain phase on this HDD VM). Orthanc barely scaled:
-its two streams collapsed to 7.4 and 9.7 MB/s each (SQLite commit
-serializes writes). Shape of the curve: our lead widens with the number of
-concurrent modalities; the modality-facing win is even larger (the outbox
-absorbs the backlog, the scanner is released in ~16 s vs ~54-67 s).
-Exploratory n=1 - a formal multi-stream suite would rerun this 3-5 times.
 
 ## 9. Honest notes and limitations
 

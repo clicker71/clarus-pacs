@@ -8,27 +8,36 @@ All raw logs: `D:\Clarus\tmp\ab_runs\cycle{N}_{mode}.txt`, parser
 
 ## 1. Summary
 
-| Metric (median)                | Clarus+bridge AV OFF | Clarus+bridge AV ON | Orthanc (Docker) |
-|---------------------------------|----------------------|---------------------|------------------|
-| C-MOVE read (1034.7 MB)         | 34.9 s               | 36.1 s              | 103.3 s          |
-|   = throughput                  | 29.7 MB/s            | 28.7 MB/s           | 10.0 MB/s        |
-| Ingest, end to end (1035.1 MB)  | 58.8 s               | 90.3 s              | 76.9 s (1)       |
-|   = throughput                  | 17.6 MB/s            | 11.5 MB/s           | 13.5 MB/s        |
-| C-STORE phase (accept only) (2) | 23.3 s               | 24.6 s              | 76.9 s (1)       |
-|   = throughput                  | 44.4 MB/s            | 42.1 MB/s           | 13.5 MB/s        |
+| Metric (median)                  | Clarus+bridge AV OFF | Clarus+bridge AV ON | Orthanc (Docker) |
+|----------------------------------|----------------------|---------------------|------------------|
+| C-MOVE read (1034.7 MB)          | 34.9 s               | 36.1 s              | 103.3 s          |
+|   = throughput                   | 29.7 MB/s            | 28.7 MB/s           | 10.0 MB/s        |
+| Ingest, end to end = HOP1+HOP2 (1035.1 MB) (1)(2) | 58.8 s      | 90.3 s              | 76.9 s (1)       |
+|   = throughput                   | 17.6 MB/s            | 11.5 MB/s           | 13.5 MB/s        |
+|   HOP1: DIMSE C-STORE into outbox (2)(3) | 23.3 s          | 24.6 s              | 76.9 s (1)       |
+|   = throughput                   | 44.4 MB/s            | 42.1 MB/s           | 13.5 MB/s        |
+|   HOP2: outbox drain -> Clarus STOW | 36.5 s             | 65.0 s              | - (single hop)   |
+|   = throughput                   | 28.4 MB/s            | 15.9 MB/s           | -                |
 
 Sample sizes: n = 7 clean runs per condition for Clarus+bridge; Orthanc
 n = 9 clean uploads / n = 10 clean reads.
 
-(1) Orthanc C-STORE is synchronous: its C-STORE phase IS its full ingest
-(acceptance and commit happen before the response). For the bridge the two
-rows differ: C-STORE phase = time to accept 1063 C-STOREs into the outbox;
-ingest = acceptance + outbox drain, i.e. the full roundtrip from the first
-C-STORE to the last byte committed to Clarus storage (incl. the 6 s
-idle-flush grace).
-(2) "Accept only" is the bridge's asynchronous C-STORE acceptance. It is NOT
-comparable to Orthanc's synchronous C-STORE (which commits before the
-response); the like-for-like ingest number is the row above it.
+(1) Orthanc does the whole job in ONE synchronous hop: its C-STORE phase IS
+its full ingest (acceptance and commit happen before the response).
+(2) Hop model: the bridge ingest is TWO hops - HOP1: DIMSE C-STORE
+acceptance into the outbox (asynchronous; 0x0000 means "accepted to the
+outbox", NOT "committed to Clarus"); HOP2: outbox drain -> STOW-RS into
+Clarus (CAS + manifest + idx). The honest like-for-like ingest vs Orthanc's
+single hop is HOP1+HOP2 - the row we headline. HOP1 and HOP2 overlap
+slightly (the outbox drains while the modality keeps sending, and ingest
+includes the 6 s idle-flush grace), so the two hop rows add up to a bit
+more than the measured ingest wall. The bridge is a legacy sidecar,
+deployable one per modality, and is expected to fade as modalities move to
+DICOMweb; the optimization target is the Clarus core (the DICOMweb path).
+(3) HOP1 "accept only" is the bridge's asynchronous C-STORE acceptance. It
+is NOT comparable to Orthanc's synchronous C-STORE (which commits before
+the response); nobody may quote 44.4 MB/s as the ingest number - the
+like-for-like row is HOP1+HOP2 above it.
 
 Headlines:
 

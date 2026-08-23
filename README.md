@@ -72,12 +72,16 @@ methodology, per-run tables, statistics and honest limitations:
 | Median | Clarus+bridge, AV OFF | Clarus+bridge, AV ON | Orthanc (Docker) |
 |--------|-----------------------|----------------------|------------------|
 | C-MOVE read | 34.9 s (29.7 MB/s) | 36.1 s (28.7 MB/s) | 103.3 s (10.0 MB/s) |
-| Ingest end to end | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 76.9 s (13.5 MB/s) (1) |
-| C-STORE phase | 23.3 s | 24.6 s | 76.9 s (1) |
-|   = throughput | 44.4 MB/s | 42.1 MB/s | 13.5 MB/s |
+| Ingest end to end (HOP1+HOP2) | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 76.9 s (13.5 MB/s) (1) |
+|   HOP1: C-STORE into outbox | 23.3 s (44.4 MB/s) | 24.6 s (42.1 MB/s) | 76.9 s (1) |
+|   HOP2: outbox drain -> Clarus STOW | 36.5 s (28.4 MB/s) | 65.0 s (15.9 MB/s) | - (single hop) |
 
-(1) Orthanc C-STORE is synchronous: its C-STORE phase equals its full ingest.
-For the bridge, ingest = C-STORE acceptance + outbox drain (full roundtrip).
+(1) Orthanc does the whole job in ONE synchronous hop: its C-STORE phase is
+its full ingest. The bridge ingest is TWO hops: HOP1 = asynchronous DIMSE
+acceptance into the outbox, HOP2 = drain into Clarus - the honest
+like-for-like number is HOP1+HOP2. HOP1 alone must never be quoted as the
+ingest rate (it is asynchronous acceptance, not commit). The two hops
+overlap slightly, so HOP1+HOP2 is a bit above the measured ingest.
 n = 7 clean runs per condition (Clarus+bridge); Orthanc n = 9 uploads /
 n = 10 reads. AV OFF = the documented Defender exclusions on the Clarus data
 dirs; the AV penalty (+54% ingest) lands entirely on the STOW write path.

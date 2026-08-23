@@ -69,17 +69,20 @@ per condition; corpus 1035.1 MB (1063 instances, 3 studies). Full
 methodology, per-run tables, statistics and honest limitations:
 [benchmark.md](./benchmark.md).
 
-| Median, n=7 | Clarus+bridge, AV OFF | Clarus+bridge, AV ON | Orthanc (Docker) |
-|-------------|-----------------------|----------------------|------------------|
-| C-STORE phase | 23.3 s | 24.6 s | 77.5 s (1) |
-|   = throughput | 44.4 MB/s | 42.1 MB/s | 13.4 MB/s |
-| Ingest end to end | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 77.5 s (13.4 MB/s) (1) |
-| C-MOVE read | 34.9 s (29.7 MB/s) | 36.1 s (28.7 MB/s) | 103.0 s (10.0 MB/s) |
+| Median | Clarus+bridge, AV OFF | Clarus+bridge, AV ON | Orthanc (Docker) |
+|--------|-----------------------|----------------------|------------------|
+| C-MOVE read | 34.9 s (29.7 MB/s) | 36.1 s (28.7 MB/s) | 103.3 s (10.0 MB/s) |
+| Ingest end to end | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 76.9 s (13.5 MB/s) (1) |
+| C-STORE phase | 23.3 s | 24.6 s | 76.9 s (1) |
+|   = throughput | 44.4 MB/s | 42.1 MB/s | 13.5 MB/s |
 
 (1) Orthanc C-STORE is synchronous: its C-STORE phase equals its full ingest.
 For the bridge, ingest = C-STORE acceptance + outbox drain (full roundtrip).
-AV OFF = the documented Defender exclusions on the Clarus data dirs; the AV
-penalty (+54% ingest) lands entirely on the STOW write path.
+n = 7 clean runs per condition (Clarus+bridge); Orthanc n = 9 uploads /
+n = 10 reads. AV OFF = the documented Defender exclusions on the Clarus data
+dirs; the AV penalty (+54% ingest) lands entirely on the STOW write path.
+Without the exclusions, Clarus+bridge is ~17% SLOWER than Orthanc - the
+exclusions are an operational requirement, not a tuning tip.
 
 The universal harness that produced these numbers is public:
 [tools/ab_test.py](./tools/ab_test.py) - point it at any DIMSE or DICOMweb

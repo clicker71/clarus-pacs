@@ -1,19 +1,24 @@
 # Clarus + clbridge vs Orthanc: DIMSE throughput benchmark (2026-08-23)
 
-Status: final. n = 7 clean runs per condition (21 full stack cycles executed).
+Status: final. n = 7 clean runs per condition (21 full stack cycles) for
+Clarus+bridge; Orthanc extended to n = 9 clean uploads / n = 10 clean reads
+to tighten its high variance.
 All raw logs: `D:\Clarus\tmp\ab_runs\cycle{N}_{mode}.txt`, parser
 `D:\Clarus\tmp\parse_ab_runs.py`, machine facts `D:\Clarus\tmp\ab_runs\machine.txt`.
 
 ## 1. Summary
 
-| Metric (median, n=7)            | Clarus+bridge AV OFF | Clarus+bridge AV ON | Orthanc (Docker) |
+| Metric (median)                | Clarus+bridge AV OFF | Clarus+bridge AV ON | Orthanc (Docker) |
 |---------------------------------|----------------------|---------------------|------------------|
-| C-STORE phase                   | 23.3 s               | 24.6 s              | 77.5 s (1)       |
-|   = throughput                  | 44.4 MB/s            | 42.1 MB/s           | 13.4 MB/s        |
-| Ingest, end to end (1035.1 MB)  | 58.8 s               | 90.3 s              | 77.5 s (1)       |
-|   = throughput                  | 17.6 MB/s            | 11.5 MB/s           | 13.4 MB/s        |
-| C-MOVE read (1034.7 MB)         | 34.9 s               | 36.1 s              | 103.0 s          |
+| C-MOVE read (1034.7 MB)         | 34.9 s               | 36.1 s              | 103.3 s          |
 |   = throughput                  | 29.7 MB/s            | 28.7 MB/s           | 10.0 MB/s        |
+| Ingest, end to end (1035.1 MB)  | 58.8 s               | 90.3 s              | 76.9 s (1)       |
+|   = throughput                  | 17.6 MB/s            | 11.5 MB/s           | 13.5 MB/s        |
+| C-STORE phase (accept only) (2) | 23.3 s               | 24.6 s              | 76.9 s (1)       |
+|   = throughput                  | 44.4 MB/s            | 42.1 MB/s           | 13.5 MB/s        |
+
+Sample sizes: n = 7 clean runs per condition for Clarus+bridge; Orthanc
+n = 9 clean uploads / n = 10 clean reads.
 
 (1) Orthanc C-STORE is synchronous: its C-STORE phase IS its full ingest
 (acceptance and commit happen before the response). For the bridge the two
@@ -21,20 +26,21 @@ rows differ: C-STORE phase = time to accept 1063 C-STOREs into the outbox;
 ingest = acceptance + outbox drain, i.e. the full roundtrip from the first
 C-STORE to the last byte committed to Clarus storage (incl. the 6 s
 idle-flush grace).
+(2) "Accept only" is the bridge's asynchronous C-STORE acceptance. It is NOT
+comparable to Orthanc's synchronous C-STORE (which commits before the
+response); the like-for-like ingest number is the row above it.
 
 Headlines:
 
-1. With the recommended Defender exclusions, the Clarus+bridge C-STORE
-   phase is ~3.3x faster than Orthanc's (23.3 s vs 77.5 s median; for
-   Orthanc the C-STORE phase equals the full ingest because it commits
-   synchronously) and the full ingest is ~24% faster (58.8 s vs 77.5 s).
-   C-MOVE read is ~3.0x faster (34.9 s vs 103.0 s).
-2. Windows Defender real-time scanning costs Clarus+bridge +54% on end-to-end
-   ingest (58.8 s -> 90.3 s), concentrated entirely in the STOW write path
-   (bridge outbox drain 36.5 s -> 65.0 s, +78%). C-STORE acceptance and reads
-   are unaffected (reads are not scanned by Defender).
-3. Under AV ON (worst case, no exclusions) Clarus+bridge ingest is still
-   within noise of Orthanc (90.3 s vs 77.5 s) on this small VM.
+1. C-MOVE read is ~3.0x faster (34.9 s vs 103.3 s median): the strongest
+   like-for-like metric - both sides transfer synchronously.
+2. End-to-end ingest is ~24% faster WITH the recommended Defender exclusions
+   (58.8 s vs 76.9 s; Orthanc commits synchronously, so its C-STORE phase
+   IS its full ingest).
+3. WITHOUT the exclusions, Defender real-time scanning eats 54% of ingest
+   (58.8 s -> 90.3 s), concentrated in the STOW write path (outbox drain
+   +78%). In that worst case Clarus+bridge is ~17% SLOWER than Orthanc
+   (90.3 s vs 76.9 s) - stated directly, not "within noise".
 
 ## 2. Environment (single VMware VM)
 
@@ -68,7 +74,9 @@ DX + 2 SR instances).
 
 ## 5. Harness and methodology
 
-The harness [tools/ab_test.py](./tools/ab_test.py) performs, per run:
+The published harness
+[ab_test.py](./tools/ab_test.py)
+performs, per run:
 
 - Upload: C-STORE to the bridge (port 8104) or Orthanc (port 4242), one
   instance per association, with an adaptive in-flight window: starts at 1
@@ -82,6 +90,14 @@ The harness [tools/ab_test.py](./tools/ab_test.py) performs, per run:
 - Read: C-MOVE at STUDY level to an in-process pynetdicom storage SCP that
   writes the received bytes to a temp dir and counts them. Same adaptive
   window on the receive rate.
+- Hop model: the bridge ingest is TWO hops - HOP1: DIMSE C-STORE acceptance
+  into the outbox (median 23.3 s); HOP2: outbox drain into Clarus STOW
+  (median 36.5 s). Orthanc does the same work in ONE synchronous hop
+  (median 76.9 s). The optimization target is the Clarus core (the DICOMweb
+  path); the bridge is a legacy sidecar, deployable one per modality, and we
+  expect it to fade as modalities move to DICOMweb. Even with two hops the
+  end-to-end ingest beats Orthanc's single hop because Orthanc pays a
+  per-instance synchronous commit while the bridge batches and overlaps.
 - DIMSE hygiene: transient 0xA700 (Out of Resources, PS3.7 C.4) is retried
   with 4 x 1.5 s backoff (the bridge answers 0xA700 while its 5 s health
   poller sees Clarus down during the harness's server restarts). A run is
@@ -107,6 +123,17 @@ avoid time-of-day drift.
   Defender does not scan container-internal files. This is inherent to the
   deployment model and is noted as a condition, not as an Orthanc handicap
   or advantage that we introduced.
+- Deployment model honesty: Orthanc ran in Docker because there is NO
+  upstream native Windows build - Docker is the supported Windows deployment
+  and what clinics actually run. WSL2 is heterogeneous: CPU is near-native
+  (~0-5% overhead), but loopback goes through the WSL vNIC (higher
+  per-request latency than a native loopback), and small synchronous writes
+  pay the layered ext4.vhdx-over-NTFS-over-HDD-vmdk stack - exactly
+  Orthanc's per-C-STORE pattern (DICOM file + SQLite index). So its 13.4
+  MB/s is "Orthanc in its default Windows deployment on HDD", not "Orthanc
+  is slow". Our bridge writes the same disk on the same machine, but
+  asynchronously in batches (100 SOP / 96 MB) - a product architecture
+  choice, not benchmark tuning.
 
 ## 7. Raw results (clean runs only)
 
@@ -145,8 +172,14 @@ Orthanc (upload seconds / read seconds):
 | 5 | 104.8 | 132.1 |
 | 6 | 92.9 | 128.4 |
 | 7 | 65.8 | 103.0 |
+| 8 | (dirty, excluded) | 103.6 |
+| 9 | 69.7 | 97.5 |
+| 10 | 73.2 | 104.7 |
 
-## 8. Statistics (n=7)
+## 8. Statistics
+
+n = 7 clean runs per condition for Clarus+bridge. Orthanc: n = 9 clean
+uploads, n = 10 clean reads (extended to tighten its high variance).
 
 | Metric | median | mean | SD | min | max |
 |--------|--------|------|----|-----|-----|
@@ -158,8 +191,8 @@ Orthanc (upload seconds / read seconds):
 | avon accept (s) | 24.6 | 23.9 | 3.2 | 19.5 | 28.0 |
 | avoff read (s) | 34.9 | 34.8 | 0.6 | 33.6 | 35.9 |
 | avon read (s) | 36.1 | 36.7 | 1.4 | 36.0 | 40.2 |
-| orthanc upload (s) | 77.5 | 79.9 | 14.4 | 59.1 | 104.8 |
-| orthanc read (s) | 103.0 | 108.7 | 14.5 | 92.6 | 132.1 |
+| orthanc upload (s) (n=9) | 76.9 | 78.0 | 13.2 | 59.1 | 104.8 |
+| orthanc read (s) (n=10) | 103.3 | 106.7 | 12.7 | 92.6 | 132.1 |
 
 AV effect on Clarus+bridge (medians): ingest +53.6%, outbox drain +78.1%,
 C-STORE acceptance +5.6%, read +3.4%. The AV penalty is entirely in the STOW
@@ -168,18 +201,38 @@ not reads).
 
 Read throughput medians: 29.7 MB/s (avoff) vs 28.7 MB/s (avon) vs 10.0 MB/s
 (Orthanc). Ingest throughput medians: 17.6 MB/s (avoff) vs 11.5 MB/s (avon)
-vs 13.4 MB/s (Orthanc upload). C-STORE phase throughput medians:
-44.4 MB/s (avoff) vs 42.1 MB/s (avon) vs 13.4 MB/s (Orthanc, synchronous
+vs 13.5 MB/s (Orthanc upload). C-STORE phase throughput medians:
+44.4 MB/s (avoff) vs 42.1 MB/s (avon) vs 13.5 MB/s (Orthanc, synchronous
 C-STORE).
+
+## 8.1 Two-stream concurrency probe (exploratory, n=1)
+
+Two CT studies (491.4 MB + 521.0 MB = 1012.4 MB) sent concurrently, same
+conditions (AV OFF, fresh stores):
+
+| | Clarus + 2 bridges (8104, 8106) | Orthanc, 2 streams, 1 instance |
+|---|---|---|
+| aggregate wall | 39.8 s | 69.0 s |
+| aggregate MB/s | 25.4 | 14.7 |
+| vs single-stream median | +44% | +9% |
+| per-modality release | 16.5 s / 15.8 s | 66.6 s / 53.6 s |
+
+The bridge side scaled (aggregate +44%; the shared Clarus STOW path is the
+cap, ~50 MB/s in the drain phase on this HDD VM). Orthanc barely scaled:
+its two streams collapsed to 7.4 and 9.7 MB/s each (SQLite commit
+serializes writes). Shape of the curve: our lead widens with the number of
+concurrent modalities; the modality-facing win is even larger (the outbox
+absorbs the backlog, the scanner is released in ~16 s vs ~54-67 s).
+Exploratory n=1 - a formal multi-stream suite would rerun this 3-5 times.
 
 ## 9. Honest notes and limitations
 
 - Single VM, loopback, HDD-backed virtual disks, 3 vCPU. Numbers are
   comparable between the two stacks on this box; they are not production
   capacity claims.
-- n=7; we report median/mean/SD/range, not p-values. Orthanc upload/read
-  variance is materially higher (SD ~14 s) than the Clarus+bridge variance
-  (SD 2-4 s on ingest).
+- n=7 per condition (Clarus+bridge); Orthanc n=9 uploads / n=10 reads. We
+  report median/mean/SD/range, not p-values. Orthanc variance remains higher
+  (SD ~13 s) than Clarus+bridge (SD 2-4 s on ingest).
 - The bridge's C-STORE acceptance is asynchronous by design: 0x0000 means
   "accepted to the outbox", not "committed to Clarus". The honest ingest
   metric is acceptance + outbox drain, which is what we report.
@@ -200,7 +253,8 @@ C-STORE).
 
 ## 10. Reproducibility
 
-- Harness: [tools/ab_test.py](./tools/ab_test.py) (usage in its docstring).
-- Driver: `D:\Clarus\tmp\ab_loop.ps1` (7 cycles, self-healing retries).
-- Parser: `D:\Clarus\tmp\parse_ab_runs.py` -> `ab_runs\summary.json`.
-- Orthanc config: `D:\Clarus\fieldtest\orthanc.json`.
+- Harness: [tools/ab_test.py](./tools/ab_test.py)
+  (usage in its docstring; local working copy D:\Clarus\ab_test.py).
+- Driver: D:\Clarus\tmp\ab_loop.ps1 (7 cycles, self-healing retries).
+- Parser: D:\Clarus\tmp\parse_ab_runs.py -> ab_runs\summary.json.
+- Orthanc config: D:\Clarus\fieldtest\orthanc.json.

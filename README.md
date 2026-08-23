@@ -52,7 +52,7 @@ one repo by design) terminates the legacy protocol:
   attributes);
 - **C-MOVE** (SCU) toward legacy viewers, served from Clarus WADO-RS;
 - **N-ACTION** (request handling; the storage commitment loop closes
-  with N-EVENT-REPORT - in progress);
+  with N-EVENT-REPORT - field-verified 2026-08-23);
 - optional **C-PRINT**;
 - **C-ECHO**.
 

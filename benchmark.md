@@ -68,7 +68,7 @@ DX + 2 SR instances).
 
 ## 5. Harness and methodology
 
-ab_test.py (D:\Clarus\ab_test.py) performs, per run:
+The harness [tools/ab_test.py](./tools/ab_test.py) performs, per run:
 
 - Upload: C-STORE to the bridge (port 8104) or Orthanc (port 4242), one
   instance per association, with an adaptive in-flight window: starts at 1
@@ -192,12 +192,15 @@ C-STORE).
   field bridge exe predated the N-EVENT-REPORT fix found by the new wire
   regression test (tests/test_storage_commitment_wire.py), so no N-EVENT-REPORT
   was observed in the harness; this has no impact on the throughput metrics.
+  The fix (plus peer-config resolution of the report destination) was built
+  and field-verified after the benchmark: N-ACTION-RSP 0x0000, 5/5 SOPs
+  WADO-confirmed, N-EVENT-REPORT delivered back (event_type=1).
 - Defender exclusions are the documented production recommendation and were
   active only in the AV OFF condition.
 
 ## 10. Reproducibility
 
-- Harness: D:\Clarus\ab_test.py (usage in its docstring).
-- Driver: D:\Clarus\tmp\ab_loop.ps1 (7 cycles, self-healing retries).
-- Parser: D:\Clarus\tmp\parse_ab_runs.py -> ab_runs\summary.json.
-- Orthanc config: D:\Clarus\fieldtest\orthanc.json.
+- Harness: [tools/ab_test.py](./tools/ab_test.py) (usage in its docstring).
+- Driver: `D:\Clarus\tmp\ab_loop.ps1` (7 cycles, self-healing retries).
+- Parser: `D:\Clarus\tmp\parse_ab_runs.py` -> `ab_runs\summary.json`.
+- Orthanc config: `D:\Clarus\fieldtest\orthanc.json`.

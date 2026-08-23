@@ -72,7 +72,8 @@ methodology, per-run tables, statistics and honest limitations:
 | Median, n=7 | Clarus+bridge, AV OFF | Clarus+bridge, AV ON | Orthanc (Docker) |
 |-------------|-----------------------|----------------------|------------------|
 | C-STORE phase | 23.3 s | 24.6 s | 77.5 s (1) |
-| Ingest end to end | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 77.5 s (13.3 MB/s) (1) |
+|   = throughput | 44.4 MB/s | 42.1 MB/s | 13.4 MB/s |
+| Ingest end to end | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 77.5 s (13.4 MB/s) (1) |
 | C-MOVE read | 34.9 s (29.7 MB/s) | 36.1 s (28.7 MB/s) | 103.0 s (10.0 MB/s) |
 
 (1) Orthanc C-STORE is synchronous: its C-STORE phase equals its full ingest.

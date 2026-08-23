@@ -9,8 +9,9 @@ All raw logs: `D:\Clarus\tmp\ab_runs\cycle{N}_{mode}.txt`, parser
 | Metric (median, n=7)            | Clarus+bridge AV OFF | Clarus+bridge AV ON | Orthanc (Docker) |
 |---------------------------------|----------------------|---------------------|------------------|
 | C-STORE phase                   | 23.3 s               | 24.6 s              | 77.5 s (1)       |
+|   = throughput                  | 44.4 MB/s            | 42.1 MB/s           | 13.4 MB/s        |
 | Ingest, end to end (1035.1 MB)  | 58.8 s               | 90.3 s              | 77.5 s (1)       |
-|   = throughput                  | 17.6 MB/s            | 11.5 MB/s           | 13.3 MB/s        |
+|   = throughput                  | 17.6 MB/s            | 11.5 MB/s           | 13.4 MB/s        |
 | C-MOVE read (1034.7 MB)         | 34.9 s               | 36.1 s              | 103.0 s          |
 |   = throughput                  | 29.7 MB/s            | 28.7 MB/s           | 10.0 MB/s        |
 
@@ -167,7 +168,9 @@ not reads).
 
 Read throughput medians: 29.7 MB/s (avoff) vs 28.7 MB/s (avon) vs 10.0 MB/s
 (Orthanc). Ingest throughput medians: 17.6 MB/s (avoff) vs 11.5 MB/s (avon)
-vs 13.3 MB/s (Orthanc upload).
+vs 13.4 MB/s (Orthanc upload). C-STORE phase throughput medians:
+44.4 MB/s (avoff) vs 42.1 MB/s (avon) vs 13.4 MB/s (Orthanc, synchronous
+C-STORE).
 
 ## 9. Honest notes and limitations
 

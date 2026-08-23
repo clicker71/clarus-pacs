@@ -10,6 +10,11 @@ in Rust.
   no VCRedist, no JVM, no interpreter. Smaller than two of the CT slices it
   stores. Fits on a single 2.88 MB ED floppy - the format that lost to the
   50-cent HD.
+- **Compiled for speed, deliberately:** the release profile is
+  `opt-level = 3` because we measured what the size-optimized build costs us:
+  criterion A/B on the fuzzymatch path (bitap SIMD hot loop), 8/8 groups,
+  p = 0.00 - medians **-58.1% .. -69.2%** vs `opt-level = "z"`
+  (2026-08-20). Speed over squeezing the last kilobyte.
 - **Conformance:** being tested against DICOM PS3.18, including field
   interoperability testing with the Weasis viewer. Public test artifacts and
   field reports are linked from this repository.

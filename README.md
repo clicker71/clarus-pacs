@@ -88,6 +88,30 @@ dirs; the AV penalty (+54% ingest) lands entirely on the STOW write path.
 Without the exclusions, Clarus+bridge is ~17% SLOWER than Orthanc - the
 exclusions are an operational requirement, not a tuning tip.
 
+## Scale-out shape: N bridges, one Clarus core
+
+The deployment model is one Clarus core plus one bridge sidecar per
+modality. First empirical probe (same VM, AV OFF, exploratory n=1 - a
+formal multi-stream suite would rerun this 3-5 times), two CT studies
+(1012.4 MB) sent through two bridges concurrently vs two streams into a
+single Orthanc instance:
+
+| | Clarus + 2 bridges (8104, 8106) | Orthanc, 2 streams, 1 instance |
+|---|---|---|
+| aggregate wall | 39.8 s | 69.0 s |
+| aggregate MB/s | 25.4 | 14.7 |
+| vs single-stream median | +44% | +9% |
+| per-modality release | 16.5 s / 15.8 s | 66.6 s / 53.6 s |
+
+The bridge side scales with the number of bridges (aggregate +44%; the
+shared Clarus STOW path is the cap, ~50 MB/s on this HDD VM). Orthanc
+barely scaled: its two streams collapsed to 7.4 and 9.7 MB/s each (SQLite
+commit serializes writes). Shape of the curve: the lead widens with the
+number of concurrent modalities, and the modality-facing win is even
+larger - the outbox absorbs the backlog and releases the scanner in
+~16 s vs ~54-67 s. Full numbers and caveats: [benchmark.md](./benchmark.md)
+section 1.1.
+
 The universal harness that produced these numbers is public:
 [tools/ab_test.py](./tools/ab_test.py) - point it at any DIMSE or DICOMweb
 server, it discovers the throughput plateau itself (adaptive window, outbox

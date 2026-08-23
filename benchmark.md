@@ -14,9 +14,9 @@ All raw logs: `D:\Clarus\tmp\ab_runs\cycle{N}_{mode}.txt`, parser
 |   = throughput                   | 29.7 MB/s            | 28.7 MB/s           | 10.0 MB/s        |
 | Ingest, end to end = HOP1+HOP2 (1035.1 MB) (1)(2) | 58.8 s      | 90.3 s              | 76.9 s (1)       |
 |   = throughput                   | 17.6 MB/s            | 11.5 MB/s           | 13.5 MB/s        |
-|   HOP1: DIMSE C-STORE into outbox (2)(3) | 23.3 s          | 24.6 s              | 76.9 s (1)       |
+| +- HOP1: DIMSE C-STORE into outbox (2)(3) | 23.3 s       | 24.6 s              | 76.9 s (1)       |
 |   = throughput                   | 44.4 MB/s            | 42.1 MB/s           | 13.5 MB/s        |
-|   HOP2: outbox drain -> Clarus STOW | 36.5 s             | 65.0 s              | - (single hop)   |
+| +- HOP2: outbox drain -> Clarus STOW | 36.5 s          | 65.0 s              | - (single hop)   |
 |   = throughput                   | 28.4 MB/s            | 15.9 MB/s           | -                |
 
 Sample sizes: n = 7 clean runs per condition for Clarus+bridge; Orthanc

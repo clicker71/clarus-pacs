@@ -73,8 +73,8 @@ methodology, per-run tables, statistics and honest limitations:
 |--------|-----------------------|----------------------|------------------|
 | C-MOVE read | 34.9 s (29.7 MB/s) | 36.1 s (28.7 MB/s) | 103.3 s (10.0 MB/s) |
 | Ingest end to end (HOP1+HOP2) | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 76.9 s (13.5 MB/s) (1) |
-|   HOP1: C-STORE into outbox | 23.3 s (44.4 MB/s) | 24.6 s (42.1 MB/s) | 76.9 s (1) |
-|   HOP2: outbox drain -> Clarus STOW | 36.5 s (28.4 MB/s) | 65.0 s (15.9 MB/s) | - (single hop) |
+| +- HOP1: C-STORE into outbox | 23.3 s (44.4 MB/s) | 24.6 s (42.1 MB/s) | 76.9 s (1) |
+| +- HOP2: outbox drain -> Clarus STOW | 36.5 s (28.4 MB/s) | 65.0 s (15.9 MB/s) | - (single hop) |
 
 (1) Orthanc does the whole job in ONE synchronous hop: its C-STORE phase is
 its full ingest. The bridge ingest is TWO hops: HOP1 = asynchronous DIMSE

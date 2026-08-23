@@ -19,9 +19,9 @@ in Rust.
   interoperability testing with the Weasis viewer. Public test artifacts and
   field reports are linked from this repository.
 - **Testing:** every release passes the public ap101 hot-path harness
-  (https://github.com/clicker71/ap101) before it ships - hot paths are
-  verified, not assumed. The repository opens when this bar holds, not
-  before.
+  (https://github.com/clicker71/ap101, MIT-licensed, already open) before it
+  ships - hot paths are verified, not assumed. The Clarus source repository
+  opens when this bar holds, not before.
 - **What is public now:**
   - Weasis interoperability field report (`weasis-report.md` in this
     repository)

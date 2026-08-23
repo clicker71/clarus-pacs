@@ -18,6 +18,8 @@ in Rust.
 - **What is public now:**
   - Weasis interoperability field report (`weasis-report.md` in this
     repository)
+  - DIMSE throughput benchmark vs Orthanc (`benchmark.md` in this
+    repository), produced by the public harness `tools/ab_test.py`
   - Bug reports and discussions we file against third-party DICOM tooling
 - **What is not public yet:** source code, binaries, documentation.
 - **License:** the source already carries LGPL-3.0 headers; it is published
@@ -59,6 +61,31 @@ store as DICOMweb traffic and is immediately searchable through QIDO-RS -
 including Unicode-safe fuzzymatch on patient names. Store-and-forward DIMSE
 traffic is what the bridge was built for.
 
+## Throughput benchmark (2026-08-23)
+
+Clarus + clbridge vs Orthanc 1.12.11 over DIMSE, on the same VMware VM
+(3 vCPU, 32 GB RAM, HDD-backed virtual disks), loopback. n = 7 clean runs
+per condition; corpus 1035.1 MB (1063 instances, 3 studies). Full
+methodology, per-run tables, statistics and honest limitations:
+[benchmark.md](./benchmark.md).
+
+| Median, n=7 | Clarus+bridge, AV OFF | Clarus+bridge, AV ON | Orthanc (Docker) |
+|-------------|-----------------------|----------------------|------------------|
+| C-STORE phase | 23.3 s | 24.6 s | 77.5 s (1) |
+| Ingest end to end | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 77.5 s (13.3 MB/s) (1) |
+| C-MOVE read | 34.9 s (29.7 MB/s) | 36.1 s (28.7 MB/s) | 103.0 s (10.0 MB/s) |
+
+(1) Orthanc C-STORE is synchronous: its C-STORE phase equals its full ingest.
+For the bridge, ingest = C-STORE acceptance + outbox drain (full roundtrip).
+AV OFF = the documented Defender exclusions on the Clarus data dirs; the AV
+penalty (+54% ingest) lands entirely on the STOW write path.
+
+The universal harness that produced these numbers is public:
+[tools/ab_test.py](./tools/ab_test.py) - point it at any DIMSE or DICOMweb
+server, it discovers the throughput plateau itself (adaptive window, outbox
+drain polling, DIMSE retry hygiene). Compare anything with anything while
+the source repository is still in closed preview.
+
 ## How we work
 
 We report what we measure. When our field testing finds a bug in someone
@@ -69,4 +96,6 @@ first example of both.
 ## Links
 
 - [Weasis field report](./weasis-report.md)
+- [DIMSE throughput benchmark vs Orthanc](./benchmark.md)
+- [Universal DICOM A/B harness](./tools/ab_test.py)
 - Upstream issues filed by the Clarus team will be linked here once filed.

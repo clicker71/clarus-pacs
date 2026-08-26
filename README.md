@@ -127,9 +127,9 @@ the source repository is still in closed preview.
 
 ## Measured headroom (2026-08-26)
 
-Loopback on a Beelink mini-PC (Intel i7 / 32 GB / 1 TB SATA SSD, Ubuntu
+Loopback on a Beelink mini-PC (Intel i7 / 32 GB / 1 TB NVMe SSD, Ubuntu
 24.04, Docker): WADO-RS study GETs serve at **1.0-1.1 GB/s warm** (page
-cache) and **344-428 MB/s cold** (drop_caches, real SSD reads) - roughly
+cache) and **344-428 MB/s cold** (drop_caches, real NVMe reads) - roughly
 the 10 GbE line rate on hot data, 3-4x a GbE link even cold. The same
 studies C-MOVE'd over a LAN whose links had negotiated 100 Mbit/s ran at
 9.1 MB/s aggregate - the server was backpressured by the network, not

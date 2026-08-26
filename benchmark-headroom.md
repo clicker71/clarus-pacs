@@ -5,14 +5,14 @@ network?
 
 ## Hardware and method
 
-- Beelink mini-PC: Intel i7, 32 GB RAM, 1 TB SATA SSD, Ubuntu 24.04.
-  Clarus + clbridge in Docker (Portainer stack, images `clarus:local` /
-  `clbridge:local`).
+- Beelink mini-PC: Intel i7, 32 GB RAM, 1 TB NVMe SSD (Crucial P3 Plus),
+  Ubuntu 24.04. Clarus + clbridge in Docker (Portainer stack, images
+  `clarus:local` / `clbridge:local`).
 - Loopback (`127.0.0.1:8024`) - no NIC in the path.
 - Corpus: two studies, 68,421,394 B (MR, 340 slices) + 77,262,352 B
   (CT, 368 slices) = 145,683,746 B total.
 - warm: page cache (studies ingested minutes before the run).
-- cold: `echo 3 > /proc/sys/vm/drop_caches` before each GET - real SSD
+- cold: `echo 3 > /proc/sys/vm/drop_caches` before each GET - real NVMe
   reads, not a synthetic sequential scan.
 - `curl -s -o /dev/null -w` with `time_total` / `size_download` /
   `speed_download`; 3 sequential passes per study, plus parallel runs.
@@ -44,8 +44,10 @@ around.
 
 - Warm numbers are page-cache serving - typical for studies ingested in
   the last days; older studies run at the cold rate.
-- Cold numbers are SATA-SSD small-file reads; NVMe would lift the cold
-  floor toward the warm line.
+- Cold numbers are NVMe small-file reads (708 files, ~200 KB each)
+  through the full serve path - per-file open/parse dominates, so the
+  cold floor is IOPS-bound, not media-bound; a different NVMe would not
+  move it much, page cache does.
 - Both are server-side loopback measurements - a real NIC caps lower
   (see the cross-check above).
 - A GbE re-run after the cable/switch fix is planned; numbers will be

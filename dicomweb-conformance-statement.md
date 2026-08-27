@@ -128,6 +128,9 @@ user-selected sizes).
   conflicts: per PS3.18 §10.5.3.1 a conflict is e.g. an unsupported SOP Class
   or Study Instance UID mismatch, and §10.5.2 allows adding instances to
   existing Studies; duplicate re-STOW is therefore a successful `200`.
+- **UID grammar gate:** instances whose Study/Series/SOP Instance UIDs
+  violate the DICOM UID grammar are refused per instance BEFORE any CAS
+  write — a stored instance must stay addressable by WADO/QIDO forever.
 - **Progress visibility:** `STOW_STUDY` progress lines are emitted every 50
   slices; the final access-log line of a STOW request is deferred to the
   next request (deliberate; see the `[logging]` notes in the server config).
@@ -169,14 +172,44 @@ user-selected sizes).
 ## 4. Transfer Syntaxes
 
 - **Ingest:** instances are accepted and stored in any transfer syntax
-  present in the STOW payload (no re-encoding on store).
-- **Retrieve:** instances are served in the stored transfer syntax;
+  present in the STOW payload (no re-encoding on store). Ingest is
+  store-as-received: no transfer syntax is rejected. (Instances whose UIDs
+  violate the DICOM UID grammar are refused per instance before any CAS
+  write — see §3.3.)
+- **Retrieve:** instances are served in the stored transfer syntax; a
   requested transfer syntax via `?transferSyntax=` requires the `transcode`
-  build feature (JPEG 2000 and JPEG-LS codecs). The baseline DICOM transfer
-  syntax (Implicit VR Little Endian) is parsed natively for metadata
-  extraction.
+  build feature.
+
+### 4.1 Transcode support (`transcode` build)
+
+**Decoders** (stored transfer syntax → pixels): Implicit VR Little Endian,
+Explicit VR Little Endian, Explicit VR Big Endian, RLE Lossless, JPEG
+Baseline (…4.50), JPEG Lossless P14 (…4.57 / …4.70), JPEG-LS Lossless /
+Near-Lossless (…4.80 / …4.81), JPEG 2000 Lossless / Lossy (…4.90 / …4.91).
+
+**Encoders** (pixels → requested transfer syntax): Explicit VR Little Endian,
+JPEG Baseline, JPEG Lossless, JPEG-LS Lossless / Near-Lossless, JPEG 2000
+Lossless / Lossy.
+
+**JPEG 2000 component policy:**
+- 1 or 3 components, 8/16-bit: fully supported.
+- N-component (≠ 1,3) codestreams (real-world: 5-component CBCT): MONOCHROME
+  images are transcoded from component 0; color images with N ≠ 3 components
+  are refused with `406`.
+- Signed codestream samples are preserved bit-exactly; the output instance
+  carries the `PixelRepresentation` (0028,0103) of the stored instance.
+
+**Not supported:** High-Throughput JPEG 2000 (…4.201–…4.203), JPIP, JPX,
+JPEG XL, MPEG/HEVC, Deflated Explicit VR LE. Such instances are stored and
+served as-is; a transcode request for them returns `406`.
+
+**Failure behavior:** when a supported target cannot be produced for a
+specific instance (codec error), the server falls back to the original bytes
+and logs a WARN that includes the codec error.
+
 - **Compile-time features:** `transcode` (JPEG 2000 + JPEG-LS on-the-fly),
-  `s3` (cold-tier fallback), `mlock`, CJK charsets.
+  `s3` (cold-tier fallback), `cjk-charsets` (CJK decoding),
+  `china_crypto` (planned: SM3 content-addressing instead of BLAKE3).
 
 ## 5. Security
 
@@ -204,6 +237,8 @@ user-selected sizes).
 | 5 | UPS-RS XML media type (`multipart/related; type="application/dicom+xml"`, Required, PS3.18 §11.1.3) | not supported — JSON only |
 | 6 | Workitem State resource (§11.7) and Request Cancellation resource (§11.8) | not exposed — state changes go through Update Workitem |
 | 7 | WADO-RS / WADO-URI rendered-resource and optional query parameters | not supported (viewport, windowing, annotation, quality, `charset`, `anonymize`) |
+| 8 | JPEG 2000 with N ≠ 1,3 components | MONOCHROME images are transcoded from component 0; color images → `406` |
+| 9 | High-Throughput JPEG 2000 (…4.201–…4.203) | not supported — stored and served as-is |
 
 ## 7. Character Sets
 
@@ -219,7 +254,8 @@ user-selected sizes).
 - Server: nginx-style config file, validated by `--test-config`.
 - Communication: HTTP/1.1 over TCP, keep-alive, thread-per-connection; TLS is
   terminated by the reverse proxy (see §5).
-- Compile-time features: `transcode`, `s3`, `mlock`, `cjk-charsets`.
+- Compile-time features: `transcode`, `s3`, `cjk-charsets`; `china_crypto`
+  (planned: SM3 content-addressing instead of BLAKE3).
 
 ## 9. Trademarks
 

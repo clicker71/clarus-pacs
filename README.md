@@ -34,7 +34,8 @@ in Rust.
 - **What is not public yet:** source code, binaries, documentation.
 - **License:** the source already carries LGPL-3.0 headers; it is published
   under LGPL-3.0 when the preview ends. Closed preview is a quality gate,
-  not a business model.
+  not a business model. Preview binaries are distributed under the
+  [closed-preview license](./LICENSE.md).
 - **Contact:** issues in this repository (fastest), or
   https://github.com/clicker71.
   No raw email addresses - public READMEs get harvested by spam bots.

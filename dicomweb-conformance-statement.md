@@ -150,9 +150,13 @@ user-selected sizes).
   (SCHEDULED → IN PROGRESS → COMPLETED/CANCELED/SUSPENDED) are driven through
   Update Workitem (PS3.18 §11.6); the non-standard `/claim` resource is no
   longer exposed.
-- **Media type:** `application/dicom+json` (Default). The Required XML media
-  type (`multipart/related; type="application/dicom+xml"`, PS3.18 §11.1.3)
-  is **not supported** — see §6.
+- **Media types:** `application/dicom+json` (Default) and
+  `application/dicom+xml` — search, create, update and retrieve workitem
+  responses are rendered as XML (PS3.19 `NativeDicomModel`, single part)
+  when requested via `Accept`. The Required media type
+  (`multipart/related; type="application/dicom+xml"`, PS3.18 §11.1.3) is
+  answered with the inner single part `application/dicom+xml` without the
+  multipart wrapper — see §6.
 - **Search keys:** Workitem UID (`0020000D`), Modality (`00080060`),
   Scheduled Station AE Title (`00400001`), Patient ID (`00100020`).
 - **Optimistic locking:** updates require the current Transaction UID; a
@@ -242,7 +246,7 @@ and logs a WARN that includes the codec error.
 | 2 | `fuzzymatch_override` (forced Levenshtein-1 on name keys) | non-standard extension, **enabled in the shipped server config** (conscious deviation: real clients such as Weasis never send `fuzzymatching=true`); set `fuzzymatch_override = false` to restore strict standard behavior |
 | 3 | `case_sensitive_pn = false` in the shipped config | non-standard Orthanc-style convenience: person-name wildcard matching is case-insensitive; set `true` for strict PS3.4 behavior |
 | 4 | STOW exact duplicates | deliberately `200` (idempotent), see §3.3 |
-| 5 | UPS-RS XML media type (`multipart/related; type="application/dicom+xml"`, Required, PS3.18 §11.1.3) | not supported — JSON only |
+| 5 | UPS-RS Required XML media type (`multipart/related; type="application/dicom+xml"`, PS3.18 §11.1.3) | XML responses are supported but delivered as a single `application/dicom+xml` part without the multipart wrapper; `Accept` negotiation is a substring match (`q=` factors are not parsed) |
 | 6 | Workitem State resource (§11.7) and Request Cancellation resource (§11.8) | not exposed — state changes go through Update Workitem |
 | 7 | WADO-RS / WADO-URI rendered-resource and optional query parameters | not supported (viewport, windowing, annotation, quality, `charset`, `anonymize`) |
 | 8 | JPEG 2000 with N ≠ 1,3 components | MONOCHROME images are transcoded from component 0; color images → `406` |

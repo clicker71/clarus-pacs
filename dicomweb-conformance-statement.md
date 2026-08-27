@@ -63,6 +63,14 @@ version.
 
 **Behavior:** unknown query keys are rejected with `400`.
 
+**`case_sensitive_pn`:** a server config option controlling the case of
+person-name wildcard patterns (`PatientName`, `ReferringPhysicianName`).
+PS3.4 wildcard matching is case-sensitive — `true` is strict standard
+behavior: `"Solgalov*"` matches `"Solgalov^Daniil^Yur'evich"`, `"solgalov*"`
+does not. The shipped config sets `false` (Orthanc-style convenience): both
+patterns match. The option does not affect wildcard-free patterns: fuzzy
+matching is case-insensitive by construction.
+
 **Fuzzy matching (documented per the requirement of PS3.18 §8.3.4.2):** the
 `fuzzymatching` parameter is optional; when absent it is `false` and literal
 matching is performed. When `true` (or when the `fuzzymatch_override`
@@ -132,8 +140,8 @@ user-selected sizes).
   violate the DICOM UID grammar are refused per instance BEFORE any CAS
   write — a stored instance must stay addressable by WADO/QIDO forever.
 - **Progress visibility:** `STOW_STUDY` progress lines are emitted every 50
-  slices; the final access-log line of a STOW request is deferred to the
-  next request (deliberate; see the `[logging]` notes in the server config).
+  slices; the final access-log line of a STOW request is written as soon as
+  the request completes.
 
 ### 3.4 UPS-RS (Unified Worklist)
 
@@ -232,8 +240,8 @@ and logs a WARN that includes the codec error.
 |---|---|---|
 | 1 | UPS-RS Subscription resource (PS3.18 §11.10, WebSocket-based notifications per §8.10) | not supported; the embedded viewer uses a private in-process SSE fan-out, which is a different mechanism |
 | 2 | `fuzzymatch_override` (forced Levenshtein-1 on name keys) | non-standard extension, **enabled in the shipped server config** (conscious deviation: real clients such as Weasis never send `fuzzymatching=true`); set `fuzzymatch_override = false` to restore strict standard behavior |
-| 3 | STOW exact duplicates | deliberately `200` (idempotent), see §3.3 |
-| 4 | Access-log final STOW line deferred to next request | documented log behavior, not a protocol deviation |
+| 3 | `case_sensitive_pn = false` in the shipped config | non-standard Orthanc-style convenience: person-name wildcard matching is case-insensitive; set `true` for strict PS3.4 behavior |
+| 4 | STOW exact duplicates | deliberately `200` (idempotent), see §3.3 |
 | 5 | UPS-RS XML media type (`multipart/related; type="application/dicom+xml"`, Required, PS3.18 §11.1.3) | not supported — JSON only |
 | 6 | Workitem State resource (§11.7) and Request Cancellation resource (§11.8) | not exposed — state changes go through Update Workitem |
 | 7 | WADO-RS / WADO-URI rendered-resource and optional query parameters | not supported (viewport, windowing, annotation, quality, `charset`, `anonymize`) |

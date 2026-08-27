@@ -70,10 +70,13 @@ send `fuzzymatching=true` (non-standard convenience extension, opt-in).
 
 ### 5.4 C-MOVE (SCP + SCU)
 Retrieval is performed via WADO-RS against Clarus and forwarded to the move
-destination with C-STORE as SCU. Any peer that has sent C-ECHO or C-STORE is
-auto-registered as a valid move destination; additional peers are configured
-in `peers.conf`. Statuses: standard C-MOVE progress/final responses;
-`0xA700` on resource exhaustion.
+destination with C-STORE as SCU. **Allowed destinations:** any peer that has
+sent C-ECHO or C-STORE is auto-registered as a move destination; additional
+destinations are configured in `peers.conf` as `AE_TITLE IP PORT` lines (the
+port may also follow a colon), where the address may be exact (`127.0.0.1`)
+or a subnet (`192.168.1.0/24`, or full mask `192.168.1.0 255.255.255.0`) so
+an entire network may receive moves. Statuses: standard C-MOVE
+progress/final responses; `0xA700` on resource exhaustion.
 
 ### 5.5 N-ACTION / N-EVENT-REPORT — Storage Commitment (SCP + SCU)
 

@@ -57,7 +57,7 @@ viewers, the companion bridge `clbridge` (Python, in the same source tree -
 one repo by design) terminates the legacy protocol:
 
 - **C-STORE** (SCP) from modalities - 71 SOP classes in the field build -
-  with automatic charset coercion, then STOW-RS into Clarus;
+  with automatic charset coercion (fixes CP1251 mojibake), then STOW-RS into Clarus;
 - **C-FIND** (SCP) from legacy viewers - mapped onto QIDO-RS (13/13 query
   attributes);
 - **C-MOVE** (SCU) toward legacy viewers, served from Clarus WADO-RS;

@@ -88,7 +88,7 @@ loopback. This is a stack-vs-stack comparison, not a raw filesystem benchmark.
 | System | Version | Notes |
 |--------|---------|-------|
 | Clarus PACS | field exe built 2026-08-23 01:26 | thread-per-connection, no tokio, CAS + CBOR manifests |
-| clbridge DIMSE bridge | field exe v0.3.0-alpha built 2026-08-23 12:17 | DIMSE -> DICOMweb adapter, outbox batching (100 SOP / 96 MB / 5 s idle) |
+| clbridge DIMSE bridge | field exe v0.3.0-alpha built 2026-08-23 12:17 | DIMSE -> DICOMweb™ adapter, outbox batching (100 SOP / 96 MB / 5 s idle) |
 | Orthanc | 1.12.11 (orthancteam/orthanc:latest) | Docker container, fresh container per cycle, storage inside the container |
 | Bench harness | ab_test.py (repo root) | python 3.12.10, pynetdicom 3.0.4, pydicom 3.0.2, requests 2.34.2 |
 
@@ -97,7 +97,7 @@ destination AE ABTEST_SCP registered in DicomModalities (host.docker.internal).
 
 ## 4. Corpus
 
-1063 DICOM files / 1035.1 MB (987.2 MiB), 3 studies, 5 series:
+1063 DICOM® files / 1035.1 MB (987.2 MiB), 3 studies, 5 series:
 two CT studies (432 and 626 instances) and one mixed study (3 JPEG-LS 1.2.840.10008.1.2.4.70
 DX + 2 SR instances).
 
@@ -267,3 +267,10 @@ C-STORE).
 - Driver: D:\Clarus\tmp\ab_loop.ps1 (7 cycles, self-healing retries).
 - Parser: D:\Clarus\tmp\parse_ab_runs.py -> ab_runs\summary.json.
 - Orthanc config: D:\Clarus\fieldtest\orthanc.json.
+
+## 11. Trademarks
+
+DICOM® is the registered trademark of the National Electrical Manufacturers
+Association (NEMA) for its standards publications relating to digital
+communications of medical information. DICOMweb™ is a trademark of NEMA.
+Clarus is not affiliated with or endorsed by NEMA.

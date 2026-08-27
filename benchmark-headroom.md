@@ -52,3 +52,10 @@ around.
   (see the cross-check above).
 - A GbE re-run after the cable/switch fix is planned; numbers will be
   appended here.
+
+## Trademarks
+
+DICOM® is the registered trademark of the National Electrical Manufacturers
+Association (NEMA) for its standards publications relating to digital
+communications of medical information. DICOMweb™ is a trademark of NEMA.
+Clarus is not affiliated with or endorsed by NEMA.

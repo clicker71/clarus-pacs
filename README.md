@@ -1,6 +1,6 @@
 # Clarus PACS
 
-Clarus is a DICOMweb PACS server (QIDO-RS, WADO-RS, STOW-RS, UPS-RS) written
+Clarus is a DICOMweb™ PACS server (QIDO-RS, WADO-RS, STOW-RS, UPS-RS) written
 in Rust.
 
 - **Status:** closed preview for now (pre-release). We are still finishing
@@ -15,7 +15,7 @@ in Rust.
   criterion A/B on the fuzzymatch path (bitap SIMD hot loop), 8/8 groups,
   p = 0.00 - medians **-58.1% .. -69.2%** vs `opt-level = "z"`
   (2026-08-20). Speed over squeezing the last kilobyte.
-- **Conformance:** being tested against DICOM PS3.18, including field
+- **Conformance:** being tested against DICOM® PS3.18, including field
   interoperability testing with the Weasis viewer. Public test artifacts and
   field reports are linked from this repository.
 - **Testing:** every release passes the public ap101 hot-path harness
@@ -27,6 +27,9 @@ in Rust.
     repository)
   - DIMSE throughput benchmark vs Orthanc (`benchmark.md` in this
     repository), produced by the public harness `tools/ab_test.py`
+  - DICOMweb™ conformance statement and the DIMSE bridge conformance
+    statement (`dicomweb-conformance-statement.md`,
+    `dimse-bridge-conformance-statement.md` in this repository)
   - Bug reports and discussions we file against third-party DICOM tooling
 - **What is not public yet:** source code, binaries, documentation.
 - **License:** the source already carries LGPL-3.0 headers; it is published
@@ -136,9 +139,43 @@ studies C-MOVE'd over a LAN whose links had negotiated 100 Mbit/s ran at
 busy. **The wall is the network, not the engine.** Methodology and
 per-run numbers: [benchmark-headroom.md](./benchmark-headroom.md).
 
-## How we work
+## FAQ
 
-We report what we measure. When our field testing finds a bug in someone
+### What happens if the server loses power mid-write? Is there a WAL?
+
+No WAL, deliberately: the B-tree never rewrites data in place, so there are
+no torn pages to journal. Instance bytes are streamed to a temp file, hashed
+with BLAKE3, fsync'd, and atomically renamed to their content-addressed
+path; the per-study CBOR manifest is committed with a single atomic rename.
+Readers see either the old state or the new state, never a partial one, and
+BLAKE3 doubles as the integrity check on every read. A `200 OK` is sent only
+after the manifest commit — before that the sender gets nothing, the bridge
+answers the modality with DIMSE `0xA700` (Out of Resources) and the modality
+is required to retry. The retry is idempotent and free: content addressing
+deduplicates it. After a power loss the worst leftovers are invisible temp
+files, and the search index is rebuilt from manifests. Honest limitation:
+the manifest file itself is intentionally not fsync'd (a documented
+trade-off); on some filesystems a just-committed manifest may be lost in a
+power cut, while the instance bytes remain in the CAS and are detected by
+their hash.
+
+### How does the engine scale to 10 million images?
+
+10M images ≈ 300-400K studies. Retrieval is O(1): the BLAKE3 hash directly
+addresses a file in a two-level sharded layout (~150 files per directory at
+10M) — no index lookup at all. Ingest is O(1) per study: one append + one
+atomic rename (measured 14-16 ms, nearly flat from 100 to 500 slices). QIDO
+by StudyInstanceUID is O(1) (the UID names exactly one manifest); by
+modality/date it is O(candidates) through day-bucket `.idx` files; fuzzy
+name search is O(candidates) through an n-gram candidate index + bitap
+matcher. Queries without an accelerator are O(n) **in RAM** over the study
+index — the disk is scanned only while that index builds lazily. Memory:
+pixels never enter process memory (page cache → socket), so the base process
+stays in the single-digit megabytes; the in-RAM study index adds ~0.5-1.5 KB
+per study ≈ 0.2-0.6 GB at 10M images — a stated trade-off, not a leak.
+Measured against SQLite on the same corpus: search within 3-10%, write path
+2.4x faster.
+
 else's tool, we file it publicly with numbers; when it finds a bug in ours,
 we say so in the same report. The Weasis field report linked here is the
 first example of both.
@@ -147,5 +184,14 @@ first example of both.
 
 - [Weasis field report](./weasis-report.md)
 - [DIMSE throughput benchmark vs Orthanc](./benchmark.md)
+- [DICOMweb™ conformance statement](./dicomweb-conformance-statement.md)
+- [DIMSE bridge conformance statement](./dimse-bridge-conformance-statement.md)
 - [Universal DICOM A/B harness](./tools/ab_test.py)
 - Upstream issues filed by the Clarus team will be linked here once filed.
+
+## Trademarks
+
+DICOM® is the registered trademark of the National Electrical Manufacturers
+Association (NEMA) for its standards publications relating to digital
+communications of medical information. DICOMweb™ is a trademark of NEMA.
+Clarus is not affiliated with or endorsed by NEMA.

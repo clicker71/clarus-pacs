@@ -1,4 +1,4 @@
-# Weasis DICOM Export (STOW-RS): field findings against a DICOMweb PACS
+# Weasis DICOM® Export (STOW-RS): field findings against a DICOMweb™ PACS
 
 **Date:** 2026-08-22
 **Client:** Weasis 4.7.2 (Windows, bundled JRE 26.0.1)
@@ -117,5 +117,12 @@ We mention these so the report is complete: two of the three Weasis-vs-server
 issues historically reported were actually ours.
 
 Prepared by the Clarus PACS team.
+
+## Trademarks
+
+DICOM® is the registered trademark of the National Electrical Manufacturers
+Association (NEMA) for its standards publications relating to digital
+communications of medical information. DICOMweb™ is a trademark of NEMA.
+Clarus is not affiliated with or endorsed by NEMA.
 
 

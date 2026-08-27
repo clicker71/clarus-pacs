@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 # Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
 
-r"""ab_test.py - universal DIMSE / DICOMweb A/B bench tool (upload then read).
+r"""ab_test.py - universal DIMSE / DICOMweb™ A/B bench tool (upload then read).
 
 Modes:
   -d DIR   DIMSE:    C-STORE upload, then C-MOVE read to an in-process SCP.
                      Target: clbridge (127.0.0.1:8104, AE CLBRIDGE) or Orthanc
                      (e.g. -d DIR --port 4242 --aet ORTHANC).
   -w DIR   DICOMweb: STOW-RS multipart upload, then WADO-RS read.
+  Trademark note: DICOM® is a registered trademark of NEMA; DICOMweb™ is a
+trademark of NEMA. Clarus is not affiliated with or endorsed by NEMA.
                      Target: Clarus (127.0.0.1:8024, base /dicomweb).
 
 DIR is scanned recursively for *.dcm. Not a dumb hammer: the tool ramps the

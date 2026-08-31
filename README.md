@@ -6,7 +6,7 @@ in Rust.
 - **Status:** closed preview for now (pre-release). We are still finishing
   internal testing and field validation; the source repository stays private
   until that bar passes, then it opens under LGPL-3.0.
-- **Footprint:** ~1.7 MB single static executable, zero runtime dependencies -
+- **Footprint:** ~1.9 MB single static executable, zero runtime dependencies -
   no VCRedist, no JVM, no interpreter. Smaller than two of the CT slices it
   stores. Fits on a single 2.88 MB ED floppy - the format that lost to the
   50-cent HD.

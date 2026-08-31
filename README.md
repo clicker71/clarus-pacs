@@ -31,7 +31,8 @@ in Rust.
     statement (`dicomweb-conformance-statement.md`,
     `dimse-bridge-conformance-statement.md` in this repository)
   - Bug reports and discussions we file against third-party DICOM tooling
-- **What is not public yet:** source code, binaries, documentation.
+- **What is not public yet:** source code and binaries; documentation is
+  published here gradually as it stabilizes.
 - **License:** the source already carries LGPL-3.0 headers; it is published
   under LGPL-3.0 when the preview ends. Closed preview is a quality gate,
   not a business model. Preview binaries are distributed under the

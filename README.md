@@ -141,6 +141,25 @@ studies C-MOVE'd over a LAN whose links had negotiated 100 Mbit/s ran at
 busy. **The wall is the network, not the engine.** Methodology and
 per-run numbers: [benchmark-headroom.md](./benchmark-headroom.md).
 
+## Measured on a Raspberry Pi 5 (2026-09-01)
+
+Same method (loopback, curl, warm/cold). Pi 5 (Cortex-A76, 2 GB RAM,
+NVMe over PCIe 2.0 x1), Raspberry Pi OS, **bare metal, native build**
+(no Docker, cpu=native). Corpus: three studies, 1,140 instances, 636 MB.
+
+| Condition | Single stream | Four streams (aggregate) |
+|---|---|---|
+| Warm (page cache) | 4.0 GB/s across the three studies | ~990 MB/s |
+| Cold (drop_caches) | 244-356 MB/s per study | ~896 MB/s |
+
+**Why does the Pi look "faster" than the i7 above?** Not hardware
+superiority - different conditions: the Beelink was measured inside
+Docker with the 26.08 build; the Pi runs the current build natively on
+bare metal. Single-stream cold is in fact slower on the Pi (244-356 vs
+344-428 MB/s) - the PCIe 2.0 x1 ceiling, honestly visible. The 4.0 GB/s
+warm figure is pure page-cache reads (the corpus fits in RAM), not a CPU
+win. These numbers do not compare CPUs; they show the engine is bound by
+memory, disk and network - not by CPU.
 ## FAQ
 
 ### What happens if the server loses power mid-write? Is there a WAL?

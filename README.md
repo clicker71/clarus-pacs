@@ -192,7 +192,8 @@ name search is O(candidates) through an n-gram candidate index + bitap
 matcher. Queries without an accelerator are O(n) **in RAM** over the study
 index — the disk is scanned only while that index builds lazily. Memory:
 pixels never enter process memory (page cache → socket), so the base process
-stays in the single-digit megabytes; the in-RAM study index adds ~0.5-1.5 KB
+RSS stays at ~6 MB on Windows and 8-13 MB on a Raspberry Pi 5
+(Linux/arm64); the in-RAM study index adds ~0.5-1.5 KB
 per study ≈ 0.2-0.6 GB at 10M images — a stated trade-off, not a leak.
 Measured against SQLite on the same corpus: search within 3-10%, write path
 2.4x faster.

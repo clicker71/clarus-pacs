@@ -160,6 +160,44 @@ bare metal. Single-stream cold is in fact slower on the Pi (244-356 vs
 warm figure is pure page-cache reads (the corpus fits in RAM), not a CPU
 win. These numbers do not compare CPUs; they show the engine is bound by
 memory, disk and network - not by CPU.
+
+## Memory profile: base build vs `transcode` build
+
+The 6-13 MB figures above are for the **base build** (no `transcode`
+feature).
+
+| Build | Idle RSS | After use |
+|---|---|---|
+| base | ~6 MB (Windows) · 8-13 MB (Pi 5, cold start) | bounded manifest cache (64 studies / 8 MB encoded) |
+| `--features transcode` | same as base | transient conversion buffers (see below) |
+
+The `transcode` feature adds codecs (JPEG-LS, JPEG Baseline/Lossless,
+JPEG 2000, RLE) and does **not** raise idle RSS. What changes is the
+**transient** memory DURING a conversion: decode + RGB + encode buffers
+sized by the image. A large multi-frame color study (e.g. 64 frames of
+600x800 RGB ultrasound) allocates ~90 MB of buffers per request; measured
+on a Pi 5 the process peaked at ~280-400 MB depending on the study and
+returned the bulk of it afterwards.
+
+On Linux, glibc keeps freed medium buffers in malloc arenas instead of
+returning them to the OS, so after a heavy transcode session RSS may sit
+at a plateau (~70 MB observed on Pi 5) - allocator behavior, not a leak.
+To make glibc trim eagerly, set in the systemd unit:
+
+```ini
+[Service]
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_TRIM_THRESHOLD_=4096
+```
+
+With these settings (measured on Pi 5): 5.5 MB cold, 6.1 MB right after a
+transcode, ~11 MB after a viewer reload + transcode - back to the base idle
+band.
+
+**Recommendation:** build with `transcode` only if you actually serve
+legacy viewers that cannot read the stored transfer syntaxes. Without it
+Clarus streams stored bytes as-is - no transcode buffers, no codec code.
+
 ## FAQ
 
 ### What happens if the server loses power mid-write? Is there a WAL?
@@ -191,9 +229,11 @@ modality/date it is O(candidates) through day-bucket `.idx` files; fuzzy
 name search is O(candidates) through an n-gram candidate index + bitap
 matcher. Queries without an accelerator are O(n) **in RAM** over the study
 index — the disk is scanned only while that index builds lazily. Memory:
-pixels never enter process memory (page cache → socket), so the base process
-RSS stays at ~6 MB on Windows and 8-13 MB on a Raspberry Pi 5
-(Linux/arm64); the in-RAM study index adds ~0.5-1.5 KB
+pixels never enter process memory (page cache → socket), so in the **base
+build** the process RSS stays at ~6 MB on Windows and 8-13 MB on a
+Raspberry Pi 5 (Linux/arm64) - the `transcode` build adds transient
+conversion buffers, see [Memory profile](#memory-profile-base-build-vs-transcode-build);
+the in-RAM study index adds ~0.5-1.5 KB
 per study ≈ 0.2-0.6 GB at 10M images — a stated trade-off, not a leak.
 Measured against SQLite on the same corpus: search within 3-10%, write path
 2.4x faster.

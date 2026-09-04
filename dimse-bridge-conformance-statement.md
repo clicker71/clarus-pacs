@@ -1,11 +1,12 @@
 # DICOM® Conformance Statement — Clarus DIMSE Bridge (clbridge)
 
-**Product:** Clarus bridge (DIMSE gateway) · **Version:** 0.3.0-alpha · **Date:** 2026-08-27
+**Product:** Clarus bridge (DIMSE gateway) · **Version:** 0.3.0-alpha · **Date:** 2026-09-04
 **Standards:** DICOM PS3.2 (Conformance, statement structure), PS3.7 (DIMSE), PS3.8 (ACSE); DICOMweb PS3.18 (user-agent side, per PS3.18 §6 the proxy functionality between DIMSE and the equivalent Web Services is described below)
 
 Re-checked against the bridge implementation on 2026-08-27 (SOP-class
 registry, C-FIND dispatch incl. MWL, `0xA700` backpressure, N-ACTION /
-N-EVENT-REPORT storage commitment, C-GET rejection).
+N-EVENT-REPORT storage commitment, C-GET rejection); 2026-09-04: optional
+forwarding channel (5.6).
 
 ---
 
@@ -19,7 +20,8 @@ Clarus is the reference target). It is not an origin server itself.
 ## 2. Implementation Model
 
 - **Roles:** DIMSE **SCP** (receives C-ECHO / C-STORE / C-FIND / C-MOVE /
-  N-ACTION), DIMSE **SCU** (C-STORE outbound for C-MOVE destinations),
+  N-ACTION), DIMSE **SCU** (C-STORE outbound for C-MOVE destinations
+  and for one optional configured forwarding destination, 5.6),
   DICOMweb **user agent** (QIDO-RS / WADO-RS / STOW-RS towards the
   configured DICOMweb origin server).
 - **Real-world activity:** modalities send studies via C-STORE; workstations
@@ -105,6 +107,28 @@ N-EVENT-REPORT.
   called AE = the tracked calling AE of the original association and our AE
   title unchanged (J.3.3.1.3 Notes 1-2); (3) undeliverable — WARN and drop
   (the SCU re-requests per its own timeout, J.3.3.1.2).
+
+### 5.6 Forwarding to a second (non-authoritative) archive (SCU, optional)
+
+Configuration: `[forward]` block in `clbridge.conf`; disabled by default
+(`enabled = false`). When enabled, the bridge additionally sends every
+received SOP Instance as C-STORE SCU to one configured destination
+(AE title + host + port).
+
+- **Best-effort:** the status returned to the originating modality is
+  decided by the primary store-and-forward path only; forwarding
+  failures are logged and counted and never change that status.
+- **Sent as stored:** instances are forwarded in their stored transfer
+  syntax; no conversion is performed.
+- **Retries:** failed deliveries are retried (default 10 attempts,
+  exponential backoff) and then kept in an undelivered directory for
+  operator action; queue overflow drops the newest item and is counted.
+- **Storage Commitment is not involved:** the second archive is
+  non-authoritative. The bridge sends it no N-ACTION and expects no
+  N-EVENT-REPORT from it; per PS3.4 J.3.1 Storage Commitment is a
+  two-party contract between the requesting SCU and the storing SCP.
+- **No query/retrieve with the second archive:** it is a C-STORE
+  receiver only; no C-FIND / C-MOVE is offered to or accepted from it.
 
 ## 6. DICOMweb User Agent Conformance
 

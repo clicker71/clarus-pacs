@@ -53,15 +53,28 @@ version.
 **Media types:** `application/dicom+json` (default) and
 `application/dicom+xml` (negotiated on `Accept`, per PS3.19).
 
-**Query parameters:** `PatientName`, `PatientID`, `AccessionNumber`,
-`StudyDescription`, `ReferringPhysicianName`, `PerformingPhysicianName`,
+**Query parameters:** `PatientName`, `ResponsiblePerson`, `PatientID`,
+`AccessionNumber`, `StudyDescription`, `ReferringPhysicianName`,
+`PerformingPhysicianName`,
 `NameOfPhysiciansReadingStudy`, `StudyInstanceUID`, `StudyID`, `StudyTime`,
 `PatientBirthDate`, `PatientSex`, `ModalitiesInStudy`, `SeriesInstanceUID`,
 `SeriesNumber`, `Modality`, `StudyDate` (range), plus `limit`, `offset`,
 `includefield`, `fuzzymatching` (person-name keys, Levenshtein-1),
 `case_sensitive_pn`.
 
-**Behavior:** unknown query keys are rejected with `400`.
+**Behavior:** unknown query keys are **ignored and logged** (interop parity
+with mainstream servers); a request with unknown keys no longer fails with
+`400`.
+
+**`ResponsiblePerson` (0010,2297) — vendor extension:** accepted as an
+additional matching key at the study and patient levels. It is beyond the
+mandatory key set of PS3.18 Table 10.6.1-5; PS3.18 §8.3.4.1 permits each
+query to define its own allowed attributes, and extensions must be declared
+in this Conformance Statement. Matching semantics follow the person-name
+keys: exact and wildcard (`*`, `?`) matching via the shared name predicate,
+`fuzzymatching=true` applies (Levenshtein-1), and case sensitivity follows
+the `case_sensitive_pn` knob. Cyrillic values are matched as decoded per
+the stored instance `SpecificCharacterSet`.
 
 **`case_sensitive_pn`:** a server config option controlling the case of
 person-name wildcard patterns (`PatientName`, `ReferringPhysicianName`).
@@ -251,6 +264,10 @@ and logs a WARN that includes the codec error.
 | 7 | WADO-RS / WADO-URI rendered-resource and optional query parameters | not supported (viewport, windowing, annotation, quality, `charset`, `anonymize`) |
 | 8 | JPEG 2000 with N ≠ 1,3 components | MONOCHROME images are transcoded from component 0; color images → `406` |
 | 9 | High-Throughput JPEG 2000 (…4.201–…4.203) | not supported — stored and served as-is |
+| 10 | Thumbnails of compressed instances (`/thumbnail`, `/rendered`) | `406 Not Acceptable` in every build — the raw 64x64 thumbnail path decodes uncompressed pixel samples only; compressed data is served in full size via `Accept: image/jpeg` (transcode build) |
+| 11 | Series metadata (`/studies/{study}/series/{series}/metadata`) without an explicit multipart Accept | single-part `application/dicom+json` array instead of the Required `multipart/related` (PS3.18 §10.4.4). OHIF's dicomweb-client requests this resource with `responseType=json` and crashes on any multipart body; the single-array answer is the deployed practice of dcm4chee/Google CH and the behavior OHIF/Weasis were field-verified against. The Required multipart media type is still fully supported for clients that ask for it |
+| 12 | `ResponsiblePerson` (0010,2297) additional matching attribute | non-standard extension, documented in §3.1; accepted for compatibility with veterinary workflows |
+| 13 | Veterinary attributes Species (0010,2201), Breed (0010,2292), Neutered (0010,2203) | captured at STOW and re-captured on rebuild, but **not searchable** as QIDO keys and **not returned** in QIDO responses until search/return behavior is decided; retrievable through WADO-RS metadata |
 
 ## 7. Character Sets
 

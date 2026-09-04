@@ -6,7 +6,7 @@ in Rust.
 - **Status:** closed preview for now (pre-release). We are still finishing
   internal testing and field validation; the source repository stays private
   until that bar passes, then it opens under LGPL-3.0.
-- **Footprint:** ~1.9 MB single static executable, zero runtime dependencies -
+- **Footprint:** ~1.7 MB single static executable, zero runtime dependencies -
   no VCRedist, no JVM, no interpreter. Smaller than two of the CT slices it
   stores. Fits on a single 2.88 MB ED floppy - the format that lost to the
   50-cent HD.
@@ -31,12 +31,11 @@ in Rust.
     statement (`dicomweb-conformance-statement.md`,
     `dimse-bridge-conformance-statement.md` in this repository)
   - Bug reports and discussions we file against third-party DICOM tooling
-- **What is not public yet:** source code and binaries; documentation is
-  published here gradually as it stabilizes.
+- **What is not public yet:** source code, binaries, documentation.
 - **License:** the source already carries LGPL-3.0 headers; it is published
   under LGPL-3.0 when the preview ends. Closed preview is a quality gate,
   not a business model. Preview binaries are distributed under the
-  [closed-preview license](./LICENSE.md).
+  [closed-preview license](./LICENSE.en.md).
 - **Contact:** issues in this repository (fastest), or
   https://github.com/clicker71.
   No raw email addresses - public READMEs get harvested by spam bots.
@@ -79,7 +78,7 @@ Clarus + clbridge vs Orthanc 1.12.11 over DIMSE, on the same VMware VM
 (3 vCPU, 32 GB RAM, HDD-backed virtual disks), loopback. n = 7 clean runs
 per condition; corpus 1035.1 MB (1063 instances, 3 studies). Full
 methodology, per-run tables, statistics and honest limitations:
-[benchmark.md](./benchmark.md).
+[benchmark.md](./benchmark.en.md).
 
 | Median | Clarus+bridge, AV OFF | Clarus+bridge, AV ON | Orthanc (Docker) |
 |--------|-----------------------|----------------------|------------------|
@@ -121,7 +120,7 @@ barely scaled: its two streams collapsed to 7.4 and 9.7 MB/s each (SQLite
 commit serializes writes). Shape of the curve: the lead widens with the
 number of concurrent modalities, and the modality-facing win is even
 larger - the outbox absorbs the backlog and releases the scanner in
-~16 s vs ~54-67 s. Full numbers and caveats: [benchmark.md](./benchmark.md)
+~16 s vs ~54-67 s. Full numbers and caveats: [benchmark.md](./benchmark.en.md)
 section 1.1.
 
 The universal harness that produced these numbers is public:
@@ -139,7 +138,7 @@ the 10 GbE line rate on hot data, 3-4x a GbE link even cold. The same
 studies C-MOVE'd over a LAN whose links had negotiated 100 Mbit/s ran at
 9.1 MB/s aggregate - the server was backpressured by the network, not
 busy. **The wall is the network, not the engine.** Methodology and
-per-run numbers: [benchmark-headroom.md](./benchmark-headroom.md).
+per-run numbers: [benchmark-headroom.md](./benchmark-headroom.en.md).
 
 ## Measured on a Raspberry Pi 5 (2026-09-01)
 
@@ -244,10 +243,10 @@ first example of both.
 
 ## Links
 
-- [Weasis field report](./weasis-report.md)
-- [DIMSE throughput benchmark vs Orthanc](./benchmark.md)
-- [DICOMweb™ conformance statement](./dicomweb-conformance-statement.md)
-- [DIMSE bridge conformance statement](./dimse-bridge-conformance-statement.md)
+- [Weasis field report](./weasis-report.en.md)
+- [DIMSE throughput benchmark vs Orthanc](./benchmark.en.md)
+- [DICOMweb™ conformance statement](./dicomweb-conformance-statement.en.md)
+- [DIMSE bridge conformance statement](./dimse-bridge-conformance-statement.en.md)
 - [Universal DICOM A/B harness](./tools/ab_test.py)
 - Upstream issues filed by the Clarus team:
   [OHIF/Viewers #6241](https://github.com/OHIF/Viewers/issues/6241)

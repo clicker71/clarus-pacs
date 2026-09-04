@@ -13,13 +13,15 @@ N-EVENT-REPORT storage commitment, C-GET rejection).
 
 The bridge is a DIMSE-to-DICOMweb gateway: it receives classic DIMSE traffic
 from modalities and workstations and translates it into DICOMweb calls to
-the Clarus origin server. It is not an origin server itself.
+the configured DICOMweb origin server (any DICOMweb-compatible server;
+Clarus is the reference target). It is not an origin server itself.
 
 ## 2. Implementation Model
 
 - **Roles:** DIMSE **SCP** (receives C-ECHO / C-STORE / C-FIND / C-MOVE /
   N-ACTION), DIMSE **SCU** (C-STORE outbound for C-MOVE destinations),
-  DICOMweb **user agent** (QIDO-RS / WADO-RS / STOW-RS towards Clarus).
+  DICOMweb **user agent** (QIDO-RS / WADO-RS / STOW-RS towards the
+  configured DICOMweb origin server).
 - **Real-world activity:** modalities send studies via C-STORE; workstations
   query via C-FIND and retrieve via C-MOVE; imaging devices request Storage
   Commitment via N-ACTION. The bridge translates each request to the
@@ -56,7 +58,8 @@ Not offered: C-GET (rejected by design — use C-MOVE), N-SET.
 SCP: answers `0x0000`. Used also for auto-registering move destinations.
 
 ### 5.2 C-STORE (SCP)
-Each instance is forwarded to STOW-RS on the Clarus origin server. Responses:
+Each instance is forwarded to STOW-RS on the configured DICOMweb origin
+server. Responses:
 success `0x0000`. Backpressure: the bridge returns `0xA700` (Out of
 Resources) when the server is unreachable or the in-memory queue is near
 full, and `0xC000` on hard rejection (queue ≥ 95%). Queue and worker sizing
@@ -69,8 +72,8 @@ Levenshtein-1 matching on person-name keys even when the device does not
 send `fuzzymatching=true` (non-standard convenience extension, opt-in).
 
 ### 5.4 C-MOVE (SCP + SCU)
-Retrieval is performed via WADO-RS against Clarus and forwarded to the move
-destination with C-STORE as SCU. **Allowed destinations:** any peer that has
+Retrieval is performed via WADO-RS against the configured DICOMweb origin
+server and forwarded to the move destination with C-STORE as SCU. **Allowed destinations:** any peer that has
 sent C-ECHO or C-STORE is auto-registered as a move destination; additional
 destinations are configured in `peers.conf` as `AE_TITLE IP PORT` lines (the
 port may also follow a colon), where the address may be exact (`127.0.0.1`)
@@ -105,8 +108,8 @@ N-EVENT-REPORT.
 
 ## 6. DICOMweb User Agent Conformance
 
-Towards the Clarus origin server the bridge uses: QIDO-RS (search),
-STOW-RS (store), WADO-RS (retrieve). See
+Towards the configured DICOMweb origin server the bridge uses: QIDO-RS
+(search), STOW-RS (store), WADO-RS (retrieve). See
 [dicomweb-conformance-statement.md](./dicomweb-conformance-statement.md) for
 the origin-server side. The bridge does not expose DICOMweb services itself.
 

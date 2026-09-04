@@ -27,7 +27,7 @@ the Clarus origin server. It is not an origin server itself.
 
 ## 3. AE Specification
 
-- **AE Title (SCP):** `CLARUS_BRIDGE` (default, configurable).
+- **AE Title (SCP):** `CLBRIDGE` (default, configurable).
 - **Port:** `8104` default (configurable).
 - **Calling AE:** accepted from any AE; association accepted unconditionally
   (result 0x0000). AE titles longer than 16 chars are truncated in logs.

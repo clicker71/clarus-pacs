@@ -25,6 +25,9 @@ in Rust.
 - **What is public now:**
   - Viewer interoperability: Weasis field report (`weasis-report.md` in
     this repository); MicroDicom and OHIF are covered by closed tests
+  - AI results pipeline: SR + PR + SEG + derived in one study, rendered
+    by Weasis (screenshot in this README, "AI results, one pipeline"
+    section)
   - DIMSE throughput benchmark vs Orthanc (`benchmark.md` in this
     repository), produced by the public harness `tools/ab_test.py`
   - DICOMweb™ conformance statement and the DIMSE bridge conformance
@@ -72,6 +75,25 @@ A study sent by a decades-old CT scanner lands in the same content-addressed
 store as DICOMweb traffic and is immediately searchable through QIDO-RS -
 including Unicode-safe fuzzymatch on patient names. Store-and-forward DIMSE
 traffic is what the bridge was built for.
+
+## AI results, one pipeline (clinfer)
+
+The processing sidecar `clinfer` claims UPS-RS workitems from Clarus, runs
+site-supplied model scripts through a model-agnostic contract (per study:
+raw frames and a manifest in, result objects out), and stores the results
+back with STOW-RS. One run of the demo pipeline produced all of the result
+kinds below in a single study - a segmentation (SEG), structured findings
+(SR), a presentation state (PR) with measurements, and a derived pathology
+image - and Weasis renders them together:
+
+![Weasis 4.7.2: SEG overlay (heart, lungs) + PR measurement + SR series in
+one Clarus study](images/weasis-object-types.png)
+
+The object names its own producer: the segmentation carries Segment
+Algorithm Name (0062,0009) = `chest-seg`, the script that computed it, and
+Weasis computes the voxel count from the stored mask (on projection
+radiographs it assumes 1 voxel = 1 mm^3). No mock-up: the same study is
+served by QIDO-RS/WADO-RS from Clarus.
 
 ## Throughput benchmark (2026-08-23)
 

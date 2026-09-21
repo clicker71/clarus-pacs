@@ -78,13 +78,28 @@ traffic is what the bridge was built for.
 
 ## AI results, one pipeline (clinfer)
 
-The processing sidecar `clinfer` claims UPS-RS workitems from Clarus, runs
-site-supplied model scripts through a model-agnostic contract (per study:
-raw frames and a manifest in, result objects out), and stores the results
-back with STOW-RS. One run of the demo pipeline produced all of the result
-kinds below in a single study - a segmentation (SEG), structured findings
-(SR), a presentation state (PR) with measurements, and a derived pathology
-image - and Weasis renders them together:
+The processing sidecar `clinfer` claims UPS-RS workitems from Clarus
+(IHE AIW-I profile), runs a site-supplied model script under a
+model-agnostic contract, and stores the results back with STOW-RS.
+Clarus acts as the AIW-I Task Manager and clinfer as the Pull-workflow
+Task Performer; the AIW-I conformance statement is published. For a
+research group this closes the gap they normally patch themselves - a
+hand-built UPS service, hand-written DICOM serialization, fragile result
+delivery. The model stays with its authors; standard delivery of results
+into the archive and viewers already works.
+
+- The model never sees DICOM: per study, clinfer lays out frames as raw
+  pixel arrays plus a manifest.json - no medical libraries required.
+- One run: the script (Python, C++, OpenVINO - any executable) runs in a
+  separate OS process with timeouts and returns one result.json.
+- clinfer validates geometry byte-for-byte and assembles standard DICOM
+  objects; one demo run produced all of them in a single study, and
+  Weasis renders them together:
+  - SEG - pixel masks of organs;
+  - SR - structured findings (including from local LLMs);
+  - PR (GSPS) - overlays and measurements with per-class colours;
+  - Derived - enhanced images (super-resolution, CLAHE);
+  - RTSTRUCT - vector contours.
 
 ![Weasis 4.7.2: SEG overlay (heart, lungs) + PR measurement + SR series in
 one Clarus study](images/weasis-object-types.png)
@@ -94,6 +109,21 @@ Algorithm Name (0062,0009) = `chest-seg`, the script that computed it, and
 Weasis computes the voxel count from the stored mask (on projection
 radiographs it assumes 1 voxel = 1 mm^3). No mock-up: the same study is
 served by QIDO-RS/WADO-RS from Clarus.
+
+Trigger without external plumbing: after a durable STOW the origin creates
+the workitem itself (`[ups] computer_aided_detection`) and clinfer polls it
+(Pull). WebSocket notifications (RAD-87/RAD-109) are in development.
+
+```mermaid
+flowchart LR
+  STOW[STOW-RS: study] --> WI[UPS workitem (Task Manager)]
+  WI --> CL[clinfer: claim]
+  CL --> AB[ABI script: frames + manifest]
+  AB --> RS[result.json]
+  RS --> CL
+  CL --> OUT[STOW-RS: SEG / SR / PR / Derived]
+  OUT --> VIEW[Clarus archive, viewed in Weasis]
+```
 
 ## Throughput benchmark (2026-08-23)
 

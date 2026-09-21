@@ -112,7 +112,7 @@ served by QIDO-RS/WADO-RS from Clarus.
 
 Trigger without external plumbing: after a durable STOW the origin
 creates the workitem itself (`[ups] computer_aided_detection`) - an
-allowed origin-server capability: "User agents and origin servers can
+allowed origin-server capability: "User agents **and origin servers** can
 create Workitems" (PS3.18 Section 11.1) - and clinfer polls it (Pull).
 WebSocket notifications (RAD-87/RAD-109) are in development.
 

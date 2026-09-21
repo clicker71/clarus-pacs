@@ -120,12 +120,19 @@ WebSocket notifications (RAD-87/RAD-109) are in development.
 flowchart LR
   STOW["STOW-RS: study"] --> WI["UPS workitem (Task Manager)"]
   WI --> CL["clinfer: claim"]
-  CL --> AB["ABI script: frames + manifest"]
+  CL --> RULE{"rules: study tags match?"}
+  RULE -- no --> DROP["cancel: no rule matches"]
+  RULE -- yes --> AB["ABI script: frames + manifest"]
   AB --> RS["result.json"]
   RS --> CL
   CL --> OUT["STOW-RS: SEG / SR / PR / Derived"]
   OUT --> VIEW["Clarus archive, viewed in Weasis"]
 ```
+
+The claim is rules-guarded, not trust-based: clinfer matches the study
+against the configured model rules (study tags - modality, body part and
+the like) and cancels a workitem no rule accepts. A chest model never
+receives knees: the mismatch is refused before the first frame is read.
 
 ## Throughput benchmark (2026-08-23)
 

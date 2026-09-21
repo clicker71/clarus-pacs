@@ -116,13 +116,13 @@ the workitem itself (`[ups] computer_aided_detection`) and clinfer polls it
 
 ```mermaid
 flowchart LR
-  STOW[STOW-RS: study] --> WI[UPS workitem (Task Manager)]
-  WI --> CL[clinfer: claim]
-  CL --> AB[ABI script: frames + manifest]
-  AB --> RS[result.json]
+  STOW["STOW-RS: study"] --> WI["UPS workitem (Task Manager)"]
+  WI --> CL["clinfer: claim"]
+  CL --> AB["ABI script: frames + manifest"]
+  AB --> RS["result.json"]
   RS --> CL
-  CL --> OUT[STOW-RS: SEG / SR / PR / Derived]
-  OUT --> VIEW[Clarus archive, viewed in Weasis]
+  CL --> OUT["STOW-RS: SEG / SR / PR / Derived"]
+  OUT --> VIEW["Clarus archive, viewed in Weasis"]
 ```
 
 ## Throughput benchmark (2026-08-23)

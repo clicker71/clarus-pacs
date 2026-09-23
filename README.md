@@ -1,12 +1,15 @@
 # Clarus PACS
 
+> **DOTADIW.** — Doug McIlroy, *UNIX Time-Sharing System: Foreword*,
+> Bell System Technical Journal, 1978.
+
 Clarus is a DICOMweb™ PACS server (QIDO-RS, WADO-RS, STOW-RS, UPS-RS) written
 in Rust.
 
 - **Status:** closed preview for now (pre-release). We are still finishing
   internal testing and field validation; the source repository stays private
   until that bar passes, then it opens under LGPL-3.0.
-- **Footprint:** ~1.9 MB single static executable, zero runtime dependencies -
+- **Footprint:** ~2 MB single static executable,[^1] zero runtime dependencies -
   no VCRedist, no JVM, no interpreter. Smaller than two of the CT slices it
   stores. Fits on a single 2.88 MB ED floppy - the format that lost to the
   50-cent HD.
@@ -63,7 +66,7 @@ one repo by design) terminates the legacy protocol:
 
 - **C-STORE** (SCP) from modalities - 71 SOP classes in the field build -
   with automatic charset coercion (fixes CP1251 mojibake), then STOW-RS into Clarus;
-- **C-FIND** (SCP) from legacy viewers - mapped onto QIDO-RS (13/13 query
+- **C-FIND** (SCP) from legacy viewers - mapped onto QIDO-RS (21/21 query
   attributes);
 - **C-MOVE** (SCU) toward legacy viewers, served from Clarus WADO-RS;
 - **N-ACTION** (request handling; the storage commitment loop closes
@@ -319,3 +322,5 @@ DICOM® is the registered trademark of the National Electrical Manufacturers
 Association (NEMA) for its standards publications relating to digital
 communications of medical information. DICOMweb™ is a trademark of NEMA.
 Clarus is not affiliated with or endorsed by NEMA.
+
+[^1]: ~4 MB in the build with the optional `transcode` feature (codecs compiled in).

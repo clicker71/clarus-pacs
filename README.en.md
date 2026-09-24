@@ -147,7 +147,7 @@ per-run numbers: [benchmark-headroom.md](./benchmark-headroom.en.md).
 
 ## Measured on a Raspberry Pi 5 (2026-09-01)
 
-![Clarus on a Raspberry Pi with the ~30 KB inline mini-viewer at /](images/clarus-raspi5.jpg)
+![Clarus on a Raspberry Pi 5 with the inline ~30 KB mini-viewer at / - a visual "ping" for the service engineer/admin](images/clarus-raspi5.jpg)
 
 Same method (loopback, curl, warm/cold). Pi 5 (Cortex-A76, 2 GB RAM,
 NVMe over PCIe 2.0 x1), Raspberry Pi OS, **bare metal, native build**

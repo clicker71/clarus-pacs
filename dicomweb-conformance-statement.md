@@ -2,7 +2,7 @@
 
 **Product:** Clarus DICOMweb origin server (`clarus` binary)
 **Version:** 0.3.0-alpha
-**Date:** 2026-09-08
+**Date:** 2026-09-24
 **Standard:** DICOM PS3.18 (Web Services), 2026c edition; DICOM PS3.19 (XML
 application of DICOM to web resources); DICOM PS3.2 (Conformance statement
 structure)
@@ -21,7 +21,8 @@ runtime. Received instances are stored as-is in a content-addressed archive
 (BLAKE3); search and retrieval are served from per-study CBOR manifests and
 append-only B-tree/n-gram indexes.
 
-- **Roles:** origin server for QIDO-RS, WADO-RS, STOW-RS, UPS-RS and WADO-URI.
+- **Roles:** origin server for QIDO-RS, WADO-RS, STOW-RS, UPS-RS,
+  WADO-URI and Storage Commitment (PS3.18 Section 13).
 - **Real-world activities:** receives instances via STOW-RS (directly or
   through the Clarus DIMSE bridge), stores them durably, answers queries
   (QIDO-RS) and serves retrievals (WADO-RS, WADO-URI) to DICOMweb user agents
@@ -82,7 +83,7 @@ request completes.
 | `/series/{series}` | `multipart/related; type="application/dicom"` |
 | `/instances/{sop}` | `application/dicom` (supports `Range`, partial content `206`) |
 | `/instances/{sop}/metadata` | `application/dicom+json` (default); `application/dicom+xml` on negotiation |
-| `/studies/{study}/series/{series}/metadata` | `multipart/related; type="application/dicom+json"` when Accept asks multipart (Required media type, PS3.18 10.4.4); a single-part `application/dicom+json` array otherwise (see 10.11) |
+| `/studies/{study}/series/{series}/metadata` | `multipart/related; type="application/dicom+json"` when Accept asks multipart (Required media type, PS3.18 10.4.4); a single-part `application/dicom+json` array otherwise (see 11.11) |
 | `/instances/{sop}/frames/{n}` | `multipart/related; type="application/octet-stream"` with a per-frame part `Content-Type` naming the stored transfer syntax (see below) |
 | `/instances/{sop}/thumbnail` | `image/jpeg` 64x64 (see 2.4) |
 | bulkdata URIs (`/bulkdata/{tag}`) | `application/octet-stream` |
@@ -161,7 +162,7 @@ keys, see below), A = CSV any-component (multi-valued attributes).
 | PerformingPhysicianName | (0008,1050) | W, F |
 | NameOfPhysiciansReadingStudy | (0008,1060) | W, F |
 | StudyInstanceUID | (0020,000D) | E |
-| ResponsiblePerson | (0010,2297) | W, F (extension, see 10.1) |
+| ResponsiblePerson | (0010,2297) | W, F (extension, see 11.1) |
 | InstitutionName | (0008,0080) | W (extension) |
 | RequestingPhysician | (0032,1032) | W (extension) |
 | RequestedProcedureDescription | (0032,1060) | W (extension) |
@@ -257,31 +258,76 @@ request. Default `limit` 250; `limit`/`offset` paging is supported.
 ### 2.5 Delete (admin extension)
 
 Instance/study deletion is exposed through the **administrative API**, not
-the DICOMweb DELETE method (see 10.4). Deletion is journaled: the study is
+the DICOMweb DELETE method (see 11.16). Deletion is journaled: the study is
 tombstoned first, blobs are reclaimed by a background worker, and every
 deletion is recorded in the append-only audit journal with the author,
 reason and timestamp.
 
-## 3. Worklist Service (UPS-RS)
+## 3. Storage Commitment Service (PS3.18 Section 13)
 
-- **Resources:** `/workitems` - search (GET and POST), create, get,
-  update, delete; `/workitems/{uid}/events` - SSE event subscription.
-  State changes (SCHEDULED to IN PROGRESS to COMPLETED/CANCELED/SUSPENDED)
-  are driven through Update Workitem (PS3.18 11.6).
+- **Resource:** `/commitment-requests/{TransactionUID}` - two
+  transactions on one resource: Commit (POST, 13.4) and Check Commit
+  Result (GET, 13.5), the Asynchronous Request-Reply pattern.
+- **Commit:** answered synchronously with Done - `200` carrying
+  per-instance results (13.4.2.1; a `200` may report every instance
+  failed). No `202` Working is ever sent. The Transaction UID travels
+  in the PATH, never in the payload (13.4.1.1); a duplicate Transaction
+  UID is `409`, a duplicated SOP Instance within one request is `400`,
+  and attributes outside the Commit payload are `400`.
+- **The commitment is verifiable:** per-instance success means the SOP
+  Instance UID is present in the study manifest - STOW answers `200`
+  only after the manifests are durable, and the manifest's instance
+  table embeds the CAS frame-chunk table, the "copy of the entire
+  pixel data" PS3.4 J.1.1 requires. A missing instance is reported
+  with Failure Reason `0112H` (No such SOP Instance) - the fact that
+  was actually checked.
+- **Check Commit Result:** GET on the same path, no query parameters
+  (an extra parameter is `400`). Media types `application/dicom+json`
+  (default) and `application/dicom+xml`, with the multipart/related
+  forms answered as a single part. An answered transaction is retained
+  `result_retention_days` days (default 30, `0` = forever); after the
+  sweep Check answers `404`, which Table 13.5.3-1 allows for a deleted
+  result - no `410` tombstone is kept.
+
+## 4. Worklist Service (UPS-RS)
+
+- **Resources:** `/workitems` - search (GET and POST, 11.9), create
+  (11.4), retrieve (11.5) and change state (PUT
+  `/workitems/{uid}/state`, 11.7); the bare PUT on the workitem is the
+  same state change; DELETE is a non-standard administration path.
+  `/workitems/{uid}/events` - per-workitem SSE event stream
+  (non-standard extension, see 11.9). Subscriptions (11.10/11.11):
+  POST/DELETE
+  `/workitems/{subscription-sop-class-uid}/subscribers/{subscriber}` -
+  the 2026c subscribe-without-payload shape (`filter` query parameter,
+  11.10.1.2/11.10.1.4), global (1.2.840.10008.5.1.4.34.5) and filtered
+  (34.5.1) forms, and the `?deletionlock` query parameter (11.10). The
+  WebSocket Notification Connection (8.10.4): `GET
+  /dicomweb/subscribers/{requester}` with the RFC 6455 upgrade headers;
+  Event Reports are JSON text frames (8.10.6).
+- **States:** SCHEDULED, IN PROGRESS, COMPLETED, CANCELED. State
+  changes carry the Procedure Step State (0074,1000) and the locking
+  Transaction UID (0008,1195) - both type 1 - and read nothing else
+  (11.7.1.4).
 - **Media types:** `application/dicom+json` (Default) and
   `application/dicom+xml`. The Required XML media type
   (`multipart/related; type="application/dicom+xml"`, PS3.18 11.1.3) is
   answered with the inner single part without the multipart wrapper
-  (see 10.9).
-- **Search keys:** Workitem UID (0020,000D), Modality (0008,0060),
-  Scheduled Station AE Title (0040,0001), Patient ID (0010,0020).
-- **Optimistic locking:** updates require the current Transaction UID; a
-  mismatch returns a conflict (`409`).
-- **Not supported:** the Subscription resource (11.10), the dedicated
-  Change Workitem State resource (11.7) and the Request Cancellation
-  resource (11.8). State changes are performed through Update Workitem.
+  (see 11.8).
+- **Search keys:** Workitem UID (0020,000D), Procedure Step State
+  (0074,1000), Procedure Step Label (0074,1204), Scheduled Station AE
+  Title (0040,0001), Patient ID (0010,0020). Modality is deliberately
+  not a key - the UPS IOD defines no Modality attribute.
+- **Optimistic locking:** state changes and updates require the current
+  Transaction UID; a mismatch returns a conflict (`409`).
+- **Not supported:** Update Workitem as an attribute-only transaction
+  (11.6) and the Request Cancellation resource (11.8) - a cancellation
+  is performed by the workitem owner through Change Workitem State.
+  The subscription registry is process-lifetime: a restart forgets
+  subscriptions and their deletion locks (the durable path is UPS
+  Search; the profile sets no persistence requirement).
 
-## 4. WADO-URI
+## 5. WADO-URI
 
 **Resource:** `/wadouri` - single-instance retrieval by UID query
 parameters. Conformance claim is limited to **Retrieve DICOM Instance,
@@ -291,19 +337,21 @@ mandatory set - `requestType` (=WADO), `studyUID`, `seriesUID`,
 `anonymize`, transfer syntax) are **not supported**; a request for
 `requestType != WADO` is rejected with `400`.
 
-## 5. Capabilities
+## 6. Capabilities
 
 **Resource:** `/dicomweb/` - returns the service capabilities document
-(`application/dicom+json`).
+(`application/dicom+json`). Advertised keys: `qido-rs`, `wado-rs`,
+`stow-rs`, `ups-rs`, `wado-uri`, `commitment-rs`,
+`transferCapabilities`.
 
-## 6. Transfer Syntaxes
+## 7. Transfer Syntaxes
 
 - **Ingest:** store-as-received; instances are accepted and stored in any
   transfer syntax present in the STOW payload, with no re-encoding.
 - **Retrieve:** served in the stored transfer syntax; a requested
   `?transferSyntax=` requires the `transcode` build feature.
 
-### 6.1 Transcode support (`transcode` build)
+### 7.1 Transcode support (`transcode` build)
 
 **Decoders** (stored transfer syntax to pixels): Implicit VR Little
 Endian, Explicit VR Little Endian, Explicit VR Big Endian, RLE Lossless,
@@ -331,7 +379,7 @@ and served as-is; a transcode request for them returns `406`.
 bytes with a logged WARN; a non-conformant codestream (component count
 mismatch) is a deterministic refusal with `406`.
 
-## 7. Character Sets
+## 8. Character Sets
 
 - The DICOM default character repertoire and Latin-1 pass through
   natively; UTF-8 (ISO_IR 192) is handled in JSON/XML responses.
@@ -342,7 +390,7 @@ mismatch) is a deterministic refusal with `406`.
   is built with the `cjk-charsets` feature; without it CJK text is not
   decoded. The shipped default build includes the feature.
 
-## 8. Security
+## 9. Security
 
 - Authentication and TLS termination are **delegated** to the reverse
   proxy (nginx). The server trusts the proxy identity headers
@@ -357,40 +405,42 @@ mismatch) is a deterministic refusal with `406`.
 - Encryption at rest is the OS-level mount encryption (BitLocker / LUKS /
   EFS); the server binary contains no symmetric encryption of its own.
 
-## 9. Configuration
+## 10. Configuration
 
 - Server: nginx-style config file (`clarus.conf`), validated by
   `clarus --test-config`.
 - Communication: HTTP/1.1 over TCP, keep-alive, thread-per-connection;
-  TLS is terminated by the reverse proxy (see 8).
+  TLS is terminated by the reverse proxy (see 9).
+- Storage Commitment retention: `[commitment] result_retention_days`
+  (default 30, `0` = forever).
 - Compile-time features: `transcode` (JPEG 2000 + JPEG-LS on-the-fly),
   `s3` (cold-tier fallback), `cjk-charsets` (CJK decoding);
   `china_crypto` (planned: SM3 content-addressing instead of BLAKE3).
 
-## 10. Extensions and Deviations
+## 11. Extensions and Deviations
 
 Vendor extensions beyond the mandatory key set of PS3.18 Table 10.6.1-5
 are legal per PS3.18 8.3.4.1 and are declared here.
 
-**10.1 `ResponsiblePerson` (0010,2297)** - additional matching key at the
+**11.1 `ResponsiblePerson` (0010,2297)** - additional matching key at the
 study and patient levels (veterinary workflows). Person-name semantics:
 exact and wildcard matching, `fuzzymatching=true` applies (Levenshtein-1),
 case sensitivity follows `case_sensitive_pn`. Cyrillic values are matched
 as decoded per the stored `SpecificCharacterSet`.
 
-**10.2 Series-level search keys `StationName` (0008,1010) and
+**11.2 Series-level search keys `StationName` (0008,1010) and
 `BodyPartExamined` (0018,0015)** - wildcard matching keys with
 `SeriesDescription` semantics (dcm4chee-arc / Orthanc parity). On
 instance resources they are accepted-and-ignored per 10.6.1.2.1; on the
 study resource they are foreign and rejected with `400`. No fuzzymatching
 and no n-gram indexing is wired for these keys.
 
-**10.3 `PatientBirthDate` range** - in addition to the exact `YYYYMMDD`
+**11.3 `PatientBirthDate` range** - in addition to the exact `YYYYMMDD`
 form, the key accepts `YYYYMMDD-YYYYMMDD` and the wildcard `*` at the
 study level and on the `/dicomweb/patients` resource. Matching is an
 inclusive numeric range over the stored date.
 
-**10.4 Seven captured search attributes** - study level:
+**11.4 Seven captured search attributes** - study level:
 `InstitutionName` (0008,0080), `RequestingPhysician` (0032,1032),
 `RequestedProcedureDescription` (0032,1060); series level:
 `Manufacturer` (0008,0070), `InstitutionalDepartmentName` (0008,1040),
@@ -401,40 +451,41 @@ template: the `case_sensitive_pn` option applies exactly as for
 `ReferringPhysicianName` / `PerformingPhysicianName`; `fuzzymatching` is
 not wired for these keys.
 
-**10.5 `fuzzymatch_override`** - a server option that forces
+**11.5 `fuzzymatch_override`** - a server option that forces
 Levenshtein-1 matching on person-name keys even when the client does not
 send `fuzzymatching=true`. Non-standard; **enabled in the shipped
 server config** (real clients such as Weasis never send
 `fuzzymatching=true`). Set `fuzzymatch_override = false` for strict
 standard behavior.
 
-**10.6 `case_sensitive_pn = false` in the shipped config** - person-name
+**11.6 `case_sensitive_pn = false` in the shipped config** - person-name
 wildcard matching is case-insensitive (Orthanc-style convenience). Set
 `true` for strict PS3.4 behavior. Wildcard-free fuzzy matching is
 case-insensitive by construction.
 
-**10.7 Series-root instances query `GET /dicomweb/series/{series}/instances`**
+**11.7 Series-root instances query `GET /dicomweb/series/{series}/instances`**
 - non-standard resource: PS3.18 defines series resources only scoped under
 a study. Weasis appends `/instances` to a series-level `RetrieveURL`; the
 resource resolves the owning study via a manifest scan and answers the
 standard study-scoped query. Standard clients keep using the study-scoped
 path.
 
-**10.8 UPS-RS XML media type** - the Required XML media type
+**11.8 UPS-RS XML media type** - the Required XML media type
 (`multipart/related; type="application/dicom+xml"`, PS3.18 11.1.3) is
 answered as a single `application/dicom+xml` part without the multipart
 wrapper; `Accept` negotiation is a substring match (`q=` factors are not
 parsed).
 
-**10.9 UPS-RS Subscription (11.10), Change Workitem State (11.7) and
-Request Cancellation (11.8)** - not supported; state changes go through
-Update Workitem; the embedded viewer uses a private in-process SSE fan-out.
+**11.9 UPS-RS SSE event stream** - `GET /workitems/{uid}/events` is a
+non-standard per-workitem SSE stream (`event: StateChange` frames,
+keep-alive); the conformant notification path is the WebSocket
+Notification Connection (8.10.4) and the durable path is UPS Search.
 
-**10.10 WADO-RS / WADO-URI rendered-resource optional query parameters**
+**11.10 WADO-RS / WADO-URI rendered-resource optional query parameters**
 - not supported (viewport, windowing, annotation, quality, `charset`,
 `anonymize`).
 
-**10.11 Series metadata without an explicit multipart Accept** - a
+**11.11 Series metadata without an explicit multipart Accept** - a
 single-part `application/dicom+json` array is returned instead of the
 Required `multipart/related` (PS3.18 10.4.4). OHIF's dicomweb-client
 requests this resource with `responseType=json` and fails on any
@@ -443,32 +494,32 @@ dcm4chee/Google Cloud Healthcare and the behavior field-verified against
 OHIF/Weasis. The Required multipart media type remains fully supported
 for clients that ask for it.
 
-**10.12 Veterinary attributes** - Species (0010,2201), Breed
+**11.12 Veterinary attributes** - Species (0010,2201), Breed
 (0010,2292), Neutered (0010,2203) are captured at STOW and re-captured on
 rebuild but are not searchable QIDO keys and are not returned in QIDO
 responses; they remain retrievable through WADO-RS metadata.
 
-**10.13 Compressed-instance thumbnails** - `406` in every build; the raw
+**11.13 Compressed-instance thumbnails** - `406` in every build; the raw
 64x64 thumbnail path decodes uncompressed pixel samples only. Compressed
 data is served in full size via `Accept: image/jpeg` (transcode build).
 
-**10.14 HTJ2K and exotic transfer syntaxes** - High-Throughput JPEG 2000
+**11.14 HTJ2K and exotic transfer syntaxes** - High-Throughput JPEG 2000
 (4.201-4.203) and other non-listed syntaxes are stored and served as-is;
 transcode requests for them return `406`.
 
-**10.15 STOW exact duplicates** - deliberately `200` (idempotent), see 2.1.
+**11.15 STOW exact duplicates** - deliberately `200` (idempotent), see 2.1.
 
-**10.16 Admin API, delete/erase and audit** - the administrative HTTP
+**11.16 Admin API, delete/erase and audit** - the administrative HTTP
 API (recovery/rebuild, erase, metrics, status), the append-only audit
 journal and the access journal are non-DICOMweb extensions and are not
 covered by this statement beyond 2.5.
 
-**10.17 SpecificCharacterSet always-on emission** - `(0008,0005) =
+**11.17 SpecificCharacterSet always-on emission** - `(0008,0005) =
 "ISO_IR 192"` is emitted on every study/series/patient QIDO row although
 the attribute is not part of the PS3.18 2026c response tables. The value
 names the repertoire actually used in the response (UTF-8).
 
-## 11. Trademarks
+## 12. Trademarks
 
 DICOM is the registered trademark of the National Electrical
 Manufacturers Association (NEMA) for its standards publications relating

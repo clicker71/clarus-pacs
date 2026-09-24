@@ -33,9 +33,11 @@ in Rust.
     section)
   - DIMSE throughput benchmark vs Orthanc (`benchmark.md` in this
     repository), produced by the public harness `tools/ab_test.py`
-  - DICOMweb™ conformance statement and the DIMSE bridge conformance
-    statement (`dicomweb-conformance-statement.md`,
-    `dimse-bridge-conformance-statement.md` in this repository)
+  - DICOMweb™ conformance statement, the DIMSE bridge conformance
+    statement and the IHE AIW-I conformance statement
+    (`dicomweb-conformance-statement.md`,
+    `dimse-bridge-conformance-statement.md`,
+    `aiw-i-conformance-statement.md` in this repository)
   - Bug reports and discussions we file against third-party DICOM tooling
 - **What is not public yet:** source code and binaries; documentation is
   published here gradually as it stabilizes.
@@ -84,8 +86,9 @@ traffic is what the bridge was built for.
 The processing sidecar `clinfer` claims UPS-RS workitems from Clarus
 (IHE AIW-I profile), runs a site-supplied model script under a
 model-agnostic contract, and stores the results back with STOW-RS.
-Clarus acts as the AIW-I Task Manager and clinfer as the Pull-workflow
-Task Performer; the AIW-I conformance statement is published. For a
+Clarus acts as the AIW-I Task Manager and clinfer as the Pull/Triggered
+Pull-workflow Task Performer; the [AIW-I conformance
+statement](./aiw-i-conformance-statement.md) is published. For a
 research group this closes the gap they normally patch themselves - a
 hand-built UPS service, hand-written DICOM serialization, fragile result
 delivery. The model stays with its authors; standard delivery of results
@@ -207,6 +210,8 @@ per-run numbers: [benchmark-headroom.md](./benchmark-headroom.md).
 
 ## Measured on a Raspberry Pi 5 (2026-09-01)
 
+![Clarus on a Raspberry Pi with the ~30 KB inline mini-viewer at /](images/clarus-raspi5.jpg)
+
 Same method (loopback, curl, warm/cold). Pi 5 (Cortex-A76, 2 GB RAM,
 NVMe over PCIe 2.0 x1), Raspberry Pi OS, **bare metal, native build**
 (no Docker, cpu=native). Corpus: three studies, 1,140 instances, 636 MB.
@@ -312,6 +317,7 @@ first example of both.
 - [DIMSE throughput benchmark vs Orthanc](./benchmark.md)
 - [DICOMweb™ conformance statement](./dicomweb-conformance-statement.md)
 - [DIMSE bridge conformance statement](./dimse-bridge-conformance-statement.md)
+- [IHE AIW-I conformance statement](./aiw-i-conformance-statement.md)
 - [Universal DICOM A/B harness](./tools/ab_test.py)
 - Upstream issues filed by the Clarus team:
   [OHIF/Viewers #6241](https://github.com/OHIF/Viewers/issues/6241)

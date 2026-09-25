@@ -250,6 +250,24 @@ else's tool, we file it publicly with numbers; when it finds a bug in ours,
 we say so in the same report. The Weasis field report linked here is the
 first example of both.
 
+### Where is the monitoring web panel? Where are the performance dashboards?
+
+There is no bundled dashboard, on purpose. Clarus does one job - moving
+and storing pixels - and does it well. Monitoring is a separate product
+category with recognised leaders (Prometheus, Grafana and friends), and we
+do not want to compete with them. We give them the data instead: every
+component exposes a Prometheus-style `/metrics` endpoint -
+
+- `clarus` - the archive's `/metrics` (counters, gauges, histograms);
+- `clbridge` - the DIMSE bridge's HTTP listener: `GET /metrics`,
+  `GET /health`;
+- `clinfer` - the sidecar's operational listener: `/health`, `/metrics`,
+  `/version`, `/processors`.
+
+Point Prometheus (or any compatible collector) at these endpoints and
+build the dashboards in Grafana. The engine stays small precisely because
+it does not grow a web UI of its own.
+
 ## Links
 
 - [Weasis field report](./weasis-report.en.md)

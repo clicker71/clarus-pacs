@@ -319,13 +319,16 @@ There is no bundled dashboard, on purpose. Clarus does one job - moving
 and storing pixels - and does it well. Monitoring is a separate product
 category with recognised leaders (Prometheus, Grafana and friends), and we
 do not want to compete with them. We give them the data instead: every
-component exposes a Prometheus-style `/metrics` endpoint -
+component exposes a Prometheus-style `/metrics` endpoint, and all three
+also answer `GET /health` and `GET /version`:
 
-- `clarus` - the archive's `/metrics` (counters, gauges, histograms);
+- `clarus` - the archive's HTTP listener: `GET /metrics` (counters,
+  gauges, histograms), `GET /health` (liveness), `GET /health/status`
+  (JSON state incl. the build version), `GET /version`;
 - `clbridge` - the DIMSE bridge's HTTP listener: `GET /metrics`,
-  `GET /health`;
-- `clinfer` - the sidecar's operational listener: `/health`, `/metrics`,
-  `/version`, `/processors`.
+  `GET /health` (pure liveness, <1 ms), `GET /version`;
+- `clinfer` - the sidecar's operational listener: `GET /health`,
+  `GET /metrics`, `GET /version`, `GET /processors`.
 
 Point Prometheus (or any compatible collector) at these endpoints and
 build the dashboards in Grafana. The engine stays small precisely because

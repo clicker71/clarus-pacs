@@ -52,9 +52,11 @@ in Rust.
 ## Under the hood
 
 - **No SQL.** Own B-tree index over the object store; no database server,
-  no ORM.
+  no ORM. Everything is a file — "The most important job of UNIX is to
+  provide a file system." (Ritchie & Thompson, CACM, 1974)
 - **No async runtime.** Synchronous thread-per-connection HTTP stack;
-  timeouts and backpressure are ours, not a runtime's.
+  timeouts and backpressure are ours, not a runtime's. "Use software
+  leverage to your advantage." — Mike Gancarz, The UNIX Philosophy (1994)
 - **Content-addressed storage.** Every blob is keyed by its BLAKE3 hash in a
   two-level sharded layout (`{xx}/{yy}/{hash}.dcm`); re-sends deduplicate.
 - **Search without a search engine.** Unicode-safe bitap fuzzy matching for

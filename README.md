@@ -107,7 +107,10 @@ into the archive and viewers already works.
   - SR - structured findings (including from local LLMs);
   - PR (GSPS) - overlays and measurements with per-class colours;
   - Derived - enhanced images (super-resolution, CLAHE);
-  - RTSTRUCT - vector contours.
+  - RTSTRUCT - vector contours;
+  - SR (TID 1500) - AI measurements with SCOORD regions: per-class
+    probabilities and the model's own operating thresholds as NUMs, plus
+    vector outlines the viewer draws on the radiograph ("where to look").
 
 ![Weasis 4.7.2: SEG overlay (heart, lungs) + PR measurement + SR series in
 one Clarus study](images/weasis-object-types.png)

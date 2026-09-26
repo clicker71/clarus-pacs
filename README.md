@@ -48,6 +48,24 @@ to fit on a couple of floppies - and fast enough for a city archive.
 - **CJK (opt-in build)**: GB18030 / KS X 1001 / ISO 2022 IR 13/87 via the
   `cjk-charsets` feature; SM3 content-addressing (planned, customer-demand)
 
+**The inversion.** DICOMweb is the CORE; DIMSE is a removable BRIDGE -
+the opposite of the usual layering, where DICOMweb is added as a facade
+on top of a DIMSE server. Storage Commitment lives in the core (PS3.18
+Section 13), so a modality can complete its full cycle - STOW plus
+Commit - over DICOMweb alone; DIMSE is no longer the only path to
+commitment. The bridge is transit, not foundation: the day the last
+DIMSE-only modality is retired, `clbridge` is removed and the archive is
+unchanged.
+
+**Why this matters.** Orthanc and dcm4chee-arc began as DIMSE servers
+and added DICOMweb as a facade: for them DIMSE is the foundation and
+DICOMweb the presentation. Clarus is the inverse - evolution happens in
+the core (AIW-I, Storage Commitment, UPS-RS land without touching the
+bridge). DIMSE will live as long as the installed base of DIMSE-only
+modalities does - a 10-15 year horizon. Clarus is built for the world
+after: DICOMweb-first, with DIMSE as a removable bridge. We do not
+"kill" DIMSE; we remove the reasons it has to exist.
+
 ## How it compares
 
 | | Clarus | Orthanc | dcm4chee-arc |

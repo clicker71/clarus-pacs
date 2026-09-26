@@ -1,297 +1,379 @@
 # Clarus PACS
 
-> A standards-complete DICOMweb archive with a minimal core.
+> **DOTADIW.** — Doug McIlroy, *UNIX Time-Sharing System: Foreword*,
+> Bell System Technical Journal, 1978.
 
-Clarus is a DICOMweb PACS server (QIDO-RS, WADO-RS, STOW-RS, UPS-RS,
-Storage Commitment) written in Rust. It conforms to PS3.18 2026c, IHE
-AIW-I Rev 1.1, and PS3.2. It does this without SQL, without an external
-database, and with no runtime dependencies: no database server, no JVM,
-no interpreter, no async runtime.
+Clarus is a DICOMweb™ PACS server (QIDO-RS, WADO-RS, STOW-RS, UPS-RS) written
+in Rust.
 
-## Why it exists
+- **Status:** closed preview for now (pre-release). We are still finishing
+  internal testing and field validation; the source repository stays private
+  until that bar passes, then it opens under LGPL-3.0.
+- **Footprint:** ~2 MB single static executable,[^1] zero runtime dependencies -
+  no VCRedist, no JVM, no interpreter. Smaller than two of the CT slices it
+  stores. Fits on a single 2.88 MB ED floppy - the format that lost to the
+  50-cent HD.
+- **Compiled for speed, deliberately:** the release profile is
+  `opt-level = 3` because we measured what the size-optimized build costs us:
+  criterion A/B on the fuzzymatch path (bitap SIMD hot loop), 8/8 groups,
+  p = 0.00 - medians **-58.1% .. -69.2%** vs `opt-level = "z"`
+  (2026-08-20). Speed over squeezing the last kilobyte.
+- **Conformance:** being tested against DICOM® PS3.18, including field
+  interoperability testing with the Weasis, MicroDicom and OHIF viewers.
+  Public test artifacts and field reports are linked from this repository.
+- **Testing:** every release passes the public ap101 hot-path harness
+  (https://github.com/clicker71/ap101, MIT-licensed, already open) before it
+  ships - hot paths are verified, not assumed. The Clarus source repository
+  opens when this bar holds, not before.
+- **What is public now:**
+  - Viewer interoperability: Weasis field report (`weasis-report.md` in
+    this repository); MicroDicom and OHIF are covered by closed tests
+  - AI results pipeline: SR + PR + SEG + derived in one study, rendered
+    by Weasis (screenshot in this README, "AI results, one pipeline"
+    section)
+  - DIMSE throughput benchmark vs Orthanc (`benchmark.md` in this
+    repository), produced by the public harness `tools/ab_test.py`
+  - DICOMweb™ conformance statement, the DIMSE bridge conformance
+    statement and the IHE AIW-I conformance statement
+    (`dicomweb-conformance-statement.md`,
+    `dimse-bridge-conformance-statement.md`,
+    `aiw-i-conformance-statement.md` in this repository)
+  - Bug reports and discussions we file against third-party DICOM tooling
+- **What is not public yet:** source code and binaries; documentation is
+  published here gradually as it stabilizes.
+- **License:** the source already carries LGPL-3.0 headers; it is published
+  under LGPL-3.0 when the preview ends. Closed preview is a quality gate,
+  not a business model. Preview binaries are distributed under the
+  [closed-preview license](./LICENSE.md).
+- **Contact:** issues in this repository (fastest), or
+  https://github.com/clicker71.
+  No raw email addresses - public READMEs get harvested by spam bots.
 
-Clarus began inside ClarityX, a two-workstation DX room with
-fluoroscopy: the viewer and the lab assistant's arm. Planning showed the
-DIMSE integration would take the longest, so the archive was split out
-into its own project. The first implementation used SQLite and the Tokio
-async runtime - it was ready very quickly, and it was the wrong shape.
-Instead of adding a faster database, we removed the database. Instead of
-adding more RAM, we removed the async runtime. Instead of adding a
-cluster, we made the archive stateless. What was left was small enough
-to fit on a couple of floppies - and fast enough for a city archive.
+## Under the hood
 
-### Principles
+- **No SQL.** Own B-tree index over the object store; no database server,
+  no ORM. Everything is a file — "The most important job of UNIX is to
+  provide a file system." (Ritchie & Thompson, CACM, 1974)
+- **No async runtime.** Synchronous thread-per-connection HTTP stack;
+  timeouts and backpressure are ours, not a runtime's. "Use software
+  leverage to your advantage." — Mike Gancarz, The UNIX Philosophy (1994)
+- **Content-addressed storage.** Every blob is keyed by its BLAKE3 hash in a
+  two-level sharded layout (`{xx}/{yy}/{hash}.dcm`); re-sends deduplicate.
+- **Search without a search engine.** Unicode-safe bitap fuzzy matching for
+  patient names; no external index service.
 
-1. Everything is a file (Unix).
-2. Data structures matter more than code (Torvalds).
-3. No optimisation without a measurement (Pike).
-4. The fastest code never executes (Galanakis).
-5. Simplicity takes work; complexity sells better (Dijkstra).
-6. Controlling complexity is the essence of programming (Kernighan).
-7. Simplicity is when you understand the system (Thompson).
+## Legacy DIMSE
 
-## What it is
+Clarus is DICOMweb-first by construction. The inversion: DICOMweb is the
+CORE, DIMSE is a removable BRIDGE - the opposite of the usual layering,
+where DICOMweb is added as a facade on top of a DIMSE server. Storage
+Commitment lives in the core (PS3.18 Section 13), so a modality can
+complete its full cycle - STOW plus Commit - over DICOMweb alone; DIMSE is
+no longer the only path to commitment. The bridge is transit, not
+foundation: the day the last DIMSE-only modality is retired, `clbridge`
+is removed and the archive is unchanged.
 
-- **DICOMweb**: QIDO-RS, WADO-RS, STOW-RS, UPS-RS, Storage Commitment
-  (PS3.18 2026c)
-- **AIW-I**: Task Manager (Clarus) + Task Performer (clinfer), Pull +
-  Triggered Pull
-- **DIMSE bridge**: C-STORE, C-FIND, C-MOVE, N-ACTION, C-ECHO.
-  **Registry-driven** (`sop_classes.yaml`): the field build ships with 72
-  SOP classes covering the installed base; adding a new SOP class is a
-  YAML edit, not a code change.
-- **Content-addressed storage**: BLAKE3, no SQL, no WAL, atomic renames
-- **Verifiable Storage Commitment**: per-instance success = SOP UID in
-  the manifest, frame-chunk table embedded in the CAS
-- **Fuzzy search**: Bitap + n-gram index, O(candidates), zero heap
-  allocation
-- **CJK**: GB18030 / KS X 1001 / ISO 2022 IR 13/87; SM3
-  content-addressing (planned, customer-demand)
+Clarus speaks DICOMweb. For the installed base of DIMSE-only modalities and
+viewers, the companion bridge `clbridge` (Python, in the same source tree -
+one repo by design) terminates the legacy protocol:
 
-## How it compares
+- **C-STORE** (SCP) from modalities - 72 SOP classes in the field build -
+  with automatic charset coercion (fixes CP1251 mojibake), then STOW-RS into Clarus;
+- **C-FIND** (SCP) from legacy viewers - mapped onto QIDO-RS (21/21 query
+  attributes);
+- **C-MOVE** (SCU) toward legacy viewers, served from Clarus WADO-RS;
+- **N-ACTION** (request handling; the storage commitment loop closes
+  with N-EVENT-REPORT - field-verified 2026-08-23);
+- optional **C-PRINT**;
+- **C-ECHO**.
 
-| | Clarus | Orthanc | dcm4chee-arc |
-|---|---|---|---|
-| **DICOMweb** | PS3.18 2026c, all mandatory transactions CONFORMANT | DICOMweb plugin (STOW/QIDO/WADO-RS) | STOW/QIDO/WADO-RS, full REST |
-| **Storage Commitment** | **Verifiable** (SOP UID in manifest, frame-chunk table in CAS) | Plugin, declarative | Present |
-| **IHE AIW-I** | **Task Manager + Task Performer CONFORMANT** | No | Not claimed as a profile |
-| **DIMSE** | Registry-driven YAML, 72 SOP classes shipped | Fixed set | Full IHE profile, tied to RDBMS |
-| **SQL** | None | SQLite | PostgreSQL / Oracle |
-| **Runtime** | ~2 MB binary (base build), ~5-13 MB RAM; no async runtime, thread-per-connection | C++ binary, ~GB RAM | JVM + WildFly, ~GB RAM |
-| **Fuzzy search** | Bitap + n-gram, O(candidates), zero heap | SQL LIKE | SQL / Lucene |
-| **CJK** | GB18030, SM3 (planned) | Depends on build | Java charsets, no SM3 |
-| **HL7 / order management** | Sidecar (planned) | - | Full IHE profile |
-| **Plugin ecosystem** | Sidecars, not plugins | Large | Moderate |
-| **Maturity** | Closed preview | Mature open source | Production, commercial support |
+A study sent by a decades-old CT scanner lands in the same content-addressed
+store as DICOMweb traffic and is immediately searchable through QIDO-RS -
+including Unicode-safe fuzzymatch on patient names. Store-and-forward DIMSE
+traffic is what the bridge was built for.
 
-**Where Clarus wins:** AIW-I, verifiable Storage Commitment, no SQL, no
-async runtime, content-addressed storage, fuzzy search, CJK.
+**Why this matters.** Orthanc, dcm4chee-arc and their peers began as DIMSE
+servers and added DICOMweb as a facade: for them DIMSE is the foundation and
+DICOMweb the presentation. Clarus is the inverse - evolution happens in the
+core (AIW-I, Storage Commitment, UPS-RS land without touching the bridge),
+the bridge stays transit, and the archive depends on the legacy protocol for
+nothing. DIMSE will live as long as the installed base of DIMSE-only
+modalities does - a 10-15 year horizon. Clarus is built for the world after:
+DICOMweb-first, with DIMSE as a removable bridge. We do not "kill" DIMSE; we
+remove the reasons it has to exist.
 
-**Where Clarus is weaker:** HL7/order management, plugin ecosystem,
-maturity, commercial support.
+## AI results, one pipeline (clinfer)
 
-**Where it can compete:** Orthanc's niche (lightweight DICOM server) -
-no SQLite, AIW-I, verifiable commitment. dcm4chee's niche (hospital
-archive) - no JVM, no RDBMS, AIW-I, verifiable commitment. For
-HL7/order management, dcm4chee remains the reference today; a Clarus
-sidecar is planned.
+The processing sidecar `clinfer` claims UPS-RS workitems from Clarus
+(IHE AIW-I profile), runs a site-supplied model script under a
+model-agnostic contract, and stores the results back with STOW-RS.
+Clarus acts as the AIW-I Task Manager and clinfer as the Pull/Triggered
+Pull-workflow Task Performer; the [AIW-I conformance
+statement](./aiw-i-conformance-statement.md) is published. For a
+research group this closes the gap they normally patch themselves - a
+hand-built UPS service, hand-written DICOM serialization, fragile result
+delivery. The model stays with its authors; standard delivery of results
+into the archive and viewers already works.
 
-## Architecture
+- The model never sees DICOM: per study, clinfer lays out frames as raw
+  pixel arrays plus a manifest.json - no medical libraries required.
+- One run: the script (Python, C++, OpenVINO - any executable) runs in a
+  separate OS process with timeouts and returns one result.json.
+- clinfer validates geometry byte-for-byte and assembles standard DICOM
+  objects; one demo run produced all of them in a single study, and
+  Weasis renders them together:
+  - SEG - pixel masks of organs;
+  - SR - structured findings (including from local LLMs);
+  - PR (GSPS) - overlays and measurements with per-class colours;
+  - Derived - enhanced images (super-resolution, CLAHE);
+  - RTSTRUCT - vector contours;
+  - SR (TID 1500) - AI measurements with SCOORD regions: per-class
+    probabilities and the model's own operating thresholds as NUMs, plus
+    vector outlines the viewer draws on the radiograph ("where to look").
 
-**Stateless compute over shared storage.**
-
-- **Clarus (core)**: DICOMweb server, content-addressed storage, UPS-RS
-  Task Manager. One binary. No SQL, no async runtime, no runtime
-  dependencies. Synchronous thread-per-connection HTTP stack; timeouts
-  and backpressure are ours, not a runtime's.
-- **clbridge (sidecar)**: DIMSE-to-DICOMweb gateway. SCP for C-STORE /
-  C-FIND / C-MOVE / N-ACTION; SCU for C-STORE outbound. Stateless.
-  Scale by adding bridges.
-- **clinfer (sidecar)**: AI processing. Claims UPS-RS workitems, runs
-  site-supplied models under a model-agnostic contract (workdir +
-  manifest.json -> result.json), stores results back with STOW-RS.
-
-Sidecars communicate with the core over standard protocols. They are
-not plugins: no shared memory, no linked code. Replace, restart, or
-scale them independently.
-
-**Scale-out shape:** N bridges, one Clarus core, one shared CAS. The
-bridge side scales with the number of bridges; the shared STOW path is
-the cap.
-
-## Verification
-
-Every release passes the public
-[ap101](https://github.com/clicker71/ap101) hot-path harness before it
-ships. Hot paths are verified, not assumed.
-
-The harness is MIT-licensed and already open. It is the gate, not a
-badge: the Clarus source repository opens when this bar holds, not
-before.
-
-**Universal A/B harness:** [`ab_test.py`](tools/ab_test.py) - point it at any
-DIMSE or DICOMweb server. It discovers the throughput plateau itself
-(adaptive window, outbox drain polling, DIMSE retry hygiene). The
-benchmark numbers in this README were produced by this harness; anyone
-can reproduce them.
-
-**What ap101 verifies:**
-
-- STOW-RS hot path: multipart parsing, BLAKE3 hashing, atomic rename,
-  manifest commit
-- WADO-RS hot path: page-cache streaming, multipart assembly,
-  transfer-syntax passthrough
-- QIDO-RS hot path: n-gram pre-filter, Bitap matching, K-way merge
-- DIMSE bridge hot path: C-STORE acceptance, outbox drain, C-MOVE
-  delivery
-- UPS-RS hot path: workitem claim, state machine, notification delivery
-
-**Why this matters:** conformance statements declare what the system
-does. ap101 verifies that it does it under load. Both are public.
-Neither requires trusting the source repository.
-
-## Deployment
-
-- **One static binary** (about 2 MB in the base build), no runtime
-  dependencies. No VCRedist, no JVM, no interpreter.
-- **~6 MB RSS** on Windows, **8-13 MB on Raspberry Pi 5** in the base
-  build.
-- **`transcode` build** adds codecs (JPEG-LS, JPEG Baseline/Lossless,
-  JPEG 2000, RLE). Idle RSS unchanged; transient buffers during
-  conversion.
-- **`s3` build feature**: cold-tier fallback.
-- **`cjk-charsets`**: included in the shipped default build.
-- **`china_crypto`**: planned (SM3 content-addressing).
-
-**Validated deployments:**
-
-- Bare metal (Windows, Linux x64)
-- Raspberry Pi 5 (Cortex-A76, 2 GB RAM, NVMe over PCIe 2.0 x1)
-
-![Raspberry Pi 5 deployment](images/clarus-raspi5.jpg)
-
-- VM (VMware, 3 vCPU, 32 GB RAM, HDD-backed)
-
-The wall is the network and the disk, not the CPU.
-
-## AI pipeline (clinfer + ABI)
-
-`clinfer` is a UPS-RS Task Performer (IHE AIW-I Triggered Pull). It
-claims workitems from Clarus, runs a site-supplied model script under a
-model-agnostic contract, and stores results back with STOW-RS.
-
-**The model never sees DICOM.** Per study, `clinfer` lays out frames as
-raw pixel arrays plus a `manifest.json`. One run: the script (Python,
-C++, OpenVINO - any executable) runs in a separate OS process with
-timeouts and returns one `result.json`. `clinfer` validates geometry
-byte-for-byte and assembles standard DICOM objects.
-
-**One pipeline, all result types:**
-
-- **SEG** - pixel masks of organs
-- **SR** - structured findings (including from local LLMs)
-- **PR (GSPS)** - overlays: boxes and contours
-- **Derived** - enhanced images (super-resolution, CLAHE)
-- **RTSTRUCT** - vector contours
-- **SR (TID 1500)** - AI measurements: per-class probabilities and the
-  model's own operating thresholds as NUMs
+![Weasis 4.7.2: SEG overlay (heart, lungs) + PR measurement + SR series in
+one Clarus study](images/weasis-object-types.png)
 
 The object names its own producer: the segmentation carries Segment
-Algorithm Name (0062,0009), the script that computed it.
+Algorithm Name (0062,0009) = `chest-seg`, the script that computed it, and
+Weasis computes the voxel count from the stored mask (on projection
+radiographs it assumes 1 voxel = 1 mm^3). No mock-up: the same study is
+served by QIDO-RS/WADO-RS from Clarus.
 
-**Rules-guarded claim:** `clinfer` matches the study against configured
-model rules (study tags - modality, body part, and the like) and cancels
-a workitem no rule accepts. A chest model never receives knees: the
-mismatch is refused before the first frame is read.
+Trigger without external plumbing: after a durable STOW the origin
+creates the workitem itself (`[ups] computer_aided_detection`) - an
+allowed origin-server capability: "User agents and origin servers can
+create Workitems" (PS3.18 Section 11.1) - and clinfer polls it (Pull).
+WebSocket notifications (RAD-87/RAD-109) are in development.
 
-See [`totalseg-demo/README.run.md`](totalseg-demo/README.run.md) for a
-working end-to-end pipeline.
+```mermaid
+flowchart LR
+  STOW["STOW-RS: study"] --> WI["UPS workitem (Task Manager)"]
+  WI --> CL["clinfer: claim"]
+  CL --> RULE{"rules: study tags match?"}
+  RULE -- no --> DROP["cancel: no rule matches"]
+  RULE -- yes --> AB["ABI script: frames + manifest"]
+  AB --> RS["result.json"]
+  RS --> CL
+  CL --> OUT["STOW-RS: SEG / SR / PR / Derived"]
+  OUT --> VIEW["Clarus archive, viewed in Weasis"]
+```
+
+The claim is rules-guarded, not trust-based: clinfer matches the study
+against the configured model rules (study tags - modality, body part and
+the like) and cancels a workitem no rule accepts. A chest model never
+receives knees: the mismatch is refused before the first frame is read.
+
+## Throughput benchmark (2026-08-23)
+
+Clarus + clbridge vs Orthanc 1.12.11 over DIMSE, on the same VMware VM
+(3 vCPU, 32 GB RAM, HDD-backed virtual disks), loopback. n = 7 clean runs
+per condition; corpus 1035.1 MB (1063 instances, 3 studies). Full
+methodology, per-run tables, statistics and honest limitations:
+[benchmark.md](./benchmark.md).
+
+| Median | Clarus+bridge, AV OFF | Clarus+bridge, AV ON | Orthanc (Docker) |
+|--------|-----------------------|----------------------|------------------|
+| C-MOVE read | 34.9 s (29.7 MB/s) | 36.1 s (28.7 MB/s) | 103.3 s (10.0 MB/s) |
+| Ingest end to end (HOP1+HOP2) | 58.8 s (17.6 MB/s) | 90.3 s (11.5 MB/s) | 76.9 s (13.5 MB/s) (1) |
+| +- HOP1: C-STORE into outbox | 23.3 s (44.4 MB/s) | 24.6 s (42.1 MB/s) | 76.9 s (1) |
+| +- HOP2: outbox drain -> Clarus STOW | 36.5 s (28.4 MB/s) | 65.0 s (15.9 MB/s) | - (single hop) |
+
+(1) Orthanc does the whole job in ONE synchronous hop: its C-STORE phase is
+its full ingest. The bridge ingest is TWO hops: HOP1 = asynchronous DIMSE
+acceptance into the outbox, HOP2 = drain into Clarus - the honest
+like-for-like number is HOP1+HOP2. HOP1 alone must never be quoted as the
+ingest rate (it is asynchronous acceptance, not commit). The two hops
+overlap slightly, so HOP1+HOP2 is a bit above the measured ingest.
+n = 7 clean runs per condition (Clarus+bridge); Orthanc n = 9 uploads /
+n = 10 reads. AV OFF = the documented Defender exclusions on the Clarus data
+dirs; the AV penalty (+54% ingest) lands entirely on the STOW write path.
+Without the exclusions, Clarus+bridge is ~17% SLOWER than Orthanc - the
+exclusions are an operational requirement, not a tuning tip.
+
+## Scale-out shape: N bridges, one Clarus core
+
+The deployment model is one Clarus core plus one bridge sidecar per
+modality. First empirical probe (same VM, AV OFF, exploratory n=1 - a
+formal multi-stream suite would rerun this 3-5 times), two CT studies
+(1012.4 MB) sent through two bridges concurrently vs two streams into a
+single Orthanc instance:
+
+| | Clarus + 2 bridges (8104, 8106) | Orthanc, 2 streams, 1 instance |
+|---|---|---|
+| aggregate wall | 39.8 s | 69.0 s |
+| aggregate MB/s | 25.4 | 14.7 |
+| vs single-stream median | +44% | +9% |
+| per-modality release | 16.5 s / 15.8 s | 66.6 s / 53.6 s |
+
+The bridge side scales with the number of bridges (aggregate +44%; the
+shared Clarus STOW path is the cap, ~50 MB/s on this HDD VM). Orthanc
+barely scaled: its two streams collapsed to 7.4 and 9.7 MB/s each (SQLite
+commit serializes writes). Shape of the curve: the lead widens with the
+number of concurrent modalities, and the modality-facing win is even
+larger - the outbox absorbs the backlog and releases the scanner in
+~16 s vs ~54-67 s. Full numbers and caveats: [benchmark.md](./benchmark.md)
+section 1.1.
+
+The universal harness that produced these numbers is public:
+[tools/ab_test.py](./tools/ab_test.py) - point it at any DIMSE or DICOMweb
+server, it discovers the throughput plateau itself (adaptive window, outbox
+drain polling, DIMSE retry hygiene). Compare anything with anything while
+the source repository is still in closed preview.
+
+## Measured headroom (2026-08-26)
+
+Loopback on a Beelink mini-PC (Intel i7 / 32 GB / 1 TB NVMe SSD, Ubuntu
+24.04, Docker): WADO-RS study GETs serve at **1.0-1.1 GB/s warm** (page
+cache) and **344-428 MB/s cold** (drop_caches, real NVMe reads) - roughly
+the 10 GbE line rate on hot data, 3-4x a GbE link even cold. The same
+studies C-MOVE'd over a LAN whose links had negotiated 100 Mbit/s ran at
+9.1 MB/s aggregate - the server was backpressured by the network, not
+busy. **The wall is the network, not the engine.** Methodology and
+per-run numbers: [benchmark-headroom.md](./benchmark-headroom.md).
+
+## Measured on a Raspberry Pi 5 (2026-09-01)
+
+![Clarus on a Raspberry Pi 5](images/clarus-raspi5.jpg)
+
+*Clarus on a Raspberry Pi 5 with the inline ~30 KB mini-viewer at / — a visual "ping" for the service engineer/admin.*
+
+Same method (loopback, curl, warm/cold). Pi 5 (Cortex-A76, 2 GB RAM,
+NVMe over PCIe 2.0 x1), Raspberry Pi OS, **bare metal, native build**
+(no Docker, cpu=native). Corpus: three studies, 1,140 instances, 636 MB.
+
+| Condition | Single stream | Four streams (aggregate) |
+|---|---|---|
+| Warm (page cache) | 4.0 GB/s across the three studies | ~990 MB/s |
+| Cold (drop_caches) | 244-356 MB/s per study | ~896 MB/s |
+
+**Why does the Pi look "faster" than the i7 above?** Not hardware
+superiority - different conditions: the Beelink was measured inside
+Docker with the 26.08 build; the Pi runs the current build natively on
+bare metal. Single-stream cold is in fact slower on the Pi (244-356 vs
+344-428 MB/s) - the PCIe 2.0 x1 ceiling, honestly visible. The 4.0 GB/s
+warm figure is pure page-cache reads (the corpus fits in RAM), not a CPU
+win. These numbers do not compare CPUs; they show the engine is bound by
+memory, disk and network - not by CPU.
+
+## Memory profile: base build vs `transcode` build
+
+The 6-13 MB figures above are for the **base build** (no `transcode`
+feature).
+
+| Build | Idle RSS | After use |
+|---|---|---|
+| base | ~6 MB (Windows) · 8-13 MB (Pi 5, cold start) | bounded manifest cache (64 studies / 8 MB encoded) |
+| `--features transcode` | same as base | transient conversion buffers (see below) |
+
+The `transcode` feature adds codecs (JPEG-LS, JPEG Baseline/Lossless,
+JPEG 2000, RLE) and does **not** raise idle RSS. What changes is the
+**transient** memory DURING a conversion: decode + RGB + encode buffers
+sized by the image. A large multi-frame color study (e.g. 64 frames of
+600x800 RGB ultrasound) allocates ~90 MB of buffers per request; measured
+on a Pi 5 the process peaked at ~280-400 MB depending on the study and
+returned the bulk of it afterwards.
+
+On Linux, glibc keeps freed medium buffers in malloc arenas instead of
+returning them to the OS, so after a heavy transcode session RSS may sit
+at a plateau (~70 MB observed on Pi 5) - allocator behavior, not a leak.
+To make glibc trim eagerly, set in the systemd unit:
+
+```ini
+[Service]
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_TRIM_THRESHOLD_=4096
+```
+
+With these settings (measured on Pi 5): 5.5 MB cold, 6.1 MB right after a
+transcode, ~11 MB after a viewer reload + transcode - back to the base idle
+band.
+
+**Recommendation:** build with `transcode` only if you actually serve
+legacy viewers that cannot read the stored transfer syntaxes. Without it
+Clarus streams stored bytes as-is - no transcode buffers, no codec code.
 
 ## FAQ
 
-**What happens if the server loses power mid-write? Is there a WAL?**
+### What happens if the server loses power mid-write? Is there a WAL?
 
-No WAL, deliberately: the B-tree never rewrites data in place, so there
-are no torn pages to journal. Instance bytes are streamed to a temp
-file, hashed with BLAKE3, fsync'd, and atomically renamed to their
-content-addressed path; the per-study CBOR manifest is committed with a
-single atomic rename. Readers see either the old state or the new
-state, never a partial one, and BLAKE3 doubles as the integrity check
-on every read. A `200 OK` is sent only after the manifest commit.
-Honest limitation: the manifest file itself is intentionally not
-fsync'd; on some filesystems a just-committed manifest may be lost in a
-power cut, while the instance bytes remain in the CAS and are detected
-by their hash.
+No WAL, deliberately: the B-tree never rewrites data in place, so there are
+no torn pages to journal. Instance bytes are streamed to a temp file, hashed
+with BLAKE3, fsync'd, and atomically renamed to their content-addressed
+path; the per-study CBOR manifest is committed with a single atomic rename.
+Readers see either the old state or the new state, never a partial one, and
+BLAKE3 doubles as the integrity check on every read. A `200 OK` is sent only
+after the manifest commit — before that the sender gets nothing, the bridge
+answers the modality with DIMSE `0xA700` (Out of Resources) and the modality
+is required to retry. The retry is idempotent and free: content addressing
+deduplicates it. After a power loss the worst leftovers are invisible temp
+files, and the search index is rebuilt from manifests. Honest limitation:
+the manifest file itself is intentionally not fsync'd (a documented
+trade-off); on some filesystems a just-committed manifest may be lost in a
+power cut, while the instance bytes remain in the CAS and are detected by
+their hash.
 
-**How does the engine scale to 10 million images?**
+### How does the engine scale to 10 million images?
 
-10M images ~ 300-400K studies. Retrieval is O(1): the BLAKE3 hash
-directly addresses a file in a two-level sharded layout - no index
-lookup. Ingest is O(1) per study: one append + one atomic rename.
-QIDO by StudyInstanceUID is O(1); by modality/date it is O(candidates)
-through day-bucket `.idx` files; fuzzy name search is O(candidates)
-through an n-gram candidate index + bitap matcher. Queries without an
-accelerator are O(n) in RAM over the study index; the disk is scanned
-only while that index builds lazily. Memory: pixels never enter process
-memory (page cache -> socket), so base build RSS stays at ~6 MB on
-Windows and 8-13 MB on a Raspberry Pi 5.
+10M images ≈ 300-400K studies. Retrieval is O(1): the BLAKE3 hash directly
+addresses a file in a two-level sharded layout (~150 files per directory at
+10M) — no index lookup at all. Ingest is O(1) per study: one append + one
+atomic rename (measured 14-16 ms, nearly flat from 100 to 500 slices). QIDO
+by StudyInstanceUID is O(1) (the UID names exactly one manifest); by
+modality/date it is O(candidates) through day-bucket `.idx` files; fuzzy
+name search is O(candidates) through an n-gram candidate index + bitap
+matcher. Queries without an accelerator are O(n) **in RAM** over the study
+index — the disk is scanned only while that index builds lazily. Memory:
+pixels never enter process memory (page cache → socket), so in the **base
+build** the process RSS stays at ~6 MB on Windows and 8-13 MB on a
+Raspberry Pi 5 (Linux/arm64) - the `transcode` build adds transient
+conversion buffers, see [Memory profile](#memory-profile-base-build-vs-transcode-build);
+the in-RAM study index adds ~0.5-1.5 KB
+per study ≈ 0.2-0.6 GB at 10M images — a stated trade-off, not a leak.
+Measured against SQLite on the same corpus: search within 3-10%, write path
+2.4x faster.
 
-**Where is the monitoring web panel? Where are the performance dashboards?**
+else's tool, we file it publicly with numbers; when it finds a bug in ours,
+we say so in the same report. The Weasis field report linked here is the
+first example of both.
+
+### Where is the monitoring web panel? Where are the performance dashboards?
 
 There is no bundled dashboard, on purpose. Clarus does one job - moving
 and storing pixels - and does it well. Monitoring is a separate product
-category with recognised leaders (Prometheus, Grafana). Every component
-exposes a Prometheus-style `/metrics` endpoint, plus `GET /health` and
-`GET /version`:
+category with recognised leaders (Prometheus, Grafana and friends), and we
+do not want to compete with them. We give them the data instead: every
+component exposes a Prometheus-style `/metrics` endpoint, and all three
+also answer `GET /health` and `GET /version`:
 
-- `clarus` - `/metrics`, `/health`, `/health/status`, `/version`
-- `clbridge` - `/metrics`, `/health`, `/version`
-- `clinfer` - `/health`, `/metrics`, `/version`, `/processors`
+- `clarus` - the archive's HTTP listener: `GET /metrics` (counters,
+  gauges, histograms), `GET /health` (liveness), `GET /health/status`
+  (JSON state incl. the build version), `GET /version`;
+- `clbridge` - the DIMSE bridge's HTTP listener: `GET /metrics`,
+  `GET /health` (pure liveness, <1 ms), `GET /version`;
+- `clinfer` - the sidecar's operational listener: `GET /health`,
+  `GET /metrics`, `GET /version`, `GET /processors`.
 
-Point Prometheus at these endpoints and build dashboards in Grafana.
-The engine stays small precisely because it does not grow a web UI of
-its own.
-
-## Status
-
-**Closed preview (pre-release).** Internal testing and field validation
-are in progress; the source repository stays private until that bar
-passes, then opens under LGPL-3.0. Closed preview is a quality gate,
-not a business model.
-
-**What is public now:**
-
-- Viewer interoperability: Weasis field report
-  ([`weasis-report.md`](weasis-report.md)); MicroDicom and OHIF covered
-  by closed tests
-
-![Weasis: SR + PR + SEG in one study](images/weasis-object-types.png)
-
-- AI results pipeline: SR + PR + SEG + derived in one study, rendered
-  by Weasis
-- DIMSE throughput benchmark vs Orthanc ([`benchmark.md`](benchmark.md))
-- Conformance statements:
-  [DICOMweb](dicomweb-conformance-statement.md),
-  [DIMSE bridge](dimse-bridge-conformance-statement.md),
-  [IHE AIW-I](aiw-i-conformance-statement.md)
-- Public test artifacts: [ap101](https://github.com/clicker71/ap101),
-  [`tools/ab_test.py`](tools/ab_test.py)
-- Bug reports against third-party DICOM tooling
-
-**What is not public yet:** source code and binaries; documentation is
-published gradually as it stabilizes.
-
-## Roadmap
-
-- **HL7 / order management** - sidecar (planned, customer-demand)
-- **`china_crypto`** - SM3 content-addressing (planned, customer-demand)
-- **Push workflow** (AIW-I) - planned, customer-demand
-- **Model-version provenance** (Type 3) - planned, customer-demand
-- **MCP server** (`clarus-mcp`) - proposed, not committed
+Point Prometheus (or any compatible collector) at these endpoints and
+build the dashboards in Grafana. The engine stays small precisely because
+it does not grow a web UI of its own.
 
 ## Links
 
-- [Weasis field report](weasis-report.md)
-- [DICOMweb conformance statement](dicomweb-conformance-statement.md)
-- [DIMSE bridge conformance statement](dimse-bridge-conformance-statement.md)
-- [IHE AIW-I conformance statement](aiw-i-conformance-statement.md)
-- [Universal DICOM A/B harness](https://github.com/clicker71/ap101)
-- [End-to-end demo](totalseg-demo/README.run.md)
+- [Weasis field report](./weasis-report.md)
+- [DIMSE throughput benchmark vs Orthanc](./benchmark.md)
+- [DICOMweb™ conformance statement](./dicomweb-conformance-statement.md)
+- [DIMSE bridge conformance statement](./dimse-bridge-conformance-statement.md)
+- [IHE AIW-I conformance statement](./aiw-i-conformance-statement.md)
+- [Universal DICOM A/B harness](./tools/ab_test.py)
+- Upstream issues filed by the Clarus team:
+  [OHIF/Viewers #6241](https://github.com/OHIF/Viewers/issues/6241)
 
 ## Trademarks
 
-DICOM(R) is the registered trademark of the National Electrical
-Manufacturers Association (NEMA) for its standards publications
-relating to digital communications of medical information. DICOMweb(TM)
-is a trademark of NEMA. IHE is a trademark of Integrating the
-Healthcare Enterprise (IHE International). Clarus is not affiliated
-with or endorsed by NEMA or IHE.
+DICOM® is the registered trademark of the National Electrical Manufacturers
+Association (NEMA) for its standards publications relating to digital
+communications of medical information. DICOMweb™ is a trademark of NEMA.
+Clarus is not affiliated with or endorsed by NEMA.
 
-## Medical device disclaimer
-
-Clarus is experimental software intended for research, development, and
-interoperability testing. **Not for clinical diagnostic use.** No
-regulatory approval (FDA 510(k), CE MDR, or equivalent). The authors
-and contributors assume no liability for any use, misuse, or
-consequences. By using this software you agree that you are solely
-responsible for compliance with applicable laws and regulations.
+[^1]: ~4 MB in the build with the optional `transcode` feature (codecs compiled in).

@@ -8,22 +8,6 @@ AIW-I Rev 1.1, and PS3.2. It does this without SQL, without an external
 database, and with no runtime dependencies: no database server, no JVM,
 no interpreter, no async runtime.
 
-> [Русская версия](./README_RU.md) | [Russian README](./README_RU.md)
-
-[![CI](https://github.com/clarus-pacs/clarus/actions/workflows/ci.yml/badge.svg)](https://github.com/clarus-pacs/clarus/actions/workflows/ci.yml)
-[![S3 Storage](https://github.com/clarus-pacs/clarus/actions/workflows/ci-s3.yml/badge.svg)](https://github.com/clarus-pacs/clarus/actions/workflows/ci-s3.yml)
-[![License: LGPLv3](https://img.shields.io/badge/license-LGPLv3-blue)](LICENSE.md)
-[![AP-101 GO FOR LAUNCH](https://img.shields.io/badge/AP--101-GO%20FOR%20LAUNCH-brightgreen)](https://github.com/clicker71/ap101)
-
-**Conformance:**
-
-- [DICOMweb](dicomweb-conformance-statement.md) - PS3.18 2026c, all
-  mandatory transactions CONFORMANT
-- [IHE AIW-I](aiw-i-conformance-statement.md) - Task Manager + Task
-  Performer CONFORMANT
-- [DIMSE bridge](dimse-bridge-conformance-statement.md) - C-STORE,
-  C-FIND, C-MOVE, N-ACTION, C-ECHO
-
 ## Why it exists
 
 Clarus began inside ClarityX, a two-workstation DX room with

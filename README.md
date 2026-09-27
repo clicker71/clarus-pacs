@@ -148,6 +148,32 @@ can reproduce them.
 does. ap101 verifies that it does it under load. Both are public.
 Neither requires trusting the source repository.
 
+## Audit
+
+Clarus keeps an append-only audit trail for security officers and
+integrators. Two journals, both plain JSON lines under the data root:
+
+- **Delete trail** - every destructive admin action: who, when (UTC),
+  what (study / series / instance UID), which patient, how much was
+  freed, why. One fsync'd line per record; never pruned by Clarus.
+  Back it up off-box: it is the only evidence of deletions.
+- **Access journal** - every access and query event on protected data,
+  tagged with the DICOM PS3.15 audit event IDs (110103 begin transfer,
+  110104 instances transferred, 110110 patient record, 110112 query,
+  110114 user authentication). Batch-flushed (<= 1 s window), pruned
+  after 1095 days by default.
+
+Attribute modifications inside stored objects (coercion at ingest, a
+re-STOW update) append a `(0400,0561)` Original Attributes Sequence
+with time, modifying system and reason - append-only, never rewritten.
+
+Logs mask patient names; the delete trail deliberately names the
+patient so a deletion stays attributable. The format is our own
+JSON-lines journal, not the DICOM XML Audit Trail Message Format, and
+the transport is files, not ATNA syslog: Clarus does not claim ATNA
+conformance, it documents the mechanism. The DICOMweb conformance
+statement (11.16) covers the admin API and the audit journals.
+
 ## Deployment
 
 - **One static binary** (about 2 MB in the base build), no runtime

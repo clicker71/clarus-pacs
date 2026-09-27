@@ -168,11 +168,23 @@ re-STOW update) append a `(0400,0561)` Original Attributes Sequence
 with time, modifying system and reason - append-only, never rewritten.
 
 Logs mask patient names; the delete trail deliberately names the
-patient so a deletion stays attributable. The format is our own
-JSON-lines journal, not the DICOM XML Audit Trail Message Format, and
-the transport is files, not ATNA syslog: Clarus does not claim ATNA
-conformance, it documents the mechanism. The DICOMweb conformance
-statement (11.16) covers the admin API and the audit journals.
+patient so a deletion stays attributable. Note the asymmetry: the
+delete trail is the STRONGER mechanism - fsync per record, never
+pruned by Clarus - while the access journal is batch-flushed and
+pruned after 1095 days by default.
+
+Clarus does not claim conformance to DICOM PS3.15 Annex A.5 (Audit
+Trail Message Format Profile) or to IHE ATNA: the XML message format
+is mandatory only for implementations claiming that profile
+(PS3.15 A.5), and neither DICOMweb, AIW-I nor Storage Commitment -
+the profiles Clarus claims - requires it. The journals use the same
+DICOM/ATNA event codes (110103/110104/110110/110112/110114) in a
+documented JSON-lines format; deployments that operate an Audit
+Record Repository can convert and forward the journals with the
+provided tools/access_journal_to_syslog.py converter, which is an
+integration aid, not an ATNA conformance claim. The DICOMweb
+conformance statement (11.16) covers the admin API and the audit
+journals.
 
 ## Deployment
 

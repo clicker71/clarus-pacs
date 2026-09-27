@@ -292,7 +292,7 @@ reason and timestamp.
 ## 4. Worklist Service (UPS-RS)
 
 - **Resources:** `/workitems` - search (GET and POST, 11.9), create
-  (11.4), retrieve (11.5) and change state (PUT
+  (11.4), retrieve (11.5), update (11.6) and change state (PUT
   `/workitems/{uid}/state`, 11.7); the bare PUT on the workitem is the
   same state change; DELETE is a non-standard administration path.
   `/workitems/{uid}/events` - per-workitem SSE event stream
@@ -305,6 +305,26 @@ reason and timestamp.
   WebSocket Notification Connection (8.10.4): `GET
   /dicomweb/subscribers/{requester}` with the RFC 6455 upgrade headers;
   Event Reports are JSON text frames (8.10.6).
+- **Create and Update are told apart the way the standard does:**
+  Create (11.4.1.1 Table 11.4.1-1) is `POST /workitems?workitem={uid}`
+  - the Workitem UID is a QUERY parameter and there is no path segment
+  after `workitems`. Update (11.6.1) is
+  `POST /workitems/{uid}?TransactionUid={uid}` - the Workitem UID is a
+  PATH segment and the Transaction UID is the query parameter. A path
+  segment means the workitem resource, so a write to it is an update; no
+  path segment means the worklist.
+- **Update (11.6):** modifies attributes only; the workflow state is not
+  touched and no event is published. The merge set is exactly the
+  AIW-I 4.84.4.1.2.1 performer report - (0040,4033) Output Information
+  Sequence, (0040,4019) Performed Workitem Code Sequence and
+  (0040,4028) Performed Station Name Code Sequence - each replaced
+  whole. An element outside that set is rejected (`400`) rather than
+  ignored, so a client that meant something this implementation does not
+  write finds out at once. The Transaction UID is required (query
+  parameter) and checked (`400` on mismatch, `409` on a concurrent
+  write); the request is refused while the workitem is unclaimed, since
+  only the SCHEDULED -> IN PROGRESS transition issues the lock. An empty
+  payload, and a present-but-empty (0040,4033), are both `400`.
 - **States:** SCHEDULED, IN PROGRESS, COMPLETED, CANCELED. State
   changes carry the Procedure Step State (0074,1000) and the locking
   Transaction UID (0008,1195) - both type 1 - and read nothing else
@@ -320,12 +340,11 @@ reason and timestamp.
   not a key - the UPS IOD defines no Modality attribute.
 - **Optimistic locking:** state changes and updates require the current
   Transaction UID; a mismatch returns a conflict (`409`).
-- **Not supported:** Update Workitem as an attribute-only transaction
-  (11.6) and the Request Cancellation resource (11.8) - a cancellation
-  is performed by the workitem owner through Change Workitem State.
-  The subscription registry is process-lifetime: a restart forgets
-  subscriptions and their deletion locks (the durable path is UPS
-  Search; the profile sets no persistence requirement).
+- **Not supported:** the Request Cancellation resource (11.8) - a
+  cancellation is performed by the workitem owner through Change
+  Workitem State. The subscription registry is process-lifetime: a
+  restart forgets subscriptions and their deletion locks (the durable
+  path is UPS Search; the profile sets no persistence requirement).
 
 ## 5. WADO-URI
 

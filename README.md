@@ -248,18 +248,19 @@ mismatch is refused before the first frame is read.
 **The Task Requester is external too - `clmcp` (demo).** AIW-I splits
 three roles: Clarus is the Task Manager, `clinfer` the Task Performer,
 and whoever creates a workitem is the Task Requester (User Agent).
-`clmcp` is a small Python sidecar that demonstrates the third role from
-outside the core: a text command ("run TotalSegmentator on study X")
-becomes a standard UPS-RS Create, the workitem lands in the same
-worklist the Weasis dropdown and `clinfer` already use, and the result
-comes back through the same STOW path. The core changes nothing - the
-server can also mint workitems itself on STOW (`task_producer`, the
-origin-server capability), but the requester role is interchangeable,
-and `clmcp` shows the external, agent-friendly one.
+`clmcp` is a small Python sidecar - a demo tool that drives the archive
+over the Model Context Protocol (MCP): a text command ("run
+TotalSegmentator on study X") becomes a standard UPS-RS Create, the
+workitem lands in the same worklist the Weasis dropdown and `clinfer`
+already use, and the result comes back through the same STOW path. The
+core changes nothing - the server can also mint workitems itself on
+STOW (`task_producer`, the origin-server capability) - but the
+requester role is interchangeable, and `clmcp` shows the external,
+agent-friendly one.
 
-It is a demo, not a product commitment: chat in, workitem out, over
-UPS-RS only. Extending it (the full tool surface, Streamable HTTP, an
-LLM front, voice) is on customer demand.
+It is a demo, not a product commitment: chat in, workitem out, over MCP
++ UPS-RS. Extending it (the full tool surface, Streamable HTTP, an LLM
+front, voice) is on customer demand.
 
 See [`totalseg-demo/README.run.md`](totalseg-demo/README.run.md) for a
 working end-to-end pipeline.

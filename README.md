@@ -206,7 +206,7 @@ journals.
 - Bare metal (Windows, Linux x64)
 - Raspberry Pi 5 (Cortex-A76, 2 GB RAM, NVMe over PCIe 2.0 x1)
 
-![Raspberry Pi 5 deployment](images/clarus-raspi5.jpg)
+![Raspberry Pi 5 deployment](images/clpi5.png)
 
 *Clarus on a Raspberry Pi 5 (2 GB RAM, NVMe) with the inline ~30 KB
 mini-viewer at `/` - a visual ping for the service engineer/admin.*

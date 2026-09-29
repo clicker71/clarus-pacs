@@ -251,8 +251,8 @@ and whoever creates a workitem is the Task Requester (User Agent).
 `clmcp` is a small Python sidecar - a demo tool that drives the archive
 over the Model Context Protocol (MCP): a text command ("run
 TotalSegmentator on study X") becomes a standard UPS-RS Create, the
-workitem lands in the same worklist the Weasis dropdown and `clinfer`
-already use, and the result comes back through the same STOW path. The
+workitem lands in the same worklist `clinfer` already uses, and the
+result comes back through the same STOW path. The
 core changes nothing - the server can also mint workitems itself on
 STOW (`task_producer`, the origin-server capability) - but the
 requester role is interchangeable, and `clmcp` shows the external,

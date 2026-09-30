@@ -31,10 +31,11 @@ DICOMweb PACS), **clinfer** (инференс-сайдкар), **ABI-скрип�
 
 ## Два режима (выберите один)
 
-У UPS-RS три роли: **Task Manager** (всегда clarus), **Task Performer**
-(всегда clinfer) и **Task Requester** — роль, которую может играть кто
-угодно. В паке два конфига сервера, различающиеся ровно одной настройкой —
-`task_producer`:
+У UPS-RS три роли — акторы IHE **AIW-I** (AI Workflow for Imaging):
+**Task Manager** (всегда clarus), **Task Performer** (всегда clinfer) и
+**Task Requester** — роль, которую может играть кто угодно. Транспорт —
+стандартный DICOMweb UPS-RS (PS3.18 §11). В паке два конфига сервера,
+различающиеся ровно одной настройкой — `task_producer`:
 
 | Конфиг | `task_producer` | Кто создаёт воркитемы |
 | --- | --- | --- |

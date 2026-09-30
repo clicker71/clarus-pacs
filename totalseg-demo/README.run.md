@@ -30,9 +30,11 @@ claim is made or implied.
 
 ## The two modes (pick one)
 
-UPS-RS has three roles: **Task Manager** (always clarus), **Task Performer**
-(always clinfer), and **Task Requester** — the role that can be anyone. The
-pack ships two server configs that differ in exactly one knob, `task_producer`:
+UPS-RS has three roles — the IHE **AIW-I** (AI Workflow for Imaging) actors:
+**Task Manager** (always clarus), **Task Performer** (always clinfer), and
+**Task Requester** — the role that can be anyone. The wire is standard
+DICOMweb UPS-RS (PS3.18 §11). The pack ships two server configs that differ
+in exactly one knob, `task_producer`:
 
 | Config | `task_producer` | Who creates workitems |
 | --- | --- | --- |

@@ -23,8 +23,8 @@ replacing it component by component, with golden tests freezing the wire
 behaviour at every step. What was left was small enough to fit on a
 couple of floppies - and fast enough for a city archive.
 
-Removing the database is not a purity move: it is what makes Storage
-Commitment verifiable. A database stores pointers, and a row that says
+Removing the database is not a purity move: it is what makes **Storage
+Commitment** verifiable. A database stores pointers, and a row that says
 "instance stored" can drift from the file it points at - the blob can be
 deleted, moved or corrupted and the row still says stored. Clarus
 addresses content by its own hash, so the address is the content: the

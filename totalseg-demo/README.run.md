@@ -7,6 +7,11 @@ scripts**, and **clmcp** (a demo Task Requester).
 NOT FOR DIAGNOSTIC USE. This is transport plus research models; no clinical
 claim is made or implied.
 
+> **Before you start:** input must be **uncompressed** CT (Explicit VR Little
+> Endian) — these demo binaries are built without the `transcode` codec
+> feature. Compressed (JPEG/JPEG2000) input is stored as-is and reaches the
+> producer still compressed. See Requirements.
+
 ## What you get
 
 - `clarus(.exe)` — one-file DICOMweb server (QIDO/WADO/STOW/UPS-RS)
@@ -114,6 +119,15 @@ Everything in the chain is observable without a debugger:
 - **`/metrics`** (Prometheus text format on the server port): HTTP requests
   labelled by handler, STOW duplicates/parse errors, and UPS push
   delivered/retried/dropped counters.
+
+The server log reads (one line per event; UIDs and numbers are illustrative):
+
+```
+2026/09/30 14:12:05 [INFO] UPS_EVENT workitem_uid=1.2.840.113619.6.412.1.20260930.1 previous_state=created new_state=SCHEDULED event_id=1
+2026/09/30 14:12:06 [INFO] UPS_EVENT workitem_uid=1.2.840.113619.6.412.1.20260930.1 previous_state=SCHEDULED new_state=IN PROGRESS event_id=2
+2026/09/30 14:13:11 [INFO] WADO_SERIES loaded study=1.2.840.113619.6.412.1.20260930 series=1.2.840.113619.6.412.1.20260930.2 slices=626 of=626 bytes=418600128 us=71204012 failed=0 user=clinfer ip=127.0.0.1
+2026/09/30 14:17:48 [INFO] STOW_STUDY completed study=1.2.840.113619.6.412.1.20260930 slices=1 stored=1 idempotent=0 failed=0 conflicts=0 bytes=48216 us=1182407 user=clinfer ip=127.0.0.1
+```
 
 ## clmcp is a demo, not a product
 

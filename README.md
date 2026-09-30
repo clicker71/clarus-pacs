@@ -104,7 +104,9 @@ sidecar is planned.
   and backpressure are ours, not a runtime's.
 - **clbridge (sidecar)**: DIMSE-to-DICOMweb gateway. SCP for C-STORE /
   C-FIND / C-MOVE / N-ACTION; SCU for C-STORE outbound. Stateless.
-  Scale by adding bridges.
+  Its N-ACTION Storage Commitment verdicts resolve against the core's
+  PS3.18 Section 13 STC resource - one source of truth for DIMSE and
+  DICOMweb clients alike. Scale by adding bridges.
 - **clinfer (sidecar)**: AI processing. Claims UPS-RS workitems, runs
   site-supplied models under a model-agnostic contract (workdir +
   manifest.json -> result.json), stores results back with STOW-RS.

@@ -17,8 +17,11 @@ into its own project. The first implementation used SQLite and the Tokio
 async runtime - it was ready very quickly, and it was the wrong shape.
 Instead of adding a faster database, we removed the database. Instead of
 adding more RAM, we removed the async runtime. Instead of adding a
-cluster, we made the archive stateless. What was left was small enough
-to fit on a couple of floppies - and fast enough for a city archive.
+cluster, we made the archive stateless. The replacement followed a
+Strangler Fig pattern: the new architecture grew around the old one,
+replacing it component by component, with golden tests freezing the wire
+behaviour at every step. What was left was small enough to fit on a
+couple of floppies - and fast enough for a city archive.
 
 Removing the database is not a purity move: it is what makes Storage
 Commitment verifiable. A database stores pointers, and a row that says

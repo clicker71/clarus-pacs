@@ -290,6 +290,7 @@ reason and timestamp.
   result - no `410` tombstone is kept.
 
 ## 4. Worklist Service (UPS-RS)
+<!-- claim:ups_sections sections="11.4 11.5 11.6 11.7 11.8 11.9 11.10 11.11" not_supported="11.8" -->
 
 - **Resources:** `/workitems` - search (GET and POST, 11.9), create
   (11.4), retrieve (11.5), update (11.6) and change state (PUT
@@ -325,6 +326,7 @@ reason and timestamp.
   write); the request is refused while the workitem is unclaimed, since
   only the SCHEDULED -> IN PROGRESS transition issues the lock. An empty
   payload, and a present-but-empty (0040,4033), are both `400`.
+<!-- claim:rad84 url="POST /workitems/{uid}?TransactionUid=" merge="0040,4033 0040,4019 0040,4028" no_event="no event is published" out_of_set="outside that set" -->
 - **States:** SCHEDULED, IN PROGRESS, COMPLETED, CANCELED. State
   changes carry the Procedure Step State (0074,1000) and the locking
   Transaction UID (0008,1195) - both type 1 - and read nothing else
@@ -334,10 +336,31 @@ reason and timestamp.
   (`multipart/related; type="application/dicom+xml"`, PS3.18 11.1.3) is
   answered with the inner single part without the multipart wrapper
   (see 11.8).
-- **Search keys:** Workitem UID (0020,000D), Procedure Step State
+- **Search keys:** Workitem UID (0008,0018), Study Instance UID
+  (0040,4021 > 0020,000D), Accession Number (0040,A370 > 0008,0050),
+  Procedure Step State
   (0074,1000), Procedure Step Label (0074,1204), Scheduled Station AE
-  Title (0040,0001), Patient ID (0010,0020). Modality is deliberately
-  not a key - the UPS IOD defines no Modality attribute.
+  Title (0040,0001), Patient ID (0010,0020), and Modality (0008,0060)
+  as a vendor extension (see below). An absent or empty key matches
+  everything; a key with a value matches exactly (case-sensitive);
+  Modality, being type CS, matches case-insensitively.
+- **Sequence-qualified keys:** Study Instance UID and Accession Number are
+  reached through a sequence in PS3.4 Table CC.2.5-3 (Input Information
+  Sequence and Referenced Request Sequence respectively). This server stores
+  one value per workitem, so the sequence segment is carried in the
+  parameter NAME: `00404021.0020000D` and `0040A370.00080050`. The bare
+  attribute tags `0020000D` and `00080050` are accepted as the same
+  statement, because a caller sending either means the same search.
+- **Modality (0008,0060) - vendor extension:** the UPS IOD defines no
+  Modality (PS3.4 Table CC.2.5-3 has no such attribute), so this is an
+  extension, not a UPS conformance claim. When a workitem is created by
+  the origin server from a stored study, its render carries the input
+  study's Modality recorded at STOW time, and the same value is a
+  matching key. The attribute is honest data or it is absent: a workitem
+  created externally through Create (11.4) has no study behind it, so it
+  renders no (0008,0060) and no Modality query selects it. The extension
+  exists because the DIMSE MWL service requires Modality as a Return key
+  Type 1 (PS3.4 Table K.6-1) and the bridge maps workitems onto MWL.
 - **Optimistic locking:** state changes and updates require the current
   Transaction UID; a mismatch returns a conflict (`409`).
 - **Not supported:** the Request Cancellation resource (11.8) - a

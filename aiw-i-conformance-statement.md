@@ -70,7 +70,7 @@ filter, and the claiming sidecar cancels a non-matching study itself.
 | Transaction | RESTful semantics (PS3.18) | Status |
 |---|---|---|
 | RAD-80 Create UPS Workitem | Create (11.4) | **CONFORMANT** (responder and initiator). Input Readiness State stored and required at creation; the internal requestor (STOW-triggered CAD workitem) populates READY, MEDIUM priority, Input Information Sequence. |
-| RAD-81 Query UPS Workitems | Search (11.9) | **CONFORMANT**. Matching keys: workitem UID, Procedure Step Label (0074,1204), Scheduled Station AE Title (0040,0001), Patient ID, Procedure Step State. The AIW-I station key is (0040,4025) Code Value, accepted as an alias of (0040,0001) - the two name one fact (AIW-I 4.80.4.1.2.1): a search carrying either form reaches the same workitem, and (0040,0001) decides when a single search carries both. Patient/procedure/task-oriented keys (0040,A370, 0040,4018, 0032,1064) are not matching keys. |
+| RAD-81 Query UPS Workitems | Search (11.9) | **CONFORMANT**. Matching keys: workitem UID, Study Instance UID (0040,4021 > 0020,000D), Accession Number (0040,A370 > 0008,0050), Procedure Step Label (0074,1204), Scheduled Station AE Title (0040,0001), Patient ID, Procedure Step State. The AIW-I station key is (0040,4025) Code Value, accepted as an alias of (0040,0001) - the two name one fact (AIW-I 4.80.4.1.2.1): a search carrying either form reaches the same workitem, and (0040,0001) decides when a single search carries both. The sequence-qualified keys are carried in the parameter name (`00404021.0020000D`, `0040A370.00080050`); the bare attribute tags are accepted as the same statement. Task-oriented keys (0040,4018, 0032,1064) are not matching keys. |
 | RAD-82 Claim UPS Workitem | Change Workitem State (11.7) to IN PROGRESS with Transaction UID | **CONFORMANT** (PS3.4 Table CC.1.1-2 state machine, locking UID enforced). |
 | RAD-83 Get UPS Workitem | Retrieve Workitem (11.5) | **CONFORMANT** (initiator and responder). |
 | RAD-84 Update UPS Workitem | Update (11.6) | **CONFORMANT**. `POST /workitems/{uid}?TransactionUid={uid}` with the locking UID required; the merge set is the 4.84.4.1.2.1 performer report - (0040,4033), (0040,4019), (0040,4028) - each replaced whole, and an element outside that set is refused rather than silently dropped. The workflow state is not modified and no event is published. |
@@ -80,6 +80,7 @@ filter, and the claiming sidecar cancels a non-matching study itself.
 | RAD-109 Open Event Channel | WebSocket notification connection | **CONFORMANT**. `GET /dicomweb/subscribers/{requester}` with the RFC 6455 upgrade headers; hand-rolled responder (no new dependencies). |
 
 Actor-level: Pull and Triggered Pull workflow CONFORMANT; Push PLANNED.
+<!-- claim:rad84 url="POST /workitems/{uid}?TransactionUid=" merge="0040,4033 0040,4019 0040,4028" no_event="no event is published" out_of_set="outside that set" -->
 
 ## 2. Task Performer (clinfer)
 

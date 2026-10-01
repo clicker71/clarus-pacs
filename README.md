@@ -85,19 +85,32 @@ after: DICOMweb-first, with DIMSE as a removable bridge. We do not
 
 ## How it compares
 
-| | Clarus | Orthanc | dcm4chee-arc |
-|---|---|---|---|
-| **DICOMweb** | PS3.18 2026c, all mandatory transactions CONFORMANT | DICOMweb plugin (STOW/QIDO/WADO-RS) | STOW/QIDO/WADO-RS, full REST |
-| **Storage Commitment** | **Verifiable** (SOP UID in manifest, frame-chunk table in CAS) | Plugin, declarative | Present |
-| **IHE AIW-I** | **Task Manager + Task Performer CONFORMANT** | No | Not claimed as a profile |
-| **DIMSE** | Registry-driven YAML, 72 SOP classes shipped | Fixed set | Full IHE profile, tied to RDBMS |
-| **SQL** | None | SQLite | PostgreSQL / Oracle |
-| **Runtime** | ~2 MB binary (base build), ~5-13 MB RAM; no async runtime, thread-per-connection | C++ binary, ~GB RAM | JVM + WildFly, ~GB RAM |
-| **Fuzzy search** | Bitap + n-gram, O(candidates), zero heap | SQL LIKE | SQL / Lucene |
-| **CJK** | GB18030 / KS X 1001 / ISO 2022 IR 13/87 (opt-in `cjk-charsets` build), SM3 (planned) | Depends on build | Java charsets, no SM3 |
-| **HL7 / order management** | Sidecar (planned) | - | Full IHE profile |
-| **Plugin ecosystem** | Sidecars, not plugins | Large | Moderate |
-| **Maturity** | Closed preview | Mature open source | Production, commercial support |
+| | Clarus | dcm4chee-arc |
+|---|---|---|
+| **DICOMweb** | PS3.18 2026c, all mandatory transactions CONFORMANT | STOW/QIDO/WADO-RS, full REST |
+| **Storage Commitment** | **Verifiable** (SOP UID in manifest, frame-chunk table in CAS) | Present (DIMSE only) |
+| **IHE AIW-I** | **Task Manager + Task Performer CONFORMANT** | Not claimed as a profile |
+| **DIMSE** | Registry-driven YAML, 72 SOP classes shipped | Full IHE profile, tied to RDBMS |
+| **SQL** | None | PostgreSQL / Oracle |
+| **Runtime** | ~2 MB binary (base build), ~5-13 MB RAM; no async runtime, thread-per-connection | JVM + WildFly, ~GB RAM |
+| **Fuzzy search** | Bitap + n-gram, O(candidates), zero heap | ESoundex, Soundex family (degenerates on non-Latin) |
+| **CJK** | GB18030 / KS X 1001 / ISO 2022 IR 13/87 (opt-in `cjk-charsets` build), SM3 (planned) | Java charsets, no SM3 |
+| **HL7 / order management** | Sidecar (planned) | Full IHE profile |
+| **Plugin ecosystem** | Sidecars, not plugins | Moderate |
+| **Maturity** | Closed preview | Production, commercial support |
+
+**Fuzzy search, measured** (`fuzzymatching=true`, same corpus on both):
+
+| Query | Clarus (Levenshtein-1) | dcm4chee-arc (ESoundex) |
+|---|---|---|
+| stored name, exact / 1 edit | match | match |
+| unrelated name, same script | no match | match |
+| unrelated name, other non-Latin script (Cyrillic, CJK, Greek, Arabic, Katakana) | no match | match - all non-Latin names collapse to one code |
+
+dcm4chee-arc fuzzy search is phonetic-code matching (default ESoundex, Soundex
+family): any character outside the Latin alphabet maps to nothing, so every
+non-Latin name shares one empty code and any non-Latin query matches every
+non-Latin patient. Clarus is Unicode-aware Levenshtein-1.
 
 **Where Clarus wins:** AIW-I, verifiable Storage Commitment, no SQL, no
 async runtime, content-addressed storage, fuzzy search, CJK.
@@ -105,11 +118,9 @@ async runtime, content-addressed storage, fuzzy search, CJK.
 **Where Clarus is weaker:** HL7/order management, plugin ecosystem,
 maturity, commercial support.
 
-**Where it can compete:** Orthanc's niche (lightweight DICOM server) -
-no SQLite, AIW-I, verifiable commitment. dcm4chee's niche (hospital
-archive) - no JVM, no RDBMS, AIW-I, verifiable commitment. For
-HL7/order management, dcm4chee remains the reference today; a Clarus
-sidecar is planned.
+**Where it can compete:** dcm4chee's niche (hospital archive) - no JVM,
+no RDBMS, AIW-I, verifiable commitment. For HL7/order management,
+dcm4chee remains the reference today; a Clarus sidecar is planned.
 
 ## Architecture
 

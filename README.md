@@ -2,9 +2,10 @@
 
 > A standards-complete DICOMweb archive with a minimal core.
 
-Clarus is a DICOMweb PACS server (QIDO-RS, WADO-RS, STOW-RS, UPS-RS,
-Storage Commitment) written in Rust. It conforms to PS3.18 2026c, IHE
-AIW-I Rev 1.1, and PS3.2. It does this without SQL, without an external
+Clarus is a vendor-neutral DICOMweb PACS server (QIDO-RS, WADO-RS,
+STOW-RS, UPS-RS, Storage Commitment) written in Rust. It conforms to
+PS3.18 2026c, IHE AIW-I Rev 1.1, and PS3.2. It does this without SQL,
+without an external
 database, and with no runtime dependencies: no database server, no JVM,
 no interpreter, no async runtime.
 

@@ -6,9 +6,7 @@ A single whole-slide image - 161,191 tiles, JPEG 2000 Lossless - landed on a
 test machine with **2 GiB of RAM**. The server died of out-of-memory. We did
 not patch that one file. We rewrote the rule.
 
-![One study, three DICOM objects: the gigapixel slide (WSI), the AI
-segmentation on top of it (SEG), and the structured measurements (TID1500 SR)
-- all served from the same Clarus archive](images/wsi.png)
+![One study, three DICOM objects: the gigapixel slide (WSI), the AI segmentation on top of it (SEG), and the structured measurements (TID1500 SR) - all served from the same Clarus archive](images/wsi.png)
 
 *One archive, three object types - 7 pyramid levels, 3 AI segmentations, and
 a structured report. Clarus serves the whole-slide image, the segmentation

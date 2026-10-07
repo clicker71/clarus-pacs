@@ -510,6 +510,28 @@ class DimseEngine:
 # ---------------------------------------------------------------------------
 # DICOMweb engine (requests, thread per worker)
 # ---------------------------------------------------------------------------
+def _stow_multipart_related(batch_files):
+    """Build a multipart/related (type=application/dicom) STOW-RS body.
+
+    STOW-RS requires multipart/related, NOT multipart/form-data. requests'
+    `files=` shortcut produces the latter and conformant origins answer 400
+    "Expected multipart/related Content-Type", so the body is built by hand:
+    one part per instance, each `Content-Type: application/dicom`, and the
+    wrapping Content-Type names the boundary + `type=application/dicom`.
+    """
+    boundary = "----clarus-ab-%d-%d" % (os.getpid(), int(time.time() * 1e6))
+    pre = ("--%s\r\nContent-Type: application/dicom\r\n\r\n"
+           % boundary).encode("ascii")
+    parts = []
+    for path, _size in batch_files:
+        with open(path, "rb") as fh:
+            parts.append(pre + fh.read() + b"\r\n")
+    body = b"".join(parts) + ("--%s--\r\n" % boundary).encode("ascii")
+    ctype = ("multipart/related; type=application/dicom; boundary=%s"
+             % boundary)
+    return body, ctype
+
+
 class WebEngine:
     def __init__(self, cfg, recv_dir):
         self.cfg = cfg
@@ -548,19 +570,16 @@ class WebEngine:
                     batch = q.get(timeout=0.3)
                 except queue.Empty:
                     continue
-                fhs = []
-                files = []
                 nbytes = 0
                 ok = False
                 try:
-                    for i, it in enumerate(batch):
-                        fh = open(it.path, "rb")
-                        fhs.append(fh)
-                        files.append(("dicom", ("%04d.dcm" % i, fh,
-                                                "application/dicom")))
-                        nbytes += it.size
-                    resp = sess.post(engine.studies_url, files=files,
-                                     timeout=(15, 600))
+                    body, ctype = _stow_multipart_related(
+                        [(it.path, it.size) for it in batch])
+                    nbytes = sum(it.size for it in batch)
+                    resp = sess.post(
+                        engine.studies_url, data=body,
+                        headers={"Content-Type": ctype},
+                        timeout=(15, 600))
                     ok = resp.status_code in (200, 201, 202, 204)
                     if not ok:
                         with engine._hint_lock:
@@ -571,12 +590,6 @@ class WebEngine:
                                          resp.text[:120].replace("\n", " ")))
                 except Exception:
                     ok = False
-                finally:
-                    for fh in fhs:
-                        try:
-                            fh.close()
-                        except Exception:
-                            pass
                 state.record(nbytes, ok)
             sess.close()
 
@@ -588,7 +601,7 @@ class WebEngine:
         ok = run_pipeline(spawn, stop, state, ramp, state.meter, verbose, "upload")
         return state, state.meter, ramp, ok
 
-    def read(self, units, chunk_mb, max_w, verbose):
+    def read(self, units, level, chunk_mb, max_w, verbose):
         q = queue.Queue()
         for u in units:
             q.put(u)
@@ -605,8 +618,16 @@ class WebEngine:
                     unit = q.get(timeout=0.3)
                 except queue.Empty:
                     continue
-                study, series = unit
-                url = "%s/studies/%s/series/%s" % (engine.base, study, series)
+                if level == "STUDY":
+                    study = unit[0]
+                    url = "%s/studies/%s" % (engine.base, study)
+                elif level == "SERIES":
+                    study, series = unit
+                    url = "%s/studies/%s/series/%s" % (engine.base, study, series)
+                else:
+                    study, series, sop = unit
+                    url = "%s/studies/%s/series/%s/instances/%s" % (
+                        engine.base, study, series, sop)
                 n = 0
                 ok = False
                 try:
@@ -670,6 +691,11 @@ def main(argv=None):
                     default="STUDY",
                     help="-d: C-MOVE level (default STUDY; bridge executes "
                          "study-level jobs regardless)")
+    ap.add_argument("--read-level", choices=["STUDY", "SERIES", "INSTANCE"],
+                    default="SERIES",
+                    help="-w: WADO-RS granularity for the read phase "
+                         "(default SERIES; INSTANCE = one GET per SOP for "
+                         "parallel small reads)")
     ap.add_argument("--stow-batch", type=int, default=20,
                     help="-w: instances per multipart POST, same-study batches (default 20)")
     ap.add_argument("--chunk-mb", type=float, default=32.0,
@@ -773,10 +799,19 @@ def main(argv=None):
                 report("upload", st, meter, ramp, t0)
                 rc = 0 if (ok and st.ok == st.total) else 2
             if not args.only_upload:
-                print("[read] WADO-RS <- %s" % eng.base)
+                if args.read_level == "STUDY":
+                    units = [(s,) for s in studies]
+                elif args.read_level == "SERIES":
+                    units = series
+                else:
+                    units = sorted(set(
+                        (it.study, it.series, it.sop) for it in items))
+                print("[read] WADO-RS <- %s (level=%s, %d units)"
+                      % (eng.base, args.read_level, len(units)))
                 t0 = time.monotonic()
                 st, meter, ramp, ok = eng.read(
-                    series, args.chunk_mb, args.max_window, args.verbose)
+                    units, args.read_level, args.chunk_mb, args.max_window,
+                    args.verbose)
                 report("read", st, meter, ramp, t0)
                 if rc == 0 and (not ok or st.ok != st.total):
                     rc = 2

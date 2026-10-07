@@ -32,9 +32,14 @@ addresses content by its own hash, so the address is the content: the
 study manifest embeds the CAS frame-chunk table, and "in the manifest"
 means the full pixel data is in the CAS (PS3.4 J.1.1). The `200 OK` is
 sent only after the manifest commit, so the acknowledgement boundary is
-the durability boundary. The hash itself (BLAKE3 by default, SM3 behind
-`china_crypto` for CN government builds) is a detail - the verifiability
-comes from content addressing, not the algorithm.
+the durability boundary. Verifiable has a price: the acknowledgement waits
+for an `fsync`. For terminal-velocity ingest, run on a server-grade NVMe
+with power-loss protection (PLP) so that fsync is cheap, and build with
+`--target-cpu=native` so the hot path uses the widest SIMD the CPU offers
+(BLAKE3 already auto-selects AVX2/AVX-512/NEON at runtime; the flag
+extends that to the rest of the code). The hash itself (BLAKE3 by default,
+SM3 behind `china_crypto` for CN government builds) is a detail - the
+verifiability comes from content addressing, not the algorithm.
 
 ### Principles
 
@@ -242,7 +247,11 @@ journals.
 *Clarus on a Raspberry Pi 5 (2 GB RAM, NVMe) with the inline ~30 KB
 mini-viewer at `/` - a visual ping for the service engineer/admin.*
 
-- VM (VMware, 3 vCPU, 32 GB RAM, HDD-backed)
+Measured on this Pi 5 (2026-09-01, loopback, 636 MB corpus): WADO-RS
+~990 MB/s warm single-stream, 4.0 GB/s four-stream aggregate; cold
+244-356 MB/s single, ~896 MB/s aggregate.
+
+- VM (VMware, 6 vCPU, 32 GB RAM, HDD-backed)
 
 The wall is the network and the disk, not the CPU.
 

@@ -89,3 +89,48 @@ query in a non-Latin script returns every non-Latin patient in the archive
 (Latin-named patients keep distinct codes and are not returned). Clarus'
 Unicode-aware Levenshtein-1 does not exhibit this. This is a search-quality
 defect with a privacy implication, not an access-control bypass.
+
+## Throughput (container-vs-container, measured 2026-10-07)
+
+Both servers run in Docker on the same host, loopback, identical corpus
+(631 files / 514 MB / 2 studies / 4 series), each started from empty storage.
+Measured with [`tools/ab_test.py`](tools/ab_test.py) (STOW-RS upload, then
+WADO-RS read). Both serve the objects from their own local storage, so there
+is no DICOMweb-to-DIMSE hop on either side.
+
+| Phase | Clarus | dcm4chee-arc |
+|---|---|---|
+| STOW-RS write | 32.1 MB/s | 19.6 MB/s |
+| WADO-RS read, sequential (series) | 54.1 MB/s | 50.2 MB/s |
+| WADO-RS read, parallel (631 instances, adaptive window) | 50.3 MB/s (window 5, 16.2 ms/instance) | 26.0 MB/s (window 7, 31.4 ms/instance) |
+
+## Where the wall is
+
+The point of the read lines above is not the absolute ~50 MB/s - it is that
+the two servers land on the *same* ~50 MB/s. That agreement is two different
+engines pressing against the ceiling of the bench they were measured on, not a
+property of either server.
+
+The bench is a VMware VM whose two disks are virtual disks on spinning HDD,
+with Docker Desktop on Windows putting every published port behind a NAT
+loopback. A single HDD does 100-200 MB/s sequential in the best case; stack
+the Docker NAT and a client writing the download back to the same HDD on top,
+and a single stream settles around 50 MB/s. Three observations pin the wall to
+the environment rather than to Clarus:
+
+1. Clarus cannot exceed ~50 MB/s even with five concurrent reads (window 5
+   gives the same 50.3 MB/s). A server limited by its own code would drift
+   below the shared ceiling as load rises; it would not sit exactly on it.
+2. The same Clarus WADO path, same code, on real hardware does not see this
+   wall: ~990 MB/s warm single-stream and 244-356 MB/s cold on a Raspberry
+   Pi 5 (Cortex-A76, 2 GB RAM, NVMe over PCIe 2.0 x1, bare metal, 2026-09-01),
+   and 344-428 MB/s cold / ~1.1 GB/s warm on an Intel i7 + NVMe box
+   ([`benchmark-headroom.md`](benchmark-headroom.md)).
+3. Where the engines actually differ, the gap is structural: 1.64x on write,
+   and ~2x lower per-instance read latency (16.2 vs 31.4 ms). That is the
+   difference between a server with no SQL transaction on its write path and
+   no per-request database lookup on its read path, and a server with both.
+
+In short: read parity on this page is a property of the measuring environment.
+The numbers that carry information about the two engines are the write
+throughput and the per-instance read latency.

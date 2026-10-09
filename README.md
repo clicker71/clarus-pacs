@@ -261,6 +261,14 @@ The wall is the network and the disk, not the CPU.
 claims workitems from Clarus, runs a site-supplied model script under a
 model-agnostic contract, and stores results back with STOW-RS.
 
+Standard on the wire, simple on the desk. Everything clinfer exchanges
+with Clarus and the viewer is standard DICOMweb + UPS-RS; the only
+non-standard part is the local model contract (`manifest.json` in,
+`result.json` out) - no HTTP server for the integrator to run. When
+DICOM Supplement 251 (Application Request) is published, clinfer will
+also speak that standard processing service, and keep the local
+contract so a model can still be shipped as a plain script.
+
 **The model never sees DICOM.** Per study, `clinfer` lays out frames as
 raw pixel arrays plus a `manifest.json`. One run: the script (Python,
 C++, OpenVINO - any executable) runs in a separate OS process with

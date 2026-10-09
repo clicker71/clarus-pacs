@@ -41,6 +41,19 @@ extends that to the rest of the code). The hash itself (BLAKE3 by default,
 SM3 behind `china_crypto` for CN government builds) is a detail - the
 verifiability comes from content addressing, not the algorithm.
 
+**Why Rust.** Not because it is fashionable. The alternative - C or C++ -
+puts memory management back in human hands, and one bad pointer in a hot
+path is a crash in a clinic at 3 a.m. We have lived on both sides of that
+crash: years in the field assembling and repairing X-ray and CT machines,
+and years before that writing C++ on NT and Pentium - threads that knew
+each other only through mutexes and semaphores - when a reboot, an
+out-of-memory or a blue screen was a several-times-a-day event. Rust gives
+the same control over layout and allocation without that class of bug.
+Async runtimes, SQL engines and plugin frameworks are not banned because
+they are bad - they are banned because they hide the cost. Rust keeps the
+cost visible: no runtime, no GC, no hidden allocation in the hot path. The
+point is the visibility, not the language.
+
 ### Principles
 
 1. Everything is a file (Unix).

@@ -3,8 +3,9 @@
 > A vendor-neutral DICOMweb archive with a minimal core.
 
 Clarus is a vendor-neutral DICOMweb archive (QIDO-RS, WADO-RS,
-STOW-RS, UPS-RS, Storage Commitment) written in Rust, with VNA-grade
-vendor-neutrality. It conforms to PS3.18 2026c, IHE AIW-I Rev 1.1, and
+STOW-RS, UPS-RS, Storage Commitment, Worklist (MWL), MPPS) written in
+Rust, with VNA-grade vendor-neutrality. It conforms to PS3.18 2026c,
+IHE AIW-I Rev 1.1, and
 PS3.2. It does this without SQL, without an external
 database, and with no runtime dependencies: no database server, no JVM,
 no interpreter, no async runtime.
@@ -66,8 +67,8 @@ point is the visibility, not the language.
 
 ## What it is
 
-- **DICOMweb**: QIDO-RS, WADO-RS, STOW-RS, UPS-RS, Storage Commitment
-  (PS3.18 2026c)
+- **DICOMweb**: QIDO-RS, WADO-RS, STOW-RS, UPS-RS, Storage Commitment,
+  Worklist (MWL), MPPS (PS3.18 2026c)
 - **AIW-I**: Task Manager (Clarus) + Task Performer (clinfer), Pull +
   Triggered Pull
 - **DIMSE bridge**: C-STORE, C-FIND, C-MOVE, N-ACTION, C-ECHO.
@@ -242,8 +243,10 @@ journals.
 - **~6 MB RSS** on Windows, **8-13 MB on Raspberry Pi 5** in the base
   build.
 - **`transcode` build** adds codecs (JPEG-LS, JPEG Baseline/Lossless,
-  JPEG 2000, RLE). Idle RSS unchanged; transient buffers during
-  conversion.
+  JPEG 2000, RLE) and server-side thumbnails. Without it, viewers that
+  decode locally (e.g. Weasis) show the preview only after the loading
+  stage, and WSI previews do not render at all. Idle RSS unchanged;
+  transient buffers during conversion.
 - **`s3` build feature**: cold-tier fallback.
 - **`cjk-charsets`**: opt-in build feature, NOT in the default build; a
   separate release variant ships with it. Without it, CJK text is not

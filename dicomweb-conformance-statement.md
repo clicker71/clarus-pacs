@@ -369,7 +369,102 @@ reason and timestamp.
   restart forgets subscriptions and their deletion locks (the durable
   path is UPS Search; the profile sets no persistence requirement).
 
-## 5. WADO-URI
+## 5. Modality Scheduled Procedure Step Service (PS3.18 Section 14)
+
+- **Resources:** `/modality-scheduled-procedure-steps` - Search (GET, 14.4),
+  the C-FIND analog. The service is **search-only**: 14.3 states that
+  "it is not possible to create Modality Scheduled Procedure Steps using
+  DICOM, neither with DIMSE, nor with DICOMweb", so this implementation
+  offers no Create, Update or Delete on the resource. The surface is off by
+  default; a deployment enables it with `[workflow] enabled = true`, and
+  while it is off the resource is absent (`404`).
+- **Matching keys:** the seven REQUIRED matching keys of PS3.4 Table K.6-1 are
+  supported - Scheduled Station AE Title (0040,0001), Scheduled Procedure Step
+  Start Date (0040,0002), Scheduled Procedure Step Start Time (0040,0003),
+  Modality (0008,0060), Scheduled Performing Physician's Name (0040,0006),
+  Patient's Name (0010,0010) and Patient ID (0010,0020). Nine optional keys are
+  also supported: Accession Number (0008,0050), Requested Procedure ID
+  (0040,1001), Requested Procedure Description (0032,1060), Study Instance UID
+  (0020,000D), Patient's Birth Date (0010,0030), Patient's Sex (0010,0040),
+  Requesting Physician (0032,1032), Referring Physician's Name (0008,0090) and
+  Scheduled Procedure Step ID (0040,0009). The Scheduled Procedure Step
+  Sequence (0040,0100) is matched with **Sequence Matching** and holds a single
+  Item as K.6-1 requires; its keys are accepted both bare and in their
+  sequence-qualified spelling.
+- **Fuzzy matching:** the `fuzzymatching` control parameter (PS3.18 Table
+  8.3.4-1, 8.3.4.2) is supported for the three Person Name matching keys -
+  Patient's Name (0010,0010), Scheduled Performing Physician's Name (0040,0006)
+  and Referring Physician's Name (0008,0090). With `fuzzymatching=true` a name
+  matches within one Levenshtein edit (the same Unicode-aware Bitap matcher
+  QIDO-RS fuzzymatch uses), and the PN separators `^`/`=` align with a
+  hand-typed space. The default (`false`) is exact single-value matching, and
+  non-PN keys always match exactly.
+- **Unsupported matching keys are rejected with `400`,** naming the key. An
+  unknown or misspelled key is never silently dropped: dropping one widens the
+  result set to the whole worklist, which a caller cannot distinguish from a
+  genuinely broad match.
+- **Response:** the reply is the SPS-level list of matching scheduled procedure
+  steps (14.4: "a list of matching scheduled procedure steps"), not a
+  Study/Series/Instance hierarchy. Search control parameters `limit` and
+  `offset` of PS3.18 Table 8.3.4-1 are honoured; a client `limit` above
+  `[workflow] mwl_max_responses` is clamped to that hard ceiling.
+- **Media types:** `application/dicom+json` (Default), `application/dicom+xml`
+  (Required), `multipart/related; type="application/dicom+json"` (Required) and
+  `multipart/related; type="application/dicom+xml"` (Required), all per 14.1.3.
+- **Record store:** MWL rows live in `[workflow] dir` (default
+  `{btree.root}/workflow`), under `mwl/`. DICOMweb defines no MWL Create, so
+  this server never writes a row through the DICOMweb surface; the store is
+  read by the search and written by a scheduler forwarder that is outside this
+  document's scope.
+
+## 6. Modality Performed Procedure Step Service (PS3.18 Section 15)
+
+- **Resources:** `/modality-performed-procedure-steps/{mppsUID}` - Create
+  (POST, 15.4, N-CREATE), Update (POST with the **mandatory** `?update` query
+  parameter, 15.5, N-SET - the parameter is what distinguishes Update from
+  Create, the two otherwise sharing one URI) and Retrieve (GET, 15.6, N-GET).
+  There is **no list/search transaction**: 15.3 states that "it is not possible
+  to list all Modality Performed Procedure Steps using DICOM, neither with
+  DIMSE, nor with DICOMweb". The surface is off by default
+  (`[workflow] enabled = true`); while off the resource is absent (`404`).
+- **MPPS Retrieve is implemented.** 15.6 marks it OPTIONAL for the origin
+  server; this implementation provides it.
+- **Create:** the Performed Procedure Step Status (0040,0252) is Type 1 at
+  N-CREATE and the request is accepted **only** when its value is
+  `IN PROGRESS` (PS3.4 F.7.2.1). A missing status, or any other value, is a
+  `400`. A Create on an MPPS UID that already exists is a `409` carrying the
+  standard's Duplicate SOP Instance code `0111H`.
+- **Update:** the state machine is `IN PROGRESS -> COMPLETED | DISCONTINUED`.
+  An N-SET after a final status is refused, and an N-SET naming an unknown MPPS
+  UID is refused (`404`) - there is no implicit create, because DICOMweb is not
+  the DIMSE vendor-tolerance path. The Performed Series Sequence (0040,0340)
+  must **not be empty** when the status becomes `COMPLETED` or `DISCONTINUED`
+  (PS3.4 F.7: "a Series must exist for every Performed Procedure Step").
+- **Discontinuation reason:** (0040,0281) is OPTIONAL (type 3/3 in Table
+  F.7.2-1) and is **not** Type 1C. When a performer wants to use it, it must be
+  created zero-length at N-CREATE, because a top-level attribute, once set,
+  cannot be deleted later (PS3.4 F.7.2.1.1 note 5). The store keeps an empty
+  reason distinct from an absent one, so that rule is representable.
+- **Study link:** the Study Instance UID lives inside the Scheduled Step
+  Attributes Sequence, (0040,0270) > (0020,000D), not as a top-level attribute;
+  the render and the reader both use that carriage.
+- **Notifications are not supported** (PS3.18 15.1: "Notifications, as defined
+  in Section F.9 in PS3.4, are not supported by this service"). For
+  notification-like behaviour the standard points to the IHE Scheduled Workflow
+  Performed Procedure Step Manager forwarding creates and updates to interested
+  actors; this server does not act as that Manager.
+- **Concurrency is last-writer-wins.** MPPS defines no Transaction UID (unlike
+  UPS 0008,1195), so there is no optimistic locking: one MPPS UID is written by
+  one modality, and the most recent write is the record. Documenting this is
+  the whole treatment - no lock is invented.
+- **Media types:** `application/dicom+json` (Default) and
+  `application/dicom+xml` (Required), per 15.1.3. **There is no
+  `multipart/related` media type for this service**, unlike MWL.
+- **Record store:** MPPS rows live in `[workflow] dir`, under `mpps/`. A
+  retention sweep removes FINAL rows older than `[workflow] retention_days`; an
+  `IN PROGRESS` row is never swept.
+
+## 7. WADO-URI
 
 **Resource:** `/wadouri` - single-instance retrieval by UID query
 parameters. Conformance claim is limited to **Retrieve DICOM Instance,
@@ -379,14 +474,14 @@ mandatory set - `requestType` (=WADO), `studyUID`, `seriesUID`,
 `anonymize`, transfer syntax) are **not supported**; a request for
 `requestType != WADO` is rejected with `400`.
 
-## 6. Capabilities
+## 8. Capabilities
 
 **Resource:** `/dicomweb/` - returns the service capabilities document
 (`application/dicom+json`). Advertised keys: `qido-rs`, `wado-rs`,
 `stow-rs`, `ups-rs`, `wado-uri`, `commitment-rs`,
 `transferCapabilities`.
 
-## 7. Transfer Syntaxes
+## 9. Transfer Syntaxes
 
 - **Ingest:** store-as-received; instances are accepted and stored in any
   transfer syntax present in the STOW payload, with no re-encoding.
@@ -421,7 +516,7 @@ and served as-is; a transcode request for them returns `406`.
 bytes with a logged WARN; a non-conformant codestream (component count
 mismatch) is a deterministic refusal with `406`.
 
-## 8. Character Sets
+## 10. Character Sets
 
 - The DICOM default character repertoire and Latin-1 pass through
   natively; UTF-8 (ISO_IR 192) is handled in JSON/XML responses.
@@ -432,7 +527,7 @@ mismatch) is a deterministic refusal with `406`.
   is built with the `cjk-charsets` feature; without it CJK text is not
   decoded. The shipped default build includes the feature.
 
-## 9. Security
+## 11. Security
 
 - Authentication and TLS termination are **delegated** to the reverse
   proxy (nginx). The server trusts the proxy identity headers
@@ -447,7 +542,7 @@ mismatch) is a deterministic refusal with `406`.
 - Encryption at rest is the OS-level mount encryption (BitLocker / LUKS /
   EFS); the server binary contains no symmetric encryption of its own.
 
-## 10. Configuration
+## 12. Configuration
 
 - Server: nginx-style config file (`clarus.conf`), validated by
   `clarus --test-config`.
@@ -459,7 +554,7 @@ mismatch) is a deterministic refusal with `406`.
   `s3` (cold-tier fallback), `cjk-charsets` (CJK decoding);
   `china_crypto` (planned: SM3 content-addressing instead of BLAKE3).
 
-## 11. Extensions and Deviations
+## 13. Extensions and Deviations
 
 Vendor extensions beyond the mandatory key set of PS3.18 Table 10.6.1-5
 are legal per PS3.18 8.3.4.1 and are declared here.
@@ -561,7 +656,7 @@ covered by this statement beyond 2.5.
 the attribute is not part of the PS3.18 2026c response tables. The value
 names the repertoire actually used in the response (UTF-8).
 
-## 12. Trademarks
+## 14. Trademarks
 
 DICOM is the registered trademark of the National Electrical
 Manufacturers Association (NEMA) for its standards publications relating

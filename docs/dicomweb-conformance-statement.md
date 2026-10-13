@@ -86,6 +86,7 @@ request completes.
 | `/studies/{study}/series/{series}/metadata` | `multipart/related; type="application/dicom+json"` when Accept asks multipart (Required media type, PS3.18 10.4.4); a single-part `application/dicom+json` array otherwise (see 11.11) |
 | `/instances/{sop}/frames/{n}` | `multipart/related; type="application/octet-stream"` with a per-frame part `Content-Type` naming the stored transfer syntax (see below) |
 | `/instances/{sop}/thumbnail` | `image/jpeg` 64x64 (see 2.4) |
+| `/instances/{sop}/rendered` | `image/jpeg` (default), `image/gif` (grayscale), `image/png` (see 2.4) |
 | bulkdata URIs (`/bulkdata/{tag}`) | `application/octet-stream` |
 
 **Multipart part headers:** every part of a study/series/frames multipart
@@ -254,6 +255,15 @@ request. Default `limit` 250; `limit`/`offset` paging is supported.
   (`Accept: image/jpeg` on the instance resource) is available; when the
   transcode pool is saturated the server answers `503` with a
   `Retry-After` header.
+- `/instances/{sop}/rendered` (Rendered Resource) serves `image/jpeg`
+  (grayscale, default), `image/gif` (grayscale) or `image/png` (RGB and
+  grayscale) for SINGLE-FRAME instances. RGB previews
+  (LABEL/THUMBNAIL/OVERVIEW) render without window/level and downscale with
+  the area-average filter. Multi-frame instances are NOT server-rendered
+  (406); clients retrieve pyramid frames via `/frames/{N}`. `image/gif` is
+  served for grayscale single-frame instances (lossless, 256-gray palette);
+  RGB single-frame instances are served as `image/png` (lossless) and
+  `image/gif` for RGB is not offered (406). `image/jp2` is not offered.
 
 ### 2.5 Delete (admin extension)
 

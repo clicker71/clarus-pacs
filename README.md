@@ -396,9 +396,9 @@ not a business model.
   by Weasis
 - DIMSE throughput benchmark vs Orthanc ([`benchmark.md`](benchmark.md))
 - Conformance statements:
-  [DICOMweb](dicomweb-conformance-statement.md),
-  [DIMSE bridge](dimse-bridge-conformance-statement.md),
-  [IHE AIW-I](aiw-i-conformance-statement.md)
+  [DICOMweb](docs/dicomweb-conformance-statement.md),
+  [DIMSE bridge](docs/dimse-bridge-conformance-statement.md),
+  [IHE AIW-I](docs/aiw-i-conformance-statement.md)
 - Public test artifacts: [ap101](https://github.com/clicker71/ap101),
   [`tools/ab_test.py`](tools/ab_test.py)
 - Bug reports against third-party DICOM tooling
@@ -417,9 +417,10 @@ published gradually as it stabilizes.
 ## Links
 
 - [Weasis field report](weasis-report.md)
-- [DICOMweb conformance statement](dicomweb-conformance-statement.md)
-- [DIMSE bridge conformance statement](dimse-bridge-conformance-statement.md)
-- [IHE AIW-I conformance statement](aiw-i-conformance-statement.md)
+- [DICOMweb conformance statement](docs/dicomweb-conformance-statement.md)
+- [DIMSE bridge conformance statement](docs/dimse-bridge-conformance-statement.md)
+- [IHE AIW-I conformance statement](docs/aiw-i-conformance-statement.md)
+- [Audit log format](docs/audit-log-format.md)
 - [Universal DICOM A/B harness](https://github.com/clicker71/ap101)
 - [End-to-end demo](totalseg-demo/README.run.md)
 

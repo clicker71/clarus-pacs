@@ -81,6 +81,26 @@ Latency (200 iterations per query, median / p99):
 | POST `/commitment-requests/{uid}` | 200 + verdict | 404 |
 | GET `/commitment-requests/{uid}` | 200 + verdict | 404 |
 
+## MWL / MPPS over DICOMweb (PS3.18 14/15)
+
+dcm4chee-arc gates every DICOMweb service behind the Web Application LDAP
+attribute `dcmWebServiceClass`: the base `DCM4CHEE` app ships with only
+`WADO_RS`/`STOW_RS`/`QIDO_RS`, and the worklist classes are added by versioned
+migrations (UPS_RS + MWL_RS in 5.22.0, MPPS_RS in 5.29.1, plus a separate
+`WORKLIST` app since 5.29.1). Measured on 5.35.2:
+
+| Resource | PS3.18 resource | Clarus | dcm4chee-arc |
+|---|---|---|---|
+| MWL search | `GET /modality-scheduled-procedure-steps` | yes | 404 on `DCM4CHEE`; served at `/mwlitems` on the separate `WORKLIST` app only |
+| MPPS | `/modality-performed-procedure-steps/{mppsUID}` | yes | 404; served at `/mpps` |
+
+dcm4chee-arc does NOT expose the standard PS3.18 14/15 resources: it serves
+proprietary QIDO-style `/mwlitems` and `/mpps` endpoints, and MWL-RS lives on
+the separate `WORKLIST` web app (`/aets/WORKLIST/rs`), not on `DCM4CHEE`. A
+standard DICOMweb MWL/MPPS client gets 404 against a default dcm4chee-arc even
+when the service classes are enabled. Clarus serves the standard resources at
+the standard paths.
+
 ## Note on over-matching
 
 dcm4chee-arc's phonetic fuzzy matching over-matches non-Latin names: every

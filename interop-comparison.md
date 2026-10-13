@@ -41,10 +41,40 @@ both), `--patient-name`/`--variants` (fuzzy queries), `--sop-class`/
 | Create: SOP Common in body | 400 | 400 |
 | Create: conformant body | 201 | 201 + Location |
 | Search: required keys | filters | filters |
+| Search: keyword spelling (PS3.18 8.3.4) | filters | filters |
+| Search: wrong-case / unknown key | 400 | 400 |
 | Search: StudyInstanceUID (optional key) | filters | ignored |
 | ChangeState `?requester=` | not required | required |
 | Update query-param name | `TransactionUid` (strict) | both spellings |
 | Update attribute set | narrow (AIW-I report) | general N-SET |
+
+## Weasis as a UPS-RS User Agent (Task Requestor)
+
+Weasis phase 1 (`UpsService` + `$ups:` commands, headless) was driven through
+the same five-step requester cycle against both origins by `UpsE2eTest.java`
+in the Weasis fork (JUnit, tagged `e2e` and property-gated so CI is untouched;
+2026-10-10). Both origins pass the full cycle:
+
+| Step | Clarus | dcm4chee-arc |
+|---|---|---|
+| Create-if-none (11.4 / RAD-80) | 201 | 201 |
+| Search (11.9 / RAD-81) | SCHEDULED + code | SCHEDULED + code |
+| Create again - idempotent | same UID, nothing minted | same UID, nothing minted |
+| Cancel (11.8) | 202, then CANCELED | 202 (accepted) |
+| Search after cancel | CANCELED | no longer SCHEDULED |
+
+The cycle is the Task-Requester surface: Weasis creates and watches, and never
+re-addresses or steps a workitem (that is the Task Manager's role). The run
+surfaced and closed three defects:
+
+- client: `run` minted no workitem UID and sent a bare `POST /workitems`;
+  fixed to `POST /workitems?workitem={uid}` (PS3.18 11.4.1.1).
+- Clarus server: Create rejected the PS3.18 F.2 array body (`obj_get`
+  understood only the object form); fixed to unwrap the single-dataset array.
+- Clarus server: the search control parameters (`includefield`, `fuzzymatching`,
+  `emptyvaluematching`, `multiplevaluematching`) were refused although
+  PS3.18 Table 8.3.4-1 marks them mandatory for the Origin Server; fixed to
+  accept them.
 
 ## Fuzzy matching (QIDO-RS PatientName)
 
@@ -112,11 +142,13 @@ defect with a privacy implication, not an access-control bypass.
 
 ## Throughput (container-vs-container, measured 2026-10-07)
 
-Both servers run in Docker on the same host, loopback, identical corpus
-(631 files / 514 MB / 2 studies / 4 series), each started from empty storage.
-Measured with [`tools/ab_test.py`](tools/ab_test.py) (STOW-RS upload, then
-WADO-RS read). Both serve the objects from their own local storage, so there
-is no DICOMweb-to-DIMSE hop on either side.
+Host: VMware VM, 6 vCPU (2 sockets x 3 cores, Intel Xeon E5-2690 v4 @ 2.60 GHz),
+32 GB RAM, storage = two VMware virtual disks on HDD (SAS). Both servers in
+Docker on the same host, loopback, identical corpus (631 files / 514 MB /
+2 studies / 4 series), each started from empty storage. Measured with
+[`tools/ab_test.py`](tools/ab_test.py) (STOW-RS upload, then WADO-RS read).
+Both serve the objects from their own local storage - there is no
+DICOMweb-to-DIMSE hop on either side, so this is apples-to-apples.
 
 | Phase | Clarus | dcm4chee-arc |
 |---|---|---|
@@ -124,33 +156,22 @@ is no DICOMweb-to-DIMSE hop on either side.
 | WADO-RS read, sequential (series) | 54.1 MB/s | 50.2 MB/s |
 | WADO-RS read, parallel (631 instances, adaptive window) | 50.3 MB/s (window 5, 16.2 ms/instance) | 26.0 MB/s (window 7, 31.4 ms/instance) |
 
-## Where the wall is
+A single bulk series read is I/O-bound and lands on the same ~50 MB/s ceiling
+for both. The gap appears on many small parallel requests: Clarus holds the
+ceiling (16.2 ms/instance) while dcm4chee-arc drops to 31.4 ms/instance,
+consistent with a heavier per-request lookup path (PostgreSQL/LDAP) at
+instance granularity.
 
-The point of the read lines above is not the absolute ~50 MB/s - it is that
-the two servers land on the *same* ~50 MB/s. That agreement is two different
-engines pressing against the ceiling of the bench they were measured on, not a
-property of either server.
+Where the wall is (and is not):
 
-The bench is a VMware VM whose two disks are virtual disks on spinning HDD,
-with Docker Desktop on Windows putting every published port behind a NAT
-loopback. A single HDD does 100-200 MB/s sequential in the best case; stack
-the Docker NAT and a client writing the download back to the same HDD on top,
-and a single stream settles around 50 MB/s. Three observations pin the wall to
-the environment rather than to Clarus:
-
-1. Clarus cannot exceed ~50 MB/s even with five concurrent reads (window 5
-   gives the same 50.3 MB/s). A server limited by its own code would drift
-   below the shared ceiling as load rises; it would not sit exactly on it.
-2. The same Clarus WADO path, same code, on real hardware does not see this
-   wall: ~990 MB/s warm single-stream and 244-356 MB/s cold on a Raspberry
-   Pi 5 (Cortex-A76, 2 GB RAM, NVMe over PCIe 2.0 x1, bare metal, 2026-09-01),
-   and 344-428 MB/s cold / ~1.1 GB/s warm on an Intel i7 + NVMe box
-   ([`benchmark-headroom.md`](benchmark-headroom.md)).
-3. Where the engines actually differ, the gap is structural: 1.64x on write,
-   and ~2x lower per-instance read latency (16.2 vs 31.4 ms). That is the
-   difference between a server with no SQL transaction on its write path and
-   no per-request database lookup on its read path, and a server with both.
-
-In short: read parity on this page is a property of the measuring environment.
-The numbers that carry information about the two engines are the write
-throughput and the per-instance read latency.
+- The ~50 MB/s read ceiling is **this machine's HDD + Docker Desktop
+  loopback** (VM NAT bridge), not the server. Both servers hit the same wall,
+  which is why sequential bulk reads are parity.
+- On NVMe the same Clarus WADO path is far faster: 344-428 MB/s cold,
+  ~1.1 GB/s warm ([`benchmark-headroom.md`](benchmark-headroom.md),
+  2026-08-26).
+- The field Raspberry Pi 5 (Cortex-A76, 2 GB RAM, NVMe over PCIe 2.0 x1)
+  measures far higher on the same WADO path: warm ~990 MB/s single stream,
+  4.0 GB/s four-stream aggregate; cold 244-356 MB/s single, ~896 MB/s
+  aggregate (2026-09-01, bare-metal native build, loopback curl, 636 MB
+  corpus). So the field box is NVMe-bound, not HDD-bound as in this VM.

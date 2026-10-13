@@ -63,24 +63,40 @@ workitem creation is exercised under the capability PS3.18 Section 11.1
 grants origin servers: "User agents and origin servers can create
 Workitems". The STOW-triggered creation is a product feature built on
 that right, not a conformance requirement: after a durable STOW the
-origin server creates one UPS-RS workitem for the study (a
-configuration-controlled feature, off by default), applies no modality
-filter, and the claiming sidecar cancels a non-matching study itself.
+origin server creates one UPS-RS workitem per AUTO catalog entry for the
+study, modality-filtered (a configuration-controlled feature, off by
+default). Manual codes are created lazily by the Task Requester (e.g.
+Weasis) through UPS Create; the origin server does not mint them, so a
+pre-minted non-terminal workitem cannot block that Create.
 
 | Transaction | RESTful semantics (PS3.18) | Status |
 |---|---|---|
-| RAD-80 Create UPS Workitem | Create (11.4) | **CONFORMANT** (responder and initiator). Input Readiness State stored and required at creation; the internal requestor (STOW-triggered CAD workitem) populates READY, MEDIUM priority, Input Information Sequence. |
-| RAD-81 Query UPS Workitems | Search (11.9) | **CONFORMANT**. Matching keys: workitem UID, Study Instance UID (0040,4021 > 0020,000D), Accession Number (0040,A370 > 0008,0050), Procedure Step Label (0074,1204), Scheduled Station AE Title (0040,0001), Patient ID, Procedure Step State. The AIW-I station key is (0040,4025) Code Value, accepted as an alias of (0040,0001) - the two name one fact (AIW-I 4.80.4.1.2.1): a search carrying either form reaches the same workitem, and (0040,0001) decides when a single search carries both. The sequence-qualified keys are carried in the parameter name (`00404021.0020000D`, `0040A370.00080050`); the bare attribute tags are accepted as the same statement. Task-oriented keys (0040,4018, 0032,1064) are not matching keys. |
+| RAD-80 Create UPS Workitem | Create (11.4) | **CONFORMANT** (responder and initiator). Input Readiness State stored and required at creation; the internal requestor (STOW-triggered CAD workitem) populates READY, MEDIUM priority, Input Information Sequence. The request body may state the study and the accession through the Referenced Request Sequence (0040,A370), which is read first (bare 0008,0050 and Input Information Sequence 0040,4021 > 0020,000D are the fallbacks), and the workitem render returns both facts through (0040,A370) - never as bare top-level tags - so a retrieved workitem reads back in the shape a requester writes. |
+| RAD-81 Query UPS Workitems | Search (11.9) | **CONFORMANT**. Matching keys: workitem UID, Study Instance UID (0040,4021 > 0020,000D), Accession Number (0040,A370 > 0008,0050), Requested Procedure ID (0040,A370 > 0040,1001), Procedure Step Label (0074,1204), Scheduled Workitem Code Value (0040,4018 > 0008,0100), Patient ID, Procedure Step State, and the station key. The station key is (0040,4025) Scheduled Station Name Code Sequence, whose Code Value names the AE Title of the Requestor's UPS SCU (AIW-I 4.81.4.1.2.1 Table 4.81.4.1.2.1-3). (0040,0001) Scheduled Station AE Title is NOT a matching key: PS3.4 Table CC.2.5-3 gives it no row, so a search carrying it is refused with 400 rather than answered, and the station is stated once, in the sequence. The sequence-qualified keys are carried in the parameter name (`00404021.0020000D`, `0040A370.00080050`, `0040A370.0020000D`, `0040A370.00401001`); the dotted-hex spelling of a sequence key is accepted as the same statement (`00404025.00080100`, `00404018.00080100`), and the Referenced Request Sequence study key is an alias of the bare Study Instance UID (one fact). |
 | RAD-82 Claim UPS Workitem | Change Workitem State (11.7) to IN PROGRESS with Transaction UID | **CONFORMANT** (PS3.4 Table CC.1.1-2 state machine, locking UID enforced). |
 | RAD-83 Get UPS Workitem | Retrieve Workitem (11.5) | **CONFORMANT** (initiator and responder). |
-| RAD-84 Update UPS Workitem | Update (11.6) | **CONFORMANT**. `POST /workitems/{uid}?TransactionUid={uid}` with the locking UID required; the merge set is the 4.84.4.1.2.1 performer report - (0040,4033), (0040,4019), (0040,4028) - each replaced whole, and an element outside that set is refused rather than silently dropped. The workflow state is not modified and no event is published. |
+| RAD-84 Update UPS Workitem | Update (11.6) | **CONFORMANT**. The Transaction UID (0008,1195) is accepted in the payload Data Set (PS3.4 CC.2.6.2, which 11.6.1.4 requires the payload to comply with - and the only carriage dcm4chee-arc reads) OR as the `?TransactionUid=` query parameter (PS3.18 11.6.1.2); both name one fact, and a request carrying both with different values is a `400`. The merge set is the 4.84.4.1.2.1 performer report - (0040,4033), (0040,4019), (0040,4028) - each replaced whole, and an element outside that set is refused rather than silently dropped. The workflow state is not modified and no event is published. |
 | RAD-85 Complete UPS Workitem | Change Workitem State (11.7) to COMPLETED/CANCELED | **CONFORMANT**. Completion is two requests in the standard's order: the Update that lists the created instances and the performed codes, then the Change State to COMPLETED. Final-state retention: final workitems are swept only after the configured retention window (>= 24 h by default), satisfying 4.85.4.1.3. |
 | RAD-86 Manage UPS Subscription | Create/Suspend/Delete Subscription (11.10/11.11) | **CONFORMANT**. Global (1.2.840.10008.5.1.4.34.5) and Filtered (34.5.1) subscriptions; subscribe, unsubscribe, suspend-global; the `?deletionlock` query parameter creates a subscription carrying a Deletion Lock (PS3.18 11.10), honoured by the retention sweep for a configurable lifetime whose default is the profile's 24-hour floor (AIW-I 4.85.4.1.3). The subscription registry is process-lifetime, so a restart forgets subscriptions and their locks - a declared behavior, not a deviation: the profile sets no persistence requirement, and the durable path is UPS Search. |
 | RAD-87 Send UPS Notification | Event reports over the open WebSocket channel | **CONFORMANT**. Event Reports are delivered as text frames on the notification connection (section 3), serialised by the same writer the SSE extension uses. |
 | RAD-109 Open Event Channel | WebSocket notification connection | **CONFORMANT**. `GET /dicomweb/subscribers/{requester}` with the RFC 6455 upgrade headers; hand-rolled responder (no new dependencies). |
 
 Actor-level: Pull and Triggered Pull workflow CONFORMANT; Push PLANNED.
-<!-- claim:rad84 url="POST /workitems/{uid}?TransactionUid=" merge="0040,4033 0040,4019 0040,4028" no_event="no event is published" out_of_set="outside that set" -->
+
+**Product feature (not an AIW-I obligation): Request Cancellation (11.8).**
+`POST /dicomweb/workitems/{uid}/cancelrequest?requester={aetitle}` cancels a
+queued (SCHEDULED) workitem: the state moves to CANCELED with the
+cancellation reason and the Procedure Step Cancellation DateTime, and the
+answer is `202 Accepted`. A terminal workitem (COMPLETED or already CANCELED)
+is `409`, and so is an IN PROGRESS one, which CC.2.2.3 would have the SCP
+cancel by informing the performing SCU - this origin is the Task Manager, not
+the performer, and the "UPS Cancel Requested" fan-out is not implemented, so
+refusing is the honest answer for "no possibility the performer will be
+informed". An unknown workitem is `404`. AIW-I Table 50.1-1 requires
+RAD-80..RAD-87 and RAD-109 and gives Request Cancellation no RAD number; the
+feature exists because a Task Requester's "cancel queued" action sends exactly
+this request for a workitem it does not own.
+<!-- claim:rad84 url="POST /workitems/{uid}" tuid="0008,1195" merge="0040,4033 0040,4019 0040,4028" no_event="no event is published" out_of_set="outside that set" -->
 
 ## 2. Task Performer (clinfer)
 
@@ -89,10 +105,10 @@ workflow models. Clarus claims **Pull** and **Triggered Pull**.
 
 | Obligation | Status |
 |---|---|
-| Query UPS Workitems (initiator) | **CONFORMANT**. The station-oriented search of 4.81.4.1.2.2 is issued with the performer's own (0040,0001); the local rule filtering remains as a fallback for work that is not tied to a station, and an origin that refuses the key degrades to the unfiltered search rather than to no work. |
+| Query UPS Workitems (initiator) | **CONFORMANT**. The station-oriented search of 4.81.4.1.2.2 is issued with the standard key: the Code Value of (0040,4025) Scheduled Station Name Code Sequence, spelled as the keyword path `ScheduledStationNameCodeSequence.CodeValue` (PS3.18 8.3.4). That is the performer's own AE Title (AIW-I 4.81.4.1.2.1 Table 4.81.4.1.2.1-3), so the query names the station the profile defines and no vendor key is involved; the local claim guard remains as a fallback. |
 | Get UPS Workitem (initiator) | **CONFORMANT**. |
 | Claim UPS Workitem (responder role via Change State) | **CONFORMANT**: claim with generated Transaction UID works; the claim guards of 4.82.4.1.1 refuse a workitem whose assignment attributes (0040,4025, 0040,4036, 0040,4026) name another performer, and refuse Input Readiness State INCOMPLETE. An absent or empty assignment names nobody, which is an offer to whoever can serve the work; a refusal is a decline that leaves the workitem SCHEDULED, not an error. |
-| Update UPS Workitem | **CONFORMANT**. Update (11.6) is a distinct transaction (`POST /workitems/{uid}?TransactionUid=`) carrying the locking UID in the query string; the state is changed by Change Workitem State (11.7), not by an update. |
+| Update UPS Workitem | **CONFORMANT**. Update (11.6) is a distinct transaction (`POST /workitems/{uid}`) carrying the locking Transaction UID (0008,1195) in the payload Data Set - the carriage PS3.4 CC.2.6.2 requires and dcm4chee-arc reads, rather than the query parameter; the state is changed by Change Workitem State (11.7), not by an update. |
 | Open Event Channel (initiator, Triggered Pull) | **CONFORMANT**. The performer opens `GET /dicomweb/subscribers/{requester}` with the RFC 6455 upgrade headers AFTER registering its subscription, and reads Event Reports from it. A dropped channel is reconnected with exponential backoff, and the reconnect re-runs the startup search so the window in which notifications were missed is recovered by UPS Search rather than lost. |
 | Receive UPS Notification (initiator, Triggered Pull) | **CONFORMANT**. A report whose state is SCHEDULED wakes the claim path; any other state, an unreadable body, or a report with no workitem UID is ignored as ordinary traffic. The claim itself is the ordinary Change State transaction, so a duplicate or lost notification costs latency and never correctness. |
 | Complete UPS Workitem with all created instances listed in Output Information Sequence (0040,4033) before the final state | **CONFORMANT**. The performer sends Update (11.6) with (0040,4033) BEFORE the Change State to COMPLETED, which is the order 4.84.4.1.2.1 sets out; the manager stores the sequence and returns it from retrieve and search. The change-state transaction carries the state and the locking UID only, so an output list sent there would be discarded - which is why the two are separate requests. |

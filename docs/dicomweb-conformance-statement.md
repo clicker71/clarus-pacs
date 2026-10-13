@@ -83,7 +83,7 @@ request completes.
 | `/series/{series}` | `multipart/related; type="application/dicom"` |
 | `/instances/{sop}` | `application/dicom` (supports `Range`, partial content `206`) |
 | `/instances/{sop}/metadata` | `application/dicom+json` (default); `application/dicom+xml` on negotiation |
-| `/studies/{study}/series/{series}/metadata` | `multipart/related; type="application/dicom+json"` when Accept asks multipart (Required media type, PS3.18 10.4.4); a single-part `application/dicom+json` array otherwise (see 11.11) |
+| `/studies/{study}/series/{series}/metadata` | `multipart/related; type="application/dicom+json"` when Accept asks multipart (Required media type, PS3.18 10.4.4); a single-part `application/dicom+json` array otherwise (see 13.11) |
 | `/instances/{sop}/frames/{n}` | `multipart/related; type="application/octet-stream"` with a per-frame part `Content-Type` naming the stored transfer syntax (see below) |
 | `/instances/{sop}/thumbnail` | `image/jpeg` 64x64 (see 2.4) |
 | `/instances/{sop}/rendered` | `image/jpeg` (default), `image/gif` (grayscale), `image/png` (see 2.4) |
@@ -108,6 +108,16 @@ syntax that cannot be produced returns `406`.
 **Retrieve Metadata:** metadata responses carry the full stored DICOM
 metadata. Values longer than 64 bytes (such as long Lookup Table values)
 are returned as `BulkDataURI` references to the bulkdata resource.
+
+Nested sequences (`SQ`) are rendered recursively as DICOMweb JSON arrays of
+objects (PS3.18 8.7.3.2): each item is a JSON object, and a sequence inside
+an item is rendered the same way, to a bounded depth. This covers the
+sequences of SR, SEG, RTSTRUCT and PR as well as WSI
+(`OpticalPathSequence`, `DimensionIndexSequence`, and so on), all through one
+generic walker. Binary values inside a sequence (for example an ICC Profile
+or a Lookup Table) are rendered inline as base64 (`InlineBinary`); a
+`BulkDataURI` is emitted only for top-level bulk values, because a tag key
+is ambiguous for a tag that appears inside many items.
 
 **Retrieve Response Status Codes:**
 
@@ -186,9 +196,12 @@ keys, see below), A = CSV any-component (multi-valued attributes).
 | InstitutionalDepartmentName | (0008,1040) | W (extension) |
 | OperatorsName | (0008,1070) | W (extension) |
 | ProtocolName | (0018,1030) | W (extension) |
+| StudyInstanceUID | (0020,000D) | E (global `/series` only) |
 
 **Instance level:** SOPInstanceUID (0008,0018) E, SOPClassUID (0008,0016)
-E, InstanceNumber (0020,0013) E.
+E, InstanceNumber (0020,0013) E. On the global `/instances` resource
+`StudyInstanceUID` (0020,000D) is also a real matching key (E) - it narrows
+the search to the named study's instances.
 
 **Patients resource:** PatientName, PatientID, PatientBirthDate (E/R/W),
 PatientSex, ResponsiblePerson.
@@ -200,10 +213,15 @@ retrievable through WADO-RS metadata.
 Cross-level keys on relational resources follow PS3.18 10.6.1.2.1:
 patient keys are accepted on all-studies/all-series/all-instances
 resources; series keys are accepted on study-scoped and global
-series/instances resources and are accepted-and-ignored on instance
-resources; keys that are foreign to a resource (e.g. a series key on
-`/studies`) are rejected with `400`. Unknown query keys are **ignored and
-logged** (interop parity with mainstream servers).
+series/instances resources; `StudyInstanceUID` is a real filter on the
+global `/series` and `/instances` resources (it resolves the named study);
+`Modality` is a real filter on the relational instance resources
+(`/studies/{study}/instances` and `/instances`), narrowing the result to
+the series of that modality; keys that are foreign to a resource (e.g. a
+series key on `/studies`, or `Modality` on the hierarchical
+`/studies/{study}/series/{series}/instances`) are rejected with `400`.
+Unknown query keys are **ignored and logged** (interop parity with
+mainstream servers).
 
 **Fuzzymatching (documented per PS3.18 8.3.4.2):** `fuzzymatching` is
 optional; when absent it is `false` and literal matching is performed.
@@ -246,15 +264,9 @@ request. Default `limit` 250; `limit`/`offset` paging is supported.
 
 ### 2.4 Rendered Resources (thumbnails)
 
-- `/instances/{sop}/thumbnail` serves a **64x64 JPEG** rendered from the
-  raw pixel path (percentile windowing, MONOCHROME1 inversion, signed
-  samples, 64-megapixel decode cap) for the three uncompressed transfer
-  syntaxes in any build.
-- Thumbnails of compressed instances return `406 Not Acceptable` in every
-  build. In the `transcode` build, full-size rendered JPEG
-  (`Accept: image/jpeg` on the instance resource) is available; when the
-  transcode pool is saturated the server answers `503` with a
-  `Retry-After` header.
+- `/instances/{sop}/thumbnail` serves a 64x64 JPEG (Thumbnail Resource,
+  `image/jpeg` only) from the raw pixel path in any build; compressed
+  thumbnails 406 in every build.
 - `/instances/{sop}/rendered` (Rendered Resource) serves `image/jpeg`
   (grayscale, default), `image/gif` (grayscale) or `image/png` (RGB and
   grayscale) for SINGLE-FRAME instances. RGB previews
@@ -268,7 +280,7 @@ request. Default `limit` 250; `limit`/`offset` paging is supported.
 ### 2.5 Delete (admin extension)
 
 Instance/study deletion is exposed through the **administrative API**, not
-the DICOMweb DELETE method (see 11.16). Deletion is journaled: the study is
+the DICOMweb DELETE method (see 13.16). Deletion is journaled: the study is
 tombstoned first, blobs are reclaimed by a background worker, and every
 deletion is recorded in the append-only audit journal with the author,
 reason and timestamp.
@@ -306,6 +318,9 @@ reason and timestamp.
   (11.4), retrieve (11.5), update (11.6) and change state (PUT
   `/workitems/{uid}/state`, 11.7); the bare PUT on the workitem is the
   same state change; DELETE is a non-standard administration path.
+  `/workitems/{uid}/cancelrequest` - Request Cancellation (11.8), a
+  product feature for a queued (SCHEDULED) workitem, not an AIW-I
+  obligation (see the AIW-I statement).
   `/workitems/{uid}/events` - per-workitem SSE event stream
   (non-standard extension, see 11.9). Subscriptions (11.10/11.11):
   POST/DELETE
@@ -319,11 +334,11 @@ reason and timestamp.
 - **Create and Update are told apart the way the standard does:**
   Create (11.4.1.1 Table 11.4.1-1) is `POST /workitems?workitem={uid}`
   - the Workitem UID is a QUERY parameter and there is no path segment
-  after `workitems`. Update (11.6.1) is
-  `POST /workitems/{uid}?TransactionUid={uid}` - the Workitem UID is a
-  PATH segment and the Transaction UID is the query parameter. A path
-  segment means the workitem resource, so a write to it is an update; no
-  path segment means the worklist.
+  after `workitems`. Update (11.6.1) is `POST /workitems/{uid}` - the
+  Workitem UID is a PATH segment, and the locking Transaction UID
+  (0008,1195) travels in the payload. A path segment means the workitem
+  resource, so a write to it is an update; no path segment means the
+  worklist.
 - **Update (11.6):** modifies attributes only; the workflow state is not
   touched and no event is published. The merge set is exactly the
   AIW-I 4.84.4.1.2.1 performer report - (0040,4033) Output Information
@@ -331,12 +346,25 @@ reason and timestamp.
   (0040,4028) Performed Station Name Code Sequence - each replaced
   whole. An element outside that set is rejected (`400`) rather than
   ignored, so a client that meant something this implementation does not
-  write finds out at once. The Transaction UID is required (query
-  parameter) and checked (`400` on mismatch, `409` on a concurrent
+  write finds out at once. The Transaction UID (0008,1195) is required and
+  is accepted as a payload Attribute (PS3.4 CC.2.6.2, the carriage
+  11.6.1.4 requires the payload to comply with, and the only one
+  dcm4chee-arc reads) or as the `?TransactionUid=` Query Parameter
+  (PS3.18 11.6.1.2); a request carrying both with different values is a
+  `400`. The UID is checked (`400` on mismatch, `409` on a concurrent
   write); the request is refused while the workitem is unclaimed, since
-  only the SCHEDULED -> IN PROGRESS transition issues the lock. An empty
-  payload, and a present-but-empty (0040,4033), are both `400`.
-<!-- claim:rad84 url="POST /workitems/{uid}?TransactionUid=" merge="0040,4033 0040,4019 0040,4028" no_event="no event is published" out_of_set="outside that set" -->
+  only the SCHEDULED -> IN PROGRESS transition issues the lock. A payload
+  that carries no merge attribute - including one that carries only the
+  Transaction UID - and a present-but-empty (0040,4033), are both `400`.
+<!-- claim:rad84 url="POST /workitems/{uid}" tuid="0008,1195" merge="0040,4033 0040,4019 0040,4028" no_event="no event is published" out_of_set="outside that set" -->
+- **Create (11.4):** the request body may name the input study and the
+  accession through the Referenced Request Sequence `(0040,A370 > 0020,000D`
+  and `0040,A370 > 0008,0050)`, which is read first (it is the standard
+  carriage, PS3.4 Table CC.2.5-3); the bare `(0008,0050)` and the Input
+  Information Sequence `(0040,4021 > 0020,000D)` are the fallbacks. The
+  workitem RENDER states both facts through `(0040,A370)`, not as bare
+  top-level tags, so a retrieved workitem reads back in the same shape a
+  requester writes.
 - **States:** SCHEDULED, IN PROGRESS, COMPLETED, CANCELED. State
   changes carry the Procedure Step State (0074,1000) and the locking
   Transaction UID (0008,1195) - both type 1 - and read nothing else
@@ -345,22 +373,34 @@ reason and timestamp.
   `application/dicom+xml`. The Required XML media type
   (`multipart/related; type="application/dicom+xml"`, PS3.18 11.1.3) is
   answered with the inner single part without the multipart wrapper
-  (see 11.8).
+  (see 13.8).
 - **Search keys:** Workitem UID (0008,0018), Study Instance UID
   (0040,4021 > 0020,000D), Accession Number (0040,A370 > 0008,0050),
-  Procedure Step State
-  (0074,1000), Procedure Step Label (0074,1204), Scheduled Station AE
-  Title (0040,0001), Patient ID (0010,0020), and Modality (0008,0060)
+  Requested Procedure ID (0040,A370 > 0040,1001), Procedure Step State
+  (0074,1000), Procedure Step Label (0074,1204), Scheduled Workitem Code
+  Value (0040,4018 > 0008,0100), Scheduled Station Name Code Value
+  (0040,4025 > 0008,0100), Patient ID (0010,0020), and Modality (0008,0060)
   as a vendor extension (see below). An absent or empty key matches
   everything; a key with a value matches exactly (case-sensitive);
-  Modality, being type CS, matches case-insensitively.
+  Modality, being type CS, matches case-insensitively. The station key is
+  (0040,4025) Code Value; (0040,0001) Scheduled Station AE Title has no row
+  in PS3.4 Table CC.2.5-3 and is refused (400), not silently ignored.
 - **Sequence-qualified keys:** Study Instance UID and Accession Number are
   reached through a sequence in PS3.4 Table CC.2.5-3 (Input Information
   Sequence and Referenced Request Sequence respectively). This server stores
   one value per workitem, so the sequence segment is carried in the
-  parameter NAME: `00404021.0020000D` and `0040A370.00080050`. The bare
-  attribute tags `0020000D` and `00080050` are accepted as the same
-  statement, because a caller sending either means the same search.
+  parameter NAME: `00404021.0020000D`, `0040A370.00080050`,
+  `0040A370.0020000D` and `0040A370.00401001`. The bare attribute tags
+  `0020000D` and `00080050` are accepted as the same statement, because a
+  caller sending either means the same search; for a key PS3.4 types as a
+  SEQUENCE the bare sequence tag is NOT accepted, and the Code Value inside it
+  is named either by the keyword path (`ScheduledStationNameCodeSequence.CodeValue`,
+  `ScheduledWorkitemCodeSequence.CodeValue`) or by the dotted tag
+  (`00404025.00080100`, `00404018.00080100`), which are the two spellings
+  PS3.18 8.3.4 and dcm4chee between them use. The Referenced Request Sequence
+  study key (`0040A370.0020000D`)
+  and the bare Study Instance UID (`0020000D`) are two spellings of one fact,
+  so search matches whichever the requester sends.
 - **Modality (0008,0060) - vendor extension:** the UPS IOD defines no
   Modality (PS3.4 Table CC.2.5-3 has no such attribute), so this is an
   extension, not a UPS conformance claim. When a workitem is created by
@@ -373,11 +413,18 @@ reason and timestamp.
   Type 1 (PS3.4 Table K.6-1) and the bridge maps workitems onto MWL.
 - **Optimistic locking:** state changes and updates require the current
   Transaction UID; a mismatch returns a conflict (`409`).
-- **Not supported:** the Request Cancellation resource (11.8) - a
-  cancellation is performed by the workitem owner through Change
-  Workitem State. The subscription registry is process-lifetime: a
-  restart forgets subscriptions and their deletion locks (the durable
-  path is UPS Search; the profile sets no persistence requirement).
+- **Request Cancellation (11.8):** `POST /workitems/{uid}/cancelrequest`
+  cancels a queued (SCHEDULED) workitem (`202`, state CANCELED with the
+  reason and the Procedure Step Cancellation DateTime). A terminal
+  (COMPLETED/CANCELED) or IN PROGRESS workitem is `409`; an unknown one is
+  `404`. This is a product feature, not an AIW-I obligation (11.8 has no RAD
+  number). **11.8 not supported in part:** the "UPS Cancel Requested"
+  N-EVENT-REPORT fan-out to the performing SCU is not implemented, so an
+  IN PROGRESS cancel is refused with `409` - the standard's own status for
+  "no possibility the performer will be informed". The subscription registry
+  is process-lifetime: a restart forgets subscriptions and their deletion
+  locks (the durable path is UPS Search; the profile sets no persistence
+  requirement).
 
 ## 5. Modality Scheduled Procedure Step Service (PS3.18 Section 14)
 
@@ -498,7 +545,7 @@ mandatory set - `requestType` (=WADO), `studyUID`, `seriesUID`,
 - **Retrieve:** served in the stored transfer syntax; a requested
   `?transferSyntax=` requires the `transcode` build feature.
 
-### 7.1 Transcode support (`transcode` build)
+### 9.1 Transcode support (`transcode` build)
 
 **Decoders** (stored transfer syntax to pixels): Implicit VR Little
 Endian, Explicit VR Little Endian, Explicit VR Big Endian, RLE Lossless,
@@ -557,7 +604,7 @@ mismatch) is a deterministic refusal with `406`.
 - Server: nginx-style config file (`clarus.conf`), validated by
   `clarus --test-config`.
 - Communication: HTTP/1.1 over TCP, keep-alive, thread-per-connection;
-  TLS is terminated by the reverse proxy (see 9).
+  TLS is terminated by the reverse proxy (see 11).
 - Storage Commitment retention: `[commitment] result_retention_days`
   (default 30, `0` = forever).
 - Compile-time features: `transcode` (JPEG 2000 + JPEG-LS on-the-fly),
@@ -569,25 +616,25 @@ mismatch) is a deterministic refusal with `406`.
 Vendor extensions beyond the mandatory key set of PS3.18 Table 10.6.1-5
 are legal per PS3.18 8.3.4.1 and are declared here.
 
-**11.1 `ResponsiblePerson` (0010,2297)** - additional matching key at the
+**13.1 `ResponsiblePerson` (0010,2297)** - additional matching key at the
 study and patient levels (veterinary workflows). Person-name semantics:
 exact and wildcard matching, `fuzzymatching=true` applies (Levenshtein-1),
 case sensitivity follows `case_sensitive_pn`. Cyrillic values are matched
 as decoded per the stored `SpecificCharacterSet`.
 
-**11.2 Series-level search keys `StationName` (0008,1010) and
+**13.2 Series-level search keys `StationName` (0008,1010) and
 `BodyPartExamined` (0018,0015)** - wildcard matching keys with
 `SeriesDescription` semantics (dcm4chee-arc / Orthanc parity). On
 instance resources they are accepted-and-ignored per 10.6.1.2.1; on the
 study resource they are foreign and rejected with `400`. No fuzzymatching
 and no n-gram indexing is wired for these keys.
 
-**11.3 `PatientBirthDate` range** - in addition to the exact `YYYYMMDD`
+**13.3 `PatientBirthDate` range** - in addition to the exact `YYYYMMDD`
 form, the key accepts `YYYYMMDD-YYYYMMDD` and the wildcard `*` at the
 study level and on the `/dicomweb/patients` resource. Matching is an
 inclusive numeric range over the stored date.
 
-**11.4 Seven captured search attributes** - study level:
+**13.4 Seven captured search attributes** - study level:
 `InstitutionName` (0008,0080), `RequestingPhysician` (0032,1032),
 `RequestedProcedureDescription` (0032,1060); series level:
 `Manufacturer` (0008,0070), `InstitutionalDepartmentName` (0008,1040),
@@ -598,41 +645,41 @@ template: the `case_sensitive_pn` option applies exactly as for
 `ReferringPhysicianName` / `PerformingPhysicianName`; `fuzzymatching` is
 not wired for these keys.
 
-**11.5 `fuzzymatch_override`** - a server option that forces
+**13.5 `fuzzymatch_override`** - a server option that forces
 Levenshtein-1 matching on person-name keys even when the client does not
 send `fuzzymatching=true`. Non-standard; **enabled in the shipped
 server config** (real clients such as Weasis never send
 `fuzzymatching=true`). Set `fuzzymatch_override = false` for strict
 standard behavior.
 
-**11.6 `case_sensitive_pn = false` in the shipped config** - person-name
+**13.6 `case_sensitive_pn = false` in the shipped config** - person-name
 wildcard matching is case-insensitive (Orthanc-style convenience). Set
 `true` for strict PS3.4 behavior. Wildcard-free fuzzy matching is
 case-insensitive by construction.
 
-**11.7 Series-root instances query `GET /dicomweb/series/{series}/instances`**
+**13.7 Series-root instances query `GET /dicomweb/series/{series}/instances`**
 - non-standard resource: PS3.18 defines series resources only scoped under
 a study. Weasis appends `/instances` to a series-level `RetrieveURL`; the
 resource resolves the owning study via a manifest scan and answers the
 standard study-scoped query. Standard clients keep using the study-scoped
 path.
 
-**11.8 UPS-RS XML media type** - the Required XML media type
+**13.8 UPS-RS XML media type** - the Required XML media type
 (`multipart/related; type="application/dicom+xml"`, PS3.18 11.1.3) is
 answered as a single `application/dicom+xml` part without the multipart
 wrapper; `Accept` negotiation is a substring match (`q=` factors are not
 parsed).
 
-**11.9 UPS-RS SSE event stream** - `GET /workitems/{uid}/events` is a
+**13.9 UPS-RS SSE event stream** - `GET /workitems/{uid}/events` is a
 non-standard per-workitem SSE stream (`event: StateChange` frames,
 keep-alive); the conformant notification path is the WebSocket
 Notification Connection (8.10.4) and the durable path is UPS Search.
 
-**11.10 WADO-RS / WADO-URI rendered-resource optional query parameters**
+**13.10 WADO-RS / WADO-URI rendered-resource optional query parameters**
 - not supported (viewport, windowing, annotation, quality, `charset`,
 `anonymize`).
 
-**11.11 Series metadata without an explicit multipart Accept** - a
+**13.11 Series metadata without an explicit multipart Accept** - a
 single-part `application/dicom+json` array is returned instead of the
 Required `multipart/related` (PS3.18 10.4.4). OHIF's dicomweb-client
 requests this resource with `responseType=json` and fails on any
@@ -641,27 +688,28 @@ dcm4chee/Google Cloud Healthcare and the behavior field-verified against
 OHIF/Weasis. The Required multipart media type remains fully supported
 for clients that ask for it.
 
-**11.12 Veterinary attributes** - Species (0010,2201), Breed
+**13.12 Veterinary attributes** - Species (0010,2201), Breed
 (0010,2292), Neutered (0010,2203) are captured at STOW and re-captured on
 rebuild but are not searchable QIDO keys and are not returned in QIDO
 responses; they remain retrievable through WADO-RS metadata.
 
-**11.13 Compressed-instance thumbnails** - `406` in every build; the raw
-64x64 thumbnail path decodes uncompressed pixel samples only. Compressed
-data is served in full size via `Accept: image/jpeg` (transcode build).
+**13.13 Compressed-instance thumbnails** - Compressed-instance thumbnails 406
+in every build; /rendered serves single-frame uncompressed instances as JPEG
+or PNG, and multi-frame instances 406 (frames are served natively via
+/frames/{N}).
 
-**11.14 HTJ2K and exotic transfer syntaxes** - High-Throughput JPEG 2000
+**13.14 HTJ2K and exotic transfer syntaxes** - High-Throughput JPEG 2000
 (4.201-4.203) and other non-listed syntaxes are stored and served as-is;
 transcode requests for them return `406`.
 
-**11.15 STOW exact duplicates** - deliberately `200` (idempotent), see 2.1.
+**13.15 STOW exact duplicates** - deliberately `200` (idempotent), see 2.1.
 
-**11.16 Admin API, delete/erase and audit** - the administrative HTTP
+**13.16 Admin API, delete/erase and audit** - the administrative HTTP
 API (recovery/rebuild, erase, metrics, status), the append-only audit
 journal and the access journal are non-DICOMweb extensions and are not
 covered by this statement beyond 2.5.
 
-**11.17 SpecificCharacterSet always-on emission** - `(0008,0005) =
+**13.17 SpecificCharacterSet always-on emission** - `(0008,0005) =
 "ISO_IR 192"` is emitted on every study/series/patient QIDO row although
 the attribute is not part of the PS3.18 2026c response tables. The value
 names the repertoire actually used in the response (UTF-8).

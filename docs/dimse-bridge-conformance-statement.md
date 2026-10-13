@@ -100,6 +100,71 @@ is honored. Optional deviation: `fuzzymatch_override` in the server config
 forces Levenshtein-1 matching on person-name keys even when the device
 does not send `fuzzymatching=true` (non-standard convenience extension).
 
+#### 5.3.1 Modality Worklist (MWL) - UPS workitem mapping (vendor extension)
+
+The Modality Worklist Information Model (PS3.4 K.6.1, Table K.6-1) is a
+flat, non-object model: it defines no SOP Common attributes and returns
+one row per Scheduled Procedure Step. The bridge maps UPS-RS workitems
+onto it as follows.
+
+Response shape. `PatientName` (0010,0010) and `PatientID` (0010,0020) are
+identifier-level Return keys; the Scheduled Procedure Step attributes are
+emitted inside the single item of `ScheduledProcedureStepSequence`
+(0040,0100), as Table K.6-1 requires. `Modality` (0008,0060), `SPS Start
+Date` (0040,0002) and `SPS Start Time` (0040,0003) are Return keys and are
+emitted whenever the workitem carries a source for them. Optional keys
+are emitted only when the requesting modality names them in its
+identifier, per PS3.4 C.4.1.1.3.2.
+
+No normative DICOM or IHE mapping from UPS workitems to a DIMSE MWL
+response exists, so the following identifiers are the bridge's own vendor
+derivation, deterministic and documented here:
+
+- `ScheduledProcedureStepID` (0040,0009) is the last 16 characters of the
+  workitem UID. The workitem UID itself (`2.25.<decimal>`, up to 43
+  characters) cannot be carried: MWL has no SOP Instance UID to hold it
+  (adding one is non-conformant) and this attribute is VR SH, 16
+  characters. The identifier is scoped by the Requested Procedure
+  (PS3.3 C.4.10), and its purpose is a stable handle for MPPS coupling,
+  not a round-trip of the UPS identity.
+- `RequestedProcedureID` (0040,1001) is the last 16 characters of the
+  input study UID `(0020,000D)`, read from the Referenced Request
+  Sequence `(0040,A370 > 0020,000D)` the origin server renders (with the
+  bare `(0020,000D)` and then the Input Information Sequence
+  `(0040,4021 > 0020,000D)` as fallbacks). A workitem that names no study
+  emits no Requested Procedure ID.
+- `ScheduledProcedureStepDescription` (0040,0007) is the workitem's
+  `ProcedureStepLabel` (0074,1204).
+- When a workitem carries only `ScheduledProcedureStepStartDateTime`
+  (0040,4005, VR DT) and no DA/TM pair, the DT is split: the first eight
+  characters become the SPS Start Date and the next six the SPS Start
+  Time. With neither source, both are omitted.
+
+Not emitted. `ScheduledPerformingPhysicianName` (0040,0006) is a Return
+key Type 2 with no UPS source, so it is omitted (Type 2 permits absence).
+`ScheduledProcedureStepPriority` (0074,1200) is a UPS attribute (PS3.3
+C.30.1) with no row in Table K.6-1 and is never emitted, even though the
+workitem render carries it. `Modality` (0008,0060) is likewise absent
+from the UPS IOD; where the server renders it as a documented vendor
+extension (the input study's modality), the bridge passes it through,
+and where the server does not, the key is simply absent.
+
+Query direction. Matching keys are read from the identifier's top level
+and from the `(0040,0100)` item. A conformant nested `ScheduledStationAETitle`
+filter is sent to the server as the standard UPS key: the Code Value of
+(0040,4025) Scheduled Station Name Code Sequence, spelled in the bridge's
+hex style as `00404025.00080100` (PS3.18 8.3.4), because (0040,0001) has no
+row in PS3.4 Table CC.2.5-3 and a UPS-RS origin refuses it. Only the keys the
+server's workitem search filters on are sent; an absent or empty key
+means match-all.
+
+Response direction. The SPS-level `ScheduledStationAETitle` (0040,0001) is
+emitted as Table K.6-1 defines it, and its VALUE is read from the UPS Code
+Value of (0040,4025) rather than from a same-named UPS attribute - the
+station is stated once on the UPS side, in the sequence, and the DIMSE
+keyword is the one the modality asked for. A workitem that names no station
+emits no station element.
+
 ### 5.4 C-MOVE (SCP + SCU)
 
 Retrieval is performed via WADO-RS against the configured DICOMweb origin

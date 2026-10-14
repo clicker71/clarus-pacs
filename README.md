@@ -208,10 +208,10 @@ integrators. Two journals, both plain JSON lines under the data root:
   freed, why. One fsync'd line per record; never pruned by Clarus.
   Back it up off-box: it is the only evidence of deletions.
 - **Access journal** - every access and query event on protected data,
-  tagged with the DICOM PS3.15 audit event IDs (110103 begin transfer,
-  110104 instances transferred, 110110 patient record, 110112 query,
-  110114 user authentication). Batch-flushed (<= 1 s window), pruned
-  after 1095 days by default.
+  tagged with the DICOM PS3.15 audit event IDs (110101 audit log used,
+  110103 DICOM instances accessed, 110104 DICOM instances transferred,
+  110110 patient record, 110111 procedure record, 110112 query).
+  Batch-flushed (<= 1 s window), pruned after 1095 days by default.
 
 Attribute modifications inside stored objects (coercion at ingest, a
 re-STOW update) append a `(0400,0561)` Original Attributes Sequence
@@ -228,8 +228,8 @@ Trail Message Format Profile) or to IHE ATNA: the XML message format
 is mandatory only for implementations claiming that profile
 (PS3.15 A.5), and neither DICOMweb, AIW-I nor Storage Commitment -
 the profiles Clarus claims - requires it. The journals use the same
-DICOM/ATNA event codes (110103/110104/110110/110112/110114) in a
-documented JSON-lines format; deployments that operate an Audit
+DICOM/ATNA event codes (110101/110103/110104/110110/110111/110112) in
+a documented JSON-lines format; deployments that operate an Audit
 Record Repository can convert and forward the journals with the
 provided tools/access_journal_to_syslog.py converter, which is an
 integration aid, not an ATNA conformance claim. The DICOMweb

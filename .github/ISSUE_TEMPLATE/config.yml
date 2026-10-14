@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Contributing guide
+    url: https://github.com/clicker71/clarus-pacs/blob/main/CONTRIBUTING.md
+    about: Read before opening an issue - privacy rules and what we can act on
+  - name: DICOMweb conformance statement
+    url: https://github.com/clicker71/clarus-pacs/blob/main/docs/dicomweb-conformance-statement.md
+    about: Reference for non-conformance reports (what Clarus claims today)
+  - name: IHE AIW-I conformance statement
+    url: https://github.com/clicker71/clarus-pacs/blob/main/docs/aiw-i-conformance-statement.md
+    about: Reference for UPS-RS / AI workflow reports

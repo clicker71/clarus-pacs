@@ -1,0 +1,39 @@
+name: DICOMweb Non-conformance
+description: A response deviates from PS3.18
+title: "Non-conformance: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when a Clarus response deviates from DICOM PS3.18.
+        Quote the section of the standard that defines the required behavior.
+  - type: input
+    id: version
+    attributes:
+      label: Clarus version
+      placeholder: "0.3.0-alpha"
+    validations:
+      required: false
+  - type: textarea
+    id: request
+    attributes:
+      label: Exact request
+      description: A copy-pasteable `curl` command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: response
+    attributes:
+      label: Exact response
+      description: Status line, headers and body you received
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: required_behavior
+    attributes:
+      label: Required behavior and standard section
+      description: What PS3.18 requires and the section number (e.g. PS3.18 10.6.1.2.1)
+    validations:
+      required: true

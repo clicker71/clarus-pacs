@@ -1,0 +1,61 @@
+name: Bug Report
+description: Something does not work as documented
+title: "Bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Anonymize anything you paste: no real
+        patient names, no real medical UIDs, no raw clinical images. See the
+        Contributing guide for the exact rules.
+  - type: input
+    id: version
+    attributes:
+      label: Clarus version
+      description: Output of `clarus --version` (short form `clarus -v`)
+      placeholder: "0.3.0-alpha"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and hardware
+      description: e.g. Raspberry Pi 5, x86_64, Linux 6.x
+      placeholder: "Raspberry Pi 5, Debian 12"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands or requests that trigger the bug
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpts
+      description: Paste the relevant log lines (server logs are already anonymized)
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration validation output (optional)
+      description: Output of `clarus --test-config` (short form `clarus -t`) if the problem is configuration-related
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

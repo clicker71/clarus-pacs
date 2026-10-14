@@ -1,0 +1,31 @@
+name: DICOM Print (C-PRINT) Driver Submission
+description: Probe output from a DICOM printer so we can write a vendor-specific driver
+title: "[C-PRINT] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        No coding required - about 10 minutes. We write the driver from your
+        probe dump, you test it against your printer, and you get credited.
+  - type: input
+    id: printer
+    attributes:
+      label: Printer vendor and model
+      placeholder: "e.g. Fujifilm DRYPIX 3500"
+    validations:
+      required: true
+  - type: input
+    id: address
+    attributes:
+      label: Printer AE Title, IP address, port
+      placeholder: "AE=DRYPIX, 192.168.1.50:104"
+    validations:
+      required: true
+  - type: textarea
+    id: probe
+    attributes:
+      label: Probe output
+      description: Paste the output of the cprint-probe script or `dcmprintscu --dump`
+      render: text
+    validations:
+      required: true

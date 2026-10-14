@@ -1,0 +1,43 @@
+name: DIMSE Device Interop Report
+description: Test results from a real DIMSE modality or workstation against the bridge
+title: "[DIMSE] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports from real devices are the contribution we value most.
+        Anonymize: names are masked by the bridge, but redact anything
+        identifying before posting.
+  - type: input
+    id: device
+    attributes:
+      label: Device vendor, model, software version
+      placeholder: "e.g. Siemens SOMATOM go.Top, VA50"
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Bridge log excerpt
+      description: Association and command logs from clbridge
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: sent
+    attributes:
+      label: What you sent
+    validations:
+      required: true
+  - type: textarea
+    id: answered
+    attributes:
+      label: What the device answered
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true

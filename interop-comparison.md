@@ -1,7 +1,7 @@
 # DICOMweb interoperability: Clarus vs dcm4chee-arc
 
 Clarus PACS compared against [dcm4chee-arc](https://github.com/dcm4chee/dcm4chee-arc)
-5.35.2, measured 2026-10-01. Every claim is reproduced by the universal test
+5.35.2, measured 2026-10-01, updated 2026-10-14. Every claim is reproduced by the universal test
 tool in this repository, [`tools/dicomweb_interop.py`](tools/dicomweb_interop.py):
 the same DICOM corpus is seeded to both servers, then identical requests are
 sent to each and the answers are shown side by side.
@@ -33,20 +33,55 @@ both), `--patient-name`/`--variants` (fuzzy queries), `--sop-class`/
   series plus CBCT; contains Latin-named and Cyrillic-named patients, so the
   fuzzy contrast covers both scripts).
 
+## PS3.18 conformance (2026-10-14, PS3.18 2026d)
+
+Measured on the same host, PS3.18 2026d, with a 32-assert gate of MANDATORY
+PS3.18 facts run as a black box against each origin: Clarus 32/32,
+dcm4chee-arc 13/32; a black-box red-team pass over the same surface found no
+remaining non-conformance in Clarus. One table for the whole comparison; the
+Conformant column names the origin that follows the standard for that row:
+
+| Check | PS3.18 anchor | Clarus | dcm4chee-arc | Conformant |
+|---|---|---|---|---|
+| Capabilities | 8.9 | WADL | 404 (no transaction) | Clarus |
+| QIDO limit=0 | 8.3.4.4.1 | 200 + empty result | 400 | Clarus |
+| QIDO truncated page | 8.3.4.4.1 | Warning 299 | no Warning | Clarus |
+| QIDO legal matching key (0008,0090) | 10.6.1-5 | accepted | 400 | Clarus |
+| Thumbnail default media type | 8.7.4-1 | image/jpeg | image/png | Clarus |
+| STOW single-part application/dicom | 8.7.3.1 | 200 | 415 | Clarus |
+| Rendered resource | 10.4.3.3.3 | rendering | rendering | both |
+| Storage Commitment | 13 | yes | 404 | Clarus |
+| MWL | 14 | yes | 404 | Clarus |
+| MPPS | 15 | yes | 404 | Clarus |
+
+Notes:
+
+- dcm4chee-arc strictness, not non-conformances: UPS-RS Create validates the
+  full CC.2.5-3 Create IOD (an empty 400 on a minimal body) and state/cancel
+  requires `?requester=` (PS3.18 11.7.2.1-1 makes it optional).
+- The Storage Commitment / MWL / MPPS "404" for dcm4chee-arc means "not on the
+  standard DICOMweb resources": it serves commitment over DIMSE and MWL/MPPS
+  via proprietary endpoints - see the sections below.
+
 ## UPS-RS (PS3.18 Worklist Service)
 
-| Check | Clarus | dcm4chee-arc |
-|---|---|---|
-| Enabled by default | yes | no (per-AE config) |
-| Create: SOP Common in body | 400 | 400 |
-| Create: conformant body | 201 | 201 + Location |
-| Search: required keys | filters | filters |
-| Search: keyword spelling (PS3.18 8.3.4) | filters | filters |
-| Search: wrong-case / unknown key | 400 | 400 |
-| Search: StudyInstanceUID (optional key) | filters | ignored |
-| ChangeState `?requester=` | not required | required |
-| Update query-param name | `TransactionUid` (strict) | both spellings |
-| Update attribute set | narrow (AIW-I report) | general N-SET |
+| Check | Clarus | dcm4chee-arc | Conformant |
+|---|---|---|---|
+| Enabled by default | yes | no (per-AE config) | both (deployment choice) |
+| Create: SOP Common in body | 400 | 400 | both |
+| Create: conformant body | 201 + Location | 201 + Location | both |
+| Search: required keys | filters | filters | both |
+| Search: keyword spelling (PS3.18 8.3.4) | filters | filters | both |
+| Search: wrong-case / unknown key | 400 | 400 | both |
+| Search: StudyInstanceUID (optional key) | filters | ignored | both (optional key) |
+| ChangeState `?requester=` | not required | required | Clarus (11.7.2.1-1: optional) |
+| Update query-param name | `TransactionUid` (strict) | both spellings | both |
+| Update attribute set | narrow (AIW-I report) | general N-SET | dcm4chee (general N-SET) |
+
+Both origins pass the full Task-Requester cycle (see the Weasis section
+below). The diverging rows are deployment or generality differences, not clean
+non-conformances; Clarus's narrow Update attribute set is declared in its
+conformance statement.
 
 ## Weasis as a UPS-RS User Agent (Task Requestor)
 
@@ -111,6 +146,9 @@ Latency (200 iterations per query, median / p99):
 | POST `/commitment-requests/{uid}` | 200 + verdict | 404 |
 | GET `/commitment-requests/{uid}` | 200 + verdict | 404 |
 
+Clarus serves the standard DICOMweb commitment resource (conformant);
+dcm4chee-arc answers 404 on it and does commitment over DIMSE instead.
+
 ## MWL / MPPS over DICOMweb (PS3.18 14/15)
 
 dcm4chee-arc gates every DICOMweb service behind the Web Application LDAP
@@ -119,10 +157,10 @@ attribute `dcmWebServiceClass`: the base `DCM4CHEE` app ships with only
 migrations (UPS_RS + MWL_RS in 5.22.0, MPPS_RS in 5.29.1, plus a separate
 `WORKLIST` app since 5.29.1). Measured on 5.35.2:
 
-| Resource | PS3.18 resource | Clarus | dcm4chee-arc |
-|---|---|---|---|
-| MWL search | `GET /modality-scheduled-procedure-steps` | yes | 404 on `DCM4CHEE`; served at `/mwlitems` on the separate `WORKLIST` app only |
-| MPPS | `/modality-performed-procedure-steps/{mppsUID}` | yes | 404; served at `/mpps` |
+| Resource | PS3.18 resource | Clarus | dcm4chee-arc | Conformant |
+|---|---|---|---|---|
+| MWL search | `GET /modality-scheduled-procedure-steps` | yes | 404 on `DCM4CHEE`; served at `/mwlitems` on the separate `WORKLIST` app only | Clarus |
+| MPPS | `/modality-performed-procedure-steps/{mppsUID}` | yes | 404; served at `/mpps` | Clarus |
 
 dcm4chee-arc does NOT expose the standard PS3.18 14/15 resources: it serves
 proprietary QIDO-style `/mwlitems` and `/mpps` endpoints, and MWL-RS lives on
@@ -142,10 +180,10 @@ defect with a privacy implication, not an access-control bypass.
 
 ## Throughput (container-vs-container, measured 2026-10-07)
 
-Host: VMware VM, 6 vCPU (2 sockets x 3 cores, Intel Xeon E5-2690 v4 @ 2.60 GHz),
-32 GB RAM, storage = two VMware virtual disks on HDD (SAS). Both servers in
-Docker on the same host, loopback, identical corpus (631 files / 514 MB /
-2 studies / 4 series), each started from empty storage. Measured with
+Host: VMware VM, 6 vCPU (2 sockets × 3 cores, Intel Xeon E5-2690 v4 @ 2.60 GHz), 32 GB RAM,
+storage = two VMware virtual disks on HDD (SAS). Both servers in Docker on
+the same host, loopback, identical corpus (631 files / 514 MB / 2 studies /
+4 series), each started from empty storage. Measured with
 [`tools/ab_test.py`](tools/ab_test.py) (STOW-RS upload, then WADO-RS read).
 Both serve the objects from their own local storage - there is no
 DICOMweb-to-DIMSE hop on either side, so this is apples-to-apples.
@@ -167,11 +205,12 @@ Where the wall is (and is not):
 - The ~50 MB/s read ceiling is **this machine's HDD + Docker Desktop
   loopback** (VM NAT bridge), not the server. Both servers hit the same wall,
   which is why sequential bulk reads are parity.
-- On NVMe the same Clarus WADO path is far faster: 344-428 MB/s cold,
-  ~1.1 GB/s warm ([`benchmark-headroom.md`](benchmark-headroom.md),
+- On NVMe the same Clarus WADO path is far faster: 344-428 MB/s cold and
+  ~1.1 GB/s warm, and 602 MiB/s in a release-profile bench run (measured
   2026-08-26).
 - The field Raspberry Pi 5 (Cortex-A76, 2 GB RAM, NVMe over PCIe 2.0 x1)
   measures far higher on the same WADO path: warm ~990 MB/s single stream,
   4.0 GB/s four-stream aggregate; cold 244-356 MB/s single, ~896 MB/s
   aggregate (2026-09-01, bare-metal native build, loopback curl, 636 MB
   corpus). So the field box is NVMe-bound, not HDD-bound as in this VM.
+

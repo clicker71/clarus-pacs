@@ -2,8 +2,8 @@
 
 **Product:** Clarus DICOMweb origin server (`clarus` binary)
 **Version:** 0.3.0-alpha
-**Date:** 2026-09-24
-**Standard:** DICOM PS3.18 (Web Services), 2026c edition; DICOM PS3.19 (XML
+**Date:** 2026-10-15
+**Standard:** DICOM PS3.18 (Web Services), 2026d edition; DICOM PS3.19 (XML
 application of DICOM to web resources); DICOM PS3.2 (Conformance statement
 structure)
 
@@ -57,6 +57,7 @@ WADO-RS/QIDO-RS.
 | 202 | stored with warnings (e.g. coerced Type 2 elements) or partial failures; per-instance failure reasons carried in the response payload |
 | 400 | nothing stored (malformed request) |
 | 409 | conflict (SOP-level) |
+| 415 | unsupported media type (request `Content-Type` is neither `application/dicom` nor `multipart/related`) |
 
 **Store Response Payload:** `ReferencedSOPSequence` per instance with the
 outcome. Warning-level coercion is reported with Failure Reason
@@ -83,6 +84,7 @@ request completes.
 | `/series/{series}` | `multipart/related; type="application/dicom"` |
 | `/instances/{sop}` | `application/dicom` (supports `Range`, partial content `206`) |
 | `/instances/{sop}/metadata` | `application/dicom+json` (default); `application/dicom+xml` on negotiation |
+| `/studies/{study}/metadata` | `multipart/related; type="application/dicom+json"` when Accept asks multipart; a single-part `application/dicom+json` array otherwise |
 | `/studies/{study}/series/{series}/metadata` | `multipart/related; type="application/dicom+json"` when Accept asks multipart (Required media type, PS3.18 10.4.4); a single-part `application/dicom+json` array otherwise (see 13.11) |
 | `/instances/{sop}/frames/{n}` | `multipart/related; type="application/octet-stream"` with a per-frame part `Content-Type` naming the stored transfer syntax (see below) |
 | `/instances/{sop}/thumbnail` | `image/jpeg` 64x64 (see 2.4) |
@@ -259,23 +261,35 @@ When `includefield` is **absent** (or equals `all`), the response carries
 never evicted.
 
 **Search Response Codes:** `200` success; `400` for an invalid value of a
-supported key (e.g. malformed date range). Unknown keys never fail the
-request. Default `limit` 250; `limit`/`offset` paging is supported.
+supported key (e.g. malformed date range) or a non-uint `limit`/`offset`
+(PS3.18 8.3.4 Table 8.3.4-1 types both as uint). Unknown keys never fail the
+request. Default `limit` 250; `limit=0` yields an empty result set (never
+"unlimited"), and a truncated response carries
+`Warning: 299 <host:port>: There are <remaining> additional results that can
+be requested` (8.3.4.4.1).
 
 ### 2.4 Rendered Resources (thumbnails)
 
 - `/instances/{sop}/thumbnail` serves a 64x64 JPEG (Thumbnail Resource,
-  `image/jpeg` only) from the raw pixel path in any build; compressed
-  thumbnails 406 in every build.
+  `image/jpeg` only). A compressed single-frame source is decoded through the
+  codec registry when the server is built with `transcode`; the default
+  (no-`transcode`) build answers 406 for a compressed source (no decoder is
+  compiled in).
 - `/instances/{sop}/rendered` (Rendered Resource) serves `image/jpeg`
   (grayscale, default), `image/gif` (grayscale) or `image/png` (RGB and
-  grayscale) for SINGLE-FRAME instances. RGB previews
-  (LABEL/THUMBNAIL/OVERVIEW) render without window/level and downscale with
-  the area-average filter. Multi-frame instances are NOT server-rendered
-  (406); clients retrieve pyramid frames via `/frames/{N}`. `image/gif` is
-  served for grayscale single-frame instances (lossless, 256-gray palette);
-  RGB single-frame instances are served as `image/png` (lossless) and
-  `image/gif` for RGB is not offered (406). `image/jp2` is not offered.
+  grayscale) for SINGLE-FRAME instances. A compressed single-frame source is
+  decoded through the codec registry when built with `transcode` and is
+  served as `image/jpeg`; the default build answers 406, and a compressed
+  source asked for `image/png`/`image/gif` is 406 in every build (that
+  decode is not wired). RGB previews (LABEL/THUMBNAIL/OVERVIEW) render
+  without window/level and downscale with the area-average filter.
+  Multi-frame instances are NOT server-rendered (406); clients retrieve
+  pyramid frames via `/frames/{N}`. `image/gif` is served for grayscale
+  single-frame instances (lossless, 256-gray palette); RGB single-frame
+  instances are served as `image/png` (lossless) and `image/gif` for RGB is
+  not offered (406). `image/jp2` is not offered. The Rendered Resource is
+  instance-level only: study-level, series-level and frame-level `/rendered`
+  are not provided (404).
 
 ### 2.5 Delete (admin extension)
 
@@ -325,7 +339,7 @@ reason and timestamp.
   (non-standard extension, see 11.9). Subscriptions (11.10/11.11):
   POST/DELETE
   `/workitems/{subscription-sop-class-uid}/subscribers/{subscriber}` -
-  the 2026c subscribe-without-payload shape (`filter` query parameter,
+  the 2026d subscribe-without-payload shape (`filter` query parameter,
   11.10.1.2/11.10.1.4), global (1.2.840.10008.5.1.4.34.5) and filtered
   (34.5.1) forms, and the `?deletionlock` query parameter (11.10). The
   WebSocket Notification Connection (8.10.4): `GET
@@ -533,10 +547,20 @@ mandatory set - `requestType` (=WADO), `studyUID`, `seriesUID`,
 
 ## 8. Capabilities
 
-**Resource:** `/dicomweb/` - returns the service capabilities document
-(`application/dicom+json`). Advertised keys: `qido-rs`, `wado-rs`,
-`stow-rs`, `ups-rs`, `wado-uri`, `commitment-rs`,
-`transferCapabilities`.
+**Resource:** the Retrieve Capabilities Transaction (PS3.18 8.9) answers on
+`OPTIONS /` (the Base URI, 8.9.1) with a WADL document
+(`application/vnd.sun.wadl+xml`, 8.9.3.1.1) whose `resources base` is the
+service Base URI. The document is a fixed WADL skeleton reflecting the route
+registry (Annex H / Table H-1, INV-002): `studies`/`series`/`instances` (with
+the `metadata`, `thumbnail`, `rendered`, `bulkdata` and `frames` children),
+`workitems` (with the `{subscriptionSOPClassUID}`/`subscribers` child),
+`commitment-requests`, `modality-scheduled-procedure-steps` (MWL) and
+`modality-performed-procedure-steps` (MPPS). The instance-level `rendered`
+resource is the only `/rendered` advertised (study/series rendering is not
+implemented); `/pixeldata` is not advertised (pixel access is via `/frames`).
+`GET /dicomweb` on the same Base URI is kept for Weasis compatibility and
+returns the same WADL document; every other `OPTIONS` path is the CORS
+preflight answer (204).
 
 ## 9. Transfer Syntaxes
 
@@ -711,7 +735,7 @@ covered by this statement beyond 2.5.
 
 **13.17 SpecificCharacterSet always-on emission** - `(0008,0005) =
 "ISO_IR 192"` is emitted on every study/series/patient QIDO row although
-the attribute is not part of the PS3.18 2026c response tables. The value
+the attribute is not part of the PS3.18 2026d response tables. The value
 names the repertoire actually used in the response (UTF-8).
 
 ## 14. Trademarks

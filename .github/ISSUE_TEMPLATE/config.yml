@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/clicker71/clarus-pacs/blob/main/SECURITY.md
+    about: Do NOT open a public issue - use the private channel (email or GitHub private reporting)
   - name: Contributing guide
     url: https://github.com/clicker71/clarus-pacs/blob/main/CONTRIBUTING.md
     about: Read before opening an issue - privacy rules and what we can act on

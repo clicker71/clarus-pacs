@@ -684,10 +684,11 @@ metric counters.
 
 **Re-store.** IOCM 4.66.4.2.3.1 and 4.66.4.3.3 state that a receiver shall not
 accept a subsequent occurrence of an instance hidden by a patient-safety or
-incorrect-worklist rejection. Such a part is refused per instance - the
-request answers `202` with a `FailedSOPSequence` entry carrying Failure Reason
-`272` (0110H, PS3.18 Table I.2-2) and an Error Comment naming the reason -
-not with a request-level `4xx`, which would discard the acceptable parts of
+incorrect-worklist rejection. Such a part is refused per instance - a
+`FailedSOPSequence` entry carrying Failure Reason `272` (0110H, PS3.18 Table
+I.2-2) and an Error Comment naming the reason. The request answers `202` when
+at least one part is accepted and one is refused, or `400` when every part is
+refused - never a request-level `4xx` that discards the acceptable parts of
 the same request. `113039` is a lifecycle marker rather than a statement that
 the content is wrong, so it does not block a re-store, and a Quality-hidden
 instance may be replaced (that is the corrected-result workflow).

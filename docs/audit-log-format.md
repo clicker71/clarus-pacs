@@ -117,10 +117,33 @@ does not change the journal's retention or loss semantics.
 ## 7. Delete trail (audit/)
 
 One JSON line per destructive event: `delete`, `delete_preview`,
-`erase_complete`, `security_perm_fix`. Identity fields: `ts`, `user`,
-target UID (study/series/instance), `patient_id`, `count`, `bytes_to_free`,
-`reason` (free text). The delete trail is the only evidence of deletions;
-back it up off-box.
+`erase_complete`, `reject`, `restore`, `security_perm_fix`. Identity fields:
+`ts`, `user`, target UID (study/series/instance), `patient_id`, `count`,
+`bytes_to_free`, `reason` (free text). The delete trail is the only evidence
+of deletions; back it up off-box.
+
+Two of these record the two halves of a clinical sequester, and they are
+deliberately not symmetric in shape:
+
+| Event | Fields | Written |
+| ----- | ------ | ------- |
+| `reject` | `user`, `reason_code`, `study`, `note_uid`, `count`, `ts` | before the instances are hidden |
+| `restore` | `batch_id`, `user`, `reason`, `reason_code`, `target`, `ts`, `patient_id`, `count` | before the instances become visible again |
+
+`reject` is one row per (study, reason) group, not per instance: a Key Object
+Selection note may name thousands of instances, and the referenced UIDs stay
+queryable through the still-stored note. Its `count` is therefore the number
+of instances the note NAMED in that study - the request's intent - while the
+number actually flipped is carried by
+`clarus_rejected_instances_total{reason=...}`. `note_uid` is the SOP Instance
+UID of the KOS note that carried the rejection; it is omitted when the batch
+did not record one, rather than written as an empty string.
+
+`reason_code` on a `reject` row is the code applied (`113037` patient safety,
+`113038` incorrect worklist entry, `113039` retention expired). On a
+`restore` row it is the code being CLEARED. An auditor reading the trail for
+one instance therefore sees which clinical decision was made, and later
+whether and why it was reversed.
 
 ## 8. Operating notes
 

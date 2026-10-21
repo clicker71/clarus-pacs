@@ -603,10 +603,12 @@ mismatch) is a deterministic refusal with `406`.
   natively; UTF-8 (ISO_IR 192) is handled in JSON/XML responses.
 - QIDO-RS responses always emit `SpecificCharacterSet` (0008,0005) =
   `"ISO_IR 192"` at study, series and patient levels (see 2.3).
-- CJK character sets (ISO 2022 IR 13/87 - Japanese, KS X 1001 - Korean,
-  GB18030 - Chinese) are decoded by the DICOM parser only when the binary
-  is built with the `cjk-charsets` feature; without it CJK text is not
-  decoded. The shipped default build includes the feature.
+- CJK character sets (ISO 2022 IR 13/87/159 - Japanese, KS X 1001 -
+  Korean, GB18030 - Chinese) are decoded by the DICOM parser only when the
+  binary is built with the opt-in `cjk-charsets` feature; without it CJK
+  text is not decoded (the default build, so this is the behavior unless
+  the feature was requested). The published `full` release variant enables
+  it; the `base` variant does not.
 
 ## 11. Security
 
@@ -622,6 +624,157 @@ mismatch) is a deterministic refusal with `406`.
   retained in the append-only journal.
 - Encryption at rest is the OS-level mount encryption (BitLocker / LUKS /
   EFS); the server binary contains no symmetric encryption of its own.
+
+## 11.1 IOCM / AIRA - Sequestering and Expose Rejected
+
+This section describes the **grouped deployment**: Clarus as the DICOMweb
+origin plus the `clbridge` DIMSE sidecar. Neither half provides the
+following behaviour alone - the server holds the sequestering state, the
+bridge provides the DIMSE surface. Claims are limited to what the pair
+actually implements.
+
+**Sequestering.** An instance may be marked *rejected* by a rejection note
+arriving at STOW-RS. A rejected instance is hidden from every ordinary
+QIDO-RS and WADO-RS request: it is absent from instance search results and
+a direct retrieve answers `404`, the same as an instance that does not
+exist. Hiding is therefore indistinguishable from absence to a client
+without access, which is the intent.
+
+The rejection note is a Key Object Selection (SOP Class
+`1.2.840.10008.5.1.4.1.1.88.59`) whose coded Document Title is a
+recognised reason code. Four standard reasons are implemented, quoted from
+PS3.16 CID 7010 and IHE RAD TF-2 4.66.4:
+
+| Code | Meaning | Scope | Expose path |
+|---|---|---|---|
+| `113001` | Rejected for Quality Reasons | AI-Result classes only | `/dicomweb_qa` |
+| `113037` | Rejected for Patient Safety Reasons | Any SOP Class | none |
+| `113038` | Incorrect Modality Worklist Entry | Any SOP Class | none |
+| `113039` | Data Retention Policy Expired | Any SOP Class | none |
+
+Codes outside this table are not recognised and the object is stored as an
+ordinary Key Object Selection. In particular the private `99DCM4CHEE`
+"restore rejected" code is deliberately not honoured: there is no standard
+DICOM un-reject, and adopting a vendor code to undo a standard one would make
+the visible state depend on which tooling was last pointed at the archive.
+
+**Scope guard (Quality).** A Quality rejection note hides only referenced
+instances whose SOP Class is in the AI-Result set (SR, SEG, PR, RTSTRUCT,
+Parametric Map, KOS). A note naming a diagnostic image is ignored for that
+image. STOW-RS is not admin-gated, so this is the bound that keeps a
+malformed or crafted note from hiding diagnostic CT/MR.
+
+**AnyClass reasons are hide-only and opt-in.** Reasons `113037`, `113038` and
+`113039` exist precisely to hide the diagnostic images a wrong-patient or
+wrong-worklist acquisition produced, so no class bound can apply to them.
+There is no expose path for them on any surface (IOCM 4.66.4.2.3 /
+4.66.4.3.3), and `/dicomweb_qa` lifts Quality rejections only. Because STOW-RS
+accepts the note from any client, these reasons are honoured only when the
+deployment has switched the feature on with `[server] anyclass_enable = true`;
+otherwise the note is stored but its hiding power is declined, logged as
+`IOCM_ANYCLASS_IGNORED` and counted in
+`clarus_iocm_anyclass_ignored_total{cause="disabled"}`.
+
+**Audit trail.** Applying a rejection note writes a `reject` row to the
+immutable audit log before the instances are hidden, naming the effective
+user, the reason code applied, the study, the KOS note that carried it and
+the number of instances the note named in that study. A sequester is
+therefore always traceable to a note and a caller, independently of the
+metric counters.
+
+**Re-store.** IOCM 4.66.4.2.3.1 and 4.66.4.3.3 state that a receiver shall not
+accept a subsequent occurrence of an instance hidden by a patient-safety or
+incorrect-worklist rejection. Such a part is refused per instance - the
+request answers `202` with a `FailedSOPSequence` entry carrying Failure Reason
+`272` (0110H, PS3.18 Table I.2-2) and an Error Comment naming the reason -
+not with a request-level `4xx`, which would discard the acceptable parts of
+the same request. `113039` is a lifecycle marker rather than a statement that
+the content is wrong, so it does not block a re-store, and a Quality-hidden
+instance may be replaced (that is the corrected-result workflow).
+
+**Expose Rejected (RESTful).** AIRA 57.2.1 defines the mechanism as "a
+webservice endpoint specifically configured to provide access to hidden
+instances" - a separate endpoint, not a query parameter. Clarus publishes
+that endpoint as the `/dicomweb_qa` base URL: the same QIDO-RS and WADO-RS
+resources, read-only (STOW-RS, update and delete are not routed there and
+answer `404`), access-controlled independently of the ordinary DICOMweb base
+by `[server] expose_rejected_cidrs`. It exposes Quality rejections only; an
+instance hidden by an AnyClass reason remains hidden there and answers `404`
+like a missing one.
+
+**Expose Rejected (DIMSE).** A DIMSE association has no per-query flag, so
+the grouped deployment exposes the same capability through a second AE
+Title bound by the bridge (`[server] expose_ae_title`, default
+`CLBRIDGE_QA`, on `[server] expose_port`). Associations there query the
+endpoint configured in the bridge's `[dicomweb] qa_url`, which for Clarus
+is `http://<host>:<port>/dicomweb_qa`; associations on the primary AE
+query the ordinary `clarus_url` and never see rejected instances.
+
+The bridge is **backend-agnostic**: it adds no vendor-specific parameter,
+so any server that publishes a designated QA endpoint can be used. See the
+DIMSE bridge conformance statement, 3.1.
+
+**Administrative restore (Clarus extension, not a standard transaction).**
+DICOM and IHE define no un-reject: `113037`, `113038` and `113039` have no
+expose path and are hide-only, and the refusal to re-store them is a
+requirement rather than a policy choice. A deployment still needs a way to
+reverse a sequester that was itself wrong - a mis-keyed worklist correction,
+or a Quality hide issued against the wrong study - without hand-editing a
+manifest. Clarus therefore publishes `POST /admin/v1/instances/restore`:
+it takes up to 500 SOP Instance UIDs and a mandatory operator `reason`,
+writes an immutable audit row, and only then clears the recorded rejection
+reason, which makes the instance visible on the ordinary base URL and
+re-stowable again. `GET /admin/v1/instances/hidden` lists what is currently
+sequestered with its reason code, and `GET /admin/v1/instances/raw` returns
+the stored bytes of one instance regardless of visibility.
+
+This API is outside every conformance claim in this statement. It is not a
+RAD transaction, it is not routed through `/dicomweb` or `/dicomweb_qa`, it
+is reachable only from the networks in `[server] admin_cidrs`, and it
+records an operator identity in the audit trail. Restoring an instance is
+indistinguishable in the stored data from never having hidden it, so
+`/dicomweb_qa` stops reporting it afterwards; the rejection note itself
+remains in CAS as the historical record. See the production setup guide,
+"Reviewing rejected AI results".
+
+**Transactions claimed in the grouped deployment.**
+
+| IHE transaction | DIMSE side (bridge) | DICOMweb side (Clarus) |
+|---|---|---|
+| RAD-66 Rejection Note Stored | C-STORE SCP | STOW-RS |
+| RAD-50 / RAD-8 Store | C-STORE SCP | STOW-RS |
+| RAD-14 / RAD-137 Query | C-FIND SCP | QIDO-RS |
+| RAD-16 / RAD-45 Retrieve | C-MOVE SCP | WADO-RS |
+
+**Not claimed.** RAD-137 as an SCU with its full matching and return-key
+repertoire is not claimed: the bridge translates the subset of C-FIND keys
+it supports and returns the QIDO-RS attribute set. Evidence SOP classes
+(SR, SEG, PR, RTSTRUCT, Parametric Map, KOS) are accepted only because
+`sop_classes.yaml` lists them; an operator who replaces that file must keep
+them, or RAD-66 stops working.
+
+**Metrics.** `clarus_rejected_instances_total` counts instances newly
+hidden by a rejection note; `clarus_instances_stored_total` counts
+instances accepted by STOW excluding exact duplicates. The rejection rate
+is their ratio, computed in the monitoring system rather than in-process.
+`clarus_rejected_by_reason_total{reason="113001"|"113037"|"113038"|"113039"}`
+is the same count split by the reason that was recorded, so a rise can be
+attributed to a reviewable Quality hide or to a permanent AnyClass one;
+the labelled series is a breakdown of the total and both move together.
+`clarus_iocm_anyclass_ignored_total{cause="disabled"}` counts rejection
+references that were left visible because `[server] anyclass_enable` is
+false - nothing was hidden, so it is deliberately not part of the rejection
+counter.
+
+`clarus_restored_total{reason="113001"|"113037"|"113038"|"113039"}`
+counts instances whose sequester was cleared by the administrative restore
+API, split by the reason that was cleared so the audit rows and the series
+correspond one for one. `clarus_rejected_instances_total` is deliberately
+**not** decremented: it is an event counter, and rewinding it would make a
+rate over any window unreadable. The number of instances currently hidden
+is the difference of the two, `clarus_rejected_instances_total -
+sum(clarus_restored_total)`, evaluated in the monitoring system like the
+rejection rate above.
 
 ## 12. Configuration
 

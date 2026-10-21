@@ -48,12 +48,48 @@ itself.
 - **User identity negotiation:** none (not offered, not requested).
 - **Maximum PDU:** pynetdicom default (16382 bytes).
 
+### 3.1 QA / Expose Rejected Instances AE (optional)
+
+A DIMSE association carries no per-query "show rejected" flag, so
+IOCM/AIRA define a designated AE Title for inspecting sequestered
+instances. AIRA 57.2.1 defines the expose mechanism as a *webservice
+endpoint specifically configured to provide access to hidden instances* -
+a separate base URL the deployment chooses, not a query parameter.
+
+When **both** `[server] expose_port` and `[dicomweb] qa_url` are set the
+bridge binds a SECOND AE on that port:
+
+| Property | Value |
+|---|---|
+| AE Title | `[server] expose_ae_title`, default `CLBRIDGE_QA` |
+| Port | `[server] expose_port` (unset = the AE is not started) |
+| DICOMweb base for its queries | `[dicomweb] qa_url` |
+| Called-AE check | required, same as the primary AE |
+| SOP classes / presentation contexts | identical to the primary AE |
+
+The primary AE is unaffected: it keeps querying `clarus_url` and keeps
+hiding sequestered instances. With either key unset - the default - the
+bridge behaves exactly as a single-AE gateway and logs a warning naming
+the missing key.
+
+**The bridge is backend-agnostic.** It never adds a vendor-specific query
+parameter for this; the QA view is selected purely by the base URL. A
+server that publishes a designated QA endpoint works unchanged, and one
+that uses a different convention is pointed at its own endpoint instead.
+For Clarus the value is `http://<host>:<port>/dicomweb_qa`; a deployment
+must also authorise the bridge's address on the origin side if the
+endpoint is access-controlled, since configuring one half without the
+other is the most likely deployment error.
+
+MWL (C-FIND) is deliberately unaffected by this AE: a worklist lists
+scheduled procedures, never stored, sequestered instances.
+
 ## 4. Presentation Contexts (SCP)
 
 | Abstract syntax | Transfer syntax(es) proposed | Notes |
 |---|---|---|
 | Verification (1.2.840.10008.1.1) | Explicit VR LE, Implicit VR LE | C-ECHO |
-| Storage SOP Classes | Explicit VR LE, Implicit VR LE, JPEG Lossless SV1 (4.70), JPEG-LS Lossless (4.80) | C-STORE; registry-driven (`sop_classes.yaml`, 71 SOP classes in the field build), fallback: built-in SOP classes |
+| Storage SOP Classes | Explicit VR LE, Implicit VR LE, JPEG Lossless SV1 (4.70), JPEG-LS Lossless (4.80) | C-STORE; registry-driven (`sop_classes.yaml`, 73 SOP classes in the shipped file), fallback: built-in SOP classes |
 | Patient Root Q/R FIND (5.1.4.1.2.1.1) | Explicit VR LE, Implicit VR LE | C-FIND |
 | Study Root Q/R FIND (5.1.4.1.2.2.1) | Explicit VR LE, Implicit VR LE | C-FIND |
 | Modality Worklist FIND (5.1.4.1.2.1.31) | Explicit VR LE, Implicit VR LE | C-FIND (MWL) |

@@ -640,6 +640,12 @@ a direct retrieve answers `404`, the same as an instance that does not
 exist. Hiding is therefore indistinguishable from absence to a client
 without access, which is the intent.
 
+This applies to the study- and series-level resource paths as well: a
+`/studies/{study}`, `/studies/{study}/series/{series}`, `/metadata` or
+`/thumbnail` request omits the hidden instances from its parts, and answers
+`404` when the study or series holds nothing else, so a bulk retrieve cannot
+serve what a per-instance retrieve refuses.
+
 The rejection note is a Key Object Selection (SOP Class
 `1.2.840.10008.5.1.4.1.1.88.59`) whose coded Document Title is a
 recognised reason code. Four standard reasons are implemented, quoted from

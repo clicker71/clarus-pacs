@@ -10,6 +10,8 @@ PS3.2. It does this without SQL, without an external
 database, and with no runtime dependencies: no database server, no JVM,
 no interpreter, no async runtime.
 
+![Clarus architecture diagram](images/diagram.png)
+
 ## Why it exists
 
 Clarus began inside ClarityX, a two-workstation DX room with

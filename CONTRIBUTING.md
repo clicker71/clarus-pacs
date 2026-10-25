@@ -14,9 +14,11 @@ Thank you for your interest in Clarus! We value your time and expertise.
 
 We genuinely want your bug reports, logs, DICOMweb conformance findings, and feedback — they make the project better, and confirmed reporters are credited in the release notes.
 
-One thing is closed, and we want to say it plainly up front: **we do not accept Pull Requests with external code.**
+We do not accept **external code contributions** (pull requests from third parties) at this time. This is a temporary policy while we finalize the contribution licensing (CLA) and the chain-of-ownership process our regulated, certified deployments require. Confirmed issues are fixed by the maintainers and land through regular pull requests, so a reported bug is closed with a PR link you can follow.
 
-This is not gatekeeping — it is how we keep the technical and legal integrity of the project. The first three reasons below are specific to the Rust core; the fourth describes the stack philosophy. These reasons apply to the entire repository, including the Python DIMSE bridge (`clbridge`).
+The project is licensed under LGPL-3.0-or-later: you are free to use, modify, and distribute it under the LGPL terms, and nothing in this document restricts that.
+
+The reasons below are what this policy protects. The first three are specific to the Rust core; the fourth is the stack philosophy. They apply to the entire repository, including the Python DIMSE bridge (`clbridge`).
 
 ### Why
 

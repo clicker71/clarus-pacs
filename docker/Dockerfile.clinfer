@@ -1,0 +1,41 @@
+# clinfer demo image, self-contained: pulls the prebuilt binary and the two
+# model-free demo ABI scripts from the weasis-demo-v0.1 release - no Rust
+# toolchain. opencv-python-headless runs the CLAHE / upscale processors.
+FROM debian:trixie-slim
+
+ARG VERSION=weasis-demo-v0.1
+ARG PACK=weasis_demo_pack-v0.1-linux.tar.gz
+ARG CLINFER_SHA256=28f11ecb77936f51c579f620678b8fa162c1813197b012bf90ee36db920a50d1
+ARG CLAHE_SHA256=75a06dd7b85d23bc8aec39e07b719251c058eeafa34384b6430210d096bd9ded
+ARG UPSCALE_SHA256=9ca8b1f8600d803e54671501017b311968f9c40ded436b558df651159350c0e6
+
+# python3 for the ABI processors; libglib2.0-0 + libgomp1 are what
+# opencv-python-headless needs at import time on slim images.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip ca-certificates curl \
+      libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL \
+      "https://github.com/clicker71/clarus-pacs/releases/download/${VERSION}/${PACK}" \
+      -o "/tmp/${PACK}" \
+    && tar -xzf "/tmp/${PACK}" -C /tmp \
+    && cd /tmp/weasis_demo_pack-v0.1-linux \
+    && echo "${CLINFER_SHA256}  clinfer" | sha256sum -c - \
+    && echo "${CLAHE_SHA256}  abi/DERIVED-clahe.py" | sha256sum -c - \
+    && echo "${UPSCALE_SHA256}  abi/DERIVED-upscale.py" | sha256sum -c - \
+    && install -m 0755 clinfer /usr/local/bin/clinfer \
+    && install -D -m 0644 abi/DERIVED-clahe.py /opt/clinfer/abi/DERIVED-clahe.py \
+    && install -D -m 0644 abi/DERIVED-upscale.py /opt/clinfer/abi/DERIVED-upscale.py \
+    && rm -rf "/tmp/${PACK}" /tmp/weasis_demo_pack-v0.1-linux
+
+# Only the two model-free demo processors ship in this image; opencv-python
+# pulls numpy as a dependency, named here for explicitness.
+RUN pip3 install --break-system-packages --no-cache-dir \
+      "opencv-python-headless>=4.9" "numpy>=1.26"
+
+COPY docker/clinfer-demo.conf /etc/clinfer/clinfer.conf
+# The server refuses world-readable configs; keep the same rule here.
+RUN chmod 600 /etc/clinfer/clinfer.conf
+VOLUME ["/data"]
+ENTRYPOINT ["clinfer", "--config", "/etc/clinfer/clinfer.conf"]

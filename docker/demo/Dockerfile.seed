@@ -1,0 +1,24 @@
+# One-shot seeder: STOWs the demo studies into Clarus on first boot.
+# Build context = docker/demo (this file + seed.sh). The demo-study .dcm
+# files are NOT committed; they are downloaded from the ohif-demo-v0.1
+# release and verified against the SHA-256 hashes pinned below.
+FROM alpine:3.20
+
+ARG VERSION=ohif-demo-v0.1
+ARG PACK=ohif_demo_study-v0.1.tar.gz
+
+RUN apk add --no-cache curl
+
+RUN curl -fsSL \
+      "https://github.com/clicker71/clarus-pacs/releases/download/${VERSION}/${PACK}" \
+      -o "/tmp/${PACK}" \
+    && mkdir -p /tmp/pack /seed \
+    && tar -xzf "/tmp/${PACK}" -C /tmp/pack \
+    && cd /tmp/pack/ohif_demo_study-v0.1/demo-study \
+    && echo "ab4509bb58486ce7686a479ead52d89ac0436bdc8890be7488134933dbd27ad2  Mass_62109.png.dcm" | sha256sum -c - \
+    && echo "fb4637fec699ed24a8fc2c2edd56af84cf3256b1905ff8239c952d349eea406e  Knee_62109.png.dcm" | sha256sum -c - \
+    && cp *.dcm /seed/ \
+    && rm -rf "/tmp/${PACK}" /tmp/pack
+
+COPY seed.sh /seed.sh
+ENTRYPOINT ["sh", "/seed.sh"]

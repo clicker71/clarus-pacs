@@ -1,0 +1,69 @@
+# OHIF UPS-RS demo stack: Clarus (origin) + clinfer (Task Performer) + seed.
+#
+# Self-contained: Clarus and clinfer images pull their PREBUILT binaries from
+# the weasis-demo-v0.1 GitHub release - no Rust toolchain needed. The demo
+# study is seeded from the same release.
+#
+# Local run:
+#   docker compose -f docker-compose.ohif-demo.yml up -d --build
+# Reset (factory):
+#   docker compose -f docker-compose.ohif-demo.yml down -v
+#   docker compose -f docker-compose.ohif-demo.yml up -d --build
+#
+# DICOMweb root for OHIF: http://127.0.0.1:8024/dicomweb
+# See docker/demo/README.md for the full run/reset notes.
+#
+# Isolated project name: keeps this demo's containers and volumes separate
+# from the production stack in docker-compose.yml (same directory otherwise).
+name: clarus-ohif-demo
+
+services:
+  clarus:
+    build:
+      context: .
+      dockerfile: Dockerfile.clarus
+    image: clarus:demo
+    ports:
+      - "8024:8024"
+    volumes:
+      - clarus-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8024/health/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  clinfer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.clinfer
+    image: clinfer:demo
+    depends_on:
+      clarus:
+        condition: service_healthy
+    volumes:
+      - clinfer-cache:/data
+    restart: unless-stopped
+
+  seed:
+    build:
+      context: docker/demo
+      dockerfile: Dockerfile.seed
+    depends_on:
+      clarus:
+        condition: service_healthy
+    restart: "no"
+
+  # Live URL (optional): expose the origin through a Cloudflare quick tunnel.
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   command: tunnel --url http://clarus:8024
+  #   depends_on:
+  #     - clarus
+  #   restart: unless-stopped
+
+volumes:
+  clarus-data: {}
+  clinfer-cache: {}

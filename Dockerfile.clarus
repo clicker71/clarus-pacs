@@ -1,0 +1,26 @@
+# Clarus demo image, self-contained: pulls the prebuilt Linux binary from the
+# weasis-demo-v0.1 GitHub release - no Rust toolchain. The release binary is
+# the transcode build, so JPEG-LS / JPEG 2000 / RLE serving is available.
+FROM debian:trixie-slim
+
+ARG VERSION=weasis-demo-v0.1
+ARG PACK=weasis_demo_pack-v0.1-linux.tar.gz
+ARG CLARUS_SHA256=0141a05affb6e4e9d3a2d5ec31899ae6383d961e7b60038ad6ebb4ebe00da39c
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL \
+      "https://github.com/clicker71/clarus-pacs/releases/download/${VERSION}/${PACK}" \
+      -o "/tmp/${PACK}" \
+    && tar -xzf "/tmp/${PACK}" -C /tmp \
+    && echo "${CLARUS_SHA256}  /tmp/weasis_demo_pack-v0.1-linux/clarus" | sha256sum -c - \
+    && install -m 0755 /tmp/weasis_demo_pack-v0.1-linux/clarus /usr/local/bin/clarus \
+    && rm -rf "/tmp/${PACK}" /tmp/weasis_demo_pack-v0.1-linux
+
+COPY docker/clarus.conf /etc/clarus/clarus.conf
+# The server refuses to start on world-readable configs (SECURITY check).
+RUN chmod 600 /etc/clarus/clarus.conf
+VOLUME ["/data"]
+EXPOSE 8024
+ENTRYPOINT ["clarus", "--config", "/etc/clarus/clarus.conf"]

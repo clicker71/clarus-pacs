@@ -19,7 +19,10 @@ self-contained executable on Windows, a plain script on Linux.
 Download. Extract. Click and run.
 
 The release package contains the complete suite of binaries: `clarus`,
-`clbridge`, and `clinfer`.
+`clbridge`, and `clinfer`. `clarus` ships built with `--features
+transcode` — it provides full DICOMweb conformance on compressed
+transfer syntaxes and viewer thumbnails, and it carries
+[additional risks](docs/production-setup.md#production-install-on-linux-optclarus).
 
 - Download the release archive for your platform from the Releases page.
 - Extract the archive to any directory.

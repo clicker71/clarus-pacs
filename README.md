@@ -26,7 +26,9 @@ transfer syntaxes and viewer thumbnails, and it carries
 
 - Download the release archive for your platform from the Releases page.
 - Extract the archive to any directory.
-- Run the binaries directly — zero configuration required.
+- Run the binaries directly — zero configuration required. Point a
+  browser at the server's `/` — an inline mini-viewer (about 30 KB)
+  answers in milliseconds, a visual ping that the archive is up.
 
 For system services, NVMe PLP storage tuning, and reverse-proxy setup,
 see the [Production Deployment Guide](docs/production-setup.md). To

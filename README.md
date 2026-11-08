@@ -190,7 +190,8 @@ platform and build.
   content-addressing).
 
 **Validated deployments:** bare metal (Windows, Linux x64), Raspberry
-Pi 5, and VM.
+Pi 5 (ARM64, Cortex-A76), and VM — one static binary per platform,
+from a server-grade NVMe box down to an embedded board.
 
 **Terminal velocity for your platform.** To achieve maximum throughput,
 use server-grade NVMe with power-loss protection (PLP) and build with

@@ -164,6 +164,8 @@ x86_64); this is only for a binary you build for your own machine. The stock
 `--release` profile is already aggressive (link-time optimization, one codegen
 unit, panic=abort), so native is a marginal gain, not a different league.
 
+### Transcode build
+
 If your archive holds JPEG 2000 or JPEG-LS studies that must be decoded
 server-side, build with the transcode feature instead:
 

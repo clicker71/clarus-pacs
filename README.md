@@ -163,7 +163,13 @@ and already open.
 
 Clarus keeps an append-only audit trail: a delete trail (fsync'd per
 record, never pruned) and an access journal (batch-flushed, pruned
-after 1095 days).
+after 1095 days). Both are plain JSON lines tagged with the DICOM
+PS3.15 audit event IDs (110101/110103/110104/110110/110111/110112); the
+format is documented in [docs/audit-log-format.md](docs/audit-log-format.md).
+This is a documented JSON-lines format, not an IHE ATNA conformance
+claim. For deployments that run a SIEM, the
+[access_journal_to_syslog.py](tools/access_journal_to_syslog.py)
+converter forwards the journals to syslog.
 
 Attribute modifications inside stored objects append a `(0400,0561)`
 Original Attributes Sequence with time, modifying system, and reason —

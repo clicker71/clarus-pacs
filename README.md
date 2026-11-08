@@ -231,6 +231,11 @@ quality gates pass.
 interoperability testing. Not for clinical diagnostic use. No
 regulatory approval (FDA 510(k), CE MDR, or equivalent).
 
+**Trademarks:** DICOM® is the registered trademark of the National
+Electrical Manufacturers Association (NEMA). DICOMweb™ is a trademark
+of NEMA. IHE is a trademark of IHE International. Clarus is not
+affiliated with or endorsed by NEMA or IHE.
+
 [^1]: The optional `s3` build pulls `tokio` inside `reqwest` for
     cold-tier fallback; the core and default builds have no async
     runtime.

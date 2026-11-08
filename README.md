@@ -32,7 +32,10 @@ power-loss protection (PLP) and build with `--target-cpu=native`.
 
 ## Components
 
-- **clarus** — core DICOMweb engine.
+- **clarus** — core DICOMweb engine. Unicode-aware fuzzy patient
+  search: `fuzzymatching=true`, Levenshtein-1 over an n-gram index,
+  correct for any script (Cyrillic, CJK, Greek, Arabic, Katakana),
+  O(candidates), zero heap in the hot path.
   [DICOMweb conformance statement](docs/dicomweb-conformance-statement.md)
 - **clbridge** — universal DIMSE ↔ DICOMweb gateway.
   [DIMSE bridge conformance statement](docs/dimse-bridge-conformance-statement.md)

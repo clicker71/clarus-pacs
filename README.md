@@ -189,11 +189,11 @@ platform and build.
 - **`china_crypto`**: planned on customer demand (SM3
   content-addressing).
 
-**Validated deployments:** bare metal (Windows, Linux x64), Raspberry
-Pi 5 (ARM64, Cortex-A76), and VM — one static binary per platform,
-from a server-grade NVMe box down to an embedded board. Other ARM64
-Linux targets (Baikal-M / Baikal-S included) are expected to run the
-same ARM64 build; only Raspberry Pi 5 is validated today.
+**Validated deployments:** bare metal (Windows, Linux x64), Docker,
+Raspberry Pi 5 (ARM64, Cortex-A76), and VM — one static binary per
+platform, from a server-grade NVMe box down to an embedded board.
+Other ARM64 Linux targets (Baikal-M / Baikal-S included) are expected
+to run the same ARM64 build; only Raspberry Pi 5 is validated today.
 
 **Terminal velocity for your platform.** To achieve maximum throughput,
 use server-grade NVMe with power-loss protection (PLP) and build with

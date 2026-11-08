@@ -7,8 +7,10 @@
 Clarus is a standalone DICOMweb archive (QIDO-RS, WADO-RS, STOW-RS,
 UPS-RS, Storage Commitment, Worklist (MWL), MPPS). It conforms to
 PS3.18 2026d and implements IHE AIW-I Rev 1.1, with conformance
-statements per PS3.2. It ships as static binaries with no SQL database,
-no JVM, and no async runtime in the core.[^1]
+statements per PS3.2. The core — `clarus` and `clinfer` — ships as
+static binaries with no SQL database, no JVM, and no async runtime in
+the core.[^1] `clbridge` is a Python sidecar: packaged as a
+self-contained executable on Windows, a plain script on Linux.
 
 ![Clarus architecture diagram](images/diagram.png)
 
@@ -159,7 +161,9 @@ append-only, never rewritten.
 
 ## Deployment
 
-Static binaries, zero runtime dependencies.
+Static binaries for the core (`clarus`, `clinfer`). `clbridge` is a
+Python sidecar — self-contained on Windows, a plain script on Linux
+(requires Python 3).
 
 A few megabytes to a few tens of megabytes of RAM, depending on
 platform and build.

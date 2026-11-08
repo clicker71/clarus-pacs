@@ -175,6 +175,11 @@ Static binaries for the core (`clarus`, `clinfer`). `clbridge` is a
 Python sidecar — self-contained on Windows, a plain script on Linux
 (requires Python 3).
 
+Every component exposes `GET /health`, Prometheus-style `/metrics`, and
+`/version` (clarus adds `/health/status`, clinfer adds `/processors`).
+There is no bundled dashboard: point Prometheus/Grafana at these
+endpoints.
+
 A few megabytes to a few tens of megabytes of RAM, depending on
 platform and build.
 

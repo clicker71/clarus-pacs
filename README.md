@@ -212,6 +212,16 @@ use server-grade NVMe with power-loss protection (PLP) and build with
 offers (BLAKE3 already auto-selects AVX2/AVX-512/NEON at runtime; the
 flag extends that to the rest of the code).
 
+## Documentation
+
+- [DICOMweb conformance statement](docs/dicomweb-conformance-statement.md)
+- [DIMSE bridge conformance statement](docs/dimse-bridge-conformance-statement.md)
+- [IHE AIW-I conformance statement](docs/aiw-i-conformance-statement.md)
+- [Production deployment guide](docs/production-setup.md)
+- [Admin API](docs/admin-api.md)
+- [Audit log format](docs/audit-log-format.md)
+- [Unsafe surface audit](docs/unsafe-audit.md)
+
 ## Status & License
 
 **Status:** Closed preview. Source opens under LGPL-3.0 once the

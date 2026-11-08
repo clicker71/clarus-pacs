@@ -28,7 +28,7 @@ transfer syntaxes and viewer thumbnails, and it carries
 - Extract the archive to any directory.
 - Run the binaries directly — zero configuration required. Point a
   browser at the server's `/` — an inline mini-viewer (about 30 KB)
-  answers in milliseconds, a visual ping that the archive is up.
+  answers in milliseconds, a visual ping that the archive is up.[^2]
 
 For system services, NVMe PLP storage tuning, and reverse-proxy setup,
 see the [Production Deployment Guide](docs/production-setup.md). To
@@ -241,3 +241,8 @@ affiliated with or endorsed by NEMA or IHE.
 [^1]: The optional `s3` build pulls `tokio` inside `reqwest` for
     cold-tier fallback; the core and default builds have no async
     runtime.
+
+[^2]: The viewer page at `/` is reachable from anywhere, but its data
+    requests (the patient registry, which is the viewer's entry point)
+    are local-only by default: from another machine they answer 403.
+    See `admin_cidrs` in `clarus.conf`.

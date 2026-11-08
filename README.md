@@ -109,6 +109,10 @@ Sidecars communicate with the core over standard protocols. They are
 not plugins: no shared memory, no linked code. Replace, restart, or
 scale them independently.
 
+**Scale-out shape:** N bridges, one Clarus core, one shared CAS. The
+bridge side scales with the number of bridges — the bridge is stateless
+and deployable one per modality — and the shared STOW path is the cap.
+
 ## Verifiable Storage Commitment
 
 Clarus uses Content-Addressed Storage (CAS) to eliminate database

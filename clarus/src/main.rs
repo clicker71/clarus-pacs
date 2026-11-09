@@ -295,7 +295,7 @@ fn is_process_alive_impl(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn is_process_alive_impl(pid: u32) -> bool {
-    crate::ffi::process_exists(pid)
+    clarus_server::ffi::process_exists(pid)
 }
 
 #[cfg(not(any(windows, unix)))]

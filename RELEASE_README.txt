@@ -42,13 +42,7 @@ with the transcode feature (full DICOMweb conformance on compressed transfer
 syntaxes and viewer thumbnails).
 
 
-BASE vs FULL
-------------
-base (3.8 MB) — SQLite storage, uncompressed DICOM only.
-full (6+ MB)  — + JPEG2000 codec, + CJK charset support (Chinese/Japanese/Korean).
-
-
 MORE INFO
 ---------
-Full documentation: https://github.com/clarus-pacs/clarus
-License: LGPLv3
+Full documentation: https://github.com/clicker71/clarus-pacs
+License: LGPL-3.0

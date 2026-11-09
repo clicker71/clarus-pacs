@@ -32,6 +32,8 @@ transfer syntaxes and viewer thumbnails, and it carries
 - Run the binaries directly — zero configuration required. Point a
   browser at the server's `/` — an inline mini-viewer (about 30 KB)
   answers in milliseconds, a visual ping that the archive is up.[^2]
+- Or run the container (no download):
+  `docker run -p 8024:8024 ghcr.io/clicker71/clarus-pacs/clarus:0.3.0-beta`
 
 For system services, NVMe PLP storage tuning, and reverse-proxy setup,
 see the [Production Deployment Guide](docs/production-setup.md). To

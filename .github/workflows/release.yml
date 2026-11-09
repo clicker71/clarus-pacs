@@ -140,8 +140,7 @@ jobs:
           ENTRYPOINT ["/clarus", "--config", "/clarus.conf"]
           EOF
           TAG="${IMG_TAG#v}"
-          docker build -t ghcr.io/clicker71/clarus-pacs/clarus:"${TAG}" -f ctx/Dockerfile.clarus ctx
-          docker push ghcr.io/clicker71/clarus-pacs/clarus:"${TAG}"
+          docker buildx build --provenance=false --push -t ghcr.io/clicker71/clarus-pacs/clarus:"${TAG}" -f ctx/Dockerfile.clarus ctx
 
       - name: Build & push clbridge (python:slim)
         run: |
@@ -154,8 +153,7 @@ jobs:
           ENTRYPOINT ["python", "clbridge.py"]
           EOF
           TAG="${IMG_TAG#v}"
-          docker build -t ghcr.io/clicker71/clarus-pacs/clbridge:"${TAG}" -f ctx/Dockerfile.clbridge ctx
-          docker push ghcr.io/clicker71/clarus-pacs/clbridge:"${TAG}"
+          docker buildx build --provenance=false --push -t ghcr.io/clicker71/clarus-pacs/clbridge:"${TAG}" -f ctx/Dockerfile.clbridge ctx
 
   release:
     name: Publish GitHub Release

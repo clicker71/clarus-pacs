@@ -27,7 +27,7 @@ transcode` — it provides full DICOMweb conformance on compressed
 transfer syntaxes and viewer thumbnails, and it carries
 [additional risks](docs/production-setup.md#transcode-build).
 
-- Download the release archive for your platform from the Releases page.
+- Download the [release archive](https://github.com/clicker71/clarus-pacs/releases) for your platform from the Releases page.
 - Extract the archive to any directory.
 - Run the binaries directly — zero configuration required. Point a
   browser at the server's `/` — an inline mini-viewer (about 30 KB)

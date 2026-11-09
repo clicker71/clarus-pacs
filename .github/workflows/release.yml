@@ -1,0 +1,173 @@
+name: Release
+
+# Runs in the PUBLIC repo, triggered by the mirrored release tag. Builds the
+# shipped artifacts (clarus + clinfer + clbridge) with the transcode feature
+# and publishes them as a GitHub Release here.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  VERSION: ${{ github.ref_name }}
+
+jobs:
+  build-linux:
+    name: Linux (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build clarus (transcode) + clinfer
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build --target x86_64-unknown-linux-musl --release --features transcode
+          cargo build --target x86_64-unknown-linux-musl --release -p clinfer
+      - name: Bundle bridge
+        run: |
+          cd clbridge
+          python3 bundle.py "${VERSION#v}" clbridge.py
+      - name: Package
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/clarus
+          strip target/x86_64-unknown-linux-musl/release/clinfer
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/clarus dist/clarus
+          cp target/x86_64-unknown-linux-musl/release/clinfer dist/clinfer
+          cp clbridge/clbridge.py clbridge/clbridge.conf \
+             clbridge/sop_classes.yaml clbridge/printers.yaml \
+             clarus.conf RELEASE_README.txt dist/
+          tar czf clarus-linux-amd64.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clarus-linux-amd64
+          path: clarus-linux-amd64.tar.gz
+
+  build-windows:
+    name: Windows (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build clarus (transcode) + clinfer
+        run: |
+          cargo build --release --features transcode
+          cargo build --release -p clinfer
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller & bridge deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pynetdicom pydicom requests prometheus_client
+      - name: Bundle bridge + build clbridge.exe
+        shell: pwsh
+        run: |
+          cd clbridge
+          python bundle.py "$env:VERSION.TrimStart('v')" clbridge.py
+          pyinstaller --onefile --console `
+            --hidden-import pynetdicom `
+            --hidden-import pydicom `
+            --hidden-import requests `
+            --name clbridge clbridge.py
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/clarus.exe dist/clarus.exe
+          Copy-Item target/release/clinfer.exe dist/clinfer.exe
+          Copy-Item clbridge/dist/clbridge.exe dist/clbridge.exe
+          Copy-Item clbridge/clbridge.py, clbridge/clbridge.conf, `
+            clbridge/sop_classes.yaml, clbridge/printers.yaml, `
+            clarus.conf, RELEASE_README.txt dist/
+          Compress-Archive -Path dist/* -DestinationPath clarus-windows-amd64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clarus-windows-amd64
+          path: clarus-windows-amd64.zip
+
+  docker:
+    name: Docker images (ghcr.io)
+    runs-on: ubuntu-latest
+    needs: [build-linux]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMG_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: clarus-linux-amd64
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract package + use Docker config
+        run: |
+          mkdir -p ctx
+          tar xzf clarus-linux-amd64.tar.gz -C ctx
+          # The container config (storage /data, admin_cidrs for the bridge)
+          # replaces the bare-metal clarus.conf the tarball ships.
+          cp docker/clarus.conf ctx/clarus.conf
+
+      - name: Build & push clarus (scratch)
+        run: |
+          cat > ctx/Dockerfile.clarus <<'EOF'
+          FROM scratch
+          COPY clarus /clarus
+          COPY clarus.conf /clarus.conf
+          VOLUME ["/data"]
+          EXPOSE 8024
+          ENTRYPOINT ["/clarus", "--config", "/clarus.conf"]
+          EOF
+          TAG="${IMG_TAG#v}"
+          docker build -t ghcr.io/clicker71/clarus-pacs/clarus:"${TAG}" -f ctx/Dockerfile.clarus ctx
+          docker push ghcr.io/clicker71/clarus-pacs/clarus:"${TAG}"
+
+      - name: Build & push clbridge (python:slim)
+        run: |
+          cat > ctx/Dockerfile.clbridge <<'EOF'
+          FROM python:3.12-slim
+          RUN pip install --no-cache-dir pynetdicom pydicom requests prometheus_client
+          COPY clbridge.py clbridge.conf sop_classes.yaml printers.yaml /app/
+          WORKDIR /app
+          EXPOSE 8104 8105
+          ENTRYPOINT ["python", "clbridge.py"]
+          EOF
+          TAG="${IMG_TAG#v}"
+          docker build -t ghcr.io/clicker71/clarus-pacs/clbridge:"${TAG}" -f ctx/Dockerfile.clbridge ctx
+          docker push ghcr.io/clicker71/clarus-pacs/clbridge:"${TAG}"
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-windows]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/clarus-linux-amd64/clarus-linux-amd64.tar.gz
+            artifacts/clarus-windows-amd64/clarus-windows-amd64.zip

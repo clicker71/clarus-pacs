@@ -1,0 +1,8 @@
+# Pin the Clarus toolchain to the version every gate is certified against.
+#
+# Channel is `stable` with NO extra components: the workspace only needs the
+# default rustc/cargo/rust-std set. Pinning here (rather than stamping the
+# version into test output) means a machine with a newer stable refuses to
+# build until the pin is reviewed and bumped.
+[toolchain]
+channel = "1.97.0"

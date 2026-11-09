@@ -1,0 +1,8 @@
+# Runtime dependencies for the Clarus DIMSE bridge (clbridge).
+# End users who run the bundled clbridge.py need exactly these.
+# Install with:  pip install -r clbridge/requirements.txt
+pynetdicom==3.0.4
+pydicom==3.0.2
+requests==2.34.2
+httpx==0.28.1
+prometheus_client==0.25.0

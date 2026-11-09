@@ -1,0 +1,491 @@
+# clinfer.conf.example.en - reference configuration.
+#
+# Copy this file to clinfer.conf next to the clinfer binary and edit per
+# site. This is the NORMATIVE English version; a Russian translation
+# with IDENTICAL YAML lives in clinfer.conf.example.ru.
+#
+# The file must be UTF-8 WITHOUT a BOM: Notepad's "UTF-8" and
+# PowerShell's `Set-Content -Encoding utf8` both write a BOM, and a BOM
+# is a load error.
+#
+# clinfer is a DICOMweb sidecar: it claims UPS workitems, runs models and
+# pushes the results BACK to the PACS as ordinary DICOM objects.
+
+server:
+  # The DICOMweb origin of the PACS (UPS/QIDO/WADO/STOW target).
+  base_url: "http://127.0.0.1:8024/dicomweb"
+
+  # Actor name stamped via the X-Authenticated-User proxy header (not an
+  # AE title - clinfer is pure DICOMweb, no DIMSE). The server logs and
+  # audits actions under this name.
+  identity_user: "clinfer"
+
+  # This sidecar's operational listener: /health, /metrics, /version and
+  # the /processors menu. Loopback only by default, and a WILDCARD bind is
+  # refused at startup. Nothing inbound is required for work to arrive -
+  # the sidecar opens the WebSocket Notification Connection itself - so
+  # this is purely the observability surface. In production TLS is nginx
+  # in front, same as Clarus.
+  listen: "127.0.0.1:8124"                # the default
+
+  # Peers allowed to call the operational endpoints above. The origin and
+  # a local supervisor are on the loopback address, so it is listed
+  # explicitly: an unlisted peer is refused, and an empty list is not
+  # "trust everyone". Nothing pushes workitems any more.
+  trusted_proxies: ["127.0.0.1"]
+
+  # Strict identity mode: a trusted peer WITHOUT the X-Authenticated-User
+  # header gets 502. Production choice: true; the shipped default is the
+  # soft mode (false + WARN). With true, trusted_proxies must be non-empty.
+  require_proxy_identity: false           # the default
+
+  # Station identity: THIS performer's own AE Title and human-readable
+  # station name. AIW-I names the station in three places, and all three
+  # are this ONE value:
+  #   - (0040,0001) Scheduled Station AE Title, sent as a matching key on
+  #     every UPS-RS search, so the origin returns the work offered to this
+  #     station instead of the whole queue (AIW-I 4.81.4.1.2.2);
+  #   - (0040,4025) Scheduled Station Name Code Sequence Code Value, the
+  #     assignment attribute a claim compares against (4.82.4.1.1);
+  #   - (0040,4028) Performed Station Name Code Sequence, written on the
+  #     update that closes the step (4.84.4.1.2.1).
+  #
+  # It is NOT an instance identity: every sidecar serving one station
+  # carries the same title, because the origin names the station, not the
+  # process. Set it to the AE Title the Task Manager knows this performer
+  # by; leave it absent and it is CLINFER.
+  #
+  # It is also sent as the optional `requester` query parameter on every
+  # Change State request (PS3.18 11.7 Table 11.7.2.1-1), the Requesting AE
+  # of the events this sidecar originates.
+  station_aet: "CLINFER"                  # the default
+
+  # The Code Meaning of (0040,4028) - what an operator reads in the
+  # archive next to the result. Defaults to station_aet when absent.
+  station_name: "Inference station"
+
+  # How often to SEARCH the worklist while the notification channel is
+  # unavailable, in seconds. Default 2; 0 disables it.
+  #
+  # This knob exists for origins that do NOT service the notification
+  # channel - an origin that refuses the Subscribe transaction and answers
+  # 404 to the WebSocket handshake (dcm4chee-arc behaves this way when the
+  # UPS-RS push channel is not enabled). With no channel there is no push,
+  # so without this key a workitem created AFTER startup would stay
+  # invisible until the sidecar restarted.
+  #
+  # An origin that DOES have the channel - Clarus included - pushes Event
+  # Reports over it, so the channel is the delivery path and this key is
+  # irrelevant there: leave it at the default (or set 0) and nothing
+  # changes except that no redundant searches are made while connected.
+  # The search only ever runs while the channel is DOWN; a working channel
+  # is never slowed down by this setting.
+  #
+  # The value is a fallback interval, not a poll loop for a healthy
+  # deployment: every search is a worklist query, and the work it finds is
+  # claimed through the same single worker either way - a poll never
+  # competes for the claim, it only makes the work visible sooner.
+  poll_interval_secs: 2                   # the default; 0 disables
+
+engine:
+  # Where work directories and the result cache live.
+  cache_dir: "./cache"
+
+  # HOW MANY MODEL PROCESSES MAY RUN AT THE SAME TIME. Not a thread count:
+  # one thread per model already exists, and threads are not the scarce
+  # resource - the model processes are. Two models running at once cost the
+  # RAM of two models (hundreds of MB each on a real one) and put two
+  # concurrent requests on the origin, which is what this key limits.
+  #
+  # Absent (the default) = every model that declares a script may run at
+  # once. That is the natural reading of a configuration that declared
+  # several, and with ONE model it is exactly the serial behaviour this
+  # sidecar has always had - the knob then does nothing, and that is fine.
+  #
+  # WHEN TO LOWER IT:
+  #   - 3+ models on a host whose RAM is tighter than the models want;
+  #   - an origin that starts answering 503 while several models are busy
+  #     (each running model is one caller, and the origin's own transcode
+  #     pool is what it is competing for);
+  #   - a first deployment of a new model, where one run at a time is the
+  #     conservative pilot.
+  # WHEN NOT TO TOUCH IT: one or two models on a box with room for them.
+  #
+  # The value is a CEILING, never a target: a model whose queue is empty
+  # uses nothing, and this key never starts work. Setting it ABOVE the
+  # number of models with a script is capped to that number rather than
+  # refused (0 is refused: it would mean a sidecar that claims work and
+  # never runs it).
+  workers: 2                              # default: one per model with a script
+
+# --------------------------------------------------------------------
+# MODELS: every model is an EXTERNAL PROCESSOR (the ABI path).
+#
+# clinfer carries NO inference engine of its own. A model is declared by
+# the `script` key alone - there is no `kind`, because there is nothing
+# else to be. clinfer writes the study's frames into a work directory,
+# runs the program over it, reads the one strict result.json it writes
+# back, and encodes the derived DICOM objects ITSELF. The processor never
+# sees a DICOM object and needs no DICOM library.
+#
+#   <interpreter> <script> <workdir>
+#
+# The full contract is clinfer/abi/README.md; DERIVED-clahe.py,
+# PR-openvino-detect.py, SR-llm.py, SEG-threshold.py, RTSTRUCT-contours.py,
+# SR-DX-torchxrayvision-regions.py and STL-mesh.py beside it are runnable examples. A site
+# copies one of them and edits the model's own constants (paths, sizes,
+# endpoint URL) in its own copy.
+#
+# The processor is an ORDINARY PROGRAM: it can be run and debugged by
+# hand, without clinfer, from the work directory the audit line names.
+# Scripts are operator-trusted configuration - clinfer does not sandbox
+# them.
+#
+# The child environment is CLEARED (PATH + PYTHONUNBUFFERED only), so a
+# site's configuration for a script - model paths, an endpoint URL, a
+# key - goes either into the script's own copy or into a site wrapper
+# script used as the interpreter:
+#
+#     #!/bin/bash
+#     export SR_LLM_MODEL="smolvlm"
+#     exec /opt/clinfer/venv/bin/python "$@"
+#
+# timeout_secs is the budget of one run; on expiry the WHOLE process
+# tree is killed (a script using multiprocessing must not orphan its
+# workers). There is no retry.
+# On Linux the whole tree is killed as one process GROUP, so a worker
+# pool dies with its script. On Windows the tree-kill walks the parent's
+# recorded children, and a helper that detached itself can survive the
+# timeout. For a model script that spawns helpers it must supervise
+# (multiprocessing, dataloaders), a LINUX deployment is strongly
+# recommended.
+#
+# max_result_bytes is the ceiling on the result.json this model may write,
+# in bytes; `k` and `m` suffixes are accepted (64m, 512m). It is PER MODEL
+# because the size is a property of what the model produces: a detector
+# writes kilobytes while an outliner writes megabytes, and one number for
+# both is a number that is wrong for one of them. Default 64m, which a box
+# list or a report never approaches.
+#
+# A STRUCTURE SET grows with the traced polygon count (three coordinates
+# per point), so a MULTI-FRAME VOLUMETRIC study needs more: measured live
+# CT output is about 0.5 MiB per frame, and a 53-frame study produced
+# 26.8 MiB. For a study with several hundred frames set a larger budget,
+# e.g. 512m on the model that outlines it. The document is the model's own
+# output on this machine, so the limit bounds a runaway script rather than
+# an untrusted input - and the encoded object has its own per-contour
+# ceiling that no value here can lift.
+#
+# A result over the budget is refused as "produced no result" in the
+# workitem; the log then carries the reason in full, naming this key:
+#
+#   result.json is N bytes, over the model's max_result_bytes limit of M
+#
+# so the line itself says which model to raise. Valid range: 1 byte ..
+# 1 GiB. 0 is refused: remove the model instead.
+
+models:
+  # Detection: boxes -> result.kind pr (GSPS overlay, Weasis renders it).
+  # The example script is PR-openvino-detect.py; a site points its own copy
+  # at its own exported IR file and labels. Paths are RELATIVE to this
+  # file: a shipped pack works from any directory, on any OS.
+  detect-pr:
+    script: "scripts/PR-openvino-detect.py"
+    interpreter: "venv/bin/python"   # default: python3
+    timeout_secs: 300           # 5..1800, default 300
+    # max_result_bytes: 64m     # per model, 1..1g, default 64m
+
+  # Report: free text -> result.kind sr (Basic Text SR). The example
+  # script SR-llm.py calls an OpenAI-compatible endpoint ITSELF (its own
+  # URL, key and prompt - the network policy belongs where the script
+  # lives). The endpoint may be a local model server (llama-server,
+  # LocalAI, ollama) or a cloud one through a LOCAL nginx hop the site
+  # owns; check the site's data policy before enabling anything that
+  # leaves the machine.
+  #
+  # report-llm:
+  #   script: "/opt/clinfer/scripts/SR-llm.py"
+  #   interpreter: "/opt/clinfer/scripts/sr_llm_wrapper.sh"  # see above
+  #   timeout_secs: 300           # 5..1800
+
+  # Measurements: numbers + SCOORD outline regions -> result.kind
+  # measurements (Enhanced SR, TID 1500). Weasis shows the NUM values in
+  # the report and draws each SCOORD region on the image. SR-DX-torchxrayvision-regions.py
+  # is a DEMO-ONLY example: it runs torchxrayvision's PSPNet over a chest
+  # radiograph and writes each structure's coverage fraction as the NUM
+  # and the traced outline of the model's own mask as the region. The
+  # script's header carries the model card's disclaimer; the weights are
+  # NOT shipped - the site downloads them into its own venv (torch +
+  # torchxrayvision).
+  #
+  # measure-xrv:
+  #   script: "/opt/clinfer/scripts/SR-DX-torchxrayvision-regions.py"
+  #   interpreter: "/opt/site/venv/bin/python"
+  #   timeout_secs: 600
+
+  # Mask: pixel masks -> result.kind seg (DICOM SEG). SEG-threshold.py is
+  # the license-clean reference example. SEG-DX-chest.py is a DEMO-ONLY
+  # clinical model (ianpan/chest-x-ray-basic): its header carries the
+  # model card's disclaimer and its weights are NOT shipped - the site
+  # downloads the model itself, into its own venv.
+  #
+  # seg-demo:
+  #   script: "/opt/clinfer/scripts/SEG-threshold.py"
+  #   interpreter: "/opt/clinfer/venv/bin/python"
+  #   timeout_secs: 1800
+
+  # Jaw/head CT: a real CT model emitting BOTH seg and rtstruct from ONE
+  # pass (RTSTRUCT-CT-totalseg.py -> TotalSegmentator `craniofacial_structures`).
+  #
+  # Two things to get right BEFORE this rule goes live:
+  #
+  #   1. Give TotalSegmentator its OWN venv. It pulls torch, and the demo
+  #      venv in abi/requirements.txt is for the small examples.
+  #   2. PRE-DOWNLOAD THE WEIGHTS. The first run fetches ~2 GB into
+  #      ~/.totalsegmentator, which alone can exceed timeout_secs and
+  #      cancel a workitem for a reason that has nothing to do with the
+  #      study:
+  #          /opt/site/venv/bin/python -m \
+  #              totalsegmentator.bin.totalseg_download_weights
+  #      Offline machines copy that directory (the tool's README).
+  #
+  # timeout_secs is 1800 because the task runs at 0.5 mm and REFUSES
+  # --fast: there is no faster mode to fall back to. max_result_bytes is
+  # left at the 64 MiB default on purpose - the seg masks are workdir
+  # FILES, so that budget is spent on the RS contours only, and three
+  # organs at <=2000 points is an order of magnitude under it.
+  #
+  # totalseg:
+  #   script: "/opt/clinfer/scripts/RTSTRUCT-CT-totalseg.py"
+  #   interpreter: "/opt/site/venv/bin/python"
+  #   timeout_secs: 1800
+  #   # max_result_bytes: 64m     # the default; the masks are not in it
+
+  # Contours: ROI polygons -> result.kind rtstruct (RT Structure Set),
+  # drawn on the study's frames. RTSTRUCT-contours.py is the
+  # license-clean reference example: no model, no weights - it
+  # thresholds the RAW pixels of an axial CT (bone and teeth windows),
+  # traces the outer contours and emits one rtstruct block. Edit the HU
+  # windows in YOUR copy for your own data.
+  #
+  # rtstruct-demo:
+  #   script: "/opt/clinfer/scripts/RTSTRUCT-contours.py"
+  #   interpreter: "/opt/clinfer/venv/bin/python"
+  #   timeout_secs: 1800
+
+  # A new image (denoise/super-resolution) -> result.kind derived; the
+  # source modality is kept. Example: DERIVED-clahe.py.
+  #
+  # clahe-demo:
+  #   script: "/opt/clinfer/scripts/DERIVED-clahe.py"
+  #   interpreter: "/opt/clinfer/venv/bin/python"
+
+  # A 3D surface from a VOLUMETRIC study (CT/MR: a flat photo cannot
+  # produce a surface) -> result.kind stl. Example: STL-mesh.py.
+  #
+  # mesh-demo:
+  #   script: "/opt/clinfer/scripts/STL-mesh.py"
+  #   interpreter: "/opt/clinfer/venv/bin/python"
+  #   timeout_secs: 1800
+
+rules:                            # study type -> model; EVERY matching rule runs
+  # S1: one rule -> one model. The FIRST key is the workitem CODE:
+  #   code - (0040,4018) Scheduled Workitem Code Sequence Value, upper-cased.
+  #     The task states its own intent, so a rule constrained by code needs
+  #     NO study fetch at all. An absent `code` key constrains nothing, which
+  #     is what every rule meant before the key existed - existing rules keep
+  #     working unchanged.
+  #
+  #     The STOW trigger writes the code from the study's modality through
+  #     the server's [ups.workitem_code] table (a DX study gets CXR-AI, a CT
+  #     study CT-ORGAN-SEG, anything else the configured fallback).
+  #     A workitem created by hand carries whatever code its requester sent.
+  #
+  # The SECOND key is the modality, and the remaining keys are optional -
+  # ANY one of them may match:
+  #   study_description_contains (0008,1030); code_meaning_contains
+  #   (0008,0104 inside sequences); body_part_contains (0018,0015);
+  #   tag - bind ANY (group,element) to patterns, keys UNQUOTED:
+  #       tag: { 00181030: ["*chest*"] }
+
+  # The result object a rule writes is decided by the SCRIPT's own
+  # result.json (it may carry any combination of
+  # pr/sr/measurements/seg/rtstruct/derived/stl blocks). The rule's
+  # `result` carries the METADATA of what clinfer
+  # encodes: the kind (for the encoder and the menu), the series
+  # description and the profile version.
+  - match:
+      modality: [DX, CR]
+      study_description_contains: ["*chest*", "*thorax*"]
+      code_meaning_contains: ["*thorax*", "*chest*"]
+    model: "detect-pr"
+    result:
+      kind: pr                    # GSPS overlay (Weasis renders it)
+      color: "#FF3B30"            # default color for ALL boxes
+      # Per-class colors (pr only, optional): one GSPS layer per class,
+      # each with its own color; `color:` is required together with
+      # `colors:`; a class not listed gets `color`.
+      # colors: { Nodule: "#FF3B30", Mass: "#007AFF" }
+      profile_version: 1          # cache/invalidation key
+      # Bump when the script's model or encoder params change; invalidates
+      # the sidecar cache only - stored PRs are never deleted here
+      # (admin API). Label geometry (pr only, optional; left < right):
+      # label:
+      #   anchor: tl               # tl = box top-left, center = center
+      #   offset_y_px: -110        # negative = above the box
+      #   offset_x_left_px: -200   # label box left edge delta
+      #   offset_x_right_px: 80    # label box right edge delta
+      # series_description: "..."  # optional (0008,103E)
+
+  # ------------------------------------------------------------------
+  # EXAMPLES (all commented). Rules are read TOP TO BOTTOM: EVERY
+  # matching rule runs, in FILE order, for ANY region (brain, knee,
+  # lungs) and any combination of blocks (mask/boxes/report - any of
+  # them may be absent). If nothing matches, default_rule: cancel at
+  # the bottom applies. Rule order = file order.
+  #
+  # The shape of a rule:
+  # match:
+  #   modality: [DX, CR]           # required: the modality list
+  #   study_description_contains: ["*chest*", "*thorax*"]   # optional
+  #   code_meaning_contains: ["*thorax*", "*chest*"]        # optional
+  #   body_part_contains: ["*chest*"]                       # optional
+  #   tag: { 00181030: ["*chest*"] }                        # optional
+  # model: "detect-pr"             # required
+  # result:
+  #   kind: pr            # pr | sr | measurements | seg | rtstruct | derived | stl
+  #
+  # 1. REPORT (SR, Basic Text) - the script calls its endpoint itself:
+  # - match:
+  #     modality: [DX, CR]
+  #     study_description_contains: ["*chest*", "*thorax*"]
+  #   model: "report-llm"
+  #   result:
+  #     kind: sr
+  #     series_description: "LLM Findings"
+  #     profile_version: 1
+  #     sr:
+  #       title: "LLM Findings"
+  #       template_id: TID2000
+  #
+  # 2. MASK (SEG):
+  # - match:
+  #     modality: [DX, CR]
+  #     study_description_contains: ["*chest*", "*thorax*"]
+  #   model: "seg-demo"
+  #   result:
+  #     kind: seg
+  #     series_description: "AI Segmentation"
+  #     profile_version: 1
+  #
+  # 2b. JAW CT (RTSTRUCT). The `code` key is what makes this rule fire on
+  # the intended workitems ONLY: the server's [ups.workitem_code] table
+  # gives a CT study the code below, so this rule matches it without
+  # fetching the study to look at a description. A rule that keyed on
+  # modality alone would run the jaw model on every CT in the department.
+  #
+  # One run writes ONE object: RTSTRUCT-CT-totalseg.py's result.json
+  # carries an rtstruct block of traced contours, and `kind` names the
+  # encoder for it, so it must be `rtstruct`. The seg half was dropped
+  # from that script, and a rule asking for `kind: seg` would get nothing.
+  #
+  # - match:
+  #     code: [CT-ORGAN-SEG]
+  #     modality: [CT]
+  #   model: "totalseg"
+  #   result:
+  #     kind: rtstruct
+  #     series_description: "Jaw CT Segmentation"
+  #     profile_version: 1
+  #
+  # 3. DERIVED (a new DICOM image) - denoise / super-resolution:
+  # - match:
+  #     modality: [DX, CR]
+  #     study_description_contains: ["*chest*"]
+  #   model: "clahe-demo"
+  #   result:
+  #     kind: derived
+  #     series_description: "AI Denoised"
+  #     profile_version: 1
+  #
+  # 4. STL (Encapsulated STL) - a 3D surface from a VOLUMETRIC study
+  #    (CT/MR):
+  # - match:
+  #     modality: [CT, MR]
+  #     study_description_contains: ["*liver*"]
+  #   model: "mesh-demo"
+  #   result:
+  #     kind: stl
+  #     series_description: "AI Surface"
+  #     profile_version: 1
+  #
+  # 3b. CONTOURS (GSPS from traced outlines, no boxes). The script's
+  #     result.json carries a `pr` block whose `contours` list holds one
+  #     entry per traced structure: a label, the ring in `[column, row]`
+  #     source pixels with the first point repeated last, and an optional
+  #     1-based `frame`. There is no confidence: a mask edge has no score.
+  #     A contour is written as a closed POLYLINE, which is the only
+  #     outline form DICOM defines (PS3.3 C.18.6.1.2 does not list
+  #     POLYGON). One script may carry BOTH blocks - a `measurements`
+  #     block for the numbers and a `pr` block for the outlines - by
+  #     writing two rules over the same model, one per `kind`. A rule
+  #     stores EVERY block its script emits, so a script run under both
+  #     rules must read the workdir manifest's `profile_version` and emit
+  #     only the block the calling rule consumes - see SR-DX-torchxrayvision-regions.py.
+  # - match:
+  #     code: [CXR-AI]
+  #     modality: [DX, CR]
+  #   model: "measure-xrv"
+  #   result:
+  #     kind: pr
+  #     series_description: "xrv anatomy outlines"
+  #     profile_version: 3
+  #
+  # 5. MEASUREMENTS (Enhanced SR, TID 1500): NUM values. The
+  #    `measurements:` key names the series title and template; the
+  #    script's result.json carries the `measurements` block with the
+  #    values.
+  #    Geometry is NOT part of this block: an outline is an object drawn
+  #    over the image rather than a number, so it belongs to the GSPS
+  #    (see block 3, `kind: pr` with a `contours` key).
+  # - match:
+  #     code: [CXR-AI]
+  #     modality: [DX, CR]
+  #   model: "measure-xrv"
+  #   result:
+  #     kind: measurements
+  #     series_description: "xrv measurements"
+  #     profile_version: 1
+  #     measurements:
+  #       title: "xrv measurements"
+  #       template_id: TID1500
+  #
+  # 6. RTSTRUCT (RT Structure Set): ROI contours as patient-space
+  #    polygons, rendered on the study's frames. The script's result.json
+  #    carries the `rtstruct` block.
+  # - match:
+  #     modality: [CT]
+  #   model: "rtstruct-demo"
+  #   result:
+  #     kind: rtstruct
+  #     series_description: "AI Structures"
+  #     profile_version: 1
+  #
+  # The chain is universal for ANY region (brain, knee, lungs): every
+  # matching rule fires, in the ORDER WRITTEN IN THIS FILE. Any block
+  # may be absent: one, two, or all of them can match.
+
+  # What to do when NO rule matches:
+
+default_rule: cancel              # cancel | off (+ counter)
+
+# OPERATIONS:
+# SIGTERM/SIGINT stop gracefully (refuse new pushes, finish the held
+# workitem, exit 0); a second signal exits immediately. A PID file
+# `<config>.pid` prevents a second clinfer on the same config: a stale
+# one is overwritten, only a LIVE foreign pid is fatal. A KILLED process
+# (SIGKILL, power loss) can strand a workitem IN PROGRESS - no sidecar
+# can release it (no DICOMweb cancel server-side): the restarted clinfer
+# logs the conflict WITH THE WORKITEM UID. Operator action: reset that
+# workitem's state through the server's admin API. Prefer SIGTERM over
+# SIGKILL; schedule restarts outside working hours.

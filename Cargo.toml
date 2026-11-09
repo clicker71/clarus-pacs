@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+    # Products live at the repository top level; crates/ holds shared
+    # libraries only.
+    "clarus",
+    "cltranscode",
+    "clinfer",
+]
+default-members = [
+    "crates/clarus-core",
+    "crates/clarus-ports",
+    "crates/clarus-adapters",
+    "clarus",
+    # cltranscode excluded from the default build (owner 22.08) - standalone
+    # binary, built explicitly with `cargo build --release -p cltranscode`.
+    # clinfer is excluded for the same reason: a standalone sidecar binary,
+    # built explicitly with `cargo build --release -p clinfer`.
+]
+
+[workspace.package]
+version = "0.3.0-beta"
+edition = "2024"
+license = "LGPL-3.0-only"
+authors = ["Daniel Solgalov <daniel.solgalov@gmail.com>"]
+# Domain models (now part of clarus-adapters)
+# Ports layer
+# Adapters layer
+# Server layer
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+# Static no-alloc gate (tools/noalloc_gate.py): same as release but with the
+# symbol table kept, so llvm-objdump can resolve the hot-path functions. Only
+# used for the `just gate-noalloc` check; the shipped release binary stays
+# stripped (the ~1.9 MB pitch must not regress).
+# `debug = 1` is required on MSVC: the linker only emits a COFF symbol table
+# under /DEBUG, so `strip = false` alone leaves an empty symtab on Windows.
+[profile.gate]
+inherits = "release"
+strip = false
+debug = 1

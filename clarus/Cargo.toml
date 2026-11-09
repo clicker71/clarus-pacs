@@ -1,0 +1,127 @@
+[package]
+name = "clarus"
+description = "#pragma once — Defined once. Works everywhere. Ultra-compact DICOMweb PACS. Single binary. Zero runtime dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "clarus_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clarus"
+path = "src/main.rs"
+
+[dependencies]
+clarus-adapters = { path = "../crates/clarus-adapters" }
+clarus-ports = { path = "../crates/clarus-ports" }
+# The B-tree tier (idx/, journal, auth, stow
+# validation). Pure Rust, no new external deps beyond blake3 (already used by
+# clarus-adapters). The B-tree tier is the sole storage tier.
+clarus-core = { path = "../crates/clarus-core" }
+
+# HTTP server facade
+# the `http` crate was removed - status classification is the
+# u16 table in clarus-core::http_status. signal-hook/log remain.
+signal-hook = "0.3"
+log = "0.4"
+
+# Progress bars for recovery UI
+
+# BLAKE3 for the date index rows.
+blake3 = "1"
+
+# Date/time for cron schedule calculation (diet 22.08: sliced default-features
+# to `clock`+`std` - the server uses `Local::now`/`DateTime`/`Duration` only;
+# `oldtime`/`iana-time-zone`/`wasmbind` extras are dropped from the default graph).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Environment scrubbing (clear secrets from process memory) + mlock (Linux)
+libc = "0.2"
+
+# S3 client for recovery (reqwest + manual SigV4 - no SDK)
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+
+# ap101 capacity const-gates (0610): `ferrite-core` supplies the
+# `capacity_eq!` macro used at module scope to pin the config defaults
+# (config.rs DEFAULT_MAX_FRAME_BYTES / DEFAULT_MAX_FRAMES_PER_INSTANCE /
+# DEFAULT_MAX_MEGAPIXELS). A macro cannot be reached through the test-only
+# ferrite-testkit dev-dep, so this is a NORMAL dependency; ap101 is
+# first-party tooling (same copyright holder), locked to the same git rev as
+# the existing testkit pins.
+ferrite-core = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
+
+[features]
+
+# S3-compatible object storage - enables S3 recovery.
+s3 = ["clarus-adapters/s3", "reqwest"]
+# DICOMweb transcoding (P36) - propagated from clarus-adapters.
+# Includes JPEG 2000 + JPEG-LS codecs for on-the-fly DICOM transcoding
+# via standard ?transferSyntax= query parameter (PS3.18 Section 10.4.2).
+transcode = ["clarus-adapters/transcode"]
+# CJK charset decoding via encoding_rs - propagated from clarus-adapters.
+# Opt-in: the parser's charset tables are compiled only when this is on, so
+# without the line the decoding code is unreachable from this binary and the
+# flag cannot even be named on the command line.
+cjk-charsets = ["clarus-adapters/cjk-charsets"]
+# DICOM XML (PS3.19) is always-on - the typed writer is dependency-free
+# (no serde) and tested every run. Negotiation happens on Accept only.
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+# the tracing pipeline is absent from the release/prod dependency tree.
+# It remains available to test code only (dev-dependencies).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "local-time"] }
+tracing-appender = "0.2"
+
+# Performance benchmarks.
+# Criterion manages iteration counts and statistical analysis itself;
+# benchmark bodies must contain exactly ONE invocation of the measured work.
+criterion = "0.5"
+
+# Raw hash A/B (BLAKE3 vs software SHA-256) - dev-only, never linked
+# into the server binary (sha2 in prod is gated behind the `s3` feature).
+# No `asm` feature: the bench box (Xeon E5-2690 v4) has no SHA-NI, so
+# pure-software SHA-256 is the honest comparison on this hardware.
+sha2 = "0.10"
+
+# ap101 zero-heap gates: the A4 clog emit gate
+# (and future B6 hotpath gates). Same git source + rev as clarus-core;
+# dev-only, never linked into the server binary.
+ferrite-testkit = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
+
+# ap101 `zero_alloc!` compile-time backstop (0610 item 2). A proc-macro is
+# build-time only; dev-scoped so it never enters the release graph.
+ferrite-macros = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
+
+[[bench]]
+name = "cas_bench"
+harness = false
+
+[[bench]]
+name = "qido_bench"
+harness = false
+
+[[bench]]
+name = "wado_bench"
+harness = false
+
+[[bench]]
+name = "index_bench"
+harness = false
+
+[[bench]]
+name = "stow_bench"
+harness = false
+
+[[bench]]
+name = "manifest_bench"
+harness = false
+
+[[bench]]
+name = "hash_bench"
+harness = false

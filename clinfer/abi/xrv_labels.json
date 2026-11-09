@@ -1,0 +1,245 @@
+{
+  "_about": [
+    "xrv_labels.json - the mapping from torchxrayvision DenseNet's 18 output",
+    "channels to the SNOMED CT finding each channel means.",
+    "",
+    "xrv's DenseNet('densenet121-res224-all') emits 18 sigmoid values in a",
+    "FIXED channel order with no 'No Finding' class. This table names, for",
+    "each channel, the finding that channel predicts, so SR-DX-SCOORD-torchxrayvision.py can attach a",
+    "coded subject to every number instead of an opaque channel index.",
+    "",
+    "EVERY CODE HERE WAS CHECKED against a public terminology server, not",
+    "recalled. See 'source' on each row and the 'verification' block below.",
+    "The prompt that asked for this file named 44169009 as an example for",
+    "Atelectasis; that code is in fact 'Loss of sense of smell', which is why",
+    "no code in this file is taken from prose or from memory."
+  ],
+  "verification": {
+    "server": "https://tx.fhir.org/r4",
+    "operations": [
+      "ValueSet/$expand?url=http://snomed.info/sct?fhir_vs&filter=<term>",
+      "CodeSystem/$lookup?system=http://snomed.info/sct&code=<code>"
+    ],
+    "edition": "SNOMED CT International Edition",
+    "checked_on": "2026-09-25",
+    "server_reported_version": "http://snomed.info/sct/900000000000207008/version/20250201",
+    "note": [
+      "The HL7-run public terminology server was the only one of the obvious",
+      "candidates that answered. The others were unreachable on the day:",
+      "browser.ihtsdotools.org/snowstorm returned 410 Gone,",
+      "clinicaltables.nlm.nih.gov/api/snomedct/v3 returned 404, BioPortal",
+      "returned 403, VSAC returned 404. The 'version' above is what the",
+      "server itself reported for each $lookup."
+    ]
+  },
+  "scheme": "SCT",
+  "channel_order_from": "xrv.models.DenseNet(weights='densenet121-res224-all').pathologies",
+  "labels": [
+    {
+      "channel": 0,
+      "model_label": "Atelectasis",
+      "code": "46621007",
+      "scheme": "SCT",
+      "meaning": "Atelectasis",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 1,
+      "model_label": "Consolidation",
+      "code": "95436008",
+      "scheme": "SCT",
+      "meaning": "Lung consolidation",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 2,
+      "model_label": "Infiltration",
+      "code": "409609008",
+      "scheme": "SCT",
+      "meaning": "Radiologic infiltrate of lung",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 3,
+      "model_label": "Pneumothorax",
+      "code": "36118008",
+      "scheme": "SCT",
+      "meaning": "Pneumothorax",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 4,
+      "model_label": "Edema",
+      "code": "267038008",
+      "scheme": "SCT",
+      "meaning": "Edema",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 5,
+      "model_label": "Emphysema",
+      "code": "87433001",
+      "scheme": "SCT",
+      "meaning": "Pulmonary emphysema",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 6,
+      "model_label": "Fibrosis",
+      "code": "51615001",
+      "scheme": "SCT",
+      "meaning": "Fibrosis of lung",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 7,
+      "model_label": "Effusion",
+      "code": "60046008",
+      "scheme": "SCT",
+      "meaning": "Pleural effusion",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 8,
+      "model_label": "Pneumonia",
+      "code": "233604007",
+      "scheme": "SCT",
+      "meaning": "Pneumonia",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 9,
+      "model_label": "Pleural_Thickening",
+      "code": "73725006",
+      "scheme": "SCT",
+      "meaning": "Thickening of pleura",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 10,
+      "model_label": "Cardiomegaly",
+      "code": "8186001",
+      "scheme": "SCT",
+      "meaning": "Cardiomegaly",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 11,
+      "model_label": "Nodule",
+      "code": "786838002",
+      "scheme": "SCT",
+      "meaning": "Nodule of lung",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 12,
+      "model_label": "Mass",
+      "code": "309529002",
+      "scheme": "SCT",
+      "meaning": "Lung mass",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 13,
+      "model_label": "Hernia",
+      "code": "39839004",
+      "scheme": "SCT",
+      "meaning": "Diaphragmatic hernia",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": [
+        "xrv's 'Hernia' channel is the NIH ChestX-ray14 label for a",
+        "diaphragmatic hernia, which is what this concept names. The generic",
+        "term 'Hernia' surfaced only 'Hernia sac' (112640005) and 'Hernia",
+        "belt' (17306006), neither of which is a finding; the specific",
+        "concept is the correct one."
+      ]
+    },
+    {
+      "channel": 14,
+      "model_label": "Lung Lesion",
+      "code": "301232003",
+      "scheme": "SCT",
+      "meaning": "Lesion of lung",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 15,
+      "model_label": "Fracture",
+      "code": "125605004",
+      "scheme": "SCT",
+      "meaning": "Fracture of bone",
+      "match": "exact",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 16,
+      "model_label": "Lung Opacity",
+      "code": "1217294009",
+      "scheme": "SCT",
+      "meaning": "Lung Opacity",
+      "match": "nearest (related)",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": [
+        "SNOMED CT has no concept for 'opacity of lung' as such. The nearest",
+        "verified concept is 1217294009 'Ground glass opacity'. The other",
+        "candidate, 717978008 'Bilateral lung opacities on plain chest X-ray',",
+        "is worse: it asserts bilaterality and a modality. 'meaning' therefore",
+        "carries the model's OWN class name, and this row is marked as an",
+        "approximation so a reader is never told the concept IS the label."
+      ]
+    },
+    {
+      "channel": 17,
+      "model_label": "Enlarged Cardiomediastinum",
+      "code": "363646005",
+      "scheme": "SCT",
+      "meaning": "Enlarged Cardiomediastinum",
+      "match": "nearest (related)",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": [
+        "SNOMED CT has neither 'enlarged mediastinum' nor a combined",
+        "cardiomediastinal concept. The nearest verified concept is",
+        "363646005 'Widened mediastinum' (synonym 'Mediastinal widening').",
+        "'meaning' carries the model's own class name and the row is marked",
+        "as an approximation."
+      ]
+    }
+  ],
+  "backlog": [
+    {
+      "item": "Lung Opacity and Enlarged Cardiomediastinum are approximations",
+      "detail": [
+        "Both rows are marked 'nearest (related)' rather than 'exact'. If the",
+        "site needs a true concept, the candidates are: submit a request to",
+        "SNOMED International for the missing concepts, use a radiology",
+        "extension (e.g. RadLex Playbook or the DICOM CID 3604/3605 context",
+        "groups) instead of the international edition, or keep the value",
+        "uncoded and let the meaning carry the label. Not resolved here"
+      ]
+    },
+    {
+      "item": "RadLex / DICOM CID alternative for chest findings",
+      "detail": [
+        "The DICOM context groups for chest findings and anatomy would let a",
+        "reader resolve a concept without a SNOMED licence. Not investigated",
+        "for this task; the prompt asked for SNOMED CT and recorded the",
+        "source, which this file does."
+      ]
+    }
+  ]
+}

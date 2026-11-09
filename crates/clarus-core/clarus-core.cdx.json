@@ -1,0 +1,443 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.3",
+  "version": 1,
+  "serialNumber": "urn:uuid:b3b71db2-8c1b-4f91-9d44-db2a2ce327b1",
+  "metadata": {
+    "timestamp": "2026-10-26T14:46:05.426819600Z",
+    "tools": [
+      {
+        "vendor": "CycloneDX",
+        "name": "cargo-cyclonedx",
+        "version": "0.5.9"
+      }
+    ],
+    "authors": [
+      {
+        "name": "Daniel Solgalov",
+        "email": "daniel.solgalov@gmail.com"
+      }
+    ],
+    "component": {
+      "type": "library",
+      "bom-ref": "path+file:///D:/Clarus/crates/clarus-core#0.3.0-alpha",
+      "author": "Daniel Solgalov <daniel.solgalov@gmail.com>",
+      "name": "clarus-core",
+      "version": "0.3.0-alpha",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "LGPL-3.0-only"
+        }
+      ],
+      "purl": "pkg:cargo/clarus-core@0.3.0-alpha?download_url=file://.",
+      "components": [
+        {
+          "type": "library",
+          "bom-ref": "path+file:///D:/Clarus/crates/clarus-core#0.3.0-alpha bin-target-0",
+          "name": "clarus_core",
+          "version": "0.3.0-alpha",
+          "purl": "pkg:cargo/clarus-core@0.3.0-alpha?download_url=file://.#src/lib.rs"
+        }
+      ]
+    },
+    "properties": [
+      {
+        "name": "cdx:rustc:sbom:target:triple",
+        "value": "x86_64-pc-windows-msvc"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#arrayvec@0.7.8",
+      "author": "bluss",
+      "name": "arrayvec",
+      "version": "0.7.8",
+      "description": "A vector with fixed capacity, backed by an array (it can be stored on the stack too). Implements fixed capacity ArrayVec and ArrayString.",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/arrayvec@0.7.8",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/arrayvec/"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/bluss/arrayvec"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#blake3@1.8.7",
+      "author": "Jack O'Connor <oconnor663@gmail.com>, Samuel Neves",
+      "name": "blake3",
+      "version": "1.8.7",
+      "description": "the BLAKE3 hash function",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/blake3@1.8.7",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/blake3"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/BLAKE3-team/BLAKE3"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.66",
+      "author": "Alex Crichton <alex@alexcrichton.com>",
+      "name": "cc",
+      "version": "1.2.66",
+      "description": "A build-time dependency for Cargo build scripts to assist in invoking the native C compiler to compile native C code into a static archive to be linked into Rust code. ",
+      "scope": "excluded",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f5d6cac793997bd970000024b2934968efe83b382de4fdcf4fcb46b6ee4ad996"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/cc@1.2.66",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/cc"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/rust-lang/cc-rs"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cc-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#cfg-if@1.0.4",
+      "author": "Alex Crichton <alex@alexcrichton.com>",
+      "name": "cfg-if",
+      "version": "1.0.4",
+      "description": "A macro to ergonomically define an item depending on a large number of #[cfg] parameters. Structured like an if-else chain, the first matching branch is the item that gets emitted. ",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/cfg-if@1.0.4",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cfg-if"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#constant_time_eq@0.4.2",
+      "author": "Cesar Eduardo Barros <cesarb@cesarb.eti.br>",
+      "name": "constant_time_eq",
+      "version": "0.4.2",
+      "description": "Compares two equal-sized byte strings in constant time.",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "CC0-1.0 OR MIT-0 OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/constant_time_eq@0.4.2",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/constant_time_eq"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/cesarb/constant_time_eq"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.0",
+      "author": "RustCrypto Developers",
+      "name": "cpufeatures",
+      "version": "0.3.0",
+      "description": "Lightweight runtime CPU feature detection for aarch64, loongarch64, and x86/x86_64 targets, with no_std support and support for mobile targets including Android and iOS ",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/cpufeatures@0.3.0",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/cpufeatures"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#find-msvc-tools@0.1.9",
+      "name": "find-msvc-tools",
+      "version": "0.1.9",
+      "description": "Find windows-specific tools, read MSVC versions from the registry and from COM interfaces",
+      "scope": "excluded",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/find-msvc-tools@0.1.9",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/find-msvc-tools"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cc-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.189",
+      "name": "libc",
+      "version": "0.2.189",
+      "description": "Raw FFI bindings to platform libraries like libc.",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/libc@0.2.189",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3",
+      "author": "Andrew Gallant <jamslam@gmail.com>, bluss",
+      "name": "memchr",
+      "version": "2.8.3",
+      "description": "Provides extremely fast (uses SIMD on x86_64, aarch64 and wasm32) routines for 1, 2 or 3 byte search and single substring search. ",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/memchr@2.8.3",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/memchr/"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/BurntSushi/memchr"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/memchr"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#memmap2@0.9.11",
+      "author": "Dan Burkert <dan@danburkert.com>, Yevhenii Reizner <razrfalcon@gmail.com>, The Contributors",
+      "name": "memmap2",
+      "version": "0.9.11",
+      "description": "Cross-platform Rust API for memory-mapped file IO",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/memmap2@0.9.11",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/memmap2"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/RazrFalcon/memmap2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#shlex@2.0.1",
+      "author": "comex <comexk@gmail.com>, Fenhl <fenhl@fenhl.net>, Adrian Taylor <adetaylor@chromium.org>, Alex Touchet <alextouchet@outlook.com>, Daniel Parks <dp+git@oxidized.org>, Garrett Berg <googberg@gmail.com>",
+      "name": "shlex",
+      "version": "2.0.1",
+      "description": "Split a string into shell words, like Python's shlex.",
+      "scope": "excluded",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/shlex@2.0.1",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/comex/rust-shlex"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "path+file:///D:/Clarus/crates/clarus-core#0.3.0-alpha",
+      "dependsOn": [
+        "registry+https://github.com/rust-lang/crates.io-index#blake3@1.8.7",
+        "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.189",
+        "registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3",
+        "registry+https://github.com/rust-lang/crates.io-index#memmap2@0.9.11"
+      ]
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#arrayvec@0.7.8"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#blake3@1.8.7",
+      "dependsOn": [
+        "registry+https://github.com/rust-lang/crates.io-index#arrayvec@0.7.8",
+        "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.66",
+        "registry+https://github.com/rust-lang/crates.io-index#cfg-if@1.0.4",
+        "registry+https://github.com/rust-lang/crates.io-index#constant_time_eq@0.4.2",
+        "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.0"
+      ]
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.66",
+      "dependsOn": [
+        "registry+https://github.com/rust-lang/crates.io-index#find-msvc-tools@0.1.9",
+        "registry+https://github.com/rust-lang/crates.io-index#shlex@2.0.1"
+      ]
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#cfg-if@1.0.4"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#constant_time_eq@0.4.2"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.0"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#find-msvc-tools@0.1.9"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.189"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#memmap2@0.9.11"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#shlex@2.0.1"
+    }
+  ]
+}

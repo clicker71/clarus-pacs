@@ -1,6 +1,9 @@
 # Clarus PACS
 
 [![AP-101](https://img.shields.io/badge/AP--101-GO%20FOR%20LAUNCH-brightgreen)](https://github.com/clicker71/ap101)
+[![build](https://github.com/clicker71/clarus-pacs/actions/workflows/build.yml/badge.svg)](https://github.com/clicker71/clarus-pacs/actions/workflows/build.yml)
+[![format+clippy](https://github.com/clicker71/clarus-pacs/actions/workflows/lint.yml/badge.svg)](https://github.com/clicker71/clarus-pacs/actions/workflows/lint.yml)
+[![black](https://github.com/clicker71/clarus-pacs/actions/workflows/black.yml/badge.svg)](https://github.com/clicker71/clarus-pacs/actions/workflows/black.yml)
 
 > A vendor-neutral DICOMweb archive with a minimal core.
 
@@ -226,8 +229,7 @@ flag extends that to the rest of the code).
 
 ## Status & License
 
-**Status:** Closed preview. Source opens under LGPL-3.0 once the
-quality gates pass.
+**License:** LGPL-3.0. Source is open; see [LICENSE.md](LICENSE.md).
 
 **Disclaimer:** Experimental software for research, development, and
 interoperability testing. Not for clinical diagnostic use. No

@@ -1,0 +1,1 @@
+{"error":"PatientBirthDate must match pattern YYYYMMDD[-YYYYMMDD] (got: 2019)"}

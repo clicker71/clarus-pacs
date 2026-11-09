@@ -1,0 +1,17 @@
+# Clarus Bridge — Printer Registry (NEMA PS3.4 H)
+# Each printer entry defines a DICOM Print SCP.
+# driver defaults to "generic_dicom" — the only driver in v0.3.
+#
+# HOW TO ADD YOUR PRINTER:
+#   1. Uncomment the example below
+#   2. Replace host, port, aet with your printer's settings
+#   3. Restart the bridge
+#
+printers:
+  # Example — replace with your printer:
+  # "my_printer":
+  #   name: My DICOM Printer
+  #   host: 192.168.1.100
+  #   port: 104
+  #   aet: PRINTER_AE
+  #   driver: generic_dicom

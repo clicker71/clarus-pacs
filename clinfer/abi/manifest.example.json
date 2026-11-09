@@ -1,0 +1,42 @@
+{
+  "protocol": { "name": "clinfer-abi", "version": 1 },
+  "clinfer_version": "0.3.0-alpha",
+  "profile_version": 2,
+  "study": {
+    "uid": "1.2.840.113857.1.1",
+    "description": "CHEST PA AND LAT",
+    "modalities": ["DX"],
+    "body_part": "CHEST"
+  },
+  "frames": [
+    {
+      "index": 1,
+      "file": "0000.raw",
+      "sop_uid": "1.2.840.113857.1.1.1",
+      "width": 2048,
+      "height": 2048,
+      "bits": 16,
+      "photometric": "MONOCHROME2",
+      "bytes": 8388608,
+      "signed": true,
+      "pixel_spacing": [0.15, 0.15],
+      "slice_spacing": 0.3,
+      "position": [-153.6, -153.6, -201.4],
+      "orientation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    },
+    {
+      "index": 2,
+      "file": "0001.raw",
+      "sop_uid": "1.2.840.113857.1.1.2",
+      "width": 2048,
+      "height": 2048,
+      "bits": 16,
+      "photometric": "MONOCHROME2",
+      "bytes": 8388608,
+      "pixel_spacing": [0.15, 0.15],
+      "slice_spacing": 0.3,
+      "position": [-153.6, -153.6, -201.1],
+      "orientation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    }
+  ]
+}

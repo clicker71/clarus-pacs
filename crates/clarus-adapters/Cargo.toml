@@ -1,0 +1,133 @@
+[package]
+name = "clarus-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "clarus_adapters"
+
+[dependencies]
+clarus-ports = { path = "../clarus-ports" }
+
+# Content-addressed file storage (CAS)
+# Content hashing uses BLAKE3 (faster, 0 deps).
+# `sha2` now only serves the S3 backend (AWS SigV4 HMAC-SHA256, etags) and is
+# gated behind the `s3` feature, so the default build is free of sha2.
+blake3 = "1"
+sha2 = { version = "0.10", optional = true }
+log = "0.4"
+# thiserror is not used - all error enums use local Display+Error.
+# byte-exact float formatting (FL/FD) for the native metadata
+# renderer. `zmij` is the shortest-round-trip f64 formatter that serde_json
+# itself delegates to (its successor of ryu), so reusing it keeps the
+# serde-free output byte-identical to the serde-era renderer. Already in the
+# dependency tree via serde_json -> Cargo.lock resolves offline with 0 new deps.
+zmij = "1"
+# `bytes` is used only by the S3 backend (reqwest blocking bodies and
+# response reads), so it is gated behind the `s3` feature to keep it out of
+# the default production dependency graph.
+bytes = { version = "1", optional = true }
+
+# DICOM streaming parser -- manual, zero-codec dependencies.
+# Windows: dicom-rs (meta-crate) pulls openjp2 -> jpeg2k -> link error.
+# Tracked in: analysis/stow-state-machine.md
+
+# S3-compatible object storage (Amazon S3, MinIO, Yandex Object Storage,
+# Google Cloud Storage, Ceph RGW). Pure reqwest + manual SigV4 - no SDK.
+# Adds ~150 KB to binary size (vs ~500 KB for rust-s3).
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "blocking"] }
+
+
+
+# CJK charset support (Japanese, Chinese, Korean) via Firefox-grade encoding library.
+# DICOM PS3.3 Table C.12-2 / PS3.5 Section 6.1.2.1:
+#   ISO_IR 13 (JIS X 0201), ISO 2022 IR 87 (JIS X 0208),
+#   ISO 2022 IR 159 (JIS X 0212), GB18030, ISO_IR 149 (KS X 1001).
+# Adds ~1 MB to binary size. Not enabled by default.
+encoding_rs = { version = "0.8", optional = true }
+
+# JPEG codecs for DICOM transcoding.
+# jpeg-encoder is an UNCONDITIONAL dep: it is a pure-Rust encoder (no decoder,
+# no attack surface), ~100 KB, and the WADO-RS thumbnail path needs it in the
+# DEFAULT build (uncompressed TS -> 64x64 JPEG) without pulling the `transcode`
+# feature's decoders.
+# All DECODERS stay optional, gated behind `transcode`.
+#
+# jpeg-decoder: pure Rust JPEG decoder (~200 KB to binary). Decode Baseline + Lossless.
+# jpeg-encoder: pure Rust JPEG encoder (~100 KB to binary). Encode Baseline.
+# pure_jpegls: JPEG-LS lossless + near-lossless (~20 KB). Encode + decode.
+# gated behind `transcode` like every other JPEG codec.
+# Decode uses T87-first with LegacyGo fallback; encode stays LegacyGo
+# (single switch point in codec/jpegls.rs).
+jpeg-decoder = { version = "0.3", optional = true }
+jpeg-encoder = "0.6"
+jpegls = { package = "pure_jpegls", version = "2", optional = true }
+
+# JPEG2000 - pure-Rust j2k-native. The former openjpeg-sys binding is gone.
+# JPEG 2000 Part 1 + HTJ2K Part 15 via pure-Rust j2k engine.
+# Pure Rust, ~280 KB to binary. Encode + decode + HTJ2K.
+# Actively maintained (unlike the unmaintained openjpeg-sys binding).
+# 0.10 pulls j2k-native itself.
+j2k = { version = "0.10", optional = true }
+
+# png is no longer a dependency (1310): the /rendered route's RGB8/Gray8
+# preview encoder is the local `src/png.rs` module - stored DEFLATE blocks,
+# no compression and no decoder, so the crate had no remaining reason to link
+# fdeflate/flate2/miniz_oxide/crc32fast/simd-adler32/bitflags.
+
+# ap101 capacity const-gates (0610): `ferrite-core` supplies the
+# `capacity_eq!`/`capacity_le!` macros used at module scope to pin the DoS
+# caps in this crate (frame.rs MAX_FRAMES_CEILING). A macro cannot be
+# reached through the test-only ferrite-testkit dev-dep, so this is a NORMAL
+# dependency; ap101 is first-party tooling (same copyright holder), locked to
+# a git rev like the existing testkit pins.
+ferrite-core = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
+
+[dev-dependencies]
+walkdir = "2"
+hex = "0.4"
+criterion = "0.5"
+# Direct-API encode arms (LegacyGo + T87) in benches/jpegls_backend.rs;
+# same package as the lib dependency `jpegls` above, dev-only.
+jpegls = { package = "pure_jpegls", version = "2" }
+
+# ap101 zero-heap gate: the A8 cas_rel_path
+# fill_buf gate. Same git source + rev as clarus-core; dev-only.
+ferrite-testkit = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
+
+[[bench]]
+name = "jpegls_backend"
+harness = false
+
+[build-dependencies]
+# JPEG2000 C/OpenJPEG shim removed in v0.3.0-alpha. No C compilation needed.
+
+[features]
+default = []
+cjk-charsets = ["encoding_rs"]
+# S3-compatible object storage backend (Amazon S3, MinIO, Ceph RGW, etc.).
+# Pure reqwest + manual SigV4 - no SDK. ~150 KB to binary.
+s3 = ["reqwest", "dep:sha2", "dep:bytes"]
+
+# ===================================================================
+# Transcoding codec features (P36)
+# ===================================================================
+
+# Full transcoding support: pixel decode/encode for chunking (Tier 2 dedup),
+# thumbnail generation, and on-the-fly transfer syntax conversion.
+#
+# Includes:
+#   JPEG Baseline (decode + encode)     ~300 KB
+#   JPEG Lossless P14/P14.1 (decode)       -  (in jpeg-decoder)
+#   JPEG 2000 Lossless + Lossy (both)   ~280 KB
+# Total: ~580 KB added to binary.
+# NOTE: JPEG-LS (jpegls, ~20 KB) is gated behind this feature too
+# (dep:jpegls below) - NOT always-on.
+transcode = [
+    "j2k",
+    "dep:jpeg-decoder", "dep:jpegls",
+]
+
+

@@ -1,0 +1,56 @@
+# One virtualenv for every demo in this directory. A site's own processor
+# needs only the lines its script actually imports; these are the union of
+# the three examples.
+#
+#   python -m venv /opt/clinfer/venv
+#   /opt/clinfer/venv/bin/pip install -r requirements.txt
+#
+# and then point the model's `interpreter` at that venv's python binary.
+
+# DERIVED-clahe.py
+opencv-python-headless>=4.9
+
+# PR-openvino-detect.py
+openvino>=2024.2
+
+# SR-llm.py uses only the standard library (urllib) for the request; cv2 and
+# numpy are already covered above for the frame encoding it does.
+numpy>=1.26
+
+# SEG-threshold.py and SR-opacity.py. numpy is covered above; scipy is
+# what SR-opacity.py uses for connected components and their statistics.
+scipy>=1.11
+
+# DERIVED-upscale.py additionally needs the dnn_superres module, which ships in
+# opencv-contrib-python rather than in the headless base package. Install
+# THIS instead of opencv-python-headless if you run the upscale demo:
+#   opencv-contrib-python-headless>=4.9
+# The .pb model weights are NOT covered here: they are a site download, and
+# their license is the site's to check (see the script's docstring).
+
+# STL-mesh.py. scikit-image is what provides measure.marching_cubes; numpy
+# is covered above. The STL itself is written by hand, so no STL library is
+# needed: the binary format is 84 bytes of header plus 50 bytes a triangle.
+scikit-image>=0.22
+
+# SEG-DX-chest.py (DEMO-ONLY, see the script's header). The model's own
+# modeling.py was written against transformers 4.x; 5.x refuses to load it
+# (missing all_tied_weights_keys on the custom class), so pin <5.
+# torch must come from the CPU index for a CPU-only site:
+#   pip install torch==2.8.0 torchvision==0.23.0 \
+#       --index-url https://download.pytorch.org/whl/cpu
+# The model weights are NOT covered here: they are a site download, and
+# their license is the site's to check (see the script's docstring).
+transformers>=4.40,<5
+timm>=0.9
+albumentations>=1.3
+
+# RTSTRUCT-CT-totalseg.py. TotalSegmentator brings nibabel, numpy and opencv itself, so
+# installing it covers this script's imports. Note that this is a sizeable
+# dependency (it pulls torch): give it its own venv rather than adding it to
+# the demos' one, and PRE-DOWNLOAD THE WEIGHTS before the rule goes live, or
+# the first timed run spends its whole timeout fetching ~2 GB:
+#   python -m totalsegmentator.bin.totalseg_download_weights
+# The weights are NOT covered here: they are a site download. The tool is
+# Apache-2.0 and the craniofacial_structures task is in its open set.
+totalsegmentator>=2.18

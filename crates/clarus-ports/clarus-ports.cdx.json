@@ -1,0 +1,56 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.3",
+  "version": 1,
+  "serialNumber": "urn:uuid:f8ff20ec-a5d2-49d7-a52c-e1fe2485380e",
+  "metadata": {
+    "timestamp": "2026-10-26T16:50:41.103061800Z",
+    "tools": [
+      {
+        "vendor": "CycloneDX",
+        "name": "cargo-cyclonedx",
+        "version": "0.5.9"
+      }
+    ],
+    "authors": [
+      {
+        "name": "Daniel Solgalov"
+      }
+    ],
+    "component": {
+      "type": "library",
+      "bom-ref": "path+cargo/clarus-ports#0.3.0-alpha",
+      "author": "Daniel Solgalov",
+      "name": "clarus-ports",
+      "version": "0.3.0-alpha",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "LGPL-3.0-only"
+        }
+      ],
+      "purl": "pkg:cargo/clarus-ports@0.3.0-alpha",
+      "components": [
+        {
+          "type": "library",
+          "bom-ref": "path+cargo/clarus-ports#0.3.0-alpha bin-target-0",
+          "name": "clarus_ports",
+          "version": "0.3.0-alpha",
+          "purl": "pkg:cargo/clarus-ports@0.3.0-alpha"
+        }
+      ]
+    },
+    "properties": [
+      {
+        "name": "cdx:rustc:sbom:target:triple",
+        "value": "x86_64-pc-windows-msvc"
+      }
+    ]
+  },
+  "components": [],
+  "dependencies": [
+    {
+      "ref": "path+cargo/clarus-ports#0.3.0-alpha"
+    }
+  ]
+}

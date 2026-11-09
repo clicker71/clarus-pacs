@@ -1,0 +1,5 @@
+# Development-only tooling for the Clarus bridge (NEVER needed by end users).
+# Install with:  pip install -r clbridge/requirements-dev.txt
+black
+ruff
+pytest==9.0.3

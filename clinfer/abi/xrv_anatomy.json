@@ -1,0 +1,181 @@
+{
+  "_about": [
+    "xrv_anatomy.json - the mapping from torchxrayvision chestx_det PSPNet's",
+    "14 output channels to the anatomical structure each channel segments.",
+    "",
+    "PSPNet() emits 14 logit planes in a FIXED channel order. This table names",
+    "each channel so SEG-DX-torchxrayvision.py can attach a category and a type code to every",
+    "segment instead of an opaque index.",
+    "",
+    "EVERY CODE HERE WAS CHECKED against a public terminology server. See the",
+    "'verification' block and each row's 'source'."
+  ],
+  "verification": {
+    "server": "https://tx.fhir.org/r4",
+    "operations": [
+      "ValueSet/$expand?url=http://snomed.info/sct?fhir_vs&filter=<term>",
+      "CodeSystem/$lookup?system=http://snomed.info/sct&code=<code>"
+    ],
+    "edition": "SNOMED CT International Edition",
+    "checked_on": "2026-09-25",
+    "server_reported_version": "http://snomed.info/sct/900000000000207008/version/20250201"
+  },
+  "scheme": "SCT",
+  "channel_order_from": "xrv.baseline_models.chestx_det.PSPNet().targets",
+  "category": {
+    "code": "91723000",
+    "scheme": "SCT",
+    "meaning": "Anatomical structure",
+    "source": "DICOM PS3.16 CID 7150 Segmented Property Category uses 91723000 'Anatomical structure'; verified by $lookup on tx.fhir.org, 2026-09-25"
+  },
+  "targets": [
+    {
+      "channel": 0,
+      "model_label": "Left Clavicle",
+      "label": "LEFT_CLAVICLE",
+      "code": "51299004",
+      "scheme": "SCT",
+      "meaning": "Bone structure of clavicle",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "SNOMED CT has one clavicle concept, with no laterality; the side is carried in 'label'."
+    },
+    {
+      "channel": 1,
+      "model_label": "Right Clavicle",
+      "label": "RIGHT_CLAVICLE",
+      "code": "51299004",
+      "scheme": "SCT",
+      "meaning": "Bone structure of clavicle",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "Same concept as the left clavicle; the side is carried in 'label'."
+    },
+    {
+      "channel": 2,
+      "model_label": "Left Scapula",
+      "label": "LEFT_SCAPULA",
+      "code": "79601000",
+      "scheme": "SCT",
+      "meaning": "Bone structure of scapula",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "SNOMED CT has one scapula concept, with no laterality; the side is carried in 'label'."
+    },
+    {
+      "channel": 3,
+      "model_label": "Right Scapula",
+      "label": "RIGHT_SCAPULA",
+      "code": "79601000",
+      "scheme": "SCT",
+      "meaning": "Bone structure of scapula",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "Same concept as the left scapula; the side is carried in 'label'."
+    },
+    {
+      "channel": 4,
+      "model_label": "Left Lung",
+      "label": "LEFT_LUNG",
+      "code": "39607008",
+      "scheme": "SCT",
+      "meaning": "Lung structure",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "SNOMED CT has one lung concept, with no laterality; the side is carried in 'label'. This matches the convention already used by SEG-DX-chest.py."
+    },
+    {
+      "channel": 5,
+      "model_label": "Right Lung",
+      "label": "RIGHT_LUNG",
+      "code": "39607008",
+      "scheme": "SCT",
+      "meaning": "Lung structure",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "Same concept as the left lung; the side is carried in 'label'."
+    },
+    {
+      "channel": 6,
+      "model_label": "Left Hilus Pulmonis",
+      "label": "LEFT_HILUS",
+      "code": "314253000",
+      "scheme": "SCT",
+      "meaning": "Lung root",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "'Hilus pulmonis' is the anatomical Latin for the lung root. The generic term 'Hilus of lung' surfaced only neoplasm concepts, so the structure concept 314253000 'Lung root' is used. No laterality in SNOMED; the side is carried in 'label'."
+    },
+    {
+      "channel": 7,
+      "model_label": "Right Hilus Pulmonis",
+      "label": "RIGHT_HILUS",
+      "code": "314253000",
+      "scheme": "SCT",
+      "meaning": "Lung root",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "Same concept as the left hilus; the side is carried in 'label'."
+    },
+    {
+      "channel": 8,
+      "model_label": "Heart",
+      "label": "HEART",
+      "code": "80891009",
+      "scheme": "SCT",
+      "meaning": "Heart structure",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 9,
+      "model_label": "Aorta",
+      "label": "AORTA",
+      "code": "15825003",
+      "scheme": "SCT",
+      "meaning": "Aortic structure",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 10,
+      "model_label": "Facies Diaphragmatica",
+      "label": "DIAPHRAGM",
+      "code": "5798000",
+      "scheme": "SCT",
+      "meaning": "Diaphragm structure",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "'Facies diaphragmatica' is the anatomical Latin for the diaphragmatic surface; the model's channel segments the diaphragm, which is what this concept names."
+    },
+    {
+      "channel": 11,
+      "model_label": "Mediastinum",
+      "label": "MEDIASTINUM",
+      "code": "72410000",
+      "scheme": "SCT",
+      "meaning": "Mediastinal structure",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25"
+    },
+    {
+      "channel": 12,
+      "model_label": "Weasand",
+      "label": "ESOPHAGUS",
+      "code": "32849002",
+      "scheme": "SCT",
+      "meaning": "Esophageal structure",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "'Weasand' is an archaic English word for the esophagus, which is what this channel segments."
+    },
+    {
+      "channel": 13,
+      "model_label": "Spine",
+      "label": "SPINE",
+      "code": "421060004",
+      "scheme": "SCT",
+      "meaning": "Structure of vertebral column",
+      "source": "tx.fhir.org SNOMED CT $lookup, 2026-09-25",
+      "note": "The term 'Spine' alone matched only non-anatomical concepts (a fish genus, a spine board); 421060004 is the vertebral column structure."
+    }
+  ],
+  "backlog": [
+    {
+      "item": "Laterality is carried in the label, not in the code",
+      "detail": [
+        "SNOMED CT International Edition has no per-side concept for lung,",
+        "clavicle, scapula or lung root. SEG-DX-chest.py already resolves this the",
+        "same way (a generic type plus the side in the label). A site with a",
+        "laterality-aware vocabulary edits this table in its own copy."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+[package]
+name = "clinfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DICOMweb inference sidecar: claims UPS workitems, runs models, stores results back as ordinary DICOM objects."
+
+[[bin]]
+name = "clinfer"
+path = "src/main.rs"
+
+[lib]
+name = "clinfer"
+path = "src/lib.rs"
+
+# clinfer carries NO inference engine of its own: every model is an
+# external processor (a site's own program, see clinfer/abi/README.md),
+# and the sidecar's own half needs three things the configuration half
+# did not: the repository's own DICOM parser for pixel geometry, the UPS
+# state machine, and a way to reach the origin over DICOMweb.
+#
+# Deliberately absent: any async runtime. The worker is one blocking
+# thread, and an executor would be a second, unused concurrency model
+# inside the same process. `cargo tree -p clinfer` must not contain
+# tokio.
+#
+# No DECODER dependencies: the FETCH contract asks the origin for
+# explicit VR little endian, so pixels arrive already decodable as bytes.
+# clarus-adapters therefore comes in with default features off. No image
+# ENCODER either: a processor renders its own frames (SR-llm.py encodes
+# PNG itself), so the sidecar never rasterizes pixels.
+#
+# NO TLS, and that is a decision rather than an omission. TLS is perimeter
+# infrastructure: the server and cltranscode already live by it, and
+# clinfer follows. The origin URL may be http on the LAN (as configured)
+# with TLS in front at the perimeter; a certificate stack inside this
+# binary would add a crypto surface to the software passport for a hop
+# the perimeter can make better.
+#
+# `signal-hook` is for graceful shutdown: a signal handler can only set a
+# flag, and ports the same flag the server's own shutdown uses. reqwest/
+# hyper/tokio remain forbidden - each would bring its own runtime and its
+# own framing, which is the second concurrency model the note above
+# refuses.
+[dependencies]
+clarus-adapters = { path = "../crates/clarus-adapters", default-features = false }
+signal-hook = "0.3"
+
+[dev-dependencies]
+# ap101 zero-heap gate: the same pinned revision clarus-adapters uses, so
+# the CPU stages are measured by the allocator implementation the server's
+# own hot-path gates use.
+ferrite-testkit = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
+# ap101 `zero_alloc!` compile-time backstop (0610 item 2), dev-only.
+ferrite-macros = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }

@@ -1,0 +1,54 @@
+[package]
+name = "clarus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "clarus_core"
+
+[dependencies]
+# Plan A-008: manifest read = mmap of the whole file, then CBOR parse.
+# memmap2 is a tiny, dependency-free, cross-platform mmap wrapper (not a CBOR crate).
+memmap2 = "0.9"
+# Plan A-004: the single hash crate for CAS addressing and .idx row keys.
+# BLAKE3: SIMD-accelerated, faster than SHA-256 at equal strength -
+# sufficient for content addressing and index keys. Runtime tree:
+# blake3 + arrayref/arrayvec/cfg-if/constant_time_eq/cpufeatures;
+# cc/find-msvc-tools/shlex are build-only (asm compilation, not linked).
+blake3 = "1"
+# The one allowed external crate - SIMD newline/CR scan for the
+# HTTP/1.1 request head parser (memchr over a byte slice, no allocation).
+memchr = "2"
+# `sendfile()`/`writev()` syscalls for the response writer (Unix).
+# Not linked on Windows (the cfg(unix) sendfile path is excluded there).
+libc = "0.2"
+
+[dev-dependencies]
+# A-009: zero-heap guarantee via TestAllocator (global allocator wrapper).
+# ferrite-core is no_std; ferrite-testkit (std) provides TestAllocator.
+# Dev-only: never linked into the server binary.
+# `subdir` was dropped: newer Cargo warns it is an unused manifest key, yet it
+# still resolves ferrite-testkit's package from the ap101 git workspace via
+# the `package` name auto-discovery.
+ferrite-testkit = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
+# AP101B-101 cache-line macros (cache_line_fields!/.crosses_line()). Needs to
+# be a DIRECT dev-dependency (a macro is not re-exported through testkit);
+# same ap101 git source already in the tree.
+ferrite-core = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
+
+tempfile = "3"
+# property-based shadow-read comparison. Dev-only, never linked into
+# the server binary. Externally agreed by the plan (Section 0.1, proptest gate).
+proptest = "1"
+# S5: fuzzymatch benchmark against the names dictionary (Priority 2).
+criterion = "0.5"
+
+[[bench]]
+name = "fuzzymatch_bench"
+harness = false
+
+[[bench]]
+name = "parse_bench"
+harness = false

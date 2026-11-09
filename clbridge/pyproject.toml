@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+markers = [
+    "integration: integration tests that require clarus-bridge running",
+]
+filterwarnings = [
+    # pydicom v3→v4 migration: these attributes are set explicitly in
+    # _measure_dataset_bytes() / stow_single_instance() for compatibility.
+    # Will be removed when we upgrade to pydicom v4.
+    "ignore::DeprecationWarning:pydicom.*",
+    # Tests use intentionally invalid UIDs (e.g. '1.2.840.test', '1.2.840.mr.1')
+    # to verify edge cases. These trigger pydicom VR UI validation warnings.
+    "ignore:Invalid value for VR UI",
+]

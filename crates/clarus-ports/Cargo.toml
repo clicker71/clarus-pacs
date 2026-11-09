@@ -1,0 +1,12 @@
+[package]
+name = "clarus-ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "clarus_ports"
+
+# thiserror removed - all error enums use local Display+Error.
+[dependencies]

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<NativeDicomModel xmlns="http://dicom.nema.org/PS3.19/models/NativeDICOM">
+<DicomAttribute tag="00080016" vr="UI" keyword=""><Value number="1">1.2.840.10008.5.1.4.1.1.4</Value></DicomAttribute><DicomAttribute tag="00080018" vr="UI" keyword=""><Value number="1">1.2.840.113619.2.55.3.1.1.77.1.1</Value></DicomAttribute><DicomAttribute tag="00080056" vr="CS" keyword=""><Value number="1">ONLINE</Value></DicomAttribute><DicomAttribute tag="0020000D" vr="UI" keyword=""><Value number="1">1.2.840.113619.2.55.3.1.1.77</Value></DicomAttribute><DicomAttribute tag="0020000E" vr="UI" keyword=""><Value number="1">1.2.840.113619.2.55.3.1.1.77.1</Value></DicomAttribute><DicomAttribute tag="00200013" vr="IS" keyword=""><Value number="1">1</Value></DicomAttribute>
+</NativeDicomModel>

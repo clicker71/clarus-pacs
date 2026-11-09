@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<NativeDicomModel xmlns="http://dicom.nema.org/PS3.19/models/NativeDICOM">
+<DicomAttribute tag="00080005" vr="CS" keyword=""><Value number="1">ISO_IR 192</Value></DicomAttribute><DicomAttribute tag="00080056" vr="CS" keyword=""><Value number="1">ONLINE</Value></DicomAttribute><DicomAttribute tag="00080060" vr="CS" keyword=""><Value number="1">MR</Value></DicomAttribute><DicomAttribute tag="0008103E" vr="LO" keyword=""><Value number="1">T2 Axial</Value></DicomAttribute><DicomAttribute tag="0020000E" vr="UI" keyword=""><Value number="1">1.2.840.113619.2.55.3.1.1.77.1</Value></DicomAttribute><DicomAttribute tag="00200011" vr="IS" keyword=""><Value number="1">2</Value></DicomAttribute><DicomAttribute tag="00201209" vr="IS" keyword=""><Value number="1">3</Value></DicomAttribute>
+</NativeDicomModel>

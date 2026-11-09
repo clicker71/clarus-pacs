@@ -1,42 +1,45 @@
-Clarus PACS v0.3.0 — Quick Start
-=================================
+Clarus PACS v0.3.0-beta - Quick Start
+=====================================
 
 COMPONENTS IN THIS PACKAGE
 --------------------------
-clarus-server-{variant}-{os}.exe   — DICOMweb server (Rust)
-clarus-bridge.exe / .py            — DIMSE→DICOMweb adapter (Python/EXE)
-drivers/                            — C-PRINT printer drivers
-sop_classes.yaml                    — SOP class registry (48 classes)
-printers.yaml                       — DICOM printer configuration
-
+clarus(.exe)        - DICOMweb server (single static binary, zero runtime deps)
+clinfer(.exe)       - AI sidecar (UPS-RS worklist + site-supplied models)
+clbridge(.exe/.py)  - DIMSE->DICOMweb bridge (Python sidecar; .exe on Windows)
+clarus.conf         - server configuration (nginx-style)
+clbridge.conf       - bridge configuration (nginx-style)
+sop_classes.yaml    - SOP class registry (72 classes)
+printers.yaml       - DICOM printer configuration (C-PRINT)
+peers.conf          - DIMSE peer registry for C-MOVE (template)
 
 QUICK START (Windows)
 ---------------------
 1. Start the server:
-   clarus-server-base-windows-amd64.exe --db-path clarus.db --storage-dir ./storage --no-auth
+   clarus.exe --config clarus.conf
 
-2. Start the bridge (choose one):
-   a) Without Python: clarus-bridge.exe --host 127.0.0.1 --port 8024 --bridge-port 8104
-   b) With Python:    python clarus-bridge.py --host 127.0.0.1 --port 8024 --bridge-port 8104
+2. Start the bridge (optional, for DIMSE modalities):
+   clbridge.exe --config clbridge.conf
 
-3. Open viewer: http://127.0.0.1:8024/
+3. Open the mini-viewer: http://127.0.0.1:8024/
 
 
 QUICK START (Linux)
 -------------------
 1. Start the server:
-   ./clarus-server-base-linux-amd64 --db-path clarus.db --storage-dir ./storage --no-auth
+   ./clarus --config clarus.conf
 
-2. Start the bridge:
-   python3 clarus-bridge.py --host 127.0.0.1 --port 8024 --bridge-port 8104
+2. Start the bridge (optional):
+   python3 clbridge.py --config clbridge.conf
 
-3. Open viewer: http://127.0.0.1:8024/
+3. Open the mini-viewer: http://127.0.0.1:8024/
 
 
-PRINTER SETUP
--------------
-Edit printers.yaml with your DICOM printer's host, port, and AE Title.
-The generic_dicom driver supports most film printers (AGFA, Carestream, etc.).
+NOTES
+-----
+The server is a static binary: no SQL database, no JVM, no async runtime.
+Storage is the filesystem (data/ next to the config). This package is built
+with the transcode feature (full DICOMweb conformance on compressed transfer
+syntaxes and viewer thumbnails).
 
 
 BASE vs FULL

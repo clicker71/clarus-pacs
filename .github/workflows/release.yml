@@ -22,8 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -46,7 +46,7 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/clarus dist/clarus
           cp target/x86_64-unknown-linux-musl/release/clinfer dist/clinfer
           cp clbridge/clbridge.py clbridge/clbridge.conf \
-             clbridge/sop_classes.yaml clbridge/printers.yaml \
+             clbridge/sop_classes.yaml clbridge/printers.yaml clbridge/peers.conf \
              clarus.conf RELEASE_README.txt dist/
           tar czf clarus-linux-amd64.tar.gz -C dist .
       - uses: actions/upload-artifact@v4
@@ -90,7 +90,7 @@ jobs:
           Copy-Item target/release/clinfer.exe dist/clinfer.exe
           Copy-Item clbridge/dist/clbridge.exe dist/clbridge.exe
           Copy-Item clbridge/clbridge.py, clbridge/clbridge.conf, `
-            clbridge/sop_classes.yaml, clbridge/printers.yaml, `
+            clbridge/sop_classes.yaml, clbridge/printers.yaml, clbridge/peers.conf, `
             clarus.conf, RELEASE_README.txt dist/
           Compress-Archive -Path dist/* -DestinationPath clarus-windows-amd64.zip
       - uses: actions/upload-artifact@v4
@@ -148,7 +148,7 @@ jobs:
           cat > ctx/Dockerfile.clbridge <<'EOF'
           FROM python:3.12-slim
           RUN pip install --no-cache-dir pynetdicom pydicom requests prometheus_client
-          COPY clbridge.py clbridge.conf sop_classes.yaml printers.yaml /app/
+          COPY clbridge.py clbridge.conf sop_classes.yaml printers.yaml peers.conf /app/
           WORKDIR /app
           EXPOSE 8104 8105
           ENTRYPOINT ["python", "clbridge.py"]

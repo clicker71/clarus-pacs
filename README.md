@@ -150,7 +150,7 @@ only non-standard part is the local model contract (`manifest.json` in,
 
 **Future-proof ABI.** When DICOM Supplement 251 (Application Request)
 is published as Final Text, clinfer will also speak that standard
-processing service, and keep the local ABI so a model can still be
+processing service, and keep the [local ABI](/clinfer/abi/README.md) so a model can still be
 shipped as a plain script.
 
 **The model never sees DICOM.** Per study, clinfer lays out frames as

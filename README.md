@@ -33,8 +33,13 @@ transfer syntaxes and viewer thumbnails, and it carries
   browser at the server's `/` — an inline mini-viewer (about 30 KB)
   answers in milliseconds, a visual ping that the archive is up.[^2]
 - Or run the containers (no download):
-  `docker run -p 8024:8024 ghcr.io/clicker71/clarus-pacs/clarus:0.3.0-beta`
-  `docker run -p 8104:8104 -p 8105:8105 ghcr.io/clicker71/clarus-pacs/clbridge:0.3.0-beta`
+  `docker run -p 8024:8024 ghcr.io/clicker71/clarus-pacs/clarus:latest`
+  `docker run -p 8104:8104 -p 8105:8105 ghcr.io/clicker71/clarus-pacs/clbridge:latest`
+
+  `latest` tracks the newest release. The running build names itself:
+  the mini-viewer at `/` prints `clarus <version> (<commit>, <date>)`,
+  and `/version` reports the same for scripts. Pin an exact version by
+  replacing `latest` with a release tag (e.g. `0.3.0-beta`).
 
 For system services, NVMe PLP storage tuning, and reverse-proxy setup,
 see the [Production Deployment Guide](docs/production-setup.md). To

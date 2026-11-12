@@ -97,31 +97,3 @@ ferrite-testkit = { git = "https://github.com/clicker71/ap101", rev = "b80ee458f
 # ap101 `zero_alloc!` compile-time backstop (0610 item 2). A proc-macro is
 # build-time only; dev-scoped so it never enters the release graph.
 ferrite-macros = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
-
-[[bench]]
-name = "cas_bench"
-harness = false
-
-[[bench]]
-name = "qido_bench"
-harness = false
-
-[[bench]]
-name = "wado_bench"
-harness = false
-
-[[bench]]
-name = "index_bench"
-harness = false
-
-[[bench]]
-name = "stow_bench"
-harness = false
-
-[[bench]]
-name = "manifest_bench"
-harness = false
-
-[[bench]]
-name = "hash_bench"
-harness = false

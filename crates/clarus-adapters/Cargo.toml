@@ -97,10 +97,6 @@ jpegls = { package = "pure_jpegls", version = "2" }
 # fill_buf gate. Same git source + rev as clarus-core; dev-only.
 ferrite-testkit = { git = "https://github.com/clicker71/ap101", rev = "b80ee458fdc6423f966c3a19d9764e772db6fb59" }
 
-[[bench]]
-name = "jpegls_backend"
-harness = false
-
 [build-dependencies]
 # JPEG2000 C/OpenJPEG shim removed in v0.3.0-alpha. No C compilation needed.
 

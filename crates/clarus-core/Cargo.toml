@@ -44,11 +44,3 @@ tempfile = "3"
 proptest = "1"
 # S5: fuzzymatch benchmark against the names dictionary (Priority 2).
 criterion = "0.5"
-
-[[bench]]
-name = "fuzzymatch_bench"
-harness = false
-
-[[bench]]
-name = "parse_bench"
-harness = false

@@ -12,7 +12,7 @@ use super::s3::{ObjectInfo, ObjectMeta, ObjectStore, S3Error};
 use super::s3_http::s3_client;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // -- S3Client -----------------------------------------------------------
 
@@ -91,11 +91,16 @@ impl S3Client {
     /// Sign and execute an HTTP request (blocking).
     /// `body` is owned so the PUT path can attach it zero-copy via
     /// `reqwest::blocking::Body::from` (diet 22.08: bytes `Bytes` unnecessary).
+    /// `timeout` is chosen by the caller: object transfers use the wide
+    /// `S3_XFER_TIMEOUT`, metadata calls (HEAD/LIST/DELETE) the short
+    /// `S3_META_TIMEOUT` - a hung metadata call must not sit out the whole
+    /// transfer ceiling while moving no bytes.
     fn request(
         &self,
         method: &str,
         url: &str,
         body: Vec<u8>,
+        timeout: Duration,
     ) -> Result<reqwest::blocking::Response, S3Error> {
         // One clock read. Two `SystemTime::now()` calls can straddle a second
         // boundary, which signs a different `x-amz-date` than the one sent.
@@ -118,7 +123,7 @@ impl S3Client {
         let req = self
             .http
             .request(method.parse().unwrap(), url)
-            .timeout(super::s3_http::S3_XFER_TIMEOUT)
+            .timeout(timeout)
             .header("Authorization", &auth)
             .header("x-amz-content-sha256", &payload_hash)
             .header("x-amz-date", &amz_date)
@@ -176,6 +181,22 @@ impl S3Client {
     }
 }
 
+/// Slice a full-object body down to the requested INCLUSIVE byte range
+/// (`start..=end`) when the server answered 200 (Range ignored). Mirrors the
+/// `InMemoryObjectStore` bounds semantics: out-of-bounds is an error, never a
+/// truncated or empty "success".
+fn slice_full_object(data: Vec<u8>, start: u64, end: u64) -> Result<Vec<u8>, S3Error> {
+    let lo = start as usize;
+    let hi = (end as usize).min(data.len().saturating_sub(1));
+    if lo > hi || lo >= data.len() {
+        return Err(S3Error::Request(format!(
+            "range {lo}-{hi} out of bounds (len={})",
+            data.len()
+        )));
+    }
+    Ok(data[lo..=hi].to_vec())
+}
+
 /// Build a ListObjectsV2 URL.
 ///
 /// Alphabetical by parameter name - the order SigV4 canonicalises to - and
@@ -213,7 +234,7 @@ impl ObjectStore for S3Client {
         let url = self.object_url(key);
         let etag = crate::hex_encode(&Sha256::digest(&data));
 
-        let resp = self.request("PUT", &url, data)?;
+        let resp = self.request("PUT", &url, data, super::s3_http::S3_XFER_TIMEOUT)?;
         let status = resp.status().as_u16();
 
         if status != 200 {
@@ -228,7 +249,7 @@ impl ObjectStore for S3Client {
 
     fn get_object(&self, key: &str) -> Result<Vec<u8>, S3Error> {
         let url = self.object_url(key);
-        let resp = self.request("GET", &url, Vec::new())?;
+        let resp = self.request("GET", &url, Vec::new(), super::s3_http::S3_XFER_TIMEOUT)?;
         let status = resp.status().as_u16();
 
         if status == 404 {
@@ -294,12 +315,21 @@ impl ObjectStore for S3Client {
         }
 
         let data = resp.bytes().map_err(|e| S3Error::Request(e.to_string()))?;
-        Ok(data.to_vec())
+        let data = data.to_vec();
+        if status == 200 {
+            // The server answered 200: it ignored (or is not required to
+            // honour) the Range header and returned the FULL object. Handing
+            // that back as "the range" would overflow caller buffers sized
+            // from the requested length, so slice the requested window
+            // locally - same bounds semantics as `InMemoryObjectStore`.
+            return slice_full_object(data, start, end);
+        }
+        Ok(data)
     }
 
     fn head_object(&self, key: &str) -> Result<ObjectMeta, S3Error> {
         let url = self.object_url(key);
-        let resp = self.request("HEAD", &url, Vec::new())?;
+        let resp = self.request("HEAD", &url, Vec::new(), super::s3_http::S3_META_TIMEOUT)?;
         let status = resp.status().as_u16();
 
         if status == 404 {
@@ -330,7 +360,7 @@ impl ObjectStore for S3Client {
 
     fn delete_object(&self, key: &str) -> Result<(), S3Error> {
         let url = self.object_url(key);
-        let resp = self.request("DELETE", &url, Vec::new())?;
+        let resp = self.request("DELETE", &url, Vec::new(), super::s3_http::S3_META_TIMEOUT)?;
         let status = resp.status().as_u16();
 
         if status == 404 {
@@ -368,7 +398,7 @@ impl ObjectStore for S3Client {
             }
 
             let url = self.list_url(prefix, Some(wanted as u32), token.as_deref());
-            let resp = self.request("GET", &url, Vec::new())?;
+            let resp = self.request("GET", &url, Vec::new(), super::s3_http::S3_META_TIMEOUT)?;
             let status = resp.status().as_u16();
 
             if status != 200 {
@@ -705,6 +735,22 @@ mod tests {
         let xml = b"<Key>hello/world.dcm</Key>";
         let result = extract_text(xml, 0, b"<Key>", b"</Key>");
         assert_eq!(result, "hello/world.dcm");
+    }
+
+    /// A 200 (Range ignored) answer must still honour the requested window:
+    /// the caller sized its buffer from the requested length, so the full body
+    /// must be sliced locally, not handed back whole.
+    #[test]
+    fn a_full_body_response_is_sliced_to_the_range() {
+        let data: Vec<u8> = (0..10u8).collect();
+        assert_eq!(slice_full_object(data, 2, 5).unwrap(), vec![2, 3, 4, 5]);
+    }
+
+    /// Out-of-bounds is an error, never a truncated or empty "success".
+    #[test]
+    fn a_range_beyond_the_full_body_is_rejected() {
+        let data: Vec<u8> = (0..5u8).collect();
+        assert!(slice_full_object(data, 5, 9).is_err());
     }
 
     /// The published AWS SigV4 example ("Example: GET Object", the

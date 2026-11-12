@@ -249,24 +249,44 @@ fn chronyc_tracking() -> Option<(bool, f64, String)> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_chronyc_tracking(&text)
+}
+
+/// Parse one `chronyc -c tracking` CSV line.
+///
+/// `chronyc -c tracking` prints, in order:
+/// ```text
+/// 0 reference ID, 1 SOURCE ADDRESS, 2 STRATUM, 3 reference time (SECONDS),
+/// 4 system time (SECONDS), 5 last offset (SECONDS), 6 RMS offset, ...
+/// ```
+///
+/// The previous code was shifted by one from column 1 on: it read the source
+/// ADDRESS as the stratum and the stratum as the reference name. The panel then
+/// reported a stratum parsed from an IP address - always the `16` "unknown"
+/// sentinel, because an address is not a number - and a sync verdict that was
+/// really a parse failure. A wrong-but-plausible number is worse than an error.
+///
+/// Compiled on every platform, not just unix: the column mapping is the part
+/// that was wrong, and a Windows build cannot otherwise test it. `chronyc` is
+/// only ever RUN on unix.
+#[cfg(any(unix, test))]
+fn parse_chronyc_tracking(text: &str) -> Option<(bool, f64, String)> {
     let cols: Vec<&str> = text.trim().split(',').collect();
-    if cols.len() < 10 {
+    // A line with fewer fields than we index is refused rather than defaulted:
+    // an unexpected column count means this is not the format the parser was
+    // written against, and guessing the rest of it would be a fabrication.
+    if cols.len() < 6 {
         return None;
     }
-    // chronyc `-c tracking` CSV columns, in order:
-    // 0 reference ID, 1 stratum, 2 reference name, 3 system time (SECONDS),
-    // 4 last offset (SECONDS), 5 RMS offset, ...
-    // The offset was reported as milliseconds while chronyc prints seconds,
-    // so a 21 ms correction surfaced as "0.021 ms" - a factor of 1000 low in
-    // the one number an operator uses to decide whether the clock is in
-    // trouble.
-    let offset_secs: f64 = cols[4].trim().parse().ok()?;
-    let offset_ms = offset_secs * 1000.0;
-    // Stratum 0 means unsynchronised; 16 is the "unknown" sentinel.
-    let stratum: i32 = cols[1].trim().parse().unwrap_or(16);
+    // Stratum 0 means unsynchronised; 16 is the "unknown" sentinel. A value
+    // that does not parse also reports unsynchronised rather than "healthy".
+    let stratum: i32 = cols[2].trim().parse().unwrap_or(16);
     let synced = stratum > 0 && stratum < 16;
-    Some((synced, offset_ms, cols[2].trim().to_string()))
+    // Column 5 is the last offset in SECONDS; the panel is in milliseconds.
+    let offset_secs: f64 = cols[5].trim().parse().ok()?;
+    let offset_ms = offset_secs * 1000.0;
+    Some((synced, offset_ms, cols[1].trim().to_string()))
 }
 
 #[cfg(target_os = "windows")]
@@ -1145,6 +1165,23 @@ const SOURCE_TIERS: [(&str, u8); 3] = [
     ("hot", clarus_core::manifest::TIER_HOT),
 ];
 
+/// Claim a rebuild, or report that one is already running.
+///
+/// Callers must hold the WRITE lock: the whole point is that the "is it
+/// running" test and the "make it running" assignment are one indivisible
+/// step. Splitting them across a read lock and a write lock let two concurrent
+/// requests both see `idle` and both start a walker.
+///
+/// Returns `true` when this caller claimed it. The running state, if any, is
+/// read from `st` by the caller under the same lock.
+fn claim_rebuild(st: &mut RebuildState, fresh: RebuildState) -> bool {
+    if st.status == "running" {
+        return false;
+    }
+    *st = fresh;
+    true
+}
+
 /// `POST /admin/v1/recovery/rebuild`. Body (JSON):
 /// `{"sources": ["s3","cold","hot"], "dry_run": false}`.
 ///
@@ -1162,18 +1199,12 @@ pub fn admin_recovery_rebuild(
     body: &[u8],
     dry_run: bool,
 ) -> Result<AdminResp, AdminErr> {
-    {
-        let st = REBUILD_STATE.read().expect("Rebuild state lock poisoned");
-        if st.status == "running" {
-            let mut b = Vec::new();
-            write_rebuild_state(&mut b, &st);
-            return Ok(AdminResp {
-                status: 409,
-                content_type: "application/json",
-                body: b,
-            });
-        }
-    }
+    // The "is a rebuild running" check and the "claim it" write happen in ONE
+    // write-lock section, below, after the request has been validated. Doing
+    // the check under a read lock and the claim under a separate write lock let
+    // two concurrent requests both observe "not running" and both start a
+    // walker - two threads writing the same manifests, which is exactly what
+    // the single-walker contract forbids.
 
     // Parse the explicit `sources` array from the JSON body.
     let mut requested: Vec<String> = Vec::new();
@@ -1265,9 +1296,10 @@ pub fn admin_recovery_rebuild(
         }
     }
 
+    // Claim the rebuild and report whether we got it, in one section.
     let started = {
         let mut st = REBUILD_STATE.write().expect("Rebuild state lock poisoned");
-        *st = RebuildState {
+        let fresh = RebuildState {
             status: "running".to_string(),
             files_scanned: 0,
             manifests_written: 0,
@@ -1279,7 +1311,21 @@ pub fn admin_recovery_rebuild(
             sources: sources.clone(),
             dry_run,
         };
-        st.clone()
+        if claim_rebuild(&mut st, fresh) {
+            st.clone()
+        } else {
+            // Another request claimed it. The state is read under the same
+            // lock the claim would take, so what we report is what blocked us.
+            let running = st.clone();
+            drop(st);
+            let mut b = Vec::new();
+            write_rebuild_state(&mut b, &running);
+            return Ok(AdminResp {
+                status: 409,
+                content_type: "application/json",
+                body: b,
+            });
+        }
     };
 
     let mut body = Vec::new();
@@ -2380,7 +2426,9 @@ fn write_restore_response(out: &mut Vec<u8>, r: &RestoreResponse) {
 }
 
 /// Native parse of the restore request body.
-fn parse_restore_request(body: &[u8]) -> (Option<Vec<String>>, Option<String>) {
+fn parse_restore_request(
+    body: &[u8],
+) -> Result<(Option<Vec<String>>, Option<String>), &'static str> {
     let mut uids = None;
     let mut reason = None;
     if let Some(pairs) = parse_json_object(body) {
@@ -2400,7 +2448,16 @@ fn parse_restore_request(body: &[u8]) -> (Option<Vec<String>>, Option<String>) {
             }
         }
     }
-    (uids, reason)
+    // The same refusal the delete path applies: an operator-supplied value that
+    // is not a UID is a bad request, not an instance that happens to be missing.
+    if let Some(list) = uids.as_deref() {
+        for uid in list {
+            if clarus_core::uid::validate_path_uid(uid).is_err() {
+                return Err("Invalid DICOM UID");
+            }
+        }
+    }
+    Ok((uids, reason))
 }
 
 /// `POST /admin/v1/instances/restore`.
@@ -2423,7 +2480,14 @@ fn parse_restore_request(body: &[u8]) -> (Option<Vec<String>>, Option<String>) {
 ///
 /// ap101: N/A - manifest write on an admin control-plane request.
 pub fn admin_restore(state: &AppState, body: &[u8], username: &str) -> Result<AdminResp, AdminErr> {
-    let (uids, reason) = parse_restore_request(body);
+    let (uids, reason) = match parse_restore_request(body) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            let mut b = Vec::new();
+            write_err_body(&mut b, "Bad Request", msg);
+            return Err(err_bytes(400, b));
+        }
+    };
 
     // FR-014: reason is mandatory, exactly as for delete. Reversing a clinical
     // sequester without recording why would make the trail useless precisely
@@ -3026,6 +3090,23 @@ fn parse_delete_request(body: &[u8]) -> Result<DeleteRequest, &'static str> {
             }
         }
     }
+    // A UID from this body becomes a path component below (`{study_uid}.batc
+    // h`, the manifest path, the tombstone path), so it has to BE a UID before
+    // anything joins it. The QIDO routes already refuse the same strings; the
+    // admin surface is the one place where a rewritten or traversing UID
+    // would reach the B-tree index instead of a manifest.
+    for uid in req.study_uid.iter().chain(req.series_uid.iter()) {
+        if clarus_core::uid::validate_path_uid(uid).is_err() {
+            return Err("Invalid DICOM UID");
+        }
+    }
+    if let Some(uids) = req.sop_instance_uids.as_deref() {
+        for uid in uids {
+            if clarus_core::uid::validate_path_uid(uid).is_err() {
+                return Err("Invalid DICOM UID");
+            }
+        }
+    }
     Ok(req)
 }
 
@@ -3166,8 +3247,11 @@ pub fn admin_delete(state: &AppState, body: &[u8], username: &str) -> Result<Adm
             response.erase = "preview".to_string();
             return Ok(admin_delete_response(response));
         }
-        response.deleted_series = 1;
         response.erase = "sync".to_string();
+        // Resolved BEFORE the rewrite: once the series leaves the manifest its
+        // instance UIDs are gone, and the derived objects that name those
+        // instances individually would survive the deletion.
+        let scope_instances = series_instance_uids(state, series_uid);
         match delete_series_manifest(
             state,
             username,
@@ -3178,13 +3262,21 @@ pub fn admin_delete(state: &AppState, body: &[u8], username: &str) -> Result<Adm
             audit_dir,
         ) {
             Ok((h, count)) => {
+                // Counted only once the rewrite succeeded: setting it before
+                // the call made a failed delete answer 200 claiming one series
+                // gone, which is the one thing an operator cannot check from
+                // outside.
+                response.deleted_series = 1;
                 response.deleted_instances = count;
                 // Only the derived objects that point at THIS series go. An
                 // annotation of the study's other series is not part of this
                 // series and must survive it.
                 let cascaded = cascade_delete(
                     state,
-                    &crate::handlers::admin::cascade::StudyScope::Series(series_uid),
+                    &crate::handlers::admin::cascade::StudyScope::Series {
+                        series_uid,
+                        instance_uids: scope_instances,
+                    },
                     username,
                     &batch_id,
                 );
@@ -3216,8 +3308,15 @@ pub fn admin_delete(state: &AppState, body: &[u8], username: &str) -> Result<Adm
     // Sub-study deletes: decide each orphaned blob's fate via the
     // live-manifest scan. Reference gone everywhere -> unlink the CAS file
     // (sync, as before); still referenced -> dedup-shared, keep it.
+    // The reference set is built ONCE: a study delete resolves one blob per
+    // instance, and a per-blob scan would re-read the whole manifest store
+    // once per instance.
+    let live_refs = live_reference_set(manifest_dir);
     for blake3_hex in &hashes {
-        if blob_is_referenced_live(manifest_dir, blake3_hex) {
+        if live_refs
+            .as_ref()
+            .is_none_or(|set| set.contains(blake3_hex))
+        {
             response.files_retained_dedup += 1;
         } else {
             // The blob may live in the COLD tier: the migration worker moves
@@ -3363,6 +3462,7 @@ fn preview_instance_delete(state: &AppState, sop_uid: &str) -> Option<DeletePlan
     let hash = hash?;
     Some(DeletePlan {
         bytes,
+        // One blob, one answer: the full scan is the cheapest form here.
         shared: blob_is_referenced_live(manifest_dir, &hash),
     })
 }
@@ -3375,6 +3475,47 @@ struct SeriesDeletePlan {
 }
 
 /// Resolve a whole series' delete plan from the live manifest. Read-only.
+/// SOP Instance UIDs held by one series, read from the owning study's manifest.
+///
+/// The series cascade needs them to claim a derived object that names its
+/// source images by ReferencedSOPInstanceUID only: the reference names an
+/// instance, and the instance's series is the fact being deleted. Read from
+/// the same manifests `delete_series_manifest` reads, so the two cannot
+/// disagree about which series the instance belongs to.
+fn series_instance_uids(state: &AppState, series_uid: &str) -> std::collections::HashSet<String> {
+    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
+    let mut out = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(manifest_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("manifest") {
+            continue;
+        }
+        let Ok(m) = read_manifest(&path) else {
+            continue;
+        };
+        for series in &m.series {
+            let is_target = series.attrs.iter().any(|(t, v)| {
+                *t == tag::SERIES_INSTANCE_UID && matches!(v, AttrValue::Text(s) if s == series_uid)
+            });
+            if !is_target {
+                continue;
+            }
+            for inst in &series.instances {
+                if let Some(uid) = inst.attrs.iter().find_map(|(t, v)| match (t, v) {
+                    (t, AttrValue::Text(s)) if *t == tag::SOP_INSTANCE_UID => Some(s.clone()),
+                    _ => None,
+                }) {
+                    out.insert(uid);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn preview_series_delete(state: &AppState, series_uid: &str) -> SeriesDeletePlan {
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let mut plan = SeriesDeletePlan {
@@ -3388,6 +3529,9 @@ fn preview_series_delete(state: &AppState, series_uid: &str) -> SeriesDeletePlan
     let Ok(entries) = std::fs::read_dir(manifest_dir) else {
         return plan;
     };
+    // Built lazily on the first series hit: a preview whose series does not
+    // exist must not pay for a store-wide scan.
+    let mut live_refs: Option<Option<std::collections::HashSet<String>>> = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("manifest") {
@@ -3407,7 +3551,15 @@ fn preview_series_delete(state: &AppState, series_uid: &str) -> SeriesDeletePlan
                 let hash = clarus_adapters::hex_encode(&inst.blake3);
                 plan.instances += 1;
                 plan.bytes += inst.file_size;
-                if blob_is_referenced_live(manifest_dir, &hash) {
+                // `shared` is a per-series dedup count over the whole store, so
+                // the reference set is built once for the series rather than
+                // re-reading every manifest per instance.
+                let refs = live_refs.get_or_insert_with(|| live_reference_set(manifest_dir));
+                let referenced = match refs {
+                    Some(set) => set.contains(&hash),
+                    None => true, // can't verify -> keep the file
+                };
+                if referenced {
                     plan.shared += 1;
                 }
             }
@@ -3755,28 +3907,39 @@ fn tombstone_empty_study(
 /// the file looks orphaned because its referrer could not be read. Deferring
 /// costs disk until the next pass; guessing costs an instance.
 fn blob_is_referenced_live(manifest_dir: &std::path::Path, blake3_hex: &str) -> bool {
-    let Ok(rd) = std::fs::read_dir(manifest_dir) else {
-        return true; // can't verify -> keep the file
-    };
+    match live_reference_set(manifest_dir) {
+        Some(set) => set.contains(blake3_hex),
+        None => true, // can't verify -> keep the file
+    }
+}
+
+/// Collect the hashes of every instance in every live manifest.
+///
+/// Built ONCE per request: a study delete resolves one blob per instance, so
+/// the per-blob form re-read and re-decoded every manifest once per instance -
+/// O(instances x manifests) reads of the whole store for a single delete.
+/// The set is the same evidence, read once.
+///
+/// `None` when a manifest could not be read or the directory could not be
+/// listed: the caller must then treat every blob as referenced (see
+/// [`blob_is_referenced_live`] for why guessing costs an instance).
+fn live_reference_set(manifest_dir: &std::path::Path) -> Option<std::collections::HashSet<String>> {
+    let rd = std::fs::read_dir(manifest_dir).ok()?;
+    let mut set = std::collections::HashSet::new();
     for ent in rd.flatten() {
         let name = ent.file_name();
         let name = name.to_string_lossy();
         if !name.ends_with(".manifest") {
             continue;
         }
-        let m = match read_manifest(&ent.path()) {
-            Ok(m) => m,
-            Err(_) => return true, // can't verify one referrer -> keep the file
-        };
+        let m = read_manifest(&ent.path()).ok()?;
         for series in &m.series {
             for inst in &series.instances {
-                if clarus_adapters::hex_encode(&inst.blake3) == blake3_hex {
-                    return true;
-                }
+                set.insert(clarus_adapters::hex_encode(&inst.blake3));
             }
         }
     }
-    false
+    Some(set)
 }
 
 /// Find the owning study of a series UID by scanning live manifests.
@@ -4359,6 +4522,102 @@ mod tests {
         InstanceModel, SeriesModel, StudyManifestAttrs, write_study_manifest_full,
     };
 
+    /// The chronyc CSV parse reads the columns chrony actually prints.
+    /// 0 reference ID, 1 source address, 2 stratum, 3 reference time,
+    /// 4 system time, 5 last offset.
+    ///
+    /// The old parser was shifted by one from column 1: stratum came from the
+    /// source ADDRESS (`192.168.1.1`, which parses as nothing and fell back to
+    /// the `16` "unknown" sentinel), so a synchronised host reported
+    /// unsynchronised and the "source" column showed the stratum.
+    #[test]
+    fn chronyc_tracking_reads_the_documented_columns() {
+        // Synced: stratum 2, last offset +0.000021 s.
+        let line = "C0A80101,192.168.1.1,2,0000000000000000,0000000000000000,\
+                    0.000021234,0.000031234,0.000012345,0.000001234,1.0,0.0,0.0,0.0,0.0";
+        let (synced, offset_ms, source) = parse_chronyc_tracking(line).expect("parses");
+        assert!(synced, "stratum 2 is synchronised");
+        assert!(
+            (offset_ms - 0.021234).abs() < 1e-9,
+            "offset_ms = {offset_ms}"
+        );
+        assert_eq!(source, "192.168.1.1", "column 1 is the source address");
+
+        // Stratum 0 means unsynchronised, whatever the other columns say.
+        let unsynced = "00000000,,0,0000000000000000,0000000000000000,\
+                        0.5,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0";
+        let (synced, _, _) = parse_chronyc_tracking(unsynced).expect("parses");
+        assert!(!synced, "stratum 0 is not synchronised");
+
+        // A field that is not a number must not read as "healthy": the stratum
+        // falls back to the unknown sentinel, which is unsynchronised.
+        let garbage = "C0A80101,192.168.1.1,not-a-stratum,0,0,\
+                       0.1,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0";
+        let (synced, _, _) = parse_chronyc_tracking(garbage).expect("parses");
+        assert!(!synced, "an unparseable stratum is not a sync verdict");
+
+        // Too few columns: refused rather than indexed blindly.
+        assert_eq!(parse_chronyc_tracking("C0A80101,192.168.1.1,2"), None);
+    }
+
+    /// Concurrent rebuild requests: exactly one wins.
+    ///
+    /// The claim is one write-lock section, so a thread that observes `idle`
+    /// also performs the transition. With the old split (read-lock test, then a
+    /// separate write-lock assignment) both threads observed `idle` and both
+    /// started a walker.
+    #[test]
+    fn two_concurrent_rebuild_claims_yield_one_winner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = Arc::new(std::sync::Mutex::new(RebuildState {
+            status: "idle".to_string(),
+            files_scanned: 0,
+            manifests_written: 0,
+            instances_indexed: 0,
+            skipped: 0,
+            errors: 0,
+            started_at: None,
+            finished_at: None,
+            sources: Vec::new(),
+            dry_run: true,
+        }));
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let state = Arc::clone(&state);
+            let winners = Arc::clone(&winners);
+            handles.push(std::thread::spawn(move || {
+                let fresh = RebuildState {
+                    status: "running".to_string(),
+                    files_scanned: 0,
+                    manifests_written: 0,
+                    instances_indexed: 0,
+                    skipped: 0,
+                    errors: 0,
+                    started_at: None,
+                    finished_at: None,
+                    sources: vec!["hot".to_string()],
+                    dry_run: true,
+                };
+                let mut st = state.lock().expect("lock");
+                if claim_rebuild(&mut st, fresh) {
+                    winners.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one request may claim the rebuild"
+        );
+        assert_eq!(state.lock().expect("lock").status, "running");
+    }
+
     /// Write one study with one instance into `dir`, returning the SOP UID.
     fn write_study(
         dir: &std::path::Path,
@@ -4483,6 +4742,82 @@ mod tests {
         assert_eq!(arr.len(), 2, "offset skips the first hit");
     }
 
+    /// The store-wide reference set answers the same question as the per-blob
+    /// scan, so a delete resolving many blobs pays for one walk.
+    ///
+    /// Falsification anchor: the second half asserts a hash NO manifest names
+    /// is absent - a set built from a subset (or one that always answers
+    /// `true`) would keep every blob and never free disk.
+    #[test]
+    fn the_live_reference_set_names_every_stored_blob_and_nothing_else() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_study(
+            tmp.path(),
+            "1.2.6.1.study",
+            "1.2.6.1.series",
+            "1.2.6.1.sop",
+            "Alpha^One",
+        );
+        write_study(
+            tmp.path(),
+            "1.2.6.2.study",
+            "1.2.6.2.series",
+            "1.2.6.2.sop",
+            "Beta^Two",
+        );
+
+        let set = live_reference_set(tmp.path()).expect("every manifest is readable");
+        // Both studies contributed, so no manifest was skipped.
+        let stored: Vec<String> = std::fs::read_dir(tmp.path())
+            .expect("dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".manifest"))
+            .flat_map(|e| read_manifest(&e.path()).expect("manifest").series)
+            .flat_map(|s| s.instances)
+            .map(|i| clarus_adapters::hex_encode(&i.blake3))
+            .collect();
+        assert_eq!(stored.len(), 2, "two instances are stored");
+        for hash in &stored {
+            assert!(
+                set.contains(hash),
+                "a stored blob is reported as referenced"
+            );
+        }
+        assert!(
+            !set.contains(&"f".repeat(64)),
+            "an unreferenced hash stays absent, so its blob would be unlinked"
+        );
+    }
+
+    /// A manifest that cannot be decoded makes the whole set unusable: the
+    /// caller must then keep every file, because the skipped study is exactly
+    /// the one whose blobs a partial set would mark orphaned.
+    #[test]
+    fn an_unreadable_manifest_makes_the_reference_set_unavailable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_study(
+            tmp.path(),
+            "1.2.7.1.study",
+            "1.2.7.1.series",
+            "1.2.7.1.sop",
+            "Gamma^Three",
+        );
+        std::fs::write(
+            tmp.path().join("1.2.7.2.study.manifest"),
+            b"\xFF\xFF\xFF\xFF",
+        )
+        .expect("corrupt manifest");
+
+        assert!(
+            live_reference_set(tmp.path()).is_none(),
+            "one undecodable manifest must not yield a partial answer"
+        );
+        assert!(
+            blob_is_referenced_live(tmp.path(), &"a".repeat(64)),
+            "an unusable set keeps the blob"
+        );
+    }
+
     /// `push_f64` is byte-exact with serde_json/ryu across the positional
     /// value range admin endpoints emit (integral floats keep their `.0`).
     /// `push_f64` is byte-exact with serde_json/ryu across the positional
@@ -4576,6 +4911,50 @@ mod tests {
         assert_eq!(q.sop_instance_uids, None);
         assert_eq!(q.study_uid, None);
         assert!(!q.dry_run);
+    }
+
+    /// A UID that is not a UID must be refused before it is joined onto a
+    /// manifest directory.
+    ///
+    /// `../index` renamed `<btree>/index.manifest` to `.del`, and a
+    /// `sop_owner/<day>` path reached the B-tree index directly. The QIDO
+    /// routes already refuse these strings; the admin surface accepted them
+    /// because nothing between the JSON body and `manifest_dir.join(..)`
+    /// looked at the value.
+    #[test]
+    fn a_delete_request_with_a_traversing_uid_is_refused() {
+        for body in [
+            r#"{"study_uid":"../index","reason":"x"}"#,
+            r#"{"series_uid":"../index","reason":"x"}"#,
+            r#"{"sop_instance_uids":["../../../etc/passwd"],"reason":"x"}"#,
+            r#"{"study_uid":"..","reason":"x"}"#,
+            r#"{"study_uid":"1.2/../3","reason":"x"}"#,
+            r#"{"study_uid":"","reason":"x"}"#,
+        ] {
+            let err = match parse_delete_request(body.as_bytes()) {
+                Ok(_) => panic!("a non-UID must not reach a path join: {body}"),
+                Err(e) => e,
+            };
+            assert_eq!(err, "Invalid DICOM UID", "for {body}");
+        }
+        // The well-formed neighbours still parse, so the refusal is about the
+        // value and not about the request shape.
+        assert!(parse_delete_request(br#"{"study_uid":"1.2.840.10008.1","reason":"x"}"#).is_ok());
+    }
+
+    /// The restore path takes the same UIDs and must apply the same refusal.
+    #[test]
+    fn a_restore_request_with_a_traversing_uid_is_refused() {
+        assert_eq!(
+            parse_restore_request(br#"{"sop_instance_uids":["../../x"],"reason":"y"}"#)
+                .expect_err("a non-UID must be refused"),
+            "Invalid DICOM UID"
+        );
+        let (uids, reason) =
+            parse_restore_request(br#"{"sop_instance_uids":["1.2.3"],"reason":"y"}"#)
+                .expect("a well-formed body parses");
+        assert_eq!(uids, Some(vec!["1.2.3".to_string()]));
+        assert_eq!(reason, Some("y".to_string()));
     }
 
     /// A `dry_run` that is not a boolean must be refused, not coerced. The

@@ -266,12 +266,32 @@ class TestMaskPatientId:
             # Same key, same token: the log stays correlatable.
             assert mask_patient_id("12345") == first
 
+            # The token must BE the HMAC, not merely change with the key.
+            # Recomputing it from the key the module is using proves the
+            # construction (HMAC-SHA256, UTF-8 message, first 12 hex chars);
+            # a truncated bare digest or a different key ordering would pass
+            # the "it changed" assertion above and fail here.
+            import hashlib
+            import hmac
+
+            expected = hmac.new(
+                utils._mask_key(), b"12345", hashlib.sha256
+            ).hexdigest()[:12]
+            assert first == expected, (
+                "the token must be HMAC-SHA256(key, patient_id)[:12]: "
+                f"expected {expected}, got {first}"
+            )
+
             utils.set_mask_key_dir(root_b)
             second = mask_patient_id("12345")
             assert second != first, (
                 "a different key must produce a different token - an unkeyed "
                 "sha256 would return the same digest either way"
             )
+            expected_b = hmac.new(
+                utils._mask_key(), b"12345", hashlib.sha256
+            ).hexdigest()[:12]
+            assert second == expected_b, (expected_b, second)
 
             # Going back to the first key reproduces the first token exactly,
             # so nothing about the token depends on call order.

@@ -325,9 +325,7 @@ pub fn transcode_dicom(
     // Both assembly paths (memcpy and rebuild) run through this post-pass.
     let mut output = output;
     // Palette conversion turns 1-sample PALETTE COLOR into 3-sample RGB;
-    // both assembly paths copied (0028,0002) SamplesPerPixel verbatim, and
-    // a 3-sample image needs (0028,0006) Planar Configuration (=0,
-    // interleaved - the native encoders emit interleaved).
+    // both assembly paths copied (0028,0002) SamplesPerPixel verbatim.
     if palette_applied {
         let out_implicit = target_ts == crate::codec::ts_uid::IMPLICIT_VR_LE;
         patch_u16_element(
@@ -337,6 +335,16 @@ pub fn transcode_dicom(
             target_is_be,
             out_implicit,
         );
+    }
+    // Every encoder in this crate emits INTERLEAVED planes, but both assembly
+    // paths copy (0028,0006) Planar Configuration from the source. A
+    // colour-by-plane source therefore produced interleaved samples behind a
+    // tag that still said 1, and a reader that trusted the tag read the three
+    // channels as one another. PS3.3 C.7.6.3.1.3: the tag is required when
+    // SamplesPerPixel > 1 and shall be 0 or 1 - the output being interleaved
+    // makes 0 the only correct value.
+    {
+        let out_implicit = target_ts == crate::codec::ts_uid::IMPLICIT_VR_LE;
         ensure_planar_configuration(
             &mut output,
             pixels.samples_per_pixel as u16,
@@ -509,7 +517,17 @@ fn copy_element_to_implicit(
                 "Cannot skip undefined element".into(),
             ));
         }
-        out.extend_from_slice(&src[elem_start..skip_pos]);
+        // Copy the ITEM STREAM only: the 4-byte length field at `*pos` was
+        // already read into `val_len` and is rewritten below. When the source
+        // is explicit, the 2 reserved bytes sit between the VR and that length
+        // field, so the stream starts right after the length - appending from
+        // `*pos` put those reserved bytes where an implicit reader expects the
+        // first item tag.
+        // PS3.5 7.5: an ITEM header is implicit in EVERY syntax, so the
+        // stream's own bytes are the target's bytes and are copied verbatim.
+        let len_u32 = val_len as u32;
+        out.extend_from_slice(&len_u32.to_le_bytes());
+        out.extend_from_slice(&src[val_start..skip_pos]);
         *pos = skip_pos;
         return Ok(());
     }
@@ -691,19 +709,38 @@ fn find_metaheader_end(data: &[u8], start: usize) -> Result<usize, CodecError> {
 }
 
 /// 3008: the ONE canonical meta-group writer for every transcode path.
-/// Emits exactly three elements in ASCENDING order - (0002,0002)
-/// MediaStorageSOPClassUID, (0002,0003) MediaStorageSOPInstanceUID,
-/// (0002,0010) TransferSyntaxUID LAST - each an Explicit VR LE UI with an
-/// EVEN value length and the trailing NULL INCLUDED in the length
-/// (PS3.5 sec 6.2). No external pad bytes in group 0002, ever; no
-/// (0002,0000) group length (retired) and no (0002,0012)/(0002,0013)
+///
+/// Emits the group in ASCENDING tag order - (0002,0000) File Meta Information
+/// Group Length, (0002,0001) File Meta Information Version, (0002,0002)
+/// MediaStorageSOPClassUID, (0002,0003) MediaStorageSOPInstanceUID, then
+/// (0002,0010) TransferSyntaxUID LAST - each Explicit VR LE, the UI values
+/// with an EVEN length and the trailing NULL INCLUDED in it (PS3.5 6.2). No
+/// external pad bytes in group 0002, ever; no (0002,0012)/(0002,0013)
 /// (Type 3, dropped deliberately).
+///
+/// (0002,0000) and (0002,0001) are Type 1 whenever group 0002 is present
+/// (PS3.10 7.1 Table 7.1-1, `standard/ps3.10/file-meta-information-7.1.json`),
+/// so a meta group without them is non-conformant. The group length counts the
+/// bytes that FOLLOW its own Value Field - the UL value's 4 bytes, the 2-byte
+/// VR and the 4-byte tag are all outside the count.
 fn write_canonical_file_meta(
     out: &mut Vec<u8>,
     sop_class: Option<&[u8]>,
     sop_instance: Option<&[u8]>,
     ts: &[u8],
 ) {
+    // Build the members first: the group length has to be known before the
+    // element that states it can be written.
+    let mut group: Vec<u8> = Vec::with_capacity(64);
+    // (0002,0001) File Meta Information Version: one bit, in the FIRST byte
+    // of a two-byte OB field.
+    group.extend_from_slice(&0x0002u16.to_le_bytes());
+    group.extend_from_slice(&0x0001u16.to_le_bytes());
+    group.extend_from_slice(b"OB");
+    group.extend_from_slice(&[0x00, 0x00]); // reserved
+    group.extend_from_slice(&2u32.to_le_bytes());
+    group.extend_from_slice(&[0x00, 0x01]);
+
     // Ascending order is guaranteed by construction. Unresolved UIDs are
     // OMITTED (degraded mode - same semantics as before 3008): a broken
     // source element is never copied as-is, and an empty UI is never
@@ -721,15 +758,23 @@ fn write_canonical_file_meta(
         } else {
             value.len() + 1
         };
-        out.extend_from_slice(&0x0002u16.to_le_bytes());
-        out.extend_from_slice(&elem.to_le_bytes());
-        out.extend_from_slice(b"UI");
-        out.extend_from_slice(&(padded_len as u16).to_le_bytes());
-        out.extend_from_slice(value);
+        group.extend_from_slice(&0x0002u16.to_le_bytes());
+        group.extend_from_slice(&elem.to_le_bytes());
+        group.extend_from_slice(b"UI");
+        group.extend_from_slice(&(padded_len as u16).to_le_bytes());
+        group.extend_from_slice(value);
         if !value.len().is_multiple_of(2) {
-            out.push(0x00); // NULL pad INCLUDED in the length
+            group.push(0x00); // NULL pad INCLUDED in the length
         }
     }
+
+    // (0002,0000) File Meta Information Group Length, UL, 4-byte value.
+    out.extend_from_slice(&0x0002u16.to_le_bytes());
+    out.extend_from_slice(&0x0000u16.to_le_bytes());
+    out.extend_from_slice(b"UL");
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&(group.len() as u32).to_le_bytes());
+    out.extend_from_slice(&group);
 }
 
 /// 3008 UID resolution for the canonical meta, in order: the SOURCE meta
@@ -1670,6 +1715,39 @@ fn write_replacement_elements(
 ) {
     let high_bit = bits_allocated.saturating_sub(1);
 
+    // PhotometricInterpretation (0028,0004) CS must come FIRST: ascending tag
+    // order inside the replacement block. Emitting it after (0028,0100..0102)
+    // left a non-ascending element stream that strict readers reject.
+    // DICOM PS3.5 Section 7.1.1: character string VRs MUST have even-length
+    // values. If the value is odd, append a SPACE (0x20) and report even
+    // length. Some parsers (pydicom, MicroDICOM) fail on odd-length CS + pad.
+    let pi_raw = photometric_interpretation.as_bytes();
+    let pi_padded: Vec<u8> = if pi_raw.len().is_multiple_of(2) {
+        pi_raw.to_vec()
+    } else {
+        let mut v = pi_raw.to_vec();
+        v.push(0x20); // SPACE pad -- included IN the value, not after it
+        v
+    };
+    if target_is_be {
+        out.extend_from_slice(&0x0028u16.to_be_bytes());
+        out.extend_from_slice(&0x0004u16.to_be_bytes());
+    } else {
+        out.extend_from_slice(&0x0028u16.to_le_bytes());
+        out.extend_from_slice(&0x0004u16.to_le_bytes());
+    }
+    if target_is_implicit {
+        out.extend_from_slice(&(pi_padded.len() as u32).to_le_bytes());
+    } else {
+        out.extend_from_slice(b"CS");
+        if target_is_be {
+            out.extend_from_slice(&(pi_padded.len() as u16).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(pi_padded.len() as u16).to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&pi_padded);
+
     // Helper: write a US element in the target VR format
     let write_us_elem = |out: &mut Vec<u8>, elem: u16, val: u16| {
         // The tag follows the target byte order, like every other element in
@@ -1702,37 +1780,6 @@ fn write_replacement_elements(
     write_us_elem(out, 0x0100, bits_allocated as u16);
     write_us_elem(out, 0x0101, bits_stored as u16);
     write_us_elem(out, 0x0102, high_bit as u16);
-
-    // PhotometricInterpretation (0028,0004) CS
-    // DICOM PS3.5 Section 7.1.1: character string VRs MUST have even-length values.
-    // If the value is odd, append a SPACE (0x20) and report even length.
-    // Some parsers (pydicom, MicroDICOM) fail on odd-length CS + pad byte.
-    let pi_raw = photometric_interpretation.as_bytes();
-    let pi_padded: Vec<u8> = if pi_raw.len().is_multiple_of(2) {
-        pi_raw.to_vec()
-    } else {
-        let mut v = pi_raw.to_vec();
-        v.push(0x20); // SPACE pad -- included IN the value, not after it
-        v
-    };
-    if target_is_be {
-        out.extend_from_slice(&0x0028u16.to_be_bytes());
-        out.extend_from_slice(&0x0004u16.to_be_bytes());
-    } else {
-        out.extend_from_slice(&0x0028u16.to_le_bytes());
-        out.extend_from_slice(&0x0004u16.to_le_bytes());
-    }
-    if target_is_implicit {
-        out.extend_from_slice(&(pi_padded.len() as u32).to_le_bytes());
-    } else {
-        out.extend_from_slice(b"CS");
-        if target_is_be {
-            out.extend_from_slice(&(pi_padded.len() as u16).to_be_bytes());
-        } else {
-            out.extend_from_slice(&(pi_padded.len() as u16).to_le_bytes());
-        }
-    }
-    out.extend_from_slice(&pi_padded);
 }
 
 /// Copy an Implicit VR LE element from source to Explicit VR LE output.
@@ -1757,7 +1804,14 @@ fn copy_implicit_element_to_explicit(
     *pos += 4;
 
     if val_len == 0xFFFF_FFFF {
-        // Undefined length - copy verbatim
+        // Undefined length: the source spells tag + u32 length only, so
+        // copying it verbatim would leave an implicit header where an
+        // explicit reader expects a VR and two reserved bytes - the walker
+        // then reads the length's low bytes as a VR and desynchronises.
+        // Emit the explicit header instead (PS3.5 7.1.2) and keep the ITEM
+        // stream as-is: item tags and lengths are always implicit little
+        // endian regardless of the enclosing syntax (PS3.5 7.5), so rewriting
+        // them would be the same class of error one level down.
         let mut skip_pos = *pos;
         if !skip_undefined_element(src, &mut skip_pos, true, source_is_be) {
             out.extend_from_slice(&src[elem_start..]);
@@ -1765,7 +1819,27 @@ fn copy_implicit_element_to_explicit(
                 "Cannot skip undefined element".into(),
             ));
         }
-        out.extend_from_slice(&src[elem_start..skip_pos]);
+        let vr = crate::codec::vr_dict::vr_for_tag(group, elem);
+        if target_is_be {
+            out.extend_from_slice(&group.to_be_bytes());
+            out.extend_from_slice(&elem.to_be_bytes());
+        } else {
+            out.extend_from_slice(&group.to_le_bytes());
+            out.extend_from_slice(&elem.to_le_bytes());
+        }
+        // Only the four short-form VRs use the 2-byte length field; SQ uses
+        // the long form with two reserved bytes (PS3.5 Table 7.1-1).
+        let vr_bytes = vr.as_bytes();
+        if vr_bytes.len() != 2 {
+            out.extend_from_slice(&src[elem_start..skip_pos]);
+            return Err(CodecError::InvalidMetadata(
+                "Sequence tag has no two-letter VR".into(),
+            ));
+        }
+        out.extend_from_slice(vr_bytes);
+        out.extend_from_slice(&[0x00, 0x00]);
+        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        out.extend_from_slice(&src[*pos..skip_pos]);
         *pos = skip_pos;
         return Ok(());
     }
@@ -2283,6 +2357,13 @@ pub fn extract_transfer_syntax(data: &[u8]) -> Option<String> {
 /// Handles the sequence/item/delimiter structure for Implicit VR encoding.
 /// On success, `pos` points past the SequenceDelimitationItem (FFFE,E0DD).
 /// Returns false if the data is truncated.
+///
+/// PS3.5 7.5: only the OUTERMOST (FFFE,E0DD) closes the element this call was
+/// asked to skip. A nested sequence contributes its own delimiters, and
+/// returning at the first one of them left `pos` inside the outer sequence -
+/// every element after it was then read from the wrong offset, so the caller
+/// either failed or copied garbage. `nesting` is the count of undefined-length
+/// elements still open; the delimiter that closes at depth zero is the answer.
 fn skip_undefined_element(
     data: &[u8],
     pos: &mut usize,
@@ -2316,9 +2397,14 @@ fn skip_undefined_element(
                 nesting = nesting.saturating_sub(1);
             }
             (0xFFFE, 0xE0DD) => {
-                // SequenceDelimitationItem - end of the undefined-length element
+                // SequenceDelimitationItem. Only the one at depth zero closes
+                // the element being skipped; an inner one closes a nested
+                // sequence and the walk continues.
                 *pos += 4;
-                return true;
+                if nesting == 0 {
+                    return true;
+                }
+                nesting -= 1;
             }
             _ => {
                 // Regular attribute inside an item - skip its value
@@ -2892,6 +2978,35 @@ mod tests {
         assert!(is_compressed_ts(ts_uid::JPEG2000_LOSSY));
         assert!(!is_compressed_ts(ts_uid::EXPLICIT_VR_LE));
         assert!(!is_compressed_ts(ts_uid::EXPLICIT_VR_BE));
+    }
+
+    /// (0028,0004) PhotometricInterpretation must precede (0028,0100..0102):
+    /// the replacement block has to be an ascending element stream or strict
+    /// readers reject the rebuilt dataset.
+    #[test]
+    fn replacement_elements_are_written_in_ascending_tag_order() {
+        let mut out = Vec::new();
+        write_replacement_elements(&mut out, false, false, 16, 12, "MONOCHROME2");
+        // Explicit VR LE walk: tag(4) + VR(2) + len(2, short VRs only) + value.
+        let mut pos = 0usize;
+        let mut seen: Vec<u32> = Vec::new();
+        while pos + 8 <= out.len() {
+            let g = u16::from_le_bytes([out[pos], out[pos + 1]]);
+            let e = u16::from_le_bytes([out[pos + 2], out[pos + 3]]);
+            let tag = (u32::from(g) << 16) | u32::from(e);
+            let vr = &out[pos + 4..pos + 6];
+            let len = match vr {
+                b"US" | b"CS" => u16::from_le_bytes([out[pos + 6], out[pos + 7]]) as usize,
+                _ => break,
+            };
+            seen.push(tag);
+            pos += 8 + len;
+        }
+        assert_eq!(
+            seen,
+            vec![0x0028_0004, 0x0028_0100, 0x0028_0101, 0x0028_0102],
+            "replacement elements must be emitted in ascending tag order"
+        );
     }
 
     #[test]
@@ -3725,10 +3840,10 @@ mod tests {
 
     // -- 3008 canonical file-meta tests (red-first) -----------------
 
-    /// Independent reference emitter for the canonical trio (same PS3.5
-    /// sec 6.2 spec as the production writer): ascending (0002,0002),
-    /// (0002,0003), (0002,0010), Explicit VR LE UI, even length with the
-    /// trailing NULL INSIDE the length, no external pad, no group length.
+    /// Independent reference emitter for the canonical group (same PS3.5 6.2
+    /// and PS3.10 7.1 rules as the production writer): ascending (0002,0000)
+    /// group length, (0002,0001) version, then the three UIDs, Explicit VR LE,
+    /// even UI length with the trailing NULL INSIDE it, no external pad.
     fn ref_ui(out: &mut Vec<u8>, elem: u16, value: &[u8]) {
         let padded = if value.len().is_multiple_of(2) {
             value.len()
@@ -3746,10 +3861,25 @@ mod tests {
     }
 
     fn ref_trio(sop_class: &[u8], sop_instance: &[u8], ts: &[u8]) -> Vec<u8> {
+        let mut members = Vec::new();
+        // (0002,0001) OB, two bytes: version bit 0 set.
+        members.extend_from_slice(&0x0002u16.to_le_bytes());
+        members.extend_from_slice(&0x0001u16.to_le_bytes());
+        members.extend_from_slice(b"OB");
+        members.extend_from_slice(&[0x00, 0x00]);
+        members.extend_from_slice(&2u32.to_le_bytes());
+        members.extend_from_slice(&[0x00, 0x01]);
+        ref_ui(&mut members, 0x0002, sop_class);
+        ref_ui(&mut members, 0x0003, sop_instance);
+        ref_ui(&mut members, 0x0010, ts);
+
         let mut out = Vec::new();
-        ref_ui(&mut out, 0x0002, sop_class);
-        ref_ui(&mut out, 0x0003, sop_instance);
-        ref_ui(&mut out, 0x0010, ts);
+        out.extend_from_slice(&0x0002u16.to_le_bytes());
+        out.extend_from_slice(&0x0000u16.to_le_bytes());
+        out.extend_from_slice(b"UL");
+        out.extend_from_slice(&4u16.to_le_bytes());
+        out.extend_from_slice(&(members.len() as u32).to_le_bytes());
+        out.extend_from_slice(&members);
         out
     }
 
@@ -3782,6 +3912,30 @@ mod tests {
             pos = vo + len + (len % 2);
         }
         (elems, pos)
+    }
+
+    /// Assert the PS3.10 7.1 Table 7.1-1 Type 1 obligations on a meta group:
+    /// (0002,0000) is present and states the byte count AFTER its own Value
+    /// Field, and (0002,0001) is the two-byte version with bit 0 set.
+    fn assert_group_length(group: &[u8], elems: &[MetaElem]) {
+        let (elem, value, _, _) = elems
+            .first()
+            .expect("the group has at least the length element");
+        assert_eq!(*elem, 0x0000, "group length is element (0002,0000)");
+        assert_eq!(value.len(), 4, "UL carries one 4-byte value");
+        let stated = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+        // The UL element is tag(4) + VR(2) + len(2) + value(4) = 12 bytes, so
+        // everything counted starts after byte 12 of the group.
+        assert_eq!(
+            stated,
+            group.len() - 12,
+            "group length counts the bytes after its own value field"
+        );
+        let version = elems
+            .iter()
+            .find(|(t, ..)| *t == 0x0001)
+            .expect("(0002,0001) File Meta Information Version is Type 1");
+        assert_eq!(version.1, vec![0x00, 0x01], "version bit 0 set");
     }
 
     /// Build an explicit VR LE dataset carrying (0008,0016)/(0008,0018),
@@ -3877,9 +4031,18 @@ mod tests {
             expected.as_slice(),
             "meta bytes differ"
         );
-        assert_eq!(elems.len(), 3, "exactly three meta elements");
+        assert_eq!(
+            elems.len(),
+            5,
+            "the canonical group: length, version + 3 UIDs"
+        );
         let tags: Vec<u16> = elems.iter().map(|e| e.0).collect();
-        assert_eq!(tags, vec![0x0002, 0x0003, 0x0010], "ascending order");
+        assert_eq!(
+            tags,
+            vec![0x0000, 0x0001, 0x0002, 0x0003, 0x0010],
+            "ascending order"
+        );
+        assert_group_length(&out[132..meta_end], &elems);
         // Dataset bytes untouched except the 4-byte pixel VALUE (same-length
         // replacement at dataset offset 114): compare everything around it.
         let ds_src = 132 + meta.len(); // dataset start in the source
@@ -3954,7 +4117,12 @@ mod tests {
             "meta bytes differ"
         );
         let tags: Vec<u16> = elems.iter().map(|e| e.0).collect();
-        assert_eq!(tags, vec![0x0002, 0x0003, 0x0010], "ascending order");
+        assert_eq!(
+            tags,
+            vec![0x0000, 0x0001, 0x0002, 0x0003, 0x0010],
+            "ascending order"
+        );
+        assert_group_length(&out[132..meta_end], &elems);
         // Dataset still starts with (0008,0016), now in Explicit VR LE.
         assert_eq!(read_u16_le(&out, meta_end), 0x0008);
         assert_eq!(read_u16_le(&out, meta_end + 2), 0x0016);
@@ -4014,7 +4182,7 @@ mod tests {
             expected.as_slice(),
             "meta bytes differ"
         );
-        assert_eq!(elems.len(), 3);
+        assert_eq!(elems.len(), 5, "length, version + three UIDs");
     }
 
     /// A source ALREADY carrying the canonical trio produces the
@@ -4087,7 +4255,9 @@ mod tests {
         .expect("direct path must succeed");
 
         let (elems, _) = walk_meta(&out);
-        let (_, value, vo, len) = elems[0].clone();
+        // The odd-length UID is (0002,0002); (0002,0000) and (0002,0001) come
+        // first, so it is the third element.
+        let (_, value, vo, len) = elems[2].clone();
         assert_eq!(value.len(), 26, "even length");
         assert_eq!(&out[vo + 25..vo + 26], &[0x00], "NULL inside the length");
         // (0002,0003) starts immediately after: no external pad byte.
@@ -4392,6 +4562,127 @@ mod tests {
     /// Where the sequence starts in [`dataset_with_undefined_sq`].
     const SQ_AT: usize = 132;
 
+    /// An undefined-length sequence whose ITEM contains another undefined
+    /// sequence, followed by a defined-length element.
+    ///
+    /// PS3.5 7.5: the inner (FFFE,E0DD) closes the nested sequence, not the
+    /// outer one. Returning at the first delimiter left the cursor inside the
+    /// outer item stream, so the element after the sequence was read from a
+    /// value byte - the caller then failed or copied garbage.
+    fn dataset_with_nested_undefined_sq() -> Vec<u8> {
+        let mut sq = Vec::new();
+        // Outer (0008,1115) SQ, undefined length.
+        sq.extend_from_slice(&0x0008u16.to_le_bytes());
+        sq.extend_from_slice(&0x1115u16.to_le_bytes());
+        sq.extend_from_slice(b"SQ");
+        sq.extend_from_slice(&[0u8, 0u8]);
+        sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Item, undefined length.
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE000u16.to_le_bytes());
+        sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Inner (0008,1140) SQ, undefined length, one empty item.
+        sq.extend_from_slice(&0x0008u16.to_le_bytes());
+        sq.extend_from_slice(&0x1140u16.to_le_bytes());
+        sq.extend_from_slice(b"SQ");
+        sq.extend_from_slice(&[0u8, 0u8]);
+        sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE000u16.to_le_bytes());
+        sq.extend_from_slice(&0u32.to_le_bytes());
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        sq.extend_from_slice(&0u32.to_le_bytes());
+        // Item delimiter, then the outer sequence delimiter.
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE00Du16.to_le_bytes());
+        sq.extend_from_slice(&0u32.to_le_bytes());
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        sq.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut out = vec![0u8; 128];
+        out.extend_from_slice(b"DICM");
+        out.extend_from_slice(&sq);
+        // (0010,0010) PN after the sequence - what the walk must reach.
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(b"PN");
+        out.extend_from_slice(&4u16.to_le_bytes());
+        out.extend_from_slice(b"TEST");
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(&0x0020u16.to_le_bytes());
+        out.extend_from_slice(b"LO");
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(b"ID");
+        out
+    }
+
+    /// A nested sequence delimiter must not end the skip.
+    ///
+    /// The counter is the whole point: `nesting` tracks how many
+    /// undefined-length elements are open, and only the delimiter that closes
+    /// one at depth zero finishes the element being skipped. The fixture puts
+    /// a defined-length element between the inner and the outer delimiter, so
+    /// stopping at the inner one lands the cursor on that element instead of
+    /// past the sequence.
+    #[test]
+    fn a_nested_sequence_delimiter_does_not_end_the_skip() {
+        let src = dataset_with_nested_undefined_sq();
+        const OUTER_SQ_AT: usize = 132;
+        // The callers hand the cursor the ITEM STREAM, i.e. just past the
+        // sequence's own tag/VR/length header (PS3.5 7.5: group FFFE inside
+        // it carries no VR).
+        let mut pos = OUTER_SQ_AT + 12;
+        assert!(
+            skip_undefined_element(&src, &mut pos, false, false),
+            "the skip succeeds"
+        );
+
+        // The cursor must be past the OUTER delimiter, i.e. exactly at the
+        // byte after it - not at the element that follows the inner one.
+        let outer_delimiter = outer_delimiter_offset(&src);
+        assert_eq!(
+            pos,
+            outer_delimiter + 8,
+            "the skip ends at the outer Sequence Delimitation Item"
+        );
+        assert!(
+            pos > inner_delimiter_offset(&src) + 8,
+            "and that is past the nested one"
+        );
+
+        // The element after the sequence is intact and parseable, which is
+        // what the caller does next: tag, VR, 2-byte length, then the value.
+        let vr = std::str::from_utf8(&src[pos + 4..pos + 6]).expect("PN VR bytes");
+        let len = read_u16_le(&src, pos + 6);
+        assert_eq!(read_u16_le(&src, pos), 0x0010, "the PN row is next");
+        assert_eq!(vr, "PN", "the element after the sequence is intact");
+        assert_eq!(len, 4);
+        assert_eq!(&src[pos + 8..pos + 12], b"TEST");
+    }
+
+    /// Offset of the INNER (FFFE,E0DD) in [`dataset_with_nested_undefined_sq`].
+    fn inner_delimiter_offset(src: &[u8]) -> usize {
+        // The inner sequence starts at the item body: the first occurrence of
+        // the nested (0008,1140) tag.
+        src.windows(4)
+            .position(|w| w == [0x08, 0x00, 0x40, 0x11])
+            .map(|at| {
+                // tag+VR+reserved+length, item, empty item value, then the
+                // delimiter's tag.
+                at + 12 + 8 + 8
+            })
+            .expect("the nested sequence is in the fixture")
+    }
+
+    /// Offset of the OUTER (FFFE,E0DD): the last delimiter before the PN.
+    fn outer_delimiter_offset(src: &[u8]) -> usize {
+        src.windows(4)
+            .rposition(|w| w == [0xFE, 0xFF, 0xDD, 0xE0])
+            .expect("the outer sequence delimiter is in the fixture")
+    }
+
     /// `copy_element_to_implicit` must walk the item stream, not read a VR.
     ///
     /// The cursor it hands to the skip function is inside the item stream,
@@ -4412,15 +4703,51 @@ mod tests {
 
         let expected_end = SQ_AT + undefined_length_sq(false).len();
         assert_eq!(pos, expected_end, "and the cursor lands past the delimiter");
-        // The function writes the tag itself before appending the span, so
-        // the output is the tag twice: the copy's own, then the verbatim
-        // span that begins with the same four bytes.
-        assert_eq!(
-            &out[4..],
-            &src[SQ_AT..expected_end],
-            "the bytes are copied verbatim, delimiters and all"
+        // PS3.5 7.5: an element carries its tag ONCE. The copy writes the tag
+        // itself, so what follows is the source's length field and item
+        // stream - NOT the source span from the tag, which is what the old
+        // assertion blessed (tag,tag,item,...).
+        //
+        // The source here is EXPLICIT VR, so its length form is VR(2) +
+        // reserved(2) + length(4); the copy is IMPLICIT VR, so the target
+        // writes the source's four LENGTH bytes verbatim and drops the VR.
+        assert_eq!(&out[..4], &src[SQ_AT..SQ_AT + 4], "the tag is written");
+        assert_ne!(
+            &out[4..8],
+            &src[SQ_AT..SQ_AT + 4],
+            "and it is not written twice: offset 4 is a length field"
         );
-        assert_eq!(&out[..4], &src[SQ_AT..SQ_AT + 4], "and the tag is written");
+        assert_eq!(
+            &out[4..8],
+            &0xFFFF_FFFFu32.to_le_bytes(),
+            "undefined length"
+        );
+        // The item stream, delimiters and all, copied ONCE from the source's
+        // own bytes, starting at its first ITEM header - i.e. after the tag
+        // (4), the VR (2), the reserved bytes (2) and the length (4).
+        let item_stream = &src[SQ_AT + 12..expected_end];
+        assert_eq!(
+            &out[8..],
+            item_stream,
+            "the source's own items and delimiters"
+        );
+        // The element parses back: tag, undefined length, and the item stream
+        // a reader walks from there. Under the old code `out[4..8]` held the
+        // tag AGAIN, so a reader that trusts the value length swallowed four
+        // bytes of the item header and every element after this one was
+        // addressed from the wrong offset.
+        //
+        // The ITEM/sequence delimiter stream is walked from the value, not
+        // from a second element header: group FFFE carries no VR (PS3.5 7.5),
+        // so this is the same walk `skip_undefined_element` performs for its
+        // callers.
+        assert_eq!(&out[8..12], &[0xFE, 0xFF, 0x00, 0xE0], "item tag next");
+        assert_eq!(
+            &out[out.len() - 8..],
+            &[0xFE, 0xFF, 0xDD, 0xE0, 0, 0, 0, 0],
+            "and the value ends with the sequence delimiter"
+        );
+        assert_eq!(out.len(), 8 + item_stream.len(), "copied exactly once");
     }
 
     /// The same walk, driven with the SOURCE marked implicit.
@@ -4439,7 +4766,23 @@ mod tests {
 
         let expected_end = SQ_AT + undefined_length_sq(true).len();
         assert_eq!(pos, expected_end);
-        assert_eq!(&out[4..], &src[SQ_AT..expected_end]);
+        // One tag, then the source's length field and item stream (see the
+        // non-implicit twin above for why the span starts after the tag). An
+        // IMPLICIT source has no VR and no reserved bytes, so its length field
+        // IS `out[4..8]` and its items start immediately after it.
+        assert_eq!(&out[..4], &src[SQ_AT..SQ_AT + 4], "the tag is written once");
+        assert_eq!(
+            &out[4..8],
+            &0xFFFF_FFFFu32.to_le_bytes(),
+            "undefined length"
+        );
+        assert_eq!(out.len(), 8 + (expected_end - (SQ_AT + 8)));
+        assert_eq!(&out[8..12], &[0xFE, 0xFF, 0x00, 0xE0], "item tag next");
+        assert_eq!(
+            &out[out.len() - 8..],
+            &[0xFE, 0xFF, 0xDD, 0xE0, 0, 0, 0, 0],
+            "and the value ends with the sequence delimiter"
+        );
     }
 
     /// PS3.5 7.1: the transfer syntax fixes the byte order of every binary VR.
@@ -4477,6 +4820,139 @@ mod tests {
         copy_element_to_implicit(&mut out_le, &le, &mut pos, 0x0028, 0x0010, 0, false, false)
             .expect("an LE source copies");
         assert_eq!(&out_le[8..10], &512u16.to_le_bytes());
+    }
+
+    /// Build a small Explicit VR LE colour instance whose PixelData is
+    /// colour-by-PLANE (PlanarConfiguration = 1).
+    ///
+    /// Three 1x1 frames' worth is enough: the point is the tag, not the
+    /// picture. The planes are written so an interleaved reader would produce
+    /// a different pixel than a planar one.
+    #[cfg(feature = "transcode")]
+    fn colour_by_plane_evrle(planar_configuration: u16) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0u8; 128]);
+        d.extend_from_slice(b"DICM");
+        let el = |buf: &mut Vec<u8>, g: u16, e: u16, vr: &[u8; 2], v: &[u8]| {
+            buf.extend_from_slice(&g.to_le_bytes());
+            buf.extend_from_slice(&e.to_le_bytes());
+            buf.extend_from_slice(vr);
+            if matches!(vr, b"OB" | b"OW" | b"SQ" | b"UN" | b"UT") {
+                buf.extend_from_slice(&[0u8, 0u8]);
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            } else {
+                buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            }
+            buf.extend_from_slice(v);
+            if !v.len().is_multiple_of(2) {
+                buf.push(0);
+            }
+        };
+        el(
+            &mut d,
+            0x0002,
+            0x0010,
+            b"UI",
+            ts_uid::EXPLICIT_VR_LE.as_bytes(),
+        );
+        el(
+            &mut d,
+            0x0002,
+            0x0002,
+            b"UI",
+            b"1.2.840.10008.5.1.4.1.1.7.3",
+        );
+        el(&mut d, 0x0002, 0x0003, b"UI", b"1.2.3.4.5.6.7.8.9");
+        el(
+            &mut d,
+            0x0008,
+            0x0016,
+            b"UI",
+            b"1.2.840.10008.5.1.4.1.1.7.3",
+        );
+        el(&mut d, 0x0008, 0x0018, b"UI", b"1.2.3.4.5.6.7.8.9");
+        el(&mut d, 0x0008, 0x0060, b"CS", b"OT");
+        el(&mut d, 0x0028, 0x0002, b"US", &3u16.to_le_bytes());
+        el(&mut d, 0x0028, 0x0004, b"CS", b"RGB");
+        el(
+            &mut d,
+            0x0028,
+            0x0006,
+            b"US",
+            &planar_configuration.to_le_bytes(),
+        );
+        el(&mut d, 0x0028, 0x0010, b"US", &1u16.to_le_bytes());
+        el(&mut d, 0x0028, 0x0011, b"US", &1u16.to_le_bytes());
+        el(&mut d, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+        el(&mut d, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+        el(&mut d, 0x0028, 0x0102, b"US", &7u16.to_le_bytes());
+        // One pixel: 3 samples. Planar order R=10, G=20, B=30 is the same as
+        // interleaved for a single pixel, so the tag is the only witness.
+        el(&mut d, 0x7FE0, 0x0010, b"OB", &[10u8, 20, 30]);
+        d
+    }
+
+    /// The output Planar Configuration must describe the bytes it ships.
+    ///
+    /// Every encoder in this crate writes interleaved samples, but the tag was
+    /// copied from the source. A colour-by-plane source therefore produced
+    /// interleaved pixel data behind `PlanarConfiguration = 1`, and a reader
+    /// obeying the tag read the red plane as the green one. PS3.3 C.7.6.3.1.3
+    /// makes the tag required for SamplesPerPixel > 1.
+    ///
+    /// Falsification anchor: the source is written with 1 precisely because
+    /// that is the value the old code passed through unchanged.
+    #[test]
+    #[cfg(feature = "transcode")]
+    fn a_colour_output_declares_the_interleaved_layout_it_encodes() {
+        let src = colour_by_plane_evrle(1);
+        let registry = crate::codec::CodecRegistry::default();
+        let out = transcode_dicom(&src, ts_uid::RLE_LOSSLESS, &registry).expect("transcode");
+
+        let elements = strict_explicit_walk(&out);
+        let pc = elements
+            .iter()
+            .find(|(tag, _, _)| *tag == (0x0028, 0x0006))
+            .expect("a colour output carries Planar Configuration");
+        let at = find_dicom_tag(&out, (0x0028, 0x0006), false, false)
+            .expect("the tag is locatable in the output");
+        let value = read_u16_le(&out, at + 8);
+        assert_eq!(
+            value, 0,
+            "the encoder emits interleaved samples, so the tag must say so \\
+             (was {:?})",
+            pc.1
+        );
+
+        // The control: an already-interleaved source stays at 0.
+        let src0 = colour_by_plane_evrle(0);
+        let out0 = transcode_dicom(&src0, ts_uid::RLE_LOSSLESS, &registry).expect("transcode");
+        let at0 = find_dicom_tag(&out0, (0x0028, 0x0006), false, false).expect("tag present");
+        assert_eq!(read_u16_le(&out0, at0 + 8), 0);
+    }
+
+    /// A colour source with NO Planar Configuration still gets one on output.
+    ///
+    /// PS3.3 C.7.6.3.1.3: the attribute is required when SamplesPerPixel > 1.
+    /// Dropping it left pydicom and dcm4che guessing the layout.
+    #[test]
+    #[cfg(feature = "transcode")]
+    fn a_colour_output_without_a_source_tag_gains_planar_configuration() {
+        let src = colour_by_plane_evrle(0);
+        // Strip (0028,0006): rebuild the element list without it.
+        let at = find_dicom_tag(&src, (0x0028, 0x0006), false, false).expect("tag present");
+        let mut stripped = src[..at].to_vec();
+        stripped.extend_from_slice(&src[at + 10..]);
+
+        let registry = crate::codec::CodecRegistry::default();
+        let out = transcode_dicom(&stripped, ts_uid::RLE_LOSSLESS, &registry).expect("transcode");
+        let at_out = find_dicom_tag(&out, (0x0028, 0x0006), false, false)
+            .expect("the output declares its planar configuration");
+        assert_eq!(
+            read_u16_le(&out, at_out + 8),
+            0,
+            "and it declares interleaved"
+        );
     }
 
     /// `copy_explicit_element` is the second half of the same defect.
@@ -4675,5 +5151,102 @@ mod tests {
             matches!(error, CodecError::InvalidMetadata(_)),
             "got {error:?}"
         );
+    }
+
+    /// An undefined-length sequence in an Implicit VR source has no VR on the
+    /// wire; the explicit output must gain one.
+    ///
+    /// Copying the source span verbatim put `FF FF FF FF` where an explicit
+    /// reader expects a two-letter VR, so the walker read the length's low
+    /// bytes as a VR and desynchronised on the next element. The test walks
+    /// the output with an explicit reader and requires both the SQ header and
+    /// the element after it.
+    #[test]
+    fn an_undefined_length_implicit_sequence_gains_an_explicit_header() {
+        let mut item = Vec::new();
+        item.extend_from_slice(&implicit_element(
+            0x0008,
+            0x0016,
+            b"1.2.840.10008.5.1.4.1.1.88.11",
+        ));
+        let mut dataset = Vec::new();
+        dataset.extend_from_slice(&implicit_element(0x0010, 0x0010, b"TEST^PATIENT "));
+        // (0040,A730) Content Sequence, Implicit VR, UNDEFINED length.
+        dataset.extend_from_slice(&0x0040u16.to_le_bytes());
+        dataset.extend_from_slice(&0xA730u16.to_le_bytes());
+        dataset.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        dataset.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        dataset.extend_from_slice(&0xE000u16.to_le_bytes());
+        dataset.extend_from_slice(&(item.len() as u32).to_le_bytes());
+        dataset.extend_from_slice(&item);
+        dataset.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        dataset.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        dataset.extend_from_slice(&0u32.to_le_bytes());
+        // The element AFTER the sequence, which desynchronises when the
+        // sequence header is left implicit.
+        dataset.extend_from_slice(&implicit_element(0x0020, 0x0013, b"1 "));
+
+        let out = reencode_implicit_to_explicit(&implicit_file(&dataset)).expect("re-encoded");
+        let dataset_start = find_metaheader_end(&out, 132).expect("meta end");
+        let body = &out[dataset_start..];
+
+        // Walk as an explicit reader: tag(4) + VR(2) + reserved(2) +
+        // length(4) for the long-form VRs, tag(4) + VR(2) + length(2) for the
+        // short ones.
+        let mut pos = 0usize;
+        let mut seen_sq = false;
+        let mut seen_after = false;
+        while pos + 8 <= body.len() {
+            let group = u16::from_le_bytes([body[pos], body[pos + 1]]);
+            let element = u16::from_le_bytes([body[pos + 2], body[pos + 3]]);
+            let vr = &body[pos + 4..pos + 6];
+            if group == 0x0040 && element == 0xA730 {
+                assert_eq!(vr, b"SQ", "the sequence carries its VR");
+                let len = u32::from_le_bytes([
+                    body[pos + 8],
+                    body[pos + 9],
+                    body[pos + 10],
+                    body[pos + 11],
+                ]);
+                assert_eq!(len, 0xFFFF_FFFF, "undefined length survives");
+                seen_sq = true;
+                // Skip the item stream to the sequence delimiter.
+                let mut scan = pos + 12;
+                while scan + 8 <= body.len() {
+                    if body[scan..scan + 4] == [0xFE, 0xFF, 0xDD, 0xE0] {
+                        scan += 8;
+                        break;
+                    }
+                    let item_len = u32::from_le_bytes([
+                        body[scan + 4],
+                        body[scan + 5],
+                        body[scan + 6],
+                        body[scan + 7],
+                    ]) as usize;
+                    scan += 8 + item_len;
+                }
+                pos = scan;
+                continue;
+            }
+            if group == 0x0020 && element == 0x0013 {
+                seen_after = true;
+                assert_eq!(vr, b"IS", "the reader stays in sync past the sequence");
+                break;
+            }
+            let len = match vr {
+                b"OB" | b"OW" | b"OF" | b"SQ" | b"UT" | b"UN" => u32::from_le_bytes([
+                    body[pos + 8],
+                    body[pos + 9],
+                    body[pos + 10],
+                    body[pos + 11],
+                ]) as usize,
+                _ => u16::from_le_bytes([body[pos + 6], body[pos + 7]]) as usize,
+            };
+            // Values are padded to an even length (PS3.5 7.1.1), so the next
+            // element starts past the pad byte.
+            pos += 8 + len + (len & 1);
+        }
+        assert!(seen_sq, "the sequence was found by an explicit walker");
+        assert!(seen_after, "the element after the sequence was reached");
     }
 }

@@ -1,7 +1,12 @@
 {
-  "protocol": { "name": "clinfer-abi", "version": 1 },
+  "protocol": { "name": "clinfer-abi", "version": 2 },
   "clinfer_version": "0.3.0-alpha",
   "profile_version": 2,
+  "parameters": {
+    "CLIP_LIMIT": [2.0],
+    "ALGORITHM": ["clahe"],
+    "Selected Organ Class": ["SRT:T-D0050", "SRT:T-D0075", "SRT:T-D0090"]
+  },
   "study": {
     "uid": "1.2.840.113857.1.1",
     "description": "CHEST PA AND LAT",

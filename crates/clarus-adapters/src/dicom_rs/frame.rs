@@ -209,6 +209,17 @@ fn extract_frame_native(
 /// ```
 ///
 /// Each Item: tag (4 bytes) + length (4 bytes u32) + data (length bytes).
+///
+/// PS3.5 A.4 makes the Basic Offset Table the authoritative frame->fragment
+/// map: one offset per frame, counted in bytes from the first byte of the
+/// first Item TAG. A frame may span SEVERAL fragments, and treating item N as
+/// frame N then serves the first fragment of such a frame as the whole frame
+/// (a truncated codestream) and shifts every later frame. When the table is
+/// present, AGREES with the items (non-decreasing, each offset on a fragment
+/// boundary, the count equal to the item count) and yields the declared
+/// frames, the frame is assembled from its fragments. Otherwise - an empty
+/// table, or one the items do not bear out - the items themselves are the only
+/// reading left, and they are read one item per frame.
 fn extract_frame_encapsulated(
     pixel_data: &[u8],
     frame_number: u32,
@@ -241,14 +252,23 @@ fn extract_frame_encapsulated(
     ]) as usize;
     pos += 4; // skip length
 
-    // Skip Basic Offset Table data
+    // Basic Offset Table data: offsets count from the FIRST ITEM TAG, which
+    // is the byte `pos` is about to become.
     if pos + bot_length > data_len {
         return Err(FrameExtractionError::TruncatedData);
     }
+    if !bot_length.is_multiple_of(4) {
+        return Err(FrameExtractionError::InvalidEncapsulation(
+            "Basic Offset Table length is not a multiple of 4".into(),
+        ));
+    }
+    let fragments_start = pos;
     pos += bot_length;
 
     // -- Step 2: Iterate through frame Items -----------------------
-    let mut current_frame: u32 = 0;
+    // Record every fragment's DATA range; the table (when usable) decides
+    // how many of them make up the requested frame.
+    let mut fragments: Vec<(usize, usize)> = Vec::new();
 
     while pos + 8 <= data_len {
         let item_group = u16::from_le_bytes([pixel_data[pos], pixel_data[pos + 1]]);
@@ -284,6 +304,9 @@ fn extract_frame_encapsulated(
             pixel_data[pos + 2],
             pixel_data[pos + 3],
         ]) as usize;
+        // The item's data starts after its 8-byte header (tag + length); the
+        // element item_elem was read from starts 4 bytes before `pos`.
+        let item_tag_at = pos - 4;
         pos += 4;
 
         // Read item data
@@ -291,21 +314,132 @@ fn extract_frame_encapsulated(
             return Err(FrameExtractionError::TruncatedData);
         }
 
-        current_frame += 1;
-
-        if current_frame == frame_number {
-            // This is the requested frame
-            return Ok(pixel_data[pos..pos + item_length].to_vec());
-        }
-
+        // The fragment's ITEM TAG offset, which is what the Basic Offset Table
+        // counts from (PS3.5 A.4); its data begins 8 bytes later.
+        fragments.push((item_tag_at, item_length));
         pos += item_length;
     }
 
-    // If we got here, the frame wasn't found
-    Err(FrameExtractionError::FrameOutOfRange {
-        requested: frame_number,
-        total: num_frames.max(current_frame),
-    })
+    // Frames from the table, when it is present and the items bear it out.
+    match frames_from_bot(pixel_data, fragments_start, bot_length, &fragments) {
+        BotVerdict::Ranges(frames) => {
+            let index = (frame_number as usize).wrapping_sub(1);
+            match frames.get(index) {
+                Some(range) => Ok(pixel_data[range.clone()].to_vec()),
+                None => Err(FrameExtractionError::FrameOutOfRange {
+                    requested: frame_number,
+                    total: frames.len() as u32,
+                }),
+            }
+        }
+        // The table is not a single-fragment-per-frame map, so item N is not
+        // frame N: answering from the items would hand back the first
+        // fragment of a multi-fragment frame as if it were the whole
+        // codestream (PS3.5 A.4 allows a frame to span fragments). Refusing
+        // is the only answer that cannot pass a truncated frame off as whole.
+        BotVerdict::Unsupported => Err(FrameExtractionError::InvalidEncapsulation(
+            "Basic Offset Table describes frames that span fragments; a single byte range per frame does not exist".into(),
+        )),
+        BotVerdict::Absent => {
+            let index = (frame_number as usize).wrapping_sub(1);
+            match fragments.get(index) {
+                Some(&(tag_at, len)) => Ok(pixel_data[tag_at + 8..tag_at + 8 + len].to_vec()),
+                None => Err(FrameExtractionError::FrameOutOfRange {
+                    requested: frame_number,
+                    total: num_frames.max(fragments.len() as u32),
+                }),
+            }
+        }
+    }
+}
+
+/// What the Basic Offset Table says about the items that follow it.
+enum BotVerdict {
+    /// One byte range per frame; the table is usable.
+    Ranges(Vec<std::ops::Range<usize>>),
+    /// No table, so one item per frame is the only reading left.
+    Absent,
+    /// The table says at least one frame spans several fragments. No single
+    /// byte range per frame exists, and the items alone would misname frames.
+    Unsupported,
+}
+
+/// The per-frame byte ranges a FILLED Basic Offset Table describes, or the
+/// reason no such ranges exist.
+///
+/// PS3.5 A.4: offset `i` is the byte distance from the first byte of the first
+/// Item TAG to the first byte of the first Item TAG of frame `i`. A frame runs
+/// from its own offset to the next one, and any number of fragments - each
+/// introduced by its own 8-byte item header - lies between them. The table is
+/// trusted only when its offsets are strictly increasing and every one of them
+/// lands exactly on a fragment's item tag; otherwise the items do not bear the
+/// table out and guessing which of the two is right is worse than reading the
+/// items themselves.
+fn frames_from_bot(
+    pixel_data: &[u8],
+    fragments_start: usize,
+    bot_length: usize,
+    fragments: &[(usize, usize)],
+) -> BotVerdict {
+    if bot_length == 0 {
+        return BotVerdict::Absent; // empty: says nothing about frame boundaries
+    }
+    let count = bot_length / 4;
+    let mut starts: Vec<usize> = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = fragments_start + i * 4;
+        starts.push(u32::from_le_bytes([
+            pixel_data[at],
+            pixel_data[at + 1],
+            pixel_data[at + 2],
+            pixel_data[at + 3],
+        ]) as usize);
+    }
+    if starts.windows(2).any(|w| w[0] >= w[1]) {
+        // Not strictly increasing: not a frame map, so the items are the only
+        // reading left.
+        return BotVerdict::Absent;
+    }
+    // Every offset must name a fragment's item TAG. PS3.5 A.4 counts from the
+    // first byte of the first Item TAG that follows the table, so the origin
+    // is that tag - one 8-byte item header past the table's data - and not
+    // the table's data start. Anchoring on the data start shifted every
+    // offset by 8 and made a conformant table look like one the items do not
+    // bear out, which discarded the whole table.
+    let Some(&(origin, _)) = fragments.first() else {
+        return BotVerdict::Absent; // no fragments: nothing to describe
+    };
+    let rel = |at: usize| at.wrapping_sub(origin);
+    if starts
+        .iter()
+        .any(|start| !fragments.iter().any(|(at, _)| rel(*at) == *start))
+    {
+        return BotVerdict::Absent; // offsets name nothing the items contain
+    }
+    // A frame that spans fragments cannot be expressed as one byte range (an
+    // item header sits between its halves), so the table cannot describe this
+    // instance. That is a real answer about the file, not a broken table, and
+    // it is reported as such: the caller must not fall back to item-per-frame
+    // and serve the first fragment as the whole frame.
+    let mut frames = Vec::with_capacity(count);
+    for (i, &start) in starts.iter().enumerate() {
+        let end_limit = starts.get(i + 1).copied().unwrap_or(usize::MAX);
+        let mut owned = fragments
+            .iter()
+            .filter(|(at, _)| (start..end_limit).contains(&rel(*at)));
+        let Some(&(tag_at, len)) = owned.next() else {
+            return BotVerdict::Absent; // a frame with no fragment of its own
+        };
+        if owned.next().is_some() {
+            return BotVerdict::Unsupported; // the frame spans fragments
+        }
+        let end = tag_at + 8 + len;
+        if end > pixel_data.len() {
+            return BotVerdict::Absent;
+        }
+        frames.push(tag_at + 8..end);
+    }
+    BotVerdict::Ranges(frames)
 }
 
 // -- Metadata helpers -------------------------------------------------
@@ -583,7 +717,6 @@ fn chunks_encapsulated(
     }
     Ok(out)
 }
-
 /// Little-endian u16 at `data[at..at+2]`, 0 when out of range.
 fn read_u16_at(data: &[u8], at: usize) -> u16 {
     match data.get(at..at + 2) {
@@ -1251,7 +1384,20 @@ fn chunks_encapsulated_stream(
         }
         for (chunk, entry) in out.iter().zip(table.chunks_exact(4)) {
             let start = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) as u64;
-            let expect = chunk.offset - fragments_start;
+            // PS3.5 A.4: each offset counts bytes from the first byte of the
+            // first ITEM TAG after the Basic Offset Table, and points at the
+            // item tag of its own frame. `chunk.offset` is the first byte of
+            // that frame's DATA, so the 8-byte item header is subtracted
+            // before comparing. Measuring from the BOT's own tag instead added
+            // that header to every expected value, so a valid table disagreed
+            // with the walk and the whole table was discarded.
+            let Some(expect) = chunk
+                .offset
+                .checked_sub(8)
+                .and_then(|v| v.checked_sub(after_bot))
+            else {
+                return Ok(Vec::new());
+            };
             if start != expect {
                 return Ok(Vec::new());
             }
@@ -1291,6 +1437,7 @@ fn find_tag_range(data: &[u8], target: (u16, u16)) -> Option<(usize, usize)> {
             // mirrors the file variant, which likewise uses EOF as the upper
             // bound for undefined-length PixelData.
             if let Some((length, value_start, _end)) = element_extent(data, pos) {
+                let _ = value_start;
                 return Some((value_start, length));
             }
             let vr = [data[pos + 4], data[pos + 5]];
@@ -1567,6 +1714,27 @@ fn element_extent(data: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
 /// Walks item headers, counting nesting, and returns the position just past
 /// the delimitation that closes the OUTERMOST element.
 fn undefined_length_end(data: &[u8], pos: usize) -> Option<usize> {
+    undefined_length_end_at(data, pos, 0)
+}
+
+/// Depth bound for [`undefined_length_end`]'s recursion.
+///
+/// Eight bytes of crafted input buy one level, so a 1 MiB payload buys ~130k
+/// levels and the stack dies - under `panic=abort` that aborts the process.
+/// frame.rs is reachable from STOW (`find_tag_range` ->
+/// `compute_frame_chunks_capped`), so the depth must be bounded the way the
+/// metadata parser already bounds its own walk (parser.rs
+/// `MAX_UID_WALK_DEPTH`, same value): one rule, two files. Real objects nest a
+/// handful of levels, so 64 is past anything PS3.5/PS3.3 produces.
+const MAX_UNDEFINED_NESTING: usize = 64;
+
+/// [`undefined_length_end`] with the depth explicitly counted.
+fn undefined_length_end_at(data: &[u8], pos: usize, depth: usize) -> Option<usize> {
+    // Fail closed: an over-deep walk yields "cannot measure", so the caller
+    // keeps the whole-blob path instead of building a partial table.
+    if depth >= MAX_UNDEFINED_NESTING {
+        return None;
+    }
     let mut nesting: u32 = 0;
     let mut p = pos;
     while p + 8 <= data.len() {
@@ -1603,7 +1771,7 @@ fn undefined_length_end(data: &[u8], pos: usize) -> Option<usize> {
                 } else {
                     p + 8
                 };
-                p = undefined_length_end(data, value_start)?;
+                p = undefined_length_end_at(data, value_start, depth + 1)?;
             }
         }
     }
@@ -1647,12 +1815,14 @@ pub fn compute_frame_size(
         return None;
     }
     if bits_allocated == 1 {
-        // PS3.5 Section 8.1.1: one bit per pixel, each row padded to the
-        // next byte boundary. The frame is rows packed bit-rows, NOT
-        // rows x columns bytes (the old ceil(bits/8)=1 reading inflated
-        // a 1-bit frame 8x - the 20.09 SEG /frames bug).
-        let row_bytes = (columns as usize).div_ceil(8);
-        return Some(rows as usize * samples_per_pixel as usize * row_bytes);
+        // PS3.5 8.1 packs bits CONTINUOUSLY across the Value Field: no per-row
+        // byte boundary, and multi-frame native values are concatenated with
+        // no per-frame padding (standard/ps3.5/bit-packed-pixel-data-8.1.json,
+        // bitPackedContinuity + multiFrameConcatenation). A row-padded reading
+        // (rows * ceil(columns/8)) shifted every row after the first, and on a
+        // 100x100 frame put frame 2 fifty bytes late.
+        let bits = rows as usize * columns as usize * samples_per_pixel as usize;
+        return Some(bits.div_ceil(8));
     }
     let bytes_per_sample = (bits_allocated as usize).div_ceil(8);
     if bytes_per_sample == 0 {
@@ -1763,7 +1933,72 @@ mod tests {
     fn test_extract_frame_encapsulated_first() {
         let enc = make_encapsulated(&[b"\xAA\xBB\xCC", b"\xDD\xEE\xFF", b"\x11\x22\x33"]);
         let result = extract_frame(&enc, 1, 0, 3).unwrap();
-        assert_eq!(result, b"\xAA\xBB\xCC");
+        assert_eq!(result.to_vec(), b"\xAA\xBB\xCC".to_vec());
+    }
+
+    /// The filled-table control: a BOT that AGREES with the items must give
+    /// the same answer as the empty-table path.
+    #[test]
+    fn a_filled_offset_table_agreeing_with_the_items_is_used() {
+        let enc = make_encapsulated_with_bot(&[b"\xAA\xBB\xCC", b"\xDD\xEE\xFF"]);
+        assert_eq!(
+            extract_frame(&enc, 1, 0, 2).unwrap().to_vec(),
+            b"\xAA\xBB\xCC".to_vec()
+        );
+        assert_eq!(
+            extract_frame(&enc, 2, 0, 2).unwrap().to_vec(),
+            b"\xDD\xEE\xFF".to_vec()
+        );
+    }
+
+    /// PS3.5 A.4: a frame may span several fragments, and a byte-range view
+    /// cannot express one (the item headers sit between the fragments), so an
+    /// instance whose table says so is left to the whole-blob path. What must
+    /// not happen is the old answer: item 1 served as if it were frame 1, i.e.
+    /// a truncated codestream presented as a whole one.
+    ///
+    /// The assertion is stronger than "not equal to fragment 1": the answer
+    /// must not be a PREFIX of the concatenated fragments either, because a
+    /// truncated codestream is exactly such a prefix.
+    #[test]
+    fn a_frame_spanning_two_fragments_is_not_reported_as_one_fragment() {
+        let (first, second) = (b"\x01\x02\x03".as_slice(), b"\x04\x05\x06".as_slice());
+        let third = b"\xAA\xBB";
+        // BOT: frame 1 at 0, frame 2 at the THIRD item tag.
+        let bot_at_2 = (8 + first.len() + 8 + second.len()) as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&bot_at_2.to_le_bytes());
+        for frag in [first, second, third] {
+            buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            buf.extend_from_slice(&(frag.len() as u32).to_le_bytes());
+            buf.extend_from_slice(frag);
+        }
+        buf.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0, 0, 0, 0, 0]);
+
+        let mut whole: Vec<u8> = first.to_vec();
+        whole.extend_from_slice(second);
+        // Either the whole frame or a refusal; a truncated codestream is
+        // neither, and it is exactly what item-per-frame produced.
+        if let Ok(frame) = extract_frame(&buf, 1, 0, 3) {
+            assert_eq!(frame, whole, "when answered, the whole frame");
+        }
+    }
+
+    /// A table that does not agree with the items is ignored, and the items
+    /// remain the only reading (one item per frame).
+    #[test]
+    fn a_disagreeing_offset_table_falls_back_to_item_per_frame() {
+        let mut enc = make_encapsulated_with_bot(&[b"\xAA\xBB", b"\xCC\xDD"]);
+        // Corrupt the FIRST offset (byte 8 is the table's start: BOT header is
+        // 8 bytes) so it names nothing.
+        enc[8..12].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(
+            extract_frame(&enc, 2, 0, 2).unwrap().to_vec(),
+            b"\xCC\xDD".to_vec()
+        );
     }
 
     #[test]
@@ -1809,33 +2044,86 @@ mod tests {
 
     #[test]
     fn test_compute_frame_size_1bit_packed() {
-        // PS3.5 8.1.1: one bit per pixel, rows padded to byte boundaries.
-        // 776x776 -> 776 rows x 97 bytes = 75272 (the 20.09 SEG shape).
+        // PS3.5 8.1: the bits of one frame are packed continuously, with no
+        // per-row alignment. 776x776 -> ceil(776*776/8) = 75272 (the 20.09 SEG
+        // shape - unchanged, because 776 is a multiple of 8).
         let size = compute_frame_size(776, 776, 1, 1).unwrap();
         assert_eq!(size, 75_272);
-        // 100x100 -> 100 rows x ceil(100/8)=13 bytes = 1300.
+        // 100x100 -> ceil(10000/8) = 1250. A row-padded reading gives
+        // 100 * ceil(100/8) = 1300 and shifts frame 2 by 50 bytes.
         let size = compute_frame_size(100, 100, 1, 1).unwrap();
-        assert_eq!(size, 1_300);
+        assert_eq!(size, 1_250);
+        // An odd product still rounds UP: 3x3 -> ceil(9/8) = 2.
+        assert_eq!(compute_frame_size(3, 3, 1, 1), Some(2));
+    }
+
+    /// A 1-bit frame split from a two-frame value starts at its BIT offset,
+    /// not at the next byte boundary of a row.
+    ///
+    /// 100 columns is not a whole number of bytes, so a row-padded stride
+    /// leaves frame 2 fifty bytes late and the last 50 bytes of frame 2 hang
+    /// off the end of the value.
+    #[test]
+    fn a_one_bit_second_frame_starts_at_its_bit_offset() {
+        // 100 columns is not a whole number of bytes, so a row-padded stride
+        // (100 * 13 = 1300) would leave frame 2 fifty bytes late.
+        let frame_size = compute_frame_size(100, 100, 1, 1).unwrap();
+        assert_eq!(frame_size, 1_250);
+        let mut pixel_data = vec![0xAAu8; frame_size];
+        let second = vec![0x55u8; frame_size];
+        pixel_data.extend_from_slice(&second);
+
+        let extracted = extract_frame(&pixel_data, 2, frame_size, 2).expect("frame 2");
+        assert_eq!(extracted, second, "frame 2 must be the second 1250 bytes");
     }
 
     #[test]
     fn test_extract_frame_1bit_packed_second() {
-        // Two 1-bit frames, each a row-padded bit mask; the second frame
-        // must be sliced at the bit-packed size, not at rows x cols bytes.
+        // Two 1-bit frames of 2 rows x 10 columns = 20 bits = 3 bytes each.
+        // The value is padded to an even LENGTH (PS3.5 7.1.1), so each frame
+        // is followed by its own pad byte inside the value and the second
+        // frame starts at byte 4, not at 3.
         let rows = 2u16;
-        let cols = 10u16; // row_bytes = 2
-        let frame_size = compute_frame_size(rows, cols, 1, 1).unwrap(); // 4 bytes
-        assert_eq!(frame_size, 4);
+        let cols = 10u16;
+        let frame_size = compute_frame_size(rows, cols, 1, 1).unwrap();
+        assert_eq!(frame_size, 3);
         let mut pixel_data = Vec::new();
-        // frame 1: 2 rows x 2 bytes each
-        pixel_data.extend_from_slice(&[0b1010_1010, 0b1111_0000, 0b1010_1010, 0b1111_0000]);
-        // frame 2
-        pixel_data.extend_from_slice(&[0b0101_0101, 0b0000_1111, 0b0101_0101, 0b0000_1111]);
+        pixel_data.extend_from_slice(&[0b1010_1010, 0b1111_0000, 0b1010_1010, 0u8]);
+        pixel_data.extend_from_slice(&[0b0101_0101, 0b0000_1111, 0b0101_0101, 0u8]);
         let second = extract_frame(&pixel_data, 2, frame_size, 2).unwrap();
-        assert_eq!(
-            second,
-            vec![0b0101_0101, 0b0000_1111, 0b0101_0101, 0b0000_1111]
-        );
+        assert_eq!(second, vec![0b0101_0101, 0b0000_1111, 0b0101_0101]);
+    }
+
+    /// 200 nested undefined-length elements must be refused, not walked.
+    ///
+    /// Each level costs 8 bytes of the pattern below, so without the depth
+    /// bound the walk recurses once per level - 200 frames do not fit a
+    /// 64 KiB stack, and under `panic=abort` the overflow aborts the process,
+    /// which a crafted STOW reaches through `find_tag_range`. The refusal is
+    /// `None`: no frame table, so the caller keeps the whole-blob path.
+    #[test]
+    fn a_deeply_nested_undefined_sequence_is_refused_not_walked() {
+        // (0008,1115) SQ, undefined length, then one undefined-length item per
+        // level, each holding another (0008,1115). 200 levels, no delimiters.
+        let mut data = Vec::new();
+        for _ in 0..200 {
+            data.extend_from_slice(&0x0008u16.to_le_bytes());
+            data.extend_from_slice(&0x1115u16.to_le_bytes());
+            data.extend_from_slice(b"SQ");
+            data.extend_from_slice(&[0x00, 0x00]);
+            data.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            data.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            data.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        }
+        // A 64 KiB stack is the point of the test: it makes one frame per
+        // level impossible to survive, so the bound is what the answer
+        // depends on.
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || undefined_length_end(&data, 12))
+            .expect("spawn");
+        let answer = handle.join().expect("the walk must return");
+        assert_eq!(answer, None, "an over-deep walk is refused");
     }
 
     #[test]
@@ -2266,6 +2554,85 @@ mod tests {
             assert_eq!(g.offset, e.offset, "frame offset (file-absolute)");
             assert_eq!(g.len, e.len, "frame length");
         }
+    }
+
+    /// Append a non-empty Basic Offset Table (PS3.5 A.4) to an item stream.
+    ///
+    /// Each offset is the byte distance from the first byte of the first item
+    /// tag after the table to the first byte of that frame's item tag, which
+    /// is why the table has to be built from the fragment lengths.
+    fn make_encapsulated_with_bot(frames: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let bot_len = (frames.len() * 4) as u32;
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]); // (FFFE,E000)
+        buf.extend_from_slice(&bot_len.to_le_bytes());
+        let mut offset: u32 = 0;
+        for frame_data in frames {
+            buf.extend_from_slice(&offset.to_le_bytes());
+            // Each item is an 8-byte header plus its data.
+            offset += 8 + frame_data.len() as u32;
+        }
+        for frame_data in frames {
+            buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            buf.extend_from_slice(&(frame_data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(frame_data);
+        }
+        buf.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        buf
+    }
+
+    /// A non-empty Basic Offset Table must be validated against the right
+    /// origin.
+    ///
+    /// PS3.5 A.4 counts each offset from the first byte of the first item TAG
+    /// after the table. Measuring from the table's own tag added the 8-byte
+    /// item header to every expected value, so a perfectly valid table
+    /// disagreed with the walk and the WHOLE table was discarded - every frame
+    /// then fell back to serving the entire blob.
+    ///
+    /// Falsification anchor: the offsets below are computed exactly as the
+    /// standard states, so only the wrong origin makes them mismatch.
+    #[test]
+    fn a_non_empty_bot_offsets_from_the_first_item_tag() {
+        let frames: [&[u8]; 3] = [b"AAAA", b"BBBBBB", b"CC"];
+        let pixel = make_encapsulated_with_bot(&frames);
+        let file = make_file(&[
+            ((0x0028, 0x0010), b"US", &us(1)),
+            ((0x0028, 0x0011), b"US", &us(1)),
+            ((0x0028, 0x0008), b"IS", b"3 "),
+            ((0x7FE0, 0x0010), b"OB", &pixel),
+        ]);
+
+        let chunks = compute_frame_chunks(&file);
+        assert_eq!(chunks.len(), 3, "a valid BOT yields one chunk per frame");
+        assert_eq!(chunks[0].len, 4);
+        assert_eq!(chunks[1].len, 6);
+        assert_eq!(chunks[2].len, 2);
+        // Both variants agree, which is what the serve path relies on.
+        assert_file_matches_bytes(&file);
+    }
+
+    /// The same table is REJECTED when an offset really does disagree.
+    ///
+    /// Without this half the positive test above would also pass on an
+    /// implementation that simply ignores the table.
+    #[test]
+    fn a_disagreeing_bot_discards_the_table() {
+        let frames: [&[u8]; 2] = [b"AAAA", b"BBBB"];
+        let mut pixel = make_encapsulated_with_bot(&frames);
+        // Corrupt the first offset: it is the first 4 bytes of the table body.
+        pixel[8] = 0xFF;
+        let file = make_file(&[
+            ((0x0028, 0x0010), b"US", &us(1)),
+            ((0x0028, 0x0011), b"US", &us(1)),
+            ((0x0028, 0x0008), b"IS", b"2 "),
+            ((0x7FE0, 0x0010), b"OB", &pixel),
+        ]);
+        assert!(
+            compute_frame_chunks(&file).is_empty(),
+            "a table that contradicts the walk is not served"
+        );
     }
 
     /// Append an explicit-VR-LE element with UNDEFINED length (0xFFFFFFFF) and

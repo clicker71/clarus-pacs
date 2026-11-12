@@ -367,9 +367,9 @@ pub fn maybe_transcode(
     registry: &clarus_adapters::codec::CodecRegistry,
     pool: &crate::state::TranscodePool,
     max_megapixels: u32,
-) -> Result<Vec<u8>, WadoError> {
+) -> Result<(Vec<u8>, String), WadoError> {
     let Some(target_ts) = requested_ts else {
-        return Ok(bytes);
+        return Ok((bytes, stored_ts.to_string()));
     };
     // "Give it back as stored" needs no codec, so it is answered BEFORE the
     // capability check: a client that asks for the syntax the object already
@@ -377,7 +377,7 @@ pub fn maybe_transcode(
     // registered for that syntax would answer 406 for a request that requires
     // no decoding at all.
     if stored_ts == target_ts {
-        return Ok(bytes);
+        return Ok((bytes, stored_ts.to_string()));
     }
     // PS3.18 8.7.3: Implicit VR LE shall not be used with Web Services, and the
     // rule is not image-scoped. An Implicit VR source is therefore re-encoded
@@ -389,15 +389,20 @@ pub fn maybe_transcode(
     if stored_ts == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE
         && target_ts == clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE
     {
-        return clarus_adapters::transcode::reencode_implicit_to_explicit(&bytes).map_err(|e| {
-            crate::clog_warn!(
-                error = %e,
-                "Re-encoding an Implicit VR instance to Explicit VR failed - 406"
-            );
-            WadoError::NotAcceptable(format!(
-                "Cannot re-encode this Implicit VR instance as Explicit VR: {e}"
-            ))
-        });
+        let out =
+            clarus_adapters::transcode::reencode_implicit_to_explicit(&bytes).map_err(|e| {
+                crate::clog_warn!(
+                    error = %e,
+                    "Re-encoding an Implicit VR instance to Explicit VR failed - 406"
+                );
+                WadoError::NotAcceptable(format!(
+                    "Cannot re-encode this Implicit VR instance as Explicit VR: {e}"
+                ))
+            })?;
+        return Ok((
+            out,
+            clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE.to_string(),
+        ));
     }
     if !registry.supports(target_ts) {
         let hint = clarus_adapters::codec::unsupported_ts_name(target_ts)
@@ -462,12 +467,16 @@ pub fn maybe_transcode(
                         target_ts = %target_ts,
                         "Transcoding failed ({stored_ts} -> {target_ts}: {other}) - serving original bytes"
                     );
-                    return Ok(bytes);
+                    // The ORIGINAL bytes, so the original syntax: the caller
+                    // labels the response from the value this returns, and a
+                    // transient decoder failure must not make the header claim
+                    // a syntax the body is not in.
+                    return Ok((bytes, stored_ts.to_string()));
                 }
             }
         }
     };
-    Ok(out)
+    Ok((out, target_ts.to_string()))
 }
 
 /// An acquired transcode permit, released on drop.
@@ -3296,7 +3305,7 @@ mod full_render_tests {
             64,
         )
         .expect("stored==target no-op must not need a permit");
-        assert_eq!(out, src);
+        assert_eq!(out, (src.clone(), "1.2.840.10008.1.2.1".to_string()));
         // Unsupported target with full pool -> NotAcceptable (406) first.
         let err = maybe_transcode(
             src.clone(),

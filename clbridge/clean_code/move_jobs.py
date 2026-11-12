@@ -16,8 +16,11 @@ Known limitations:
 
 import ipaddress
 import logging
+import sqlite3
 import threading
 import time
+
+from clean_code.utils import normalize_host
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,24 @@ def _migrate_move_jobs(conn):
     if "expose_rejected" not in cols:
         conn.execute(
             "ALTER TABLE move_jobs ADD COLUMN expose_rejected INTEGER NOT NULL DEFAULT 0"
+        )
+    # PS3.4 C.4.2.1.2: the C-MOVE-RQ names the SCOPE (STUDY/SERIES/IMAGE) and
+    # the UIDs that scope it. The level and UIDs live on the job because the
+    # worker thread outlives the association that queued the work. An empty
+    # level means STUDY (the historical behaviour), so an existing row keeps
+    # the meaning it had.
+    if "request_level" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN request_level TEXT NOT NULL DEFAULT ''"
+        )
+    if "request_series_uid" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN request_series_uid TEXT"
+            " NOT NULL DEFAULT ''"
+        )
+    if "request_sop_uid" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN request_sop_uid TEXT NOT NULL DEFAULT ''"
         )
 
 
@@ -84,9 +105,23 @@ def _migrate_scp_targets(conn):
     if create_sql and "PRIMARY KEY (ae_title, host)" in create_sql[0]:
         return  # Already v2
 
-    # Migrate: create v2, copy data, drop v1, rename
+    # Migrate: create v2, copy data, drop v1, rename.
+    #
+    # Crash-safe (each step is idempotent on its own):
+    #   * `scp_targets_v2` may already exist from a crashed run - IF NOT EXISTS
+    #     turns the leftover into a no-op instead of "table already exists";
+    #   * the copy is INSERT OR IGNORE, so re-running after a partial copy adds
+    #     only the rows that are still missing;
+    #   * DROP + RENAME happen together, so a crash between them leaves either
+    #     the old table intact (safe: the migration runs again) or v2 already
+    #     named `scp_targets` (safe: the PK check above returns early);
+    #   * a leftover `scp_targets_v2` from a crash AFTER the rename cannot
+    #     exist, because RENAME removes it.
+    # Before this, a crash after the CREATE left `scp_targets_v2` behind, and
+    # the next start died on "table scp_targets_v2 already exists" - a bridge
+    # that could not open its own database.
     conn.execute(
-        "CREATE TABLE scp_targets_v2 ("
+        "CREATE TABLE IF NOT EXISTS scp_targets_v2 ("
         "  ae_title TEXT NOT NULL,"
         "  host TEXT NOT NULL,"
         "  port INTEGER NOT NULL DEFAULT 104,"
@@ -95,12 +130,17 @@ def _migrate_scp_targets(conn):
         "  PRIMARY KEY (ae_title, host)"
         ")"
     )
-    conn.execute(
-        "INSERT OR IGNORE INTO scp_targets_v2"
-        " SELECT ae_title, host, port, last_seen, consecutive_failures"
-        " FROM scp_targets"
-    )
-    conn.execute("DROP TABLE scp_targets")
+    # The v1 table may be gone already (a crash between DROP and RENAME): the
+    # copy then has nothing to read, which is not an error.
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO scp_targets_v2"
+            " SELECT ae_title, host, port, last_seen, consecutive_failures"
+            " FROM scp_targets"
+        )
+    except sqlite3.OperationalError:
+        logging.debug("[MOVE-JOBS] scp_targets_v1 already migrated away")
+    conn.execute("DROP TABLE IF EXISTS scp_targets")
     conn.execute("ALTER TABLE scp_targets_v2 RENAME TO scp_targets")
 
 
@@ -187,6 +227,9 @@ class MoveJobManager:
         target_host="",
         target_port=0,
         expose_rejected=False,
+        request_level="",
+        request_series_uid="",
+        request_sop_uid="",
     ):
         """Create a new pending C-MOVE job. Returns job id.
 
@@ -195,14 +238,18 @@ class MoveJobManager:
         expose_rejected: the job was queued over the QA AE; the worker queries
         the configured `[dicomweb] qa_url` endpoint instead of `clarus_url`.
         Stored because the worker outlives the association.
+        request_level/request_series_uid/request_sop_uid: the Query/Retrieve
+        scope of the request (PS3.4 C.4.2.1.2), stored for the same reason -
+        a SERIES-level C-MOVE must not retrieve the whole study.
         """
         now = int(time.time())
         with self._db.locked() as conn:
             cur = conn.execute(
                 "INSERT INTO move_jobs"
                 " (study_uid, move_dest_ae, target_host, target_port,"
-                "  status, created_at, updated_at, expose_rejected)"
-                " VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                "  status, created_at, updated_at, expose_rejected,"
+                "  request_level, request_series_uid, request_sop_uid)"
+                " VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
                 (
                     study_uid,
                     move_dest_ae,
@@ -211,12 +258,25 @@ class MoveJobManager:
                     now,
                     now,
                     1 if expose_rejected else 0,
+                    str(request_level or ""),
+                    str(request_series_uid or ""),
+                    str(request_sop_uid or ""),
                 ),
             )
             conn.commit()
-            with self._cond:
-                self._cond.notify()  # wake one waiting worker
-            return cur.lastrowid
+            job_id = cur.lastrowid
+        # NOTIFY AFTER the db lock is released. `pick_pending_job` takes
+        # `_cond` and then `_db` (it must, to make its empty-check and wait
+        # atomic against this notify); notifying while still holding `_db`
+        # made this path `_db -> _cond`, the exact opposite order. A worker
+        # holding `_cond` waiting for `_db` and a reactor holding `_db`
+        # waiting for `_cond` deadlock the whole C-MOVE subsystem, including
+        # the metrics scrape. The wakeup is only a hint, so releasing first
+        # costs nothing: a worker that cannot see the new row yet simply
+        # re-selects under `_cond`.
+        with self._cond:
+            self._cond.notify()
+        return job_id
 
     def count_pending(self):
         """Number of jobs in the 'pending' state (drain gauge).
@@ -233,26 +293,50 @@ class MoveJobManager:
         except Exception:
             return 0
 
-    def pick_pending_job(self, timeout=5.0):
+    def _select_pending(self):
+        """The pending-row SELECT used by `pick_pending_job`.
+
+        Split out so the caller can run it while holding `self._cond`, which
+        is what makes the empty-check/wait pair atomic against `insert`'s
+        notify.
+        """
+        with self._db.locked() as conn:
+            return conn.execute(
+                "SELECT id, study_uid, move_dest_ae, attempts,"
+                " target_host, target_port"
+                " FROM move_jobs WHERE status = 'pending'"
+                " ORDER BY created_at ASC"
+            ).fetchall()
+
+    def pick_pending_job(self, timeout=5.0, skip=None):
         """Atomically pick one pending job.
+
+        `skip(host, port, ae) -> bool` marks rows that must not be claimed
+        yet (a peer another worker is streaming to). A skipped row stays
+        pending and visible to the other workers; when every pending row is
+        skipped the caller waits exactly as for an empty queue.
 
         Returns dict or None.
         """
         while True:
-            with self._db.locked() as conn:
-                rows = conn.execute(
-                    "SELECT id, study_uid, move_dest_ae, attempts,"
-                    " target_host, target_port"
-                    " FROM move_jobs WHERE status = 'pending'"
-                    " ORDER BY created_at ASC"
-                ).fetchall()
-
-            if len(rows) == 0:
-                with self._cond:
-                    notified = self._cond.wait(timeout=timeout)
-                if not notified:
-                    return None
-                continue
+            # The empty-check and the wait must be ONE atomic step against the
+            # notifier. `insert` wakes a waiter under `self._cond`; taking the
+            # same lock around the SELECT closes the lost-wakeup window where a
+            # row was inserted after an empty SELECT and before the wait, which
+            # left the worker asleep with pending work on disk until the
+            # timeout expired.
+            with self._cond:
+                rows = self._select_pending()
+                if skip is not None:
+                    rows = [
+                        r
+                        for r in rows
+                        if not skip(r[4] or "", r[5] or 0, r[2] or "")
+                    ]
+                if not rows:
+                    if not self._cond.wait(timeout=timeout):
+                        return None
+                    continue
 
             row = rows[0]
             job_id = row[0]
@@ -260,7 +344,8 @@ class MoveJobManager:
             with self._db.locked() as conn:
                 row2 = conn.execute(
                     "SELECT id, study_uid, move_dest_ae, attempts,"
-                    " target_host, target_port, expose_rejected"
+                    " target_host, target_port, expose_rejected,"
+                    " request_level, request_series_uid, request_sop_uid"
                     " FROM move_jobs WHERE status = 'pending' AND id = ?",
                     (job_id,),
                 ).fetchone()
@@ -286,7 +371,41 @@ class MoveJobManager:
                     # row. Omitting it here silently sent every QA job to
                     # clarus_url, i.e. the sequester was never lifted.
                     "expose_rejected": int(row2[6] or 0),
+                    # PS3.4 C.4.2.1.2: the scope travels with the job for the
+                    # same reason - the worker no longer has the event.
+                    "request_level": str(row2[7] or ""),
+                    "request_series_uid": str(row2[8] or ""),
+                    "request_sop_uid": str(row2[9] or ""),
                 }
+
+    def requeue_job_without_retry(self, job_id):
+        """Return a claimed job to pending without charging it an attempt (R9).
+
+        The worker claims a job and THEN takes the per-peer gate, so with more
+        than one worker a job could be claimed for a peer another worker was
+        already streaming to. It was then invisible in `in_progress/` for the
+        whole of that transfer. This hands it back so other workers can see it;
+        `attempts` is decremented because the claim already incremented it and
+        nothing was attempted - otherwise a busy peer would burn the job's
+        retry budget without a single C-STORE.
+
+        Only a job still in `in_progress` for this claim is released: a job the
+        reaper or a cancel already moved is not ours to rewrite.
+        """
+        now = int(time.time())
+        with self._db.locked() as conn:
+            cur = conn.execute(
+                "UPDATE move_jobs SET status = 'pending', attempts = "
+                "CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,"
+                " updated_at = ? WHERE id = ? AND status = 'in_progress'",
+                (now, job_id),
+            )
+            conn.commit()
+            changed = cur.rowcount or 0
+        if changed:
+            with self._cond:
+                self._cond.notify()
+        return bool(changed)
 
     def update_job_progress(self, job_id, completed, failed, total):
         """Update job progress counters (CM-005)."""
@@ -482,9 +601,15 @@ class MoveJobManager:
                     return (host, port)
             return None
 
-        # Priority 1: exact IP match (non-CIDR)
+        # Priority 1: exact address match (non-CIDR). Both sides are
+        # normalised so `VIEWER localhost 11112` matches a request from
+        # 127.0.0.1, and `::1` matches `[::1]`; a raw string compare made the
+        # operator see "Unknown Move Destination" (A801) instead of a match.
+        # CIDR entries are untouched here and only treated as networks below,
+        # so normalisation cannot promote a subnet to an exact hit.
+        want = normalize_host(client_ip)
         for host, port in rows:
-            if "/" not in host and host == client_ip:
+            if "/" not in host and normalize_host(host) == want:
                 return (host, port)
 
         # Priority 2: CIDR subnet match
@@ -537,6 +662,19 @@ class MoveJobManager:
             # so routing to the stale row was a destination the config no
             # longer names. Deleting by (ae_title, host) keeps a peer that is
             # still listed under a different port.
+            #
+            # An EMPTY parse result is the one case that must not delete
+            # anything: a file mid-save, a truncated write or a crash leaves a
+            # config that parses to zero peers, and treating that as "every
+            # peer was removed" silently unregistered the whole peer table.
+            if not seen:
+                logging.warning(
+                    "[PEER] %s parsed to no peers - keeping the existing table "
+                    "(a truncated or empty file must not wipe routing)",
+                    peers_file,
+                )
+                conn.commit()
+                return 0
             stale = [
                 (ae, host)
                 for ae, host in conn.execute("SELECT ae_title, host FROM scp_targets")

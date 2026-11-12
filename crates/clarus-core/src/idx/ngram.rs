@@ -194,7 +194,14 @@ pub fn read_study_uids(
         Err(e) => return Err(e),
     };
     let mut out = Vec::new();
-    for line in data.split(|&b| b == b'\n') {
+    // A row is `uid\n`; the final segment without a terminating newline is a
+    // torn append (a crash between `write_all` and the newline), not a study
+    // UID. `split` returns it as if it were whole, so it is excluded below.
+    let mut segments: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+    if data.last() != Some(&b'\n') {
+        segments.pop();
+    }
+    for line in segments {
         if line.is_empty() {
             continue;
         }

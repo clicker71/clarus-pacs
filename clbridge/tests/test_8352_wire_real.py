@@ -121,7 +121,15 @@ def _check_received(raw, ds, fm, src):
     not __import__("os").path.exists(FIXTURE),
     reason="field fixture tmp/8352_1.dcm not present",
 )
-def test_8352_real_4_70_survives_both_send_topologies():
+def test_8352_real_4_70_survives_the_wire_on_both_association_topologies():
+    """The FILE survives the wire intact on both association shapes.
+
+    T2: this drives `assoc.send_c_store` directly, not the bridge's production
+    sender (which stages a temp file per instance and picks a context per
+    stored TS). It therefore proves the association topology and the
+    pre-processing do not damage the bytes - it does NOT prove the production
+    sender picks the right context. The name says so.
+    """
     src = dcmread(FIXTURE)
     assert str(src.file_meta.TransferSyntaxUID) == TS_470
     assert str(src.SOPClassUID) == MR
@@ -131,7 +139,9 @@ def test_8352_real_4_70_survives_both_send_topologies():
     sop_uid = str(src.SOPInstanceUID)
     processed = _ensure_file_meta_bytes(raw, MR, sop_uid, TS_470)
 
-    src_ds = dcmread(io.BytesIO(processed))
+    # T1: the fidelity baseline is the UNMODIFIED source, so the comparison
+    # cannot be satisfied by both sides drifting the same way.
+    src_ds = src
 
     received = {}
     for name, make_assoc in (

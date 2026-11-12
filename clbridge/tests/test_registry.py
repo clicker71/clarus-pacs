@@ -15,7 +15,18 @@ class TestBuiltinSopClasses:
 
     def test_returns_expected_number_of_classes(self):
         registry = _BUILTIN_SOP_CLASSES()
-        assert len(registry) == 11
+        assert len(registry) == 13
+
+    def test_current_ultrasound_multiframe_is_accepted(self):
+        """A cine loop arrives as ...3.1 on current equipment; without it a
+        Multi-frame US study is rejected whenever no sop_classes.yaml exists."""
+        registry = _BUILTIN_SOP_CLASSES()
+        assert _is_sop_accepted(registry, "1.2.840.10008.5.1.4.1.1.3.1") is True
+
+    def test_current_nuclear_medicine_is_accepted(self):
+        """NM is ...20 on current equipment; ...5 is the Retired UID."""
+        registry = _BUILTIN_SOP_CLASSES()
+        assert _is_sop_accepted(registry, "1.2.840.10008.5.1.4.1.1.20") is True
 
     def test_verification_is_accepted(self):
         registry = _BUILTIN_SOP_CLASSES()
@@ -48,7 +59,7 @@ class TestGetSopRegistryUids:
     def test_returns_all_accepted_uids(self):
         registry = _BUILTIN_SOP_CLASSES()
         uids = _get_sop_registry_uids(registry)
-        assert len(uids) == 11
+        assert len(uids) == 13
         assert "1.2.840.10008.1.1" in uids
 
     def test_filters_out_disabled(self):

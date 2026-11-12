@@ -155,8 +155,15 @@ STUDY_ROOT_UID = "1.2.840.10008.5.1.4.1.2.2.1"
 MWL_UID = "1.2.840.10008.5.1.4.31"
 
 # QIDO JSON key -> (DICOM tag group, element, VR, keyword)
+#
+# DELIBERATE omission: 0008,0005 SpecificCharacterSet. _json_map_to_dataset
+# forces ISO_IR 192 (UTF-8) on the dataset BEFORE this map is applied, so that
+# Cyrillic PatientName / StudyDescription survives (INC-004). A server study
+# row that carries its own charset would REPLACE that value - the row is the
+# server's opinion of the bytes it stored, not of the bytes this bridge emits -
+# and a Latin-1 declaration makes a Cyrillic value unencodable on the wire.
+# The series map below omits the same key for the same reason.
 QIDO_KEY_TO_TAG = {
-    "00080005": (0x0008, 0x0005, "CS", "SpecificCharacterSet"),
     "00080020": (0x0008, 0x0020, "DA", "StudyDate"),
     "00080030": (0x0008, 0x0030, "TM", "StudyTime"),
     "00080050": (0x0008, 0x0050, "SH", "AccessionNumber"),
@@ -465,7 +472,44 @@ MWL_TO_UPS_PARAM = {
     "PatientID": "00100020",
     "StudyInstanceUID": "0020000D",
     "ProcedureStepState": "00741000",
+    "ScheduledProcedureStepStartDate": "00404005",
 }
+
+
+def _mwl_date_to_ups_datetime(value):
+    """Map a (0040,0002) DA match value onto the (0040,4005) DT grammar.
+
+    MWL matches a DATE; UPS stores a DATETIME. The server compares the query
+    value against the stored DT with string semantics inside an inclusive
+    range (`<lo>-<hi>`), so:
+      - `YYYYMMDD`        -> `YYYYMMDD000000-YYYYMMDD235959` (the whole day)
+      - `YYYYMMDD-YYYYMMDD` -> `YYYYMMDD000000-YYYYMMDD235959`
+      - a DT-shaped value is passed through untouched (some senders fill the
+        DA key with the full instant).
+    An unusable value is returned unchanged: a filter that cannot be built is
+    not a reason to widen the search silently, and the server answers the
+    unchanged form as it always has.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    def _day(part):
+        part = part.strip()
+        return part if len(part) == 8 and part.isdigit() else None
+
+    if "-" in text:
+        low, _, high = text.partition("-")
+        lo, hi = _day(low), _day(high)
+        # Open-ended ranges keep their open end (the server treats an empty
+        # bound as unbounded).
+        if lo is None and hi is None:
+            return text
+        return f"{lo or ''}000000-{hi or ''}235959" if (lo or hi) else text
+    day = _day(text)
+    if day is None:
+        return text
+    return f"{day}000000-{day}235959"
 
 
 def _build_mwl_params(ds):
@@ -503,6 +547,8 @@ def _build_mwl_params(ds):
         else:
             val = str(elem.value).strip()
         if val:
+            if keyword == "ScheduledProcedureStepStartDate":
+                val = _mwl_date_to_ups_datetime(val)
             params[param] = val
     return params
 
@@ -515,32 +561,51 @@ def _safe_add_new(ds, group, elem, vr, val):
         ds[(group, elem)] = DataElement((group, elem), vr, val)
 
 
-def _json_add_vr(ds, group, elem, vr, raw_first):
+def _json_add_vr(ds, group, elem, vr, raw_value):
     """Add one DICOMweb JSON value to `ds` under the element's VR (CMP-005).
 
     The single place a JSON value becomes a pydicom element, shared by the
     QIDO and MWL converters so the two cannot drift on VR handling. Returns
     True when the element was added.
+
+    `raw_value` is the whole DICOMweb `Value` array (already checked non-empty
+    by the caller). CS, UI and SH are value-multiplicity VRs (PS3.5 Table
+    6.2-1): ModalitiesInStudy (0008,0061) legitimately carries several CS
+    values, and taking `Value[0]` reported one modality for a study performed
+    on three. Rendering the array with `str()` would be no better - the SCU
+    would read "['CT', 'MR']" as a single value.
+
+    A JSON `null` inside `Value` is an ABSENT value, not the text "None":
+    `["CT", null]` stringified the null into five characters that then
+    travelled to the SCU as a modality. Nulls are dropped before conversion;
+    an array of nothing but nulls carries no value at all and is not added.
     """
     try:
-        if vr == "PN":
-            # Person Name: prefer the Alphabetic component.
-            if isinstance(raw_first, dict):
-                val = raw_first.get("Alphabetic", "")
-            else:
-                val = str(raw_first)
-        elif vr == "IS":
-            val = int(raw_first)
-        elif vr == "TM":
-            # Time: normalize the display "HH:MM:SS" form to the canonical
-            # DICOM "HHMMSS.FFFFFF" (PS3.5 6.2). pydicom logs
-            # "Invalid value for VR TM: '11:25:01'" when a colon form is
-            # constructed (field noise on every C-FIND); stripping the
-            # colons keeps the attribute valid and warning-free.
-            val = str(raw_first).replace(":", "")
+        items = [v for v in raw_value if v is not None]
+        if not items:
+            return False
+        if vr in ("CS", "UI", "SH") and len(items) > 1:
+            val = [str(item) for item in items]
         else:
-            # CS, UI, LO, SH, DA - plain string. CS may arrive as a list.
-            val = str(raw_first)
+            raw_first = items[0]
+            if vr == "PN":
+                # Person Name: prefer the Alphabetic component.
+                if isinstance(raw_first, dict):
+                    val = raw_first.get("Alphabetic", "")
+                else:
+                    val = str(raw_first)
+            elif vr == "IS":
+                val = int(raw_first)
+            elif vr == "TM":
+                # Time: normalize the display "HH:MM:SS" form to the canonical
+                # DICOM "HHMMSS.FFFFFF" (PS3.5 6.2). pydicom logs
+                # "Invalid value for VR TM: '11:25:01'" when a colon form is
+                # constructed (field noise on every C-FIND); stripping the
+                # colons keeps the attribute valid and warning-free.
+                val = str(raw_first).replace(":", "")
+            else:
+                # LO, DA - plain string.
+                val = str(raw_first)
     except (TypeError, ValueError, IndexError):
         return False
     _safe_add_new(ds, group, elem, vr, val)
@@ -579,7 +644,7 @@ def _json_map_to_dataset(json_obj, keymap):
             # zero-length attribute; we deliberately do not do that (keeps
             # the rows minimal and is tolerated by all viewers).
             continue
-        _json_add_vr(ds, group, elem, vr, raw_value[0])
+        _json_add_vr(ds, group, elem, vr, raw_value)
     return ds
 
 
@@ -593,12 +658,18 @@ def _json_first_value(json_obj, key):
 
     PN values arrive as {"Alphabetic": ...} objects; everything else as
     plain strings/numbers.
+
+    A JSON null (or an empty list) means the attribute carries NO value, and
+    returns None rather than the string "None": `str(None)` is a plausible
+    looking token that then travels as a UID.
     """
     attr = json_obj.get(key) or {}
     values = attr.get("Value") or []
     if not values:
         return ""
     first = values[0]
+    if first is None:
+        return None
     if isinstance(first, dict):
         return str(first.get("Alphabetic", ""))
     return str(first)
@@ -656,18 +727,22 @@ def _json_to_dataset_series(json_obj, request_keywords, study_json=None):
 
 
 def _mwl_tail(value):
-    """Last MWL_SPS_ID_LEN characters of an identifier, or '' when too short.
+    """An identifier that fits MWL_SPS_ID_LEN characters, or '' when absent.
 
     Both identifiers below live in VR SH (16 characters). A UPS workitem UID is
     `2.25.<decimal u128>` (up to 43 characters), so it cannot be carried
-    verbatim; the tail is used instead. This is a DERIVATION into an
+    verbatim and its tail is used instead. This is a DERIVATION into an
     identifier's own scoped namespace, not a truncation of a value the modality
     must round-trip: a modality only needs a stable handle to couple MPPS to
     the step, and SPS ID is scoped by the Requested Procedure (PS3.3 C.4.10).
+
+    A value that ALREADY fits is returned unchanged. Returning '' for it made
+    a short workitem UID yield no (0040,0009) at all - a Type 1 MWL key - even
+    though the only reason to shorten anything is the VR's 16 characters.
     """
     text = str(value or "").strip()
-    if len(text) < MWL_SPS_ID_LEN:
-        return ""
+    if len(text) <= MWL_SPS_ID_LEN:
+        return text
     return text[-MWL_SPS_ID_LEN:]
 
 
@@ -761,7 +836,7 @@ def _json_to_dataset_mwl(json_obj, request_keywords):
                 # attribute with no value is absent from the row (documented
                 # deviation, PS3.4 C.4.1.1.3.2 note 2 would allow zero-length).
                 continue
-            _json_add_vr(target, group, elem, vr, raw_value[0])
+            _json_add_vr(target, group, elem, vr, raw_value)
 
     # Identifier level: the two Return keys, then the request-gated Optional
     # ones. The study and the accession live in the Referenced Request
@@ -779,6 +854,17 @@ def _json_to_dataset_mwl(json_obj, request_keywords):
         # dropped StudyInstanceUID while leaving the RP ID derived from it.
         if flat_key == "0020000D":
             value = _json_workitem_study_uid(json_obj)
+        elif flat_key == "00080050":
+            # AccessionNumber (0008,0050) is Type 2: a present-but-EMPTY flat
+            # tag is the valid "not recorded" marker, not a value. The
+            # accession's standard carriage is (0040,A370) Referenced Request
+            # Sequence (PS3.4 Table CC.2.5-3), so it is resolved FIRST, with
+            # the bare tag only as a fallback. The old guard skipped the
+            # resolution on the bare tag's mere presence, so an empty flat tag
+            # shadowed a sequence value and fill() dropped the attribute.
+            value = _json_seq_first_value(
+                json_obj, seq_key, item_key
+            ) or _json_first_value(json_obj, flat_key)
         else:
             if flat_key in optional_source:
                 continue
@@ -844,15 +930,20 @@ def _parse_n_action_rq(event):
     Returns (transaction_uid, [(sop_class_uid, sop_instance_uid), ...]).
     Raises ValueError if TransactionUID (0008,1195) is missing.
     """
-    # pynetdicom N-ACTION-RQ: dataset is in .dataset or fallback to .action_information
+    # An N-ACTION-RQ carries its payload as the Action Information parameter
+    # (PS3.7 9.3.2), which is `event.action_information`. `event.dataset` reads
+    # the C-STORE Data Set parameter instead and RAISES for an N-ACTION, so it
+    # is only a fallback for test doubles that populate it.
+    ds = None
     try:
-        ds = event.dataset
+        ds = event.action_information
     except AttributeError:
-        ds = (
-            event.action_information
-            if hasattr(event, "action_information")
-            else Dataset()
-        )
+        pass
+    if ds is None:
+        try:
+            ds = event.dataset
+        except AttributeError:
+            ds = Dataset()
     tx_uid = getattr(ds, "TransactionUID", None)
     if not tx_uid or str(tx_uid).strip() == "":
         raise ValueError("N-ACTION-RQ: missing TransactionUID (0008,1195)")

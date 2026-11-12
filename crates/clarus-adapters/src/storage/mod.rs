@@ -676,7 +676,15 @@ impl ContentAddressedStorage {
         report: &mut ScrubReport,
         dir: std::path::PathBuf,
     ) -> Result<(), StorageError> {
-        for entry in std::fs::read_dir(&dir)? {
+        // The bucket may vanish between the parent listing and this call
+        // (concurrent erase/cleanup). A missing bucket dir is not a scrub
+        // failure: skip it instead of aborting the whole sweep.
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
@@ -1245,6 +1253,27 @@ mod tests {
         assert_eq!(report.total, 0);
         assert_eq!(report.healthy, 0);
         assert!(report.corrupted.is_empty());
+        assert!(report.unreadable.is_empty());
+    }
+
+    // A bucket that vanishes between the parent listing and the scrub_dir
+    // call must not abort the sweep: the erase worker unlinks empty buckets
+    // concurrently. The whole `read_dir` returned NotFound, so the bucket is
+    // simply skipped (nothing was lost that still needs checking).
+    #[test]
+    fn scrub_skips_a_vanished_bucket() {
+        let cas = temp_cas();
+        let mut report = ScrubReport {
+            total: 0,
+            healthy: 0,
+            corrupted: Vec::new(),
+            unreadable: Vec::new(),
+        };
+        let missing = cas.root_dir().join("ab").join("cd");
+        assert!(!missing.exists());
+        cas.scrub_dir(&mut report, missing)
+            .expect("vanished bucket is skipped");
+        assert_eq!(report.total, 0);
         assert!(report.unreadable.is_empty());
     }
 

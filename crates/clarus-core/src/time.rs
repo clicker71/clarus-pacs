@@ -68,6 +68,25 @@ pub fn local_now() -> LocalTime {
     }
 }
 
+/// Break down an epoch offset into local wall-clock fields.
+///
+/// The journal stamps an event when it is queued and renders it later, so the
+/// conversion has to accept a stored instant rather than reading the clock
+/// again. Sub-second precision is not recoverable from an epoch second and is
+/// reported as 0.
+pub fn from_epoch_secs(epoch_secs: i64) -> LocalTime {
+    let (year, month, day, hour, minute, second) = local_broken_down(epoch_secs as libc::time_t);
+    LocalTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        millis: 0,
+    }
+}
+
 /// Fill a `libc::tm` from the OS for a given epoch offset, returning the
 /// broken-down civil fields. The OS call itself lives in
 /// [`crate::ffi::localtime_civil`] (audited OS boundary); here we only

@@ -62,6 +62,88 @@ class TestOutboxQueue:
         # Blob file still exists after dequeue (only removed by cleanup)
         assert os.path.isfile(blob_path), "Blob file should persist after dequeue"
 
+    def test_dequeue_unescapes_a_uid_with_percent_and_slash(self, outbox):
+        """A UID whose file-name form escaped `%` and `/` must round-trip
+        through enqueue -> dequeue.
+
+        `dequeue` used to re-escape the already-escaped name (`%2F` ->
+        `%252F`), so the meta lookup opened a file that does not exist and the
+        item stayed in pending/ forever.
+        """
+        from pydicom.dataset import FileMetaDataset
+        from pydicom.uid import ImplicitVRLittleEndian
+
+        uid = "1.2.3%4/5"
+        ds = Dataset()
+        ds.SOPInstanceUID = uid
+        ds.PatientName = "Test^Patient"
+        ds.StudyInstanceUID = "1.2.3.4.5"
+        ds.SeriesInstanceUID = "1.2.3.4.5.6"
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7"
+        ds.file_meta.MediaStorageSOPInstanceUID = uid
+        ds.file_meta.TransferSyntaxUID = ImplicitVRLittleEndian
+
+        assert outbox.enqueue(ds) is True
+        # The on-disk name is the escaped form.
+        assert os.path.isfile(outbox._dcm_path(outbox._pending, uid))
+
+        sop_uid, ds_out, _blob, _raw = outbox.dequeue()
+        assert sop_uid == uid, f"the UID must round-trip: {sop_uid!r}"
+        assert str(ds_out.SOPInstanceUID) == uid
+        # The item was claimed out of pending/ (moved to in_progress/), not
+        # skipped forever.
+        assert not os.path.isfile(outbox._dcm_path(outbox._pending, uid))
+        assert os.path.isfile(outbox._dcm_path(outbox._in_progress, uid))
+
+    def test_orphan_sweep_unescapes_a_uid_with_percent_and_slash(self, outbox):
+        """An orphan blob whose UID contains `%` and `/` must be adopted under
+        the SAME .meta name dequeue will look for.
+
+        The orphan sweep derived the UID from the ESCAPED filename and handed
+        it straight to `_meta_path`, which escaped it a second time - the
+        .meta it created was under a name no read path can match, so the
+        orphan was re-adopted (and re-logged) on every sweep and never became
+        deliverable.
+        """
+        from clean_code.outbox import ENQUEUE_PUBLISH_GRACE_SEC
+        from pydicom import dcmwrite
+        from pydicom.dataset import FileMetaDataset
+        from pydicom.uid import ImplicitVRLittleEndian
+
+        uid = "1.2.3%4/5"
+        ds = Dataset()
+        ds.SOPInstanceUID = uid
+        ds.PatientName = "Test^Patient"
+        ds.StudyInstanceUID = "1.2.3.4.5"
+        ds.SeriesInstanceUID = "1.2.3.4.5.6"
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7"
+        ds.file_meta.MediaStorageSOPInstanceUID = uid
+        ds.file_meta.TransferSyntaxUID = ImplicitVRLittleEndian
+
+        # Simulate a crashed enqueue: .dcm on disk, no .meta.
+        blob_path = outbox._dcm_path(outbox._pending, uid)
+        tmp_path = blob_path + ".tmp"
+        dcmwrite(tmp_path, ds, enforce_file_format=True)
+        os.replace(tmp_path, blob_path)
+        aged = time.time() - (ENQUEUE_PUBLISH_GRACE_SEC + 60)
+        os.utime(blob_path, (aged, aged))
+
+        rec, _und = outbox.recover_stuck()
+        assert rec == 1, "the orphan was adopted exactly once"
+        # (a) the .meta is the one dequeue will look for.
+        assert os.path.isfile(outbox._meta_path(outbox._pending, uid))
+
+        # (b) a second sweep finds no orphan: nothing is re-created.
+        rec2, _und2 = outbox.recover_stuck()
+        assert rec2 == 0, "the adopted orphan must not be re-adopted"
+
+        # And the adopted item is deliverable.
+        sop_uid, ds_out, _blob, _raw = outbox.dequeue()
+        assert sop_uid == uid, f"dequeue must find the adopted orphan: {sop_uid!r}"
+        assert str(ds_out.SOPInstanceUID) == uid
+
     def test_dequeue_lazy_parse_unmodified(self, monkeypatch, outbox):
         """OPT-1: an UNmodified blob (no .mods sidecar) is parsed header-only
         (stop_before_pixels=True) - the drain only needs the header fields;
@@ -194,10 +276,15 @@ class TestOutboxQueue:
         assert outbox.pending_count() == 1
 
     def test_recovery_finds_orphan_files(self, outbox):
-        """Recovery: blob file without SQLite row → creates row.
+        """Recovery: blob file without SQLite row -> creates row.
 
-        Scenario: enqueue writes file → bridge crashes before INSERT.
+        Scenario: enqueue writes file -> bridge crashes before INSERT.
         On recovery, the orphan file should be detected and a row created.
+
+        The blob is aged past ENQUEUE_PUBLISH_GRACE_SEC first: a fresh .dcm
+        without a .meta is an enqueue still in flight (enqueue writes the blob
+        first and the ready-marker last), and adopting that one published a
+        half-written instance.
         """
         sop_uid = "1.2.840.10008.5.1.4.1.1.2.orphan"
         ds = _make_dataset(sop_uid)
@@ -210,6 +297,11 @@ class TestOutboxQueue:
         dcmwrite(tmp_path, ds, enforce_file_format=True)
         os.replace(tmp_path, blob_path)
         assert os.path.isfile(blob_path)
+        # The crash happened long enough ago that nothing is still writing.
+        from clean_code.outbox import ENQUEUE_PUBLISH_GRACE_SEC
+
+        aged = time.time() - (ENQUEUE_PUBLISH_GRACE_SEC + 60)
+        os.utime(blob_path, (aged, aged))
 
         # No .meta → not counted
         assert outbox.pending_count() == 0

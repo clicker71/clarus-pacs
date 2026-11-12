@@ -25,6 +25,11 @@ SC = "1.2.840.10008.5.1.4.1.1.2"  # 25 chars - odd
 SI = "1.2.3.4.5.6.7.8.9.10"  # 20 chars - even
 TS = "1.2.840.10008.1.2.1"  # 19 chars - odd
 
+# PS3.10 7.1 Table 7.1-1 marks six elements Type 1 in the File Meta
+# Information. A group 0002 without (0002,0000), (0002,0001) or (0002,0012)
+# is a non-conformant Part 10 file even though pydicom still parses it.
+MANDATORY_META_ELEMS = [0x0000, 0x0001, 0x0002, 0x0003, 0x0010, 0x0012]
+
 
 def _ui(value):
     """Reference UI element bytes (even length, NULL inside)."""
@@ -100,16 +105,26 @@ def test_ensure_ts_only_meta_emits_canonical_trio():
     out = _ensure_file_meta_bytes(original, "", "", TS)
 
     _, elems, meta_end = _walk_meta(out)
-    assert [e for e, _ in elems] == [0x0002, 0x0003, 0x0010]  # ascending
+    assert [e for e, _ in elems] == MANDATORY_META_ELEMS  # ascending
     values = {e: v for e, v in elems}
+    assert values[0x0001] == b"\x00\x01", "Version: bit 0 of the first byte"
     assert values[0x0002].rstrip(b"\x00") == SC.encode("ascii")
     assert values[0x0003].rstrip(b"\x00") == SI.encode("ascii")
     assert values[0x0010].rstrip(b"\x00") == TS.encode("ascii")
-    # Every value length is even and the pad is INSIDE the length.
+    assert values[0x0012], "(0002,0012) Implementation Class UID is Type 1"
+    # (0002,0000) counts the bytes that follow its own value field.
+    assert struct.unpack("<I", values[0x0000])[0] == meta_end - 132 - 12, (
+        "the group length must cover exactly the rest of group 0002"
+    )
+    # Every value length is even and the pad is INSIDE the length. The UL
+    # group length and the UI UIDs use the 8-byte SHORT header; the OB
+    # version element uses the 12-byte LONG one (2 reserved bytes + 4-byte
+    # length), which is how pydicom's own writer encodes (0002,0001).
     pos = 132
     for _e, v in elems:
         assert len(v) % 2 == 0
-        pos += 8 + len(v)
+        pos += 12 if _e == 0x0001 else 8
+        pos += len(v)
     assert pos == meta_end
     # The old TS-only element is gone (exactly one 0010) and the dataset is
     # untouched.
@@ -123,14 +138,14 @@ def test_ensure_ts_only_meta_emits_canonical_trio():
 
 
 def test_ensure_canonical_trio_unchanged():
-    trio = (
-        _meta_ui_bytes(0x0002, SC)
-        + _meta_ui_bytes(0x0003, SI)
-        + _meta_ui_bytes(0x0010, TS)
-    )
-    original = _with_preamble(trio + _explicit_dataset())
-    out = _ensure_file_meta_bytes(original, "", "", TS)
-    assert out == original  # byte-identical no-op
+    # The writer's OWN output is the fixed point: repairing it changes nothing.
+    body = _explicit_dataset()
+    once = _ensure_file_meta_bytes(_with_preamble(body), "", "", TS)
+    twice = _ensure_file_meta_bytes(once, "", "", TS)
+    assert twice == once  # byte-identical no-op
+    _, elems, meta_end = _walk_meta(once)
+    assert [e for e, _ in elems] == MANDATORY_META_ELEMS
+    assert once[meta_end:] == body
 
 
 def test_ensure_rewrites_external_pad_meta():
@@ -148,7 +163,7 @@ def test_ensure_rewrites_external_pad_meta():
     out = _ensure_file_meta_bytes(original, "", "", TS)
 
     _, elems, meta_end = _walk_meta(out)
-    assert [e for e, _ in elems] == [0x0002, 0x0003, 0x0010]
+    assert [e for e, _ in elems] == MANDATORY_META_ELEMS
     for _e, v in elems:
         assert len(v) % 2 == 0  # even length, NULL inside
     assert out[meta_end:] == _explicit_dataset()
@@ -277,12 +292,12 @@ def test_empty_pydicom_value_does_not_suppress_0003():
 
 
 def test_meta_less_source_builds_preamble_and_trio():
-    # No DICM magic at all: preamble is built, trio synthesized.
+    # No DICM magic at all: preamble is built, the full meta group synthesized.
     body = _explicit_dataset()
     out = _ensure_file_meta_bytes(body, "", "", TS)
     assert out[:132] == b"\x00" * 128 + b"DICM"
     _, elems, meta_end = _walk_meta(out)
-    assert [e for e, _ in elems] == [0x0002, 0x0003, 0x0010]
+    assert [e for e, _ in elems] == MANDATORY_META_ELEMS
     assert out[meta_end:] == body
     ds = dcmread(io.BytesIO(out), stop_before_pixels=True)
     assert str(ds.file_meta.TransferSyntaxUID) == TS

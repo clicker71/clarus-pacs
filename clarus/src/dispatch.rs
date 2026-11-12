@@ -252,6 +252,19 @@ fn write_resp(conn: &mut Conn, status: u16, ctype: &[u8], body: &[u8], ka: bool)
     conn.write_all_configured(body)
 }
 
+/// Whether this response may keep the connection open.
+///
+/// The hand-built heads (`render_qido`/`render_ups`/`render_workflow`/
+/// `render_admin`) append `Connection: close` themselves, so they must apply
+/// the same rule `write_resp` does: a body the server never read must not be
+/// followed by the next `read_head`, which would parse those bytes as a request
+/// line (PS3.18 8.1 request framing). A handler that answers without draining
+/// the request would otherwise leave the connection in a state where the client
+/// and the server disagree on where the next message starts.
+fn may_keep_alive(ctx: &RequestContext<'_>) -> bool {
+    ctx.keep_alive == KeepAlive::On && !ctx.conn.body_pending()
+}
+
 fn reason_phrase(code: u16) -> &'static str {
     match code {
         200 => "OK",
@@ -424,7 +437,7 @@ fn render_qido(
                 heads.extend_from_slice(
                     format!("Content-Length: {}\r\n", resp.body.len()).as_bytes(),
                 );
-                if ctx.keep_alive != KeepAlive::On {
+                if !may_keep_alive(ctx) {
                     heads.extend_from_slice(b"Connection: close\r\n");
                 }
                 heads.extend_from_slice(b"\r\n");
@@ -633,7 +646,7 @@ fn render_ups(
             }
             heads.extend_from_slice(clarus_core::http::response::CORS_ALLOW_ORIGIN);
             heads.extend_from_slice(format!("Content-Length: {}\r\n", resp.body.len()).as_bytes());
-            if ctx.keep_alive != KeepAlive::On {
+            if !may_keep_alive(ctx) {
                 heads.extend_from_slice(b"Connection: close\r\n");
             }
             heads.extend_from_slice(b"\r\n");
@@ -907,13 +920,13 @@ fn h_ups_unsubscribe(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     write_resp(ctx.conn, r.status, JSON_CT, &r.body, ka)
 }
 
-/// The Workitem Subscription template's DELETE. Unsubscribing is keyed by AE
-/// Title alone (PS3.4 CC.2.3.1: the dependency is one subscription per
-/// subscriber), so the workitem UID narrows the URL but does not narrow the
-/// removal - the router requires it only because the template does.
+/// The Workitem Subscription template's DELETE. The URL names ONE workitem, so
+/// only that scope is removed; the whole-AE form also dropped the subscriber's
+/// Worklist subscription, which this request never named.
 fn h_ups_unsubscribe_workitem(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     let subscriber = ctx.uid(1).to_string();
-    let r = crate::handlers::subscribe_pure::unsubscribe(&subscriber);
+    let workitem_uid = ctx.uid(0).to_string();
+    let r = crate::handlers::subscribe_pure::unsubscribe_scoped(&subscriber, &workitem_uid);
     let ka = ctx.keep_alive == KeepAlive::On;
     write_resp(ctx.conn, r.status, JSON_CT, &r.body, ka)
 }
@@ -1025,7 +1038,7 @@ fn render_workflow(
             }
             heads.extend_from_slice(clarus_core::http::response::CORS_ALLOW_ORIGIN);
             heads.extend_from_slice(format!("Content-Length: {}\r\n", resp.body.len()).as_bytes());
-            if ctx.keep_alive != KeepAlive::On {
+            if !may_keep_alive(ctx) {
                 heads.extend_from_slice(b"Connection: close\r\n");
             }
             heads.extend_from_slice(b"\r\n");
@@ -1160,7 +1173,7 @@ fn render_admin(
             // surface is reached by a tool, not by a third-party web page, so
             // the wildcard buys nothing and gives a lot away.
             heads.extend_from_slice(format!("Content-Length: {}\r\n", resp.body.len()).as_bytes());
-            if ctx.keep_alive != KeepAlive::On {
+            if !may_keep_alive(ctx) {
                 heads.extend_from_slice(b"Connection: close\r\n");
             }
             heads.extend_from_slice(b"\r\n");
@@ -1405,30 +1418,55 @@ fn h_admin_instances_restore(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     render_admin(ctx, result)
 }
 
+/// Read `?dry_run=` as a boolean, or reject it.
+///
+/// `None` (the parameter is absent) is `false` - the historical default. A
+/// substring test cannot tell `dry_run=false` from `dry_run=true`, and the
+/// dangerous direction is the one that reads `dry_run=no` as TRUE: a
+/// destructive maintenance or audit run then becomes a no-op while reporting
+/// success. Anything not recognisably boolean is a 400, because guessing is
+/// what turned the value into its opposite.
+fn parse_dry_run(ctx: &RequestContext<'_>) -> Result<bool, String> {
+    // A bare `?dry_run` is the conventional HTTP spelling of a true flag, and
+    // `query_value` cannot see it: it skips a pair whose value is empty, which
+    // makes a valueless flag look absent. Presence is therefore checked on the
+    // raw query, and only a value that is actually present is parsed.
+    let Some(raw) = ctx.query_str() else {
+        return Ok(false);
+    };
+    let Some(value) = raw.split('&').find_map(|pair| match pair.split_once('=') {
+        Some(("dry_run", v)) => Some(v),
+        None if pair == "dry_run" => Some(""),
+        _ => None,
+    }) else {
+        return Ok(false);
+    };
+    if value.is_empty() {
+        return Ok(true);
+    }
+    let v = crate::handlers::wado::types::url_decode(value);
+    if v.eq_ignore_ascii_case("true") || v == "1" {
+        return Ok(true);
+    }
+    if v.eq_ignore_ascii_case("false") || v == "0" {
+        return Ok(false);
+    }
+    Err(format!("dry_run must be true or false, got '{v}'"))
+}
+
 fn h_admin_maintenance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     let Some(body) = admin_json_body(ctx)? else {
         return Ok(());
     };
     let user = std::str::from_utf8(ctx.user).unwrap_or("anonymous");
-    // A parameter, not a substring test: `contains("dry_run")` also matched
-    // `dry_run=false`, a value in some unrelated parameter, and a misspelled
-    // key that merely began with those characters. The dangerous direction is
-    // the other one - `dry_run=no` reads as TRUE under a substring test and
-    // turns a destructive maintenance run into a no-op - so the value is read
-    // as a boolean and anything unclear is a 400.
-    let dry_run = match ctx.query_value("dry_run").as_deref() {
-        None => false,
-        Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => true,
-        Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => false,
-        Some(v) => {
+    let dry_run = match parse_dry_run(ctx) {
+        Ok(v) => v,
+        Err(msg) => {
             return render_admin(
                 ctx,
                 Err(crate::handlers::admin::pure::AdminErr {
                     status: 400,
-                    body: crate::handlers::json_common::err_msg_json(
-                        "Bad Request",
-                        &format!("dry_run must be true or false, got '{v}'"),
-                    ),
+                    body: crate::handlers::json_common::err_msg_json("Bad Request", &msg),
                 }),
             );
         }
@@ -1470,10 +1508,18 @@ fn h_admin_instances_delete(ctx: &mut RequestContext<'_>) -> io::Result<()> {
 }
 
 fn h_admin_cas_audit(ctx: &mut RequestContext<'_>) -> io::Result<()> {
-    let dry_run = ctx
-        .query_str()
-        .map(|q| q.contains("dry_run"))
-        .unwrap_or(false);
+    let dry_run = match parse_dry_run(ctx) {
+        Ok(v) => v,
+        Err(msg) => {
+            return render_admin(
+                ctx,
+                Err(crate::handlers::admin::pure::AdminErr {
+                    status: 400,
+                    body: crate::handlers::json_common::err_msg_json("Bad Request", &msg),
+                }),
+            );
+        }
+    };
     let result = crate::handlers::admin::pure::admin_cas_audit_start(ctx.state, dry_run);
     // when the pure side accepted (202), run the actual CAS walk on a
     // background std thread (no tokio, per) and stream progress back
@@ -1483,6 +1529,7 @@ fn h_admin_cas_audit(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         && resp.status == 202
     {
         let cas_root = ctx.state.cas.root_dir().to_path_buf();
+        let temp_dir = ctx.state.cas.temp_dir();
         let manifest_dir = std::path::PathBuf::from(&ctx.state.config.btree.manifest_dir);
         std::thread::Builder::new()
             .name("cas-audit".into())
@@ -1490,6 +1537,7 @@ fn h_admin_cas_audit(ctx: &mut RequestContext<'_>) -> io::Result<()> {
                 crate::cas_audit_worker::run_cas_audit(
                     cas_root,
                     manifest_dir,
+                    temp_dir,
                     &crate::handlers::admin::pure::AUDIT_STATE,
                 )
             })
@@ -1508,10 +1556,18 @@ fn h_admin_recovery_rebuild(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     let Some(body) = admin_json_body(ctx)? else {
         return Ok(());
     };
-    let dry_run = ctx
-        .query_str()
-        .map(|q| q.contains("dry_run"))
-        .unwrap_or(false);
+    let dry_run = match parse_dry_run(ctx) {
+        Ok(v) => v,
+        Err(msg) => {
+            return render_admin(
+                ctx,
+                Err(crate::handlers::admin::pure::AdminErr {
+                    status: 400,
+                    body: crate::handlers::json_common::err_msg_json("Bad Request", &msg),
+                }),
+            );
+        }
+    };
     let result = crate::handlers::admin::pure::admin_recovery_rebuild(ctx.state, &body, dry_run);
     if let Ok(resp) = &result
         && resp.status == 202

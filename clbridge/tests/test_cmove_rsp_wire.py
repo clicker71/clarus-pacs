@@ -317,3 +317,183 @@ def test_unexpected_cstore_mid_move_final_rsp_survives():
     finally:
         scp.shutdown()
         viewer.shutdown()
+
+
+class _WireDb:
+    """Minimal SharedDb-shaped wrapper for MoveJobManager (one connection,
+    one lock) - the same contract the bridge's own SharedDb exposes."""
+
+    def __init__(self):
+        import sqlite3
+
+        self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self._lock = threading.Lock()
+
+    def locked(self):
+        class _L:
+            def __init__(s, lock, conn):
+                s._lock = lock
+                s._conn = conn
+
+            def __enter__(s):
+                s._lock.acquire()
+                return s._conn
+
+            def __exit__(s, *a):
+                s._lock.release()
+
+        return _L(self._lock, self._conn)
+
+    def close(self):
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+
+class _RealScp:
+    """Stub C-MOVE SCP that drives the REAL handle_c_move, so the count the
+    handler actually computes crosses the wire to the viewer."""
+
+    def __init__(self, poll_timeout):
+        from clean_code.handlers.cmove import handle_c_move
+        from clean_code.move_jobs import MoveJobManager
+
+        self.ae = AE(ae_title="BRIDGE")
+        self.ae.network_timeout = 30
+        self.ae.acse_timeout = 30
+        self.ae.dimse_timeout = 60
+        self.ae.add_supported_context(StudyRootQueryRetrieveInformationModelMove)
+        self.ae.add_requested_context(CTImageStorage)
+        self.ae.add_supported_context(CTImageStorage)
+        self.port = _free_port()
+        self.move_jobs = MoveJobManager(shared_db=_WireDb())
+        self._viewer_port = None
+        self._poll_timeout = poll_timeout
+
+        def _on_move(event):
+            yield from handle_c_move(
+                event,
+                self.move_jobs,
+                peers_file="",
+                clarus_url="http://127.0.0.1:8024/dicomweb",
+                bridge_ae_title="BRIDGE",
+                move_poll_timeout=self._poll_timeout,
+            )
+
+        self.server = self.ae.start_server(
+            (ADDR, self.port),
+            block=False,
+            evt_handlers=[(evt.EVT_C_MOVE, _on_move)],
+        )
+        time.sleep(0.2)
+
+    def wait_for_job(self, timeout=10.0):
+        """Block until handle_c_move has created its job, then return the id."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.move_jobs._db.locked() as conn:
+                row = conn.execute(
+                    "SELECT id FROM move_jobs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            if row:
+                return int(row[0])
+            time.sleep(0.05)
+        raise AssertionError("handle_c_move never created its job")
+
+    def shutdown(self):
+        try:
+            self.ae.shutdown()
+        except Exception:
+            pass
+
+
+def _run_real(outcome, poll_timeout=30.0):
+    """Drive the REAL handle_c_move; `outcome` is zero / partial / timeout.
+
+    A helper thread simulates the worker by updating the job once the handler
+    has created it; the handler's own terminal-count selection then decides
+    what the viewer receives.
+    """
+    scp = _RealScp(poll_timeout)
+    viewer = _Viewer()
+    scp._viewer_port = viewer.port
+    scp.move_jobs.register_peer("VIEWER", "127.0.0.1", viewer.port)
+
+    def _simulate():
+        job_id = scp.wait_for_job()
+        if outcome == "zero":
+            scp.move_jobs.update_job_progress(job_id, completed=0, failed=432, total=432)
+            scp.move_jobs.set_job_failed_sops(job_id, [FAILED_UID])
+            scp.move_jobs.finish_job(job_id, success=False)
+        elif outcome == "partial":
+            scp.move_jobs.update_job_progress(job_id, completed=430, failed=2, total=432)
+            scp.move_jobs.set_job_failed_sops(job_id, [FAILED_UID])
+            scp.move_jobs.finish_job(job_id, success=False)
+        # "timeout": leave the job pending; the handler's poll timeout fires.
+
+    sim = threading.Thread(target=_simulate, daemon=True)
+    sim.start()
+    try:
+        assoc = viewer.ae.associate(ADDR, scp.port, ae_title="BRIDGE")
+        try:
+            assert assoc.is_established, "C-MOVE association failed"
+            ds = Dataset()
+            ds.StudyInstanceUID = STUDY
+            ds.QueryRetrieveLevel = "STUDY"
+            statuses = []
+            for status, identifier in assoc.send_c_move(
+                ds,
+                "VIEWER",
+                StudyRootQueryRetrieveInformationModelMove,
+                msg_id=7,
+            ):
+                if not status:
+                    break
+                if status.Status not in (0xFF00, 0xFF01):
+                    statuses.append((status.Status, identifier))
+                    break
+            return statuses, viewer
+        finally:
+            try:
+                assoc.release()
+            except Exception:
+                pass
+    finally:
+        sim.join(timeout=30)
+        scp.shutdown()
+        viewer.shutdown()
+
+
+def test_zero_delivered_receives_c000_with_0008_0058():
+    """Zero delivered (0 of 432): the SCU receives 0xC000, not 0x0000, and
+    the Identifier carries (0008,0058)."""
+    statuses, viewer = _run_real("zero")
+    assert [s for s, _ in statuses] == [0xC000], (
+        f"a zero-delivered move must answer Failure, got {statuses}"
+    )
+    _, identifier = statuses[-1]
+    assert _has_failed_uid(
+        identifier
+    ), "Failure must carry (0008,0058) in the Identifier"
+
+
+def test_partial_receives_b000_with_0008_0058():
+    """Partial delivery (430 of 432): 0xB000 with (0008,0058), not 0x0000."""
+    statuses, viewer = _run_real("partial")
+    assert [s for s, _ in statuses] == [0xB000], (
+        f"a partial move must answer Warning, got {statuses}"
+    )
+    _, identifier = statuses[-1]
+    assert _has_failed_uid(
+        identifier
+    ), "Warning must carry (0008,0058) in the Identifier"
+
+
+def test_poll_timeout_zero_delivered_receives_c000():
+    """Poll timeout with nothing delivered: 0xC000, not 0x0000."""
+    statuses, viewer = _run_real("timeout", poll_timeout=2.0)
+    assert [s for s, _ in statuses] == [0xC000], (
+        f"a timed-out zero-delivered move must answer Failure, got {statuses}"
+    )

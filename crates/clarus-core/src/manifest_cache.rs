@@ -78,6 +78,17 @@ struct CacheSlot {
     /// ticket on the slot itself means "least recently used" is answerable
     /// for both kinds without a second pass over the entries.
     last_live: u64,
+    /// Writers that called `begin_write` and have not yet `end_write`d.
+    /// Never evicted while > 0: the slot holds their version guard.
+    writers: u32,
+    /// Readers that snapshotted this slot's version and are still decoding.
+    ///
+    /// `v0` alone is not a generation identity: an evicted slot FREES the
+    /// version, and a new slot for the same study starts again at 0, so a
+    /// reader that paused after snapshotting `v0` can resume and match a
+    /// generation it never saw. Counting the reader keeps the slot - and its
+    /// version - alive until the miss resolves.
+    readers: u32,
 }
 
 static CACHE: std::sync::OnceLock<RwLock<HashMap<String, CacheSlot>>> = std::sync::OnceLock::new();
@@ -110,12 +121,20 @@ fn touch() -> u64 {
 /// removed so a concurrent reader can never be served pre-mutation content.
 pub fn begin_write(study: &str) -> (u64, Option<Arc<Manifest>>) {
     let mut cache = write_lock();
+    let stamp = touch();
     let slot = cache.entry(study.to_string()).or_insert(CacheSlot {
         v: 0,
         entry: None,
-        last_live: touch(),
+        last_live: stamp,
+        writers: 0,
+        readers: 0,
     });
     slot.v += 1;
+    slot.writers += 1;
+    // A writer that runs for a long time must not look like the coldest slot:
+    // the slot bound orders by this ticket, and a slot created before a burst
+    // of unrelated reads would otherwise be the first one dropped.
+    slot.last_live = stamp;
     (slot.v, slot.entry.take().map(|e| e.manifest))
 }
 
@@ -125,6 +144,9 @@ pub fn begin_write(study: &str) -> (u64, Option<Arc<Manifest>>) {
 /// if the slot version is still `v` (a newer writer began in the meantime -
 /// the disk may already carry its content, so ours would be stale). A slot
 /// that disappeared (LRU-evicted) is left absent: the next read re-decodes.
+///
+/// The in-flight count is released on BOTH paths: a losing writer must not
+/// leave its count behind, or the slot could never be reclaimed.
 pub fn end_write(
     study: &str,
     v: u64,
@@ -133,17 +155,23 @@ pub fn end_write(
     manifests_dir: &Path,
 ) {
     let mut cache = write_lock();
-    if let Some(slot) = cache.get_mut(study).filter(|s| s.v == v) {
-        let stamp = touch();
-        slot.last_live = stamp;
-        slot.entry = Some(ArcEntry {
-            manifest,
-            encoded_len,
-            manifests_dir: manifests_dir.to_path_buf(),
-            last_use: AtomicU64::new(stamp),
-        });
-        evict_lru_locked(&mut cache, study);
+    let Some(slot) = cache.get_mut(study) else {
+        return;
+    };
+    // Release the count on BOTH paths: a losing writer must not leak it.
+    slot.writers = slot.writers.saturating_sub(1);
+    if slot.v != v {
+        return;
     }
+    let stamp = touch();
+    slot.last_live = stamp;
+    slot.entry = Some(ArcEntry {
+        manifest,
+        encoded_len,
+        manifests_dir: manifests_dir.to_path_buf(),
+        last_use: AtomicU64::new(stamp),
+    });
+    evict_lru_locked(&mut cache, study);
 }
 
 /// Read path: return a cached `Arc<Manifest>` for `study`.
@@ -167,22 +195,47 @@ pub fn get_or_load(manifests_dir: &Path, study: &str) -> Result<Arc<Manifest>, M
             return Ok(Arc::clone(&entry.manifest));
         }
     }
+    // Snapshot the generation AND register as an in-flight reader in the same
+    // lock section. Without the registration an eviction could drop the slot,
+    // free version `v0`, and a fresh slot for this study would start again at
+    // 0 - our insert would then match a generation that never existed for the
+    // content we decoded.
     let v0 = {
-        let cache = read_lock();
-        cache.get(study).map(|s| s.v).unwrap_or(0)
+        let mut cache = write_lock();
+        let slot = cache.entry(study.to_string()).or_insert(CacheSlot {
+            v: 0,
+            entry: None,
+            last_live: touch(),
+            writers: 0,
+            readers: 0,
+        });
+        slot.readers += 1;
+        slot.v
     };
     // Miss path (allocates by design - decode + owned strings; not gated).
+    // Every early return below must release the reader count.
     let manifest_path = manifests_dir.join(format!("{study}.manifest"));
-    let manifest = Arc::new(read_manifest(&manifest_path)?);
+    let decoded = read_manifest(&manifest_path);
     let encoded_len = std::fs::metadata(&manifest_path)
         .map(|m| m.len())
         .unwrap_or(0);
+    // Release the in-flight registration before deciding, so BOTH outcomes
+    // leave the slot reclaimable.
+    {
+        let mut cache = write_lock();
+        if let Some(slot) = cache.get_mut(study) {
+            slot.readers = slot.readers.saturating_sub(1);
+        }
+    }
+    let manifest = Arc::new(decoded?);
     {
         let mut cache = write_lock();
         let slot = cache.entry(study.to_string()).or_insert(CacheSlot {
             v: 0,
             entry: None,
             last_live: touch(),
+            writers: 0,
+            readers: 0,
         });
         if try_insert(
             slot,
@@ -271,11 +324,41 @@ fn evict_lru_locked(cache: &mut HashMap<String, CacheSlot>, keep: &str) {
 fn evict_empty_slots_locked(cache: &mut HashMap<String, CacheSlot>, keep: &str) {
     let mut slots = cache.len();
     while slots > MAX_SLOTS {
-        let victim = cache
+        // Unversioned first: a slot with `v == 0` is one no writer has ever
+        // begun against, so dropping it can never invalidate a live
+        // `begin_write`/`end_write` pair.
+        let unversioned = cache
             .iter()
-            .filter(|(k, s)| k.as_str() != keep && s.entry.is_none() && s.v == 0)
+            .filter(|(k, s)| {
+                k.as_str() != keep
+                    && s.entry.is_none()
+                    && s.v == 0
+                    && s.writers == 0
+                    && s.readers == 0
+            })
             .map(|(k, s)| (s.last_live, k.clone()))
             .min();
+        // Otherwise the least recently LIVE empty slot, whatever its version.
+        // Returning early here left the map above `MAX_SLOTS` for as long as
+        // the store kept being written to: every study acquires a versioned
+        // empty slot the first time it is written, so a store with more than
+        // `MAX_SLOTS` written studies could never shrink again - the exact
+        // unbounded growth this bound exists to prevent.
+        //
+        // `writers == 0` is what makes the fallback safe: a slot whose writer
+        // has not called `end_write` yet is empty and versioned exactly like a
+        // finished, evicted study, but it still holds that writer's version
+        // guard. Dropping it would send `end_write` down its `v != v` path on
+        // a slot the reader recreated with `v == 0`, and the committed
+        // manifest would never be installed.
+        let versioned = cache
+            .iter()
+            .filter(|(k, s)| {
+                k.as_str() != keep && s.entry.is_none() && s.writers == 0 && s.readers == 0
+            })
+            .map(|(k, s)| (s.last_live, k.clone()))
+            .min();
+        let victim = unversioned.or(versioned);
         let Some((_, victim)) = victim else { return };
         cache.remove(&victim);
         slots -= 1;
@@ -300,6 +383,26 @@ fn try_insert(slot: &mut CacheSlot, v0: u64, manifests_dir: &Path, entry: ArcEnt
     }
 }
 
+/// A crate-wide test mutex for the process-global cache.
+///
+/// The cache is a `static` shared by EVERY test in this binary, and more than
+/// the cache module touches it: `write_study_manifest_full` calls
+/// `begin_write`/`end_write`, so any test that writes a manifest installs or
+/// evicts cache entries. A cache test that asserted an exact map size was
+/// counting the OTHER module's entries whenever the two ran on parallel
+/// threads - the number drifted test-run to test-run. This mutex is the one
+/// serial point all cache-touching tests take, so size assertions see a map
+/// only their own run populated.
+#[cfg(test)]
+pub(crate) mod test_sync {
+    static CACHE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the shared cache-test guard (poison-tolerant).
+    pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,12 +410,11 @@ mod tests {
     use crate::stow::StudyManifestAttrs;
 
     /// The cache is a process-global static: tests share its state and the
-    /// LRU budget. Serialize the whole module and use unique study names.
-    /// `into_inner` on poison: one failing test must not cascade.
-    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// LRU budget. Serialize through the crate-wide [`test_sync`] guard and
+    /// use unique study names. `into_inner` on poison: one failing test must
+    /// not cascade.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
-        TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+        test_sync::lock()
     }
 
     /// Whether `study` holds a LIVE entry.
@@ -383,6 +485,8 @@ mod tests {
             v: 0,
             entry: None,
             last_live: 0,
+            writers: 0,
+            readers: 0,
         };
         assert!(try_insert(&mut slot, 0, dir, entry), "fresh slot accepts");
         // Slot version moved -> rejected.
@@ -390,6 +494,8 @@ mod tests {
             v: 1,
             entry: None,
             last_live: 0,
+            writers: 0,
+            readers: 0,
         };
         let entry = ArcEntry {
             manifest: Arc::new(sample_manifest("guard")),
@@ -406,6 +512,8 @@ mod tests {
             v: 1,
             entry: None,
             last_live: 0,
+            writers: 0,
+            readers: 0,
         };
         let entry = ArcEntry {
             manifest: Arc::new(sample_manifest("guard")),
@@ -430,6 +538,8 @@ mod tests {
             v: 1,
             entry: None,
             last_live: 0,
+            writers: 0,
+            readers: 0,
         };
         let entry = ArcEntry {
             manifest: Arc::new(sample_manifest("guard")),
@@ -562,6 +672,116 @@ mod tests {
         write_sample(dir.path(), "corrupt.1");
         let m = get_or_load(dir.path(), "corrupt.1").expect("decode after repair");
         assert_eq!(m.sys.version, 1);
+    }
+
+    /// C9: a slot with a reader mid-miss is never chosen for eviction, so its
+    /// generation survives and the resumed insert cannot install stale bytes.
+    ///
+    /// The defect sequence: reader snapshots `v0`; a writer commits (bumping
+    /// `v`); slot-bound eviction reclaims the slot, which FREES the version; a
+    /// fresh slot for the same study starts again at 0, so the paused reader's
+    /// `try_insert(slot, v0)` matches and caches the PRE-commit manifest under
+    /// a generation it does not belong to.
+    ///
+    /// This test pushes the cache past `MAX_SLOTS` so the eviction loop really
+    /// runs, then asserts the reader's slot is still there with its version and
+    /// its registration intact.
+    #[test]
+    fn an_in_flight_miss_survives_slot_eviction() {
+        let _g = serial();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut cache = write_lock();
+            cache.clear();
+        }
+        let study = "gen.identity";
+        write_sample(dir.path(), study);
+
+        // What `get_or_load` does on the miss path: snapshot + register.
+        let v0 = {
+            let mut cache = write_lock();
+            let slot = cache.entry(study.to_string()).or_insert(CacheSlot {
+                v: 0,
+                entry: None,
+                last_live: touch(),
+                writers: 0,
+                readers: 0,
+            });
+            slot.readers += 1;
+            slot.v
+        };
+        assert_eq!(v0, 0, "fresh slot starts at version 0");
+
+        // The reader's slot is still at v == 0 - it is decoding and no writer
+        // has begun - so it is exactly what the UNVERSIONED eviction filter
+        // would take. `readers` is the only thing that can save it.
+        {
+            let mut cache = write_lock();
+            let s = cache.get_mut(study).expect("slot present");
+            s.last_live = 1; // LRU order must pick this one first
+            assert_eq!(s.v, 0);
+            assert_eq!(s.readers, 1);
+        }
+
+        // Force the slot bound: more live slots than MAX_SLOTS.
+        {
+            let mut cache = write_lock();
+            for i in 0..(MAX_SLOTS + 16) {
+                let pad = format!("genpad.{i}");
+                cache.insert(
+                    pad,
+                    CacheSlot {
+                        v: 0,
+                        entry: None,
+                        last_live: touch(),
+                        writers: 0,
+                        readers: 0,
+                    },
+                );
+            }
+        }
+        {
+            let mut cache = write_lock();
+            evict_lru_locked(&mut cache, "some.other.study");
+            let slot = cache
+                .get(study)
+                .expect("a slot with a live reader must not be reclaimed");
+            assert_eq!(slot.v, 0, "the generation must survive untouched");
+            assert_eq!(slot.readers, 1, "the reader registration is intact");
+            assert!(
+                cache.len() <= MAX_SLOTS,
+                "the bound still has to be enforced: len={}",
+                cache.len()
+            );
+        }
+
+        // A writer commits NOW. Because the slot survived, it is the same slot
+        // the reader registered against, so the bump is visible to the reader's
+        // eventual insert and that insert is refused.
+        let (writer_v, _) = begin_write(study);
+        assert_eq!(writer_v, 1, "the writer bumped the version");
+
+        // The reader resumes: release, then attempt the stale install.
+        {
+            let mut cache = write_lock();
+            let slot = cache.get_mut(study).unwrap();
+            slot.readers -= 1;
+            let accepted = try_insert(
+                slot,
+                v0,
+                dir.path(),
+                ArcEntry {
+                    manifest: Arc::new(sample_manifest(study)),
+                    encoded_len: 0,
+                    manifests_dir: dir.path().to_path_buf(),
+                    last_use: AtomicU64::new(touch()),
+                },
+            );
+            assert!(
+                !accepted,
+                "a stale pre-commit manifest must not install under a newer generation"
+            );
+        }
     }
 
     #[test]
@@ -753,5 +973,230 @@ mod tests {
             Some(v),
             "the slot still carries the writer's version"
         );
+    }
+
+    /// Written studies must not pin the slot map forever.
+    ///
+    /// Every study acquires a versioned slot the first time it is written, so
+    /// a store with more than [`MAX_SLOTS`] written studies has nothing but
+    /// versioned empty slots to reclaim. Preferring them is fine; refusing to
+    /// drop them was the leak - the map stayed above the bound for as long as
+    /// the store kept growing.
+    ///
+    /// Falsification anchor: the in-flight guard test above still has to pass,
+    /// and it does, because the sweep prefers unversioned slots and only falls
+    /// back to versioned ones once none are left.
+    #[test]
+    fn the_slot_map_shrinks_again_when_every_slot_is_versioned() {
+        let _g = serial();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut cache = write_lock();
+            cache.clear();
+        }
+
+        // Written studies only: each `end_write` leaves a versioned empty slot.
+        let stream = MAX_SLOTS * 2;
+        for i in 0..stream {
+            let study = format!("written.{i}");
+            let (v, _) = begin_write(&study);
+            end_write(&study, v, Arc::new(sample_manifest(&study)), 0, dir.path());
+            // Trim to one entry: the study's slot stays (versioned, empty).
+            let mut cache = write_lock();
+            evict_lru_locked(&mut cache, &study);
+            if let Some(slot) = cache.get_mut(&study) {
+                slot.entry = None;
+            }
+            evict_lru_locked(&mut cache, &study);
+        }
+
+        let cache = read_lock();
+        assert!(
+            cache.len() <= MAX_SLOTS,
+            "a store of {stream} written studies must not pin {} slots",
+            cache.len()
+        );
+    }
+
+    /// A slot an in-flight writer holds is EMPTY and VERSIONED, which is also
+    /// what a finished, evicted study looks like. Treating the two as one
+    /// class lets the slot bound drop a live writer's version guard.
+    #[test]
+    fn a_versioned_slot_with_an_in_flight_writer_is_never_evicted() {
+        let _g = serial();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut cache = write_lock();
+            cache.clear();
+        }
+
+        // A writer begins against a brand-new study and stalls. Its slot is
+        // empty and versioned, so it has the oldest `last_live` of any slot
+        // the sweep could pick.
+        let (v, _) = begin_write("inflight.writer");
+
+        // Fill the map past the slot bound with versioned EMPTY slots: written
+        // studies whose entry was cleared, i.e. the population the versioned
+        // fallback exists to reclaim.
+        for i in 0..MAX_SLOTS * 2 {
+            let study = format!("inflight.written.{i}");
+            let (wv, _) = begin_write(&study);
+            end_write(&study, wv, Arc::new(sample_manifest(&study)), 0, dir.path());
+            let mut cache = write_lock();
+            if let Some(slot) = cache.get_mut(&study) {
+                slot.entry = None;
+            }
+            evict_lru_locked(&mut cache, &study);
+        }
+
+        assert!(
+            read_lock().contains_key("inflight.writer"),
+            "the slot holding an in-flight writer's version guard was evicted"
+        );
+        // And the guard still lands, which is the property the slot exists for.
+        end_write(
+            "inflight.writer",
+            v,
+            Arc::new(sample_manifest("inflight.writer")),
+            0,
+            dir.path(),
+        );
+        assert!(
+            has_entry(&read_lock(), "inflight.writer"),
+            "the stalled writer's install must land"
+        );
+    }
+
+    /// The reviewer's four-step interleaving, driven sequentially (the
+    /// interleaving is sequential - no threads, no sleeps).
+    ///
+    /// 1. reader snapshots `v0 = 0` and starts decoding from disk;
+    /// 2. writer calls `begin_write` (slot `v = 1`, entry taken) and the sweep
+    ///    removes that slot under slot pressure;
+    /// 3. the reader's `or_insert(v: 0)` recreates the slot with `v = 0`, so
+    ///    its `try_insert(v0 = 0)` succeeds and it caches the PRE-write
+    ///    manifest;
+    /// 4. `end_write` finds no slot and installs nothing -> the cache serves
+    ///    pre-mutation content after a successful commit.
+    #[test]
+    fn the_reviewer_sequence() {
+        let _g = serial();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut cache = write_lock();
+            cache.clear();
+        }
+        let committed_before = write_sample(dir.path(), "race.study");
+        // Step 1: what `get_or_load` decoded and the version it snapped.
+        let pre_write = read_manifest(&committed_before).expect("decode pre-write");
+        assert_eq!(pre_write.sys.version, 1);
+        // Step 2: the writer begins and takes its version guard.
+        let (v, _taken) = begin_write("race.study");
+        // Slot pressure: enough versioned empty slots to force the sweep, and
+        // the writer's own slot is the coldest (it was created first).
+        for i in 0..MAX_SLOTS * 2 {
+            let study = format!("race.pressure.{i}");
+            let (wv, _) = begin_write(&study);
+            end_write(&study, wv, Arc::new(sample_manifest(&study)), 0, dir.path());
+            let mut cache = write_lock();
+            if let Some(slot) = cache.get_mut(&study) {
+                slot.entry = None;
+            }
+            evict_lru_locked(&mut cache, &study);
+        }
+        // Step 3: the reader inserts what it decoded with `v0 = 0`.
+        {
+            let mut cache = write_lock();
+            let slot = cache.entry("race.study".to_string()).or_insert(CacheSlot {
+                v: 0,
+                entry: None,
+                last_live: touch(),
+                writers: 0,
+                readers: 0,
+            });
+            let _ = try_insert(
+                slot,
+                0,
+                dir.path(),
+                ArcEntry {
+                    manifest: Arc::new(pre_write),
+                    encoded_len: 0,
+                    manifests_dir: dir.path().to_path_buf(),
+                    last_use: AtomicU64::new(touch()),
+                },
+            );
+        }
+        // Step 4: the writer commits and installs.
+        end_write(
+            "race.study",
+            v,
+            Arc::new(sample_manifest("race.study")),
+            0,
+            dir.path(),
+        );
+        // The served manifest must be the COMMITTED one. `sample_manifest`
+        // and the on-disk file both carry format version 1, so the entry is
+        // identified by its encoded_len (the committed install says 0; the
+        // pre-write decode reports the file size).
+        let served = get_or_load(dir.path(), "race.study").expect("read after commit");
+        {
+            let cache = read_lock();
+            let entry = cache
+                .get("race.study")
+                .and_then(|s| s.entry.as_ref())
+                .expect("the committed manifest must be installed");
+            assert_eq!(
+                entry.encoded_len, 0,
+                "the cache serves content that missed the commit"
+            );
+            assert_eq!(
+                cache.get("race.study").map(|s| s.v),
+                Some(v),
+                "the writer's guard still describes the slot"
+            );
+        }
+        assert_eq!(served.sys.version, 1);
+    }
+
+    /// A stale `end_write` must not match a new writer's version, and must not
+    /// leave its in-flight count behind either.
+    #[test]
+    fn a_stale_end_write_does_not_match_a_new_writer() {
+        let _g = serial();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut cache = write_lock();
+            cache.clear();
+        }
+        write_sample(dir.path(), "stale.ew");
+        let (v1, _) = begin_write("stale.ew");
+        let (v2, _) = begin_write("stale.ew");
+        assert_eq!((v1, v2), (1, 2));
+        // The loser finishes first: no install, but its count is released.
+        end_write(
+            "stale.ew",
+            v1,
+            Arc::new(sample_manifest("stale.ew")),
+            9,
+            dir.path(),
+        );
+        {
+            let cache = read_lock();
+            let slot = cache.get("stale.ew").expect("slot");
+            assert!(slot.entry.is_none(), "a stale version must not install");
+            assert_eq!(slot.writers, 1, "only the loser's own count is released");
+        }
+        // The winner finishes: installs and drops the last count.
+        end_write(
+            "stale.ew",
+            v2,
+            Arc::new(sample_manifest("stale.ew")),
+            7,
+            dir.path(),
+        );
+        let cache = read_lock();
+        let slot = cache.get("stale.ew").expect("slot");
+        assert_eq!(slot.entry.as_ref().map(|e| e.encoded_len), Some(7));
+        assert_eq!(slot.writers, 0, "no writer remains in flight");
     }
 }

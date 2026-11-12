@@ -33,21 +33,20 @@ impl std::error::Error for ManifestReadError {}
 
 /// Read and decode a manifest from `path` by mmap-ing the whole file.
 pub fn read_manifest(path: &Path) -> Result<Manifest, ManifestReadError> {
-    let file = std::fs::File::open(path).map_err(ManifestReadError::Io)?;
-    // The mmap itself lives in the audited OS boundary (crate::ffi): `file`
-    // is a read-only handle, manifests are written temp+rename (no in-place
-    // writer), and the mapping is dropped when this function returns.
-    let mmap = crate::ffi::map_readonly(&file).map_err(ManifestReadError::Io)?;
-    read_manifest_at(&mmap)
+    // Manifests are written temp+rename (see `stow/manifest.rs`), so no writer
+    // mutates a published path in place; `MappedFile` additionally pins the
+    // descriptor for as long as the bytes are mapped.
+    let mapped = crate::ffi::MappedFile::open_readonly(path).map_err(ManifestReadError::Io)?;
+    read_manifest_at(&mapped)
 }
 
 /// Same as [`read_manifest`] but parses **only** the study-level QIDO
 /// attributes - series, instance, and frame records are skipped via
 /// [`CborReader::skip_value`]. This is the QIDO hotpath.
 pub fn read_manifest_study_only(path: &Path) -> Result<Manifest, ManifestReadError> {
-    let file = std::fs::File::open(path).map_err(ManifestReadError::Io)?;
-    let mmap = crate::ffi::map_readonly(&file).map_err(ManifestReadError::Io)?;
-    Manifest::decode_study_only(&mmap).map_err(|e| ManifestReadError::Decode(e.to_string()))
+    // SAFETY: same argument as `read_manifest` above.
+    let mapped = crate::ffi::MappedFile::open_readonly(path).map_err(ManifestReadError::Io)?;
+    Manifest::decode_study_only(&mapped).map_err(|e| ManifestReadError::Decode(e.to_string()))
 }
 
 /// Decode a manifest from an already-mapped byte range.

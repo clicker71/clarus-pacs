@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
 
 import pytest
-from clean_code.handlers.cmove import _stream_and_send_study
+from clean_code.handlers.cmove import _stream_and_send_study, _walk_meta
 from clean_code.streaming import (
     SpilledPart,
     _stream_multipart_instances,
@@ -280,7 +280,15 @@ def test_send_loop_streams_spilled_part_in_chunks_and_unlinks_on_success():
     assert (completed, failed, total) == (1, 0, 1)
     assert (cancelled, no_common) == (False, False)
     assert sent_sops == [(CT, SOP)]
-    assert sent == [body]  # head + spill reassembled byte-exact
+    # Head + spill reassembled byte-exact, minus the file-meta group the
+    # bridge REWRITES before every C-STORE: the canonical group carries the
+    # PS3.10 Table 7.1-1 Type 1 set, so the sent bytes are the body with a
+    # different (conformant) meta header, not the source header.
+    sent_bytes = sent[0]
+    data_start, _elems, meta_end = _walk_meta(sent_bytes)
+    body_start, _selems, sbody_end = _walk_meta(body)
+    assert data_start == 132 and body_start == 132
+    assert sent_bytes[meta_end:] == body[sbody_end:]
     assert copy_mock.call_count == 1
     assert copy_mock.call_args.args[2] == 1024 * 1024  # chunked copy
     assert set(_spill_files()) - before == set()

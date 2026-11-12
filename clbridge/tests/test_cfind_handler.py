@@ -94,8 +94,11 @@ class TestHandleCFindDispatch:
         assert len(results) == 1
         assert results[0] == (0xC000, None)
 
-    def test_qido_connection_error_yields_c000(self, mock_shutdown_not_set):
-        """QIDO request failure → 0xC000."""
+    def test_qido_connection_error_yields_a700(self, mock_shutdown_not_set):
+        """QIDO transport failure -> 0xA700 (transient, retryable), not 0xC000.
+
+        A broken TCP link must NOT read as a permanent refusal: 0xC000 told
+        the SCU the query failed for good, so it would never retry."""
         import httpx
 
         event = make_fake_find_event(model_uid=PATIENT_ROOT_UID)
@@ -109,4 +112,4 @@ class TestHandleCFindDispatch:
             )
             results = list(gen)
             assert len(results) == 1
-            assert results[0] == (0xC000, None)
+            assert results[0] == (0xA700, None)

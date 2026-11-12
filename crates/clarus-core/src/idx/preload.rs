@@ -19,8 +19,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use memmap2::Mmap;
-
 /// Errors produced during preload.
 #[derive(Debug)]
 pub enum PreloadError {
@@ -53,9 +51,10 @@ pub struct MappedIndex {
     pub path: PathBuf,
     /// The day key (`YYYYMMDD`) this file covers.
     pub day: [u8; 8],
-    /// The mapped bytes. Read-only; the underlying file must never be
-    /// truncated or replaced while a mapping is alive.
-    mmap: Mmap,
+    /// The mapped bytes, plus the descriptor they came from. Read-only; the
+    /// underlying file must never be truncated or replaced while a mapping is
+    /// alive - `MappedFile` pins the handle so closing it cannot happen.
+    mmap: crate::ffi::MappedFile,
 }
 
 impl MappedIndex {
@@ -91,8 +90,10 @@ fn parse_day(name: &str) -> Option<[u8; 8]> {
 /// Map the most recent `n` *immutable* day files under `dir`, excluding today.
 ///
 /// `today` is excluded (it is still mutable). Files are selected by parsing
-/// each `YYYYMMDD.idx` name, keeping the newest `n`, and mapping them
-/// read-only. Returns the mappings sorted newest-first.
+/// each `YYYYMMDD.idx` name, walking newest-first, and mapping them read-only;
+/// a day that cannot be mapped is skipped and the next-oldest takes its slot,
+/// so the result holds up to `n` mappings. Returns the mappings sorted
+/// newest-first.
 pub fn preload_recent<P: AsRef<Path>>(
     dir: P,
     today: [u8; 8],
@@ -109,24 +110,49 @@ pub fn preload_recent<P: AsRef<Path>>(
         .collect();
     // Highest day value == most recent (8-digit zero-padded YYYYMMDD).
     days.sort_unstable_by(|a, b| b.cmp(a));
-    days.truncate(n);
+    // Do NOT truncate to `n` here: a day that fails to open or map must be
+    // replaced by the next-oldest day, not silently dropped from the warm set.
+    //
+    // `n == 0` is answered before the loop, not by it: the loop's bound is
+    // checked AFTER a push, so with `n == 0` the first day was mapped and kept
+    // and the "holds up to n mappings" contract was broken by one. Callers pass
+    // a config value bounded to 1..=3650, but this is a public function.
+    if n == 0 {
+        return Ok(Vec::new());
+    }
     if days.is_empty() {
         return Err(PreloadError::NothingToPreload);
     }
 
-    let mut mapped = Vec::with_capacity(days.len());
+    // Capacity is bounded by the request, not by the directory: a store with
+    // thousands of day files must not reserve a slot per file.
+    let mut mapped = Vec::with_capacity(n.min(days.len()));
     for day in days {
         let path = dir.join(format!(
             "{}.idx",
             std::str::from_utf8(&day).unwrap_or("00000000")
         ));
-        let file = fs::File::open(&path).map_err(PreloadError::Io)?;
-        // The mmap itself lives in the audited OS boundary (crate::ffi).
+        // One missing or unreadable day is a SKIP, not an abort: preloading
+        // warms pages and a single torn file must not cost the cache the other
+        // days it could still hold. `preload_recent` used to propagate the
+        // first open/mmap failure, so a bad day wiped the whole warm set.
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
         // Preload maps only immutable (rolled-over) days, so no concurrent
         // writer extends or truncates the file for the lifetime of the
-        // mapping; `file` stays alive for the mapping's scope.
-        let mmap = crate::ffi::map_readonly(&file).map_err(PreloadError::Io)?;
-        mapped.push(MappedIndex { path, day, mmap });
+        // mapping, and `MappedFile` keeps the descriptor pinned besides.
+        let Ok(mapped_file) = crate::ffi::MappedFile::from_file(file) else {
+            continue;
+        };
+        mapped.push(MappedIndex {
+            path,
+            day,
+            mmap: mapped_file,
+        });
+        if mapped.len() == n {
+            break;
+        }
     }
     Ok(mapped)
 }
@@ -207,5 +233,49 @@ mod tests {
         assert_eq!(maps.len(), 2);
         assert_eq!(maps[0].day, *b"20240115");
         assert_eq!(maps[1].day, *b"20240114");
+    }
+
+    /// A day that cannot be opened must be replaced by the next-oldest one,
+    /// not silently turn into a short warm set.
+    ///
+    /// The newest day here is a DIRECTORY named `20240103.idx`: `File::open`
+    /// succeeds on a directory on Windows and fails on Unix, so the test uses
+    /// the mmap step to make the failure platform-independent - mapping a
+    /// directory fails on both. (An empty regular file would NOT work as the
+    /// fixture: `map(0)` succeeds on both platforms.)
+    #[test]
+    fn a_failed_day_is_backfilled_from_the_next_oldest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = *b"20240104";
+        write_file(&dir.path().join("20240101.idx"), b"one\n");
+        write_file(&dir.path().join("20240102.idx"), b"two\n");
+        std::fs::create_dir(dir.path().join("20240103.idx")).expect("mkdir");
+
+        let maps = preload_recent(dir.path(), today, 2).expect("preload");
+        assert_eq!(
+            maps.iter().map(|m| m.day).collect::<Vec<_>>(),
+            vec![*b"20240102", *b"20240101"],
+            "the unopenable newest day must free its slot for 20240101"
+        );
+    }
+
+    /// `n == 0` means "map nothing". The loop's bound is checked after a push,
+    /// so it could not express that: with `n == 0` the first day was pushed and
+    /// the loop ran on, returning EVERY day. `preload_recent` is public and
+    /// documents "holds up to n mappings".
+    #[test]
+    fn zero_days_requested_maps_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = *b"20240104";
+        write_file(&dir.path().join("20240101.idx"), b"one\n");
+        write_file(&dir.path().join("20240102.idx"), b"two\n");
+        write_file(&dir.path().join("20240103.idx"), b"three\n");
+
+        let maps = preload_recent(dir.path(), today, 0).expect("preload");
+        assert!(
+            maps.is_empty(),
+            "n = 0 must map nothing, got {} mapping(s)",
+            maps.len()
+        );
     }
 }

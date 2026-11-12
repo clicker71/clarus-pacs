@@ -159,8 +159,64 @@ impl FilterRouting {
 /// Cheaply cloneable - shares the same backing `Arc`.
 #[derive(Clone)]
 pub struct UpsEventBus {
-    senders: Arc<Mutex<HashMap<String, Vec<SyncSender<UpsEvent>>>>>,
+    senders: Arc<Mutex<HashMap<String, Vec<Registration>>>>,
     counter: Arc<AtomicU64>,
+}
+
+/// A live subscription: owns the receiver and the registration together.
+///
+/// Dropping it removes this subscriber's sender from the bus, so a client that
+/// disconnects is forgotten at once instead of waiting for the next `send()` -
+/// which for an idle workitem may never come.
+pub struct UpsSubscription {
+    rx: mpsc::Receiver<UpsEvent>,
+    uid: String,
+    /// Position-independent identity of this registration.
+    id: u64,
+    senders: Arc<Mutex<HashMap<String, Vec<Registration>>>>,
+}
+
+impl UpsSubscription {
+    /// Block for the next event, giving up after `timeout`.
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<UpsEvent, mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    /// Non-blocking receive.
+    pub fn try_recv(&self) -> Result<UpsEvent, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Blocking receive, ending when the bus drops every sender.
+    pub fn recv(&self) -> Result<UpsEvent, mpsc::RecvError> {
+        self.rx.recv()
+    }
+}
+
+impl Drop for UpsSubscription {
+    fn drop(&mut self) {
+        // Remove exactly OUR registration, matched by id. Dropping the last
+        // element of the list would be wrong whenever two subscriptions for one
+        // workitem are dropped out of order - the survivor's senders would be
+        // the ones removed.
+        let mut senders = self.senders.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(list) = senders.get_mut(&self.uid) else {
+            return;
+        };
+        list.retain(|r| r.id != self.id);
+        if list.is_empty() {
+            senders.remove(&self.uid);
+        }
+    }
+}
+
+/// One registered subscriber: its sender, plus the id that names it.
+struct Registration {
+    id: u64,
+    tx: SyncSender<UpsEvent>,
 }
 
 impl UpsEventBus {
@@ -182,18 +238,26 @@ impl UpsEventBus {
     /// - `Disconnected` -> the subscriber vanished; its sender is removed
     ///   here, under the same lock (no separate GC pass).
     pub fn send(&self, mut event: UpsEvent) {
-        // Assign a monotonic event ID.
-        event.event_id = self.counter.fetch_add(1, Ordering::SeqCst);
         // Format timestamp if not already set.
         if event.timestamp.is_empty() {
             event.timestamp = timestamp_now();
         }
 
+        // The ID is assigned INSIDE the publication lock, not before it.
+        //
+        // `counter.fetch_add` alone orders IDs but not DELIVERY: publisher A
+        // could reserve 0 and pause, publisher B reserve 1 and publish first,
+        // and one subscriber would then observe 1 followed by 0. Because the
+        // fan-out below happens while the same guard is held, reserving here
+        // makes the ID order and the delivery order the same order.
+        let mut senders = self.senders.lock().unwrap_or_else(|p| p.into_inner());
+        event.event_id = self.counter.fetch_add(1, Ordering::SeqCst);
+
         // One journal line per event, emitted HERE and not in a transport: this
         // is the single place an event is raised, so a line here describes every
         // event exactly once, whatever carries it (SSE, WebSocket, or nothing).
         //
-        // It is written BEFORE the subscriber lookup on purpose. A workitem
+        // It is written BEFORE the subscriber fan-out on purpose. A workitem
         // created with nobody yet subscribed is the common case - the performer
         // subscribes after the workitem exists - so logging only the delivered
         // events would hide precisely the ones an operator asks about
@@ -218,12 +282,11 @@ impl UpsEventBus {
             event.event_id
         );
 
-        let mut senders = self.senders.lock().unwrap_or_else(|p| p.into_inner());
         let Some(list) = senders.get_mut(&event.workitem_uid) else {
             // Nobody subscribed to this workitem; nothing to fan out.
             return;
         };
-        list.retain(|tx| match tx.try_send(event.clone()) {
+        list.retain(|r| match r.tx.try_send(event.clone()) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 crate::clog_debug!(
@@ -252,17 +315,37 @@ impl UpsEventBus {
     ///
     /// Creates the fan-out channel if it doesn't exist. The receiver (and
     /// only it) may block on `recv_timeout`; the publisher never blocks.
-    /// Unsubscribe happens implicitly: when the receiver is dropped the
-    /// sender's send fails with `Disconnected` and the bus garbage-collects
-    /// it on the next event.
-    pub fn subscribe(&self, workitem_uid: &str) -> mpsc::Receiver<UpsEvent> {
+    ///
+    /// The returned [`UpsSubscription`] owns the receiver AND the registration:
+    /// dropping it removes the sender immediately. That matters because the only
+    /// other cleanup hook is `send()`, which for an idle SCHEDULED workitem may
+    /// never run - so every SSE reconnect used to leave a dead sender behind,
+    /// and the map grew for as long as clients kept reconnecting.
+    pub fn subscribe(&self, workitem_uid: &str) -> UpsSubscription {
         let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let id = self.counter.fetch_add(1, Ordering::SeqCst);
         let mut senders = self.senders.lock().unwrap_or_else(|p| p.into_inner());
         senders
             .entry(workitem_uid.to_string())
             .or_default()
-            .push(tx);
-        rx
+            .push(Registration { id, tx });
+        UpsSubscription {
+            rx,
+            uid: workitem_uid.to_string(),
+            id,
+            senders: Arc::clone(&self.senders),
+        }
+    }
+
+    /// Number of live registrations for a workitem.
+    ///
+    /// The count is what an idle-workitem leak looks like, so tests need to
+    /// read it directly - the defect is precisely that no `send()` ever runs to
+    /// trigger the `Disconnected` sweep.
+    #[cfg(test)]
+    pub fn subscriber_count(&self, workitem_uid: &str) -> usize {
+        let senders = self.senders.lock().unwrap_or_else(|p| p.into_inner());
+        senders.get(workitem_uid).map_or(0, |l| l.len())
     }
 
     /// Send a notification that a workitem was created.
@@ -333,4 +416,127 @@ fn timestamp_now() -> String {
         .unwrap_or_default()
         .as_secs()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(uid: &str, from: &str, to: &str) -> UpsEvent {
+        UpsEvent {
+            workitem_uid: uid.to_string(),
+            previous_state: from.to_string(),
+            new_state: to.to_string(),
+            timestamp: String::new(),
+            event_id: 0,
+            step_label: String::new(),
+            scheduled_code: None,
+            input_readiness: "READY".to_string(),
+            filter: Box::new(FilterRouting::default()),
+        }
+    }
+
+    /// A2: dropping the subscription removes the registration at once.
+    ///
+    /// The only other cleanup hook is `send()`, which for an idle SCHEDULED
+    /// workitem may never run - so a client that reconnected repeatedly left one
+    /// dead sender behind per attempt, and the map grew for the life of the
+    /// process.
+    #[test]
+    fn dropping_a_subscription_removes_it_without_a_send() {
+        let bus = UpsEventBus::new();
+        let sub = bus.subscribe("1.2.3");
+        assert_eq!(bus.subscriber_count("1.2.3"), 1, "registered");
+
+        // No send() happens between these two lines - that is the point.
+        drop(sub);
+        assert_eq!(
+            bus.subscriber_count("1.2.3"),
+            0,
+            "the registration must be gone without waiting for an event"
+        );
+    }
+
+    /// A2: the removal is per-registration, not "the last one wins".
+    ///
+    /// Two subscribers on one workitem dropped out of order must each remove
+    /// their OWN sender; a `pop()` would delete the survivor's.
+    #[test]
+    fn dropping_one_of_two_subscriptions_keeps_the_other() {
+        let bus = UpsEventBus::new();
+        let first = bus.subscribe("1.2.3");
+        let second = bus.subscribe("1.2.3");
+        assert_eq!(bus.subscriber_count("1.2.3"), 2);
+
+        drop(first);
+        assert_eq!(bus.subscriber_count("1.2.3"), 1, "only one removed");
+
+        // The survivor still receives: the wrong sender was not taken.
+        bus.send(event("1.2.3", "SCHEDULED", "IN PROGRESS"));
+        assert!(
+            second
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_ok(),
+            "the surviving subscriber must still get events"
+        );
+
+        drop(second);
+        assert_eq!(bus.subscriber_count("1.2.3"), 0);
+    }
+
+    /// A1: IDs are assigned under the publication lock, so delivery order and
+    /// ID order agree.
+    ///
+    /// With the reservation outside the lock, two publishers could reserve 0
+    /// and 1 and then publish in the other order, so a subscriber would see 1
+    /// then 0. This drives many concurrent publishers through one subscriber
+    /// and requires the received IDs to be strictly increasing.
+    #[test]
+    fn concurrent_publishers_deliver_ids_in_increasing_order() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let bus = std::sync::Arc::new(UpsEventBus::new());
+        let sub = bus.subscribe("1.2.3");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+        let collector = {
+            let sub = sub;
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                loop {
+                    match sub.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(ev) => ids.push(ev.event_id),
+                        Err(_) if stop.load(AtomicOrdering::Relaxed) => break,
+                        Err(_) => {}
+                    }
+                }
+                ids
+            })
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let bus = bus.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..40 {
+                    bus.send(event("1.2.3", "SCHEDULED", "IN PROGRESS"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("publisher");
+        }
+        stop.store(true, AtomicOrdering::Relaxed);
+        let ids = collector.join().expect("collector");
+
+        assert!(ids.len() > 1, "events were delivered: {}", ids.len());
+        for pair in ids.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "delivery order must follow ID order, got {:?}",
+                &ids
+            );
+        }
+    }
 }

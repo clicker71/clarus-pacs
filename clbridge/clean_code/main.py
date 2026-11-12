@@ -17,6 +17,7 @@ import functools
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -136,6 +137,13 @@ import argparse
 # failures.
 _SCP_FAILURES_BEFORE_REMOVE = 3
 
+# Watchdog stall threshold. The idle worker refreshes its heartbeat once per
+# pass, so this is how long a SINGLE pass (a blocked dequeue, a stuck
+# filesystem call) must run before the worker is treated as stalled. The idle
+# wait itself is bounded by next_retry_wait_sec() (5s), so a healthy loop stays
+# far below this. Named so a test can drive the branch without waiting 120s.
+_OUTBOX_STALL_SEC = 120.0
+
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -184,7 +192,7 @@ def _populate_args(cfg):
     # [server]
     args.bridge_host = cfg.get("server", "host", default="127.0.0.1")
     args.bridge_port = cfg.get_int("server", "port", default=8104)
-    args.ae_title = cfg.get("server", "ae_title", default="CLARUS_BRIDGE")
+    args.ae_title = cfg.get("server", "ae_title", default="CLBRIDGE")
     # QA / Expose Rejected Instances AE (AIRA 57.2.1). A DIMSE association has
     # no per-query "show rejected" flag, so the standard mechanism is a second
     # AE Title whose queries go to a separately configured QA webservice
@@ -221,8 +229,12 @@ def _populate_args(cfg):
         "dimse", "c_find_max_responses", default=200
     )
     # c_move_workers: auto-scale - I/O-bound workers (TCP to viewer + HTTP from Clarus).
-    # max(2, cpu_count()//2). 2-2, 4-2, 8-4, 16-8. Admin can override in config.
-    _default_cmove = max(2, (os.cpu_count() or 2) // 2)
+    # min(16, max(2, cpu_count()//2)): the lower bound keeps at least one
+    # reader and one writer, the 16 ceiling keeps the pool bounded even on
+    # many-core hosts (the valid config range caps at 16; an unbounded
+    # cpu//2 gave 32 workers on 64 cores, outside the validated maximum).
+    # 2-2, 4-2, 8-4, 16-8 ... 64-16. Admin can override in config.
+    _default_cmove = min(16, max(2, (os.cpu_count() or 2) // 2))
     args.c_move_workers = cfg.get_int("dimse", "c_move_workers", default=_default_cmove)
     args.no_storage_commit = cfg.get_bool("dimse", "no_storage_commit", default=False)
     # peers_file: path to peers.conf (chmod 644, public peer list)
@@ -358,6 +370,19 @@ def _validate_config(cfg):
     # Server
     port = cfg.get_int("server", "port", default=8104)
     check(1 <= port <= 65535, f"server.port {port} out of range [1..65535]")
+    # The QA AE listens on its own socket, and binding a port outside 1..65535
+    # raises OverflowError - which is NOT an OSError and so escaped the bind
+    # error handling as a traceback. Range-check it here, with `server.port`,
+    # and leave 0 (the "QA AE disabled" default) alone.
+    eport = cfg.get_int("server", "expose_port", default=0)
+    check(
+        eport == 0 or 1 <= eport <= 65535,
+        f"server.expose_port {eport} out of range [0 or 1..65535]",
+    )
+    check(
+        eport != port,
+        f"server.expose_port {eport} must differ from server.port",
+    )
 
     # DICOMweb
     # 2908: clarus_url validated fail-fast (scheme, host, legacy-key removal,
@@ -632,7 +657,12 @@ def _check_port_available(port: int, bind_addr: str, name: str) -> None:
     """
     import socket
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # The family must match the address, not the platform default: `[server]
+    # host = ::` is a legitimate IPv6 listener choice, and binding an AF_INET
+    # socket to `::` raises, which turned a valid configuration into
+    # "[FATAL] ... Refusing to start".
+    family = socket.AF_INET6 if ":" in str(bind_addr) else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         if sys.platform == "win32":
             exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
@@ -653,6 +683,17 @@ def _check_port_available(port: int, bind_addr: str, name: str) -> None:
         sys.exit(1)
     finally:
         sock.close()
+
+
+def _qa_port_will_bind(args):
+    """True when the Expose Rejected Instances listener will actually bind.
+
+    The QA AE is constructed only under `args.expose_port AND args.qa_url`;
+    either half alone is dead config and is reported as a warning instead of
+    started. The startup port probe asks this so it can never refuse to start
+    on a port this configuration never binds.
+    """
+    return bool(args.expose_port) and bool(args.qa_url)
 
 
 def _check_dimse_unique(host: str, port: int, my_ae_title: str) -> None:
@@ -711,9 +752,21 @@ def _check_dimse_unique(host: str, port: int, my_ae_title: str) -> None:
                     remote_ae,
                 )
             sys.exit(1)
-    except Exception:
-        # - - - - -. -.
-        pass
+    except (ConnectionRefusedError, ConnectionResetError, TimeoutError, OSError) as e:
+        # These mean "nothing is listening on that port", which is the clean
+        # answer this probe exists to produce. Any other exception is a FAILED
+        # probe, and reporting it as clean is the optimistic default: the check
+        # would pass without ever having looked.
+        logging.debug("[STARTUP] C-ECHO probe on %s:%d: %s", host, port, e)
+    except Exception as e:
+        logging.warning(
+            "[STARTUP] C-ECHO probe on %s:%d could not complete (%s: %s) - "
+            "duplicate-instance state is UNKNOWN, continuing",
+            host,
+            port,
+            type(e).__name__,
+            e,
+        )
     finally:
         _probe_logger.setLevel(_probe_prev_level)
         try:
@@ -810,39 +863,74 @@ def _write_pid_file(path: str) -> None:
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
-        with open(path) as f:
-            old_pid = f.read().strip()
+        # Reading the stale file is the next thing that can fail, and it is
+        # NOT the same class as the create above: permission-denied or a file
+        # deleted between the two calls raised straight out of process start.
         try:
-            alive = _pid_is_alive(int(old_pid))
-        except ValueError:
-            alive = False
-        if alive:
-            logging.error(
-                "[FATAL] PID file %s exists and pid=%s is ALIVE. "
-                "Another instance is running. Remove %s manually if stale.",
-                path,
-                old_pid,
-                path,
-            )
-            # os._exit: immediate process termination, works on Win+*nix.
-            # sys.exit only raises SystemExit - non-daemon threads prevent exit.
-            os._exit(1)
-        else:
+            with open(path) as f:
+                old_pid = f.read().strip()
+        except OSError as e:
             logging.warning(
-                "[WARN] Stale PID file %s (pid=%s is dead). Overwriting.",
+                "[WARN] Existing PID file %s cannot be read: %s. Removing it "
+                "and continuing.",
                 path,
-                old_pid,
+                e,
             )
             try:
                 os.remove(path)
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            except OSError as e:
+            except OSError as e2:
                 logging.warning(
-                    "[WARN] Cannot rewrite stale PID file %s: %s. Continuing without it.",
+                    "[WARN] Cannot rewrite PID file %s: %s. Continuing without it.",
                     path,
-                    e,
+                    e2,
                 )
                 return
+        else:
+            try:
+                old_pid_int = int(old_pid)
+            except ValueError:
+                old_pid_int = None
+            # Our OWN pid is not a competing instance. After a crash / SIGKILL the
+            # file survives, and in a container with a stable filesystem across
+            # `docker restart` the new process gets the same pid (1 or 7 is common
+            # when /var/run is unwritable and the fallback path is used) - the
+            # liveness probe then answered "alive" for the current process and the
+            # bridge refused to start on every restart. Layers 1 and 2 already
+            # detect a live second instance, so this check only has to reject a
+            # FOREIGN live pid.
+            alive = (
+                old_pid_int is not None
+                and old_pid_int != os.getpid()
+                and _pid_is_alive(old_pid_int)
+            )
+            if alive:
+                logging.error(
+                    "[FATAL] PID file %s exists and pid=%s is ALIVE. "
+                    "Another instance is running. Remove %s manually if stale.",
+                    path,
+                    old_pid,
+                    path,
+                )
+                # os._exit: immediate process termination, works on Win+*nix.
+                # sys.exit only raises SystemExit - non-daemon threads prevent exit.
+                os._exit(1)
+            else:
+                logging.warning(
+                    "[WARN] Stale PID file %s (pid=%s is dead). Overwriting.",
+                    path,
+                    old_pid,
+                )
+                try:
+                    os.remove(path)
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except OSError as e:
+                    logging.warning(
+                        "[WARN] Cannot rewrite stale PID file %s: %s. Continuing without it.",
+                        path,
+                        e,
+                    )
+                    return
     except OSError as e:
         # PermissionError is an OSError. NOT fatal: the service must start.
         logging.warning(
@@ -928,8 +1016,13 @@ def _start_background_services(
         max_retries=args.outbox_max_retries,
         cleanup=args.outbox_cleanup,
         retry_interval=args.outbox_retry_interval,
+        # R7: the documented RAM budget becomes a real limit. Backpressure
+        # takes the worse of the slot ratio and this byte ratio, so a queue
+        # that is 2% full by count but 400% over its memory budget still
+        # refuses.
+        max_queue_bytes=int(args.stow_queue_max_mb) * 1024 * 1024,
     )
-    recovered, undelivered = outbox.recover_stuck()
+    recovered, undelivered = outbox.recover_stuck(force=True)
     outbox_pending.set(outbox.pending_count())
     if recovered > 0:
         outbox_recovery_total.inc(recovered)
@@ -961,6 +1054,9 @@ def _start_background_services(
             pending_gauge=forward_pending,
             undelivered_total=forward_undelivered_total,
         )
+        # Same startup sweep as the primary queue: a fresh in_progress/ item
+        # from a crashed drain worker must be visible immediately.
+        forward_outbox.recover_stuck(force=True)
         logging.info(
             "[FORWARD] secondary queue enabled -> %s (max_queue=%d, max_retries=10)",
             forward_dir,
@@ -993,8 +1089,27 @@ def _start_background_services(
         health_checker=health_checker,
         move_jobs=move_jobs,
     )
-    http_server = ThreadingHTTPServer(
-        (args.http_print_bind, args.http_port),
+    # HTTPServer defaults to AF_INET, so an IPv6 http_bind (e.g. "::1" or
+    # "::") dies at bind time with a name-resolution error and takes the whole
+    # bridge down - a site that only has IPv6 management connectivity gets no
+    # health/metrics endpoint at all. Pick the family from the literal address;
+    # DualStack keeps "::" reachable over IPv4 too.
+    bind_host = args.http_print_bind
+    family = socket.AF_INET
+    if ":" in bind_host:
+        family = socket.AF_INET6
+    elif bind_host:
+        try:
+            family = socket.getaddrinfo(bind_host, args.http_port, 0, socket.SOCK_STREAM)[0][0]
+        except OSError:
+            family = socket.AF_INET
+
+    class _BridgeHTTPServer(ThreadingHTTPServer):
+        address_family = family
+        daemon_threads = True
+
+    http_server = _BridgeHTTPServer(
+        (bind_host, args.http_port),
         HandlerCls,
     )
     http_thread = threading.Thread(
@@ -1063,9 +1178,16 @@ def _start_background_services(
     )
 
     # Bridge: start C-MOVE cleanup worker
+    #
+    # R10: it also expires abandoned Storage Commitment batches, so the
+    # retention sweep rides this existing hourly cycle rather than adding a
+    # thread. The tracker is built later in this function, so the worker
+    # receives a holder it reads each cycle instead of the object itself.
+    cleanup_thread_tracker = [None]
     cleanup_thread = threading.Thread(
         target=_cmove_cleanup_worker,
         args=(move_jobs, 24),
+        kwargs={"commit_tracker_holder": cleanup_thread_tracker},
         name="cmove-cleanup",
         daemon=False,
     )
@@ -1176,6 +1298,12 @@ def _start_background_services(
         daemon=False,
     )
     commit_thread.start()
+    # R10: hand the tracker to the cleanup worker started earlier, which
+    # expires abandoned batches once an hour.
+    try:
+        cleanup_thread_tracker[0] = commit_tracker
+    except NameError:
+        pass
     # Expose the tracker to the /metrics scrape (pending-batch gauges). The
     # HTTP server is already serving, so the ref is attached to its handler
     # class once the tracker exists.
@@ -1252,7 +1380,7 @@ def _outbox_worker(
     batch_idle_sec=5.0,
     health_checker=None,
     tls=None,
-    bridge_ae_title="CLARUS_BRIDGE",
+    bridge_ae_title="CLBRIDGE",
 ):
     """Background worker: drains outbox, batches same-study SOPs into one STOW-RS.
 
@@ -1279,7 +1407,7 @@ def _outbox_worker(
     import httpx
 
     from clean_code.http_helpers import stow_batch_instances
-    from clean_code.outbox import STUCK_ITEM_CHECK_INTERVAL
+    from clean_code.outbox import STUCK_ITEM_CHECK_INTERVAL, STUCK_ITEM_TIMEOUT
 
     # P30: persistent HTTP client -- Keep-Alive. One handshake for the whole
     # queue drain instead of one per instance (x2 throughput).
@@ -1314,6 +1442,21 @@ def _outbox_worker(
     _batch: list = []  # (sop_uid, ds, blob_path, raw_bytes, dataset_modified)
     _batch_study: str | None = None
     _batch_bytes = 0
+    # R3: monotonic instant the FIRST item of the open batch was buffered.
+    # The idle flush only fires on a dequeue gap, so a source trickling one
+    # instance every `batch_idle_sec - 1` s keeps the batch open indefinitely;
+    # past STUCK_ITEM_TIMEOUT the reaper returns the oldest claimed item to
+    # pending, and the next dequeue sends it a SECOND time (delivered twice,
+    # mark_delivered twice, backpressure and metrics wrong).
+    _batch_started_at = 0.0
+
+    # R3: hard cap on how long ONE batch may stay open. It must stay well
+    # below the stuck-item timeout (300 s), because past that instant the
+    # reaper hands the oldest CLAIMED item back to pending while this batch
+    # still owns it - and the next dequeue sends it a second time. A quarter
+    # of the reaper window leaves three intervals of slack for one flush to
+    # finish before the item could be reclaimed, and 60 s bounds it anyway.
+    _batch_max_age_sec = min(60.0, STUCK_ITEM_TIMEOUT / 4)
 
     def _log_study_start(sop_uid, ds, study_uid):
         """First SOP of a study: log and seed per-study stats."""
@@ -1349,6 +1492,8 @@ def _outbox_worker(
         nonlocal _delivered_total, _delivered_failed, _last_summary_log
         nonlocal _queue_was_empty, _current_study
         nonlocal _pause_until
+        nonlocal _last_progress
+        nonlocal _batch_started_at
         if not _batch:
             return
         batch_study = _batch_study
@@ -1389,6 +1534,7 @@ def _outbox_worker(
             _batch = []
             _batch_study = None
             _batch_bytes = 0
+            _batch_started_at = 0.0
             with _progress_lock:
                 _last_progress = time.time()
             return
@@ -1403,6 +1549,7 @@ def _outbox_worker(
             _batch = []
             _batch_study = None
             _batch_bytes = 0
+            _batch_started_at = 0.0
             with _progress_lock:
                 _last_progress = time.time()
             outbox_pending_files.set(outbox.pending_count())
@@ -1452,7 +1599,10 @@ def _outbox_worker(
                     _study_stats[study_uid]["delivered"] += 1
                     _study_stats[study_uid]["failed"] += 1
                 retries = outbox._get_retry_count(uid)
-                if retries >= outbox.MAX_RETRIES:
+                # mark_failed already parked the item when it hit MAX_RETRIES;
+                # a second unconditional move double-decrements the pending
+                # counter and double-bumps undelivered_total.
+                if retries >= outbox.MAX_RETRIES and not outbox._is_undelivered(uid):
                     outbox.move_to_undelivered(uid)
 
         logging.info(
@@ -1463,6 +1613,7 @@ def _outbox_worker(
         _batch = []
         _batch_study = None
         _batch_bytes = 0
+        _batch_started_at = 0.0
 
         # 2908: observability - last successful STOW flush (unix time).
         if batch_ok > 0:
@@ -1519,6 +1670,49 @@ def _outbox_worker(
         # burning STOW retries (MAX_RETRIES=10 -> undelivered -> manual).
         # Reads the health checker's cached event - no HTTP on the hot path.
         if health_checker is not None and not health_checker.is_healthy():
+            if _batch:
+                # The paused batch's items are already CLAIMED (dequeue moved
+                # them to in_progress/), and only `_deliver_batch` gives them
+                # back. Pausing with a non-empty `_batch` therefore left a
+                # partially built batch owned by nobody: the stuck-item sweep
+                # later returned those files to pending/ and re-sent the very
+                # instances this batch still held - a double delivery.
+                #
+                # Hand the tail back to pending UNBURNED. The peer is known
+                # down, not rejecting: sending anyway costs a retry per item
+                # for a guaranteed failure (ten of them park the study in
+                # undelivered/), and marking them delivered would lie. A
+                # store-and-forward queue exists to survive exactly this state.
+                logging.warning(
+                    "[OUTBOX-WORKER] Server down with %d buffered item(s) - "
+                    "returning them to pending and pausing",
+                    len(_batch),
+                )
+                # `_batch` holds 5-tuples. Passing the TUPLE to `requeue` sent
+                # it into `_safe_uid`, whose string methods raised
+                # AttributeError for every item - the batch was then cleared and
+                # the claimed files sat in in_progress/ until the 300 s reaper
+                # ran, which in Storage Commitment mode can push SOPs past the
+                # CommitTracker deadline and report them not committed.
+                for _uid, _ds, _bp, _raw, _mod in list(_batch):
+                    try:
+                        outbox.requeue(_uid, "server down")
+                    except Exception as e:
+                        logging.error(
+                            "[OUTBOX-WORKER] Could not return %s to pending: %s",
+                            _uid,
+                            e,
+                        )
+                # Reset EVERY field of the batch state, not just the list.
+                # A surviving `_batch_study` made the next enqueue look like a
+                # continuation of the abandoned study, so the first instance of
+                # the NEXT study was appended to it (and flushed under the old
+                # study's stats); a surviving `_batch_bytes` skewed the size
+                # guard and the flush log by the abandoned tail's bytes.
+                _batch = []
+                _batch_study = None
+                _batch_bytes = 0
+                _batch_started_at = 0.0
             if not _was_paused:
                 _was_paused = True
                 logging.warning(
@@ -1581,12 +1775,14 @@ def _outbox_worker(
                 # P8 + retry: sleep until next_retry_at (bounded by 5s).
                 wait = outbox.next_retry_wait_sec()
                 _shutdown_requested.wait(timeout=wait)
-                # P30/P1-4: watchdog heartbeat -- worker is alive and waiting.
-                with _progress_lock:
-                    _last_progress = time.time()
+                # P30/P1-4: watchdog. Measure the age of the PREVIOUS
+                # heartbeat, then refresh it. Writing the heartbeat before
+                # measuring makes dead_sec ~0 by construction and leaves the
+                # branch below unreachable.
                 with _progress_lock:
                     dead_sec = time.time() - _last_progress
-                if dead_sec > 120 and outbox.pending_count() > 0:
+                    _last_progress = time.time()
+                if dead_sec > _OUTBOX_STALL_SEC and outbox.pending_count() > 0:
                     logging.warning(
                         "[OUTBOX-WATCHDOG] Worker stalled %.0fs with %d pending - "
                         "running recovery",
@@ -1668,6 +1864,10 @@ def _outbox_worker(
 
         # P8: raw pass-through for CAS dedup. Modified instances (raw=None)
         # are re-serialized by stow_batch_instances via dcmwrite.
+        if not _batch:
+            # R3: the batch's age is fixed by its FIRST item, not refreshed by
+            # later ones - the stuck-item reaper counts from that instant.
+            _batch_started_at = time.monotonic()
         _batch.append(
             (
                 sop_uid,
@@ -1683,8 +1883,14 @@ def _outbox_worker(
             _batch_bytes += len(raw_bytes) if raw_bytes else 0
         _batch_study = _study_uid
 
-        # Flush when count or bytes trigger fires.
-        if len(_batch) >= batch_max_sop or _batch_bytes >= batch_max_bytes:
+        # Flush when count, bytes or AGE trigger fires. The age limit is the
+        # one that protects the oldest item from the stuck-item reaper: see
+        # _batch_started_at for the double-delivery it prevents.
+        if (
+            len(_batch) >= batch_max_sop
+            or _batch_bytes >= batch_max_bytes
+            or time.monotonic() - _batch_started_at >= _batch_max_age_sec
+        ):
             _deliver_batch()
 
     if _batch:
@@ -1704,7 +1910,7 @@ def _start_outbox_workers(
     batch_idle_sec=5.0,
     health_checker=None,
     tls=None,
-    bridge_ae_title="CLARUS_BRIDGE",
+    bridge_ae_title="CLBRIDGE",
 ):
     """Start single background outbox worker thread. KISS."""
     t = threading.Thread(
@@ -1809,6 +2015,10 @@ def _forward_open_assoc(
     ae.network_timeout = network_timeout
     ae.acse_timeout = acse_timeout
     ae.dimse_timeout = dimse_timeout
+    # F12 sibling: bound the raw TCP connect. A black-hole forward
+    # destination otherwise parks this association on the OS SYN timeout
+    # (minutes), and the forward worker is the only thing draining its queue.
+    ae.connection_timeout = acse_timeout
     for sop_class, ts_uid in sorted(pairs):
         if sop_class and ts_uid:
             ae.add_requested_context(sop_class, ts_uid)
@@ -1856,6 +2066,12 @@ def _forward_process_batch(
     non-zero); False if the association could NOT be established at all, in
     which case the CALLER requeues the whole batch (no retry burn) and pauses.
 
+    `_forward_process_batch.handled` carries the UIDs this call already
+    settled (delivered / failed / requeued) before returning False for a lost
+    association. The caller requeues only the items NOT in that set: the ones
+    after the loss were never attempted on the wire, and the ones before it
+    must not be requeued twice.
+
     Per instance it READS every C-STORE-RSP: 0x0000 -> mark_delivered;
     a non-zero RSP -> mark_failed (backoff, then undelivered at max retries);
     a lost/None RSP or an unasendable context mismatch -> requeued without a
@@ -1867,7 +2083,35 @@ def _forward_process_batch(
     reproducible everywhere, and keeps the wire test's exact-order pin valid.
     """
     items = sorted(items, key=lambda item: item[0])
-    pairs = sorted({(sop, ts) for (_, sop, ts, _) in items if sop and ts})
+    self_handled = set()
+
+    # Items that lost their sop_class / stored_ts cannot be proposed over any
+    # negotiated context. They used to be silently dropped from `pairs` while
+    # staying unsent: never delivered, never failed, so the caller requeued
+    # the whole batch forever and one broken item blocked every valid one
+    # behind it. Fail them HERE (before the association) and proceed with the
+    # rest.
+    sendable = []
+    pairs = set()
+    for uid, sop_class, stored_ts, blob_path in items:
+        if sop_class and stored_ts:
+            sendable.append((uid, sop_class, stored_ts, blob_path))
+            pairs.add((sop_class, stored_ts))
+        else:
+            logging.warning(
+                "[FORWARD] SOP %s missing sop_class/stored_ts - mark_failed",
+                uid,
+            )
+            forward_failed_total.inc()
+            try:
+                forward_outbox.mark_failed(uid, "missing sop_class/stored_ts")
+            except Exception:
+                pass
+    if not sendable:
+        # Nothing sendable remained; every item was already failed above, so
+        # the batch is terminal (not retryable).
+        return True
+    pairs = sorted(pairs)
     assoc = _forward_open_assoc(
         calling_ae,
         dest_ae,
@@ -1898,7 +2142,7 @@ def _forward_process_batch(
             accepted.setdefault(str(ctx.abstract_syntax), set()).update(ts_list)
 
         delivered_any = False
-        for uid, sop_class, stored_ts, blob_path in items:
+        for uid, sop_class, stored_ts, blob_path in sendable:
             # Only send when the negotiated context actually covers this
             # sop_class and stored TS; sending stored bytes as-is over a
             # foreign/absent TS would corrupt them. A peer that cannot accept
@@ -1921,14 +2165,66 @@ def _forward_process_batch(
                     forward_outbox.mark_failed(uid, "context not covered")
                 except Exception:
                     pass
+                self_handled.add(uid)
                 continue
 
             # Size is read BEFORE the send: mark_delivered removes the blob,
             # so measuring afterwards always yields 0.
             _blob_size = _forward_blob_size(blob_path)
+            # Ship the audit trail WITH the instance. `enqueue_from_blob`
+            # copies the primary `.mods` sidecar alongside the blob, but the
+            # forward channel used to send the raw file and drop the sidecar -
+            # so the second archive stored an instance whose Modified
+            # Attributes Sequence was missing, i.e. a different record from
+            # the one this bridge keeps. When a sidecar exists the instance is
+            # re-serialized with the same `record_modification` entries the
+            # primary drain applies, and THAT byte stream is what goes on the
+            # wire.
+            _send_path = blob_path
+            _mods_extra = None
+            try:
+                _mods_json = forward_outbox.read_mods_sidecar(blob_path)
+            except Exception:
+                _mods_json = None
+            if _mods_json:
+                try:
+                    from pydicom import dcmread as _fwd_dcmread
+
+                    from clean_code.validation import record_modification
+
+                    _fds = _fwd_dcmread(blob_path)
+                    for entry in _mods_json:
+                        record_modification(
+                            _fds,
+                            tuple(entry["tag"]),
+                            entry["old"],
+                            modifying_operator="DIMSE",
+                            modifying_system=calling_ae,
+                        )
+                    import os as _os_fwd
+                    import tempfile as _tf_fwd
+
+                    _fh = _tf_fwd.NamedTemporaryFile(
+                        suffix=".dcm", delete=False, dir=_os_fwd.path.dirname(blob_path)
+                    )
+                    _fh.close()
+                    _fds.save_as(_fh.name, enforce_file_format=True)
+                    _send_path = _fh.name
+                    _mods_extra = _fh.name
+                    _blob_size = _forward_blob_size(_send_path)
+                except Exception as mods_err:
+                    logging.warning(
+                        "[FORWARD] SOP %s: audit sidecar could not be applied "
+                        "(%s) - sending the stored blob unchanged",
+                        uid,
+                        mods_err,
+                    )
+                    _send_path = blob_path
+                    _mods_extra = None
+                    _blob_size = _forward_blob_size(blob_path)
             try:
                 _t0 = time.perf_counter()
-                status = assoc.send_c_store(blob_path)
+                status = assoc.send_c_store(_send_path)
                 try:
                     cstore_outbound_duration.labels(peer=ae_label(dest_ae)).observe(
                         time.perf_counter() - _t0
@@ -1941,17 +2237,63 @@ def _forward_process_batch(
                     uid,
                     type(fwd_err).__name__,
                 )
+                if _mods_extra:
+                    try:
+                        import os as _os_fwd2
+
+                        _os_fwd2.unlink(_mods_extra)
+                    except OSError:
+                        pass
                 try:
                     forward_outbox.requeue(
                         uid, f"send exception: {type(fwd_err).__name__}"
                     )
                 except Exception:
                     pass
+                self_handled.add(uid)
                 continue
+            finally:
+                if _mods_extra:
+                    try:
+                        import os as _os_fwd3
 
-            # READ every C-STORE-RSP.
-            if status is not None and status.Status == 0x0000:
+                        _os_fwd3.unlink(_mods_extra)
+                    except OSError:
+                        pass
+
+            # READ every C-STORE-RSP. `send_c_store` also RETURNS an EMPTY
+            # Dataset when the peer times out, aborts or sends an invalid
+            # response, so `status is not None` is not "a status arrived":
+            # reading `Status` off that empty set used to raise AttributeError,
+            # which escaped this function and killed the batch with no cost
+            # recorded for the instance that caused it.
+            try:
+                rsp_status = getattr(status, "Status", None)
+            except Exception as stat_err:
+                # A malformed Status element (wrong VR, unexpected type) is a
+                # per-instance verdict, not a batch-level crash: cost it like a
+                # rejection and keep draining the rest of the batch.
+                forward_failed_total.inc()
+                logging.warning(
+                    "[FORWARD] SOP %s: malformed C-STORE-RSP Status (%s) - "
+                    "counted as rejected",
+                    uid,
+                    stat_err,
+                )
+                try:
+                    forward_outbox.mark_failed(uid, f"malformed RSP: {stat_err}")
+                except Exception:
+                    pass
+                continue
+            # PS3.7 Annex C: a WARNING is a SUCCESS class status - the instance
+            # WAS stored. Treating 0xB000/0xB006/0xB007 as a failure marked a
+            # delivered instance failed, retried it, and eventually parked it in
+            # undelivered/ while the destination held it all along.
+            if rsp_status == 0x0000 or (
+                0xB000 <= (rsp_status or 0) <= 0xBFFF
+            ) or rsp_status in (0x0001, 0x0107):
                 forward_outbox.mark_delivered(uid)
+                self_handled.add(uid)
                 forward_delivered_total.inc()
                 try:
                     bytes_total.labels(direction="tx", peer=ae_label(dest_ae)).inc(
@@ -1960,24 +2302,49 @@ def _forward_process_batch(
                 except Exception:
                     pass
                 delivered_any = True
-                logging.debug("[FORWARD] SOP %s delivered (0x0000)", uid)
-            elif status is None:
-                # Lost/aborted association transport - requeue, no retry burn.
+                logging.debug("[FORWARD] SOP %s delivered (0x%04X)", uid, rsp_status)
+            elif rsp_status is None:
+                # No C-STORE-RSP at all: the peer dropped the association, or
+                # returned an EMPTY Dataset. When the association is GONE the
+                # remaining items in this batch were never attempted on the
+                # wire at all - charging each of them a retry burned the whole
+                # batch's budget (20 items x MAX_RETRIES) on one transport
+                # failure and parked a healthy queue in undelivered/. Hand the
+                # rest back unclaimed and let the caller pause and retry the
+                # batch on a fresh association.
+                if not getattr(assoc, "is_established", False):
+                    logging.warning(
+                        "[FORWARD] association lost before SOP %s - handing "
+                        "back the rest of the batch uncharged",
+                        uid,
+                    )
+                    self_handled.add(uid)
+                    return False
+                # Association still up: this one instance produced no answer.
+                # Requeueing it for free let a single instance that always
+                # loses its response hot-loop the channel forever: every drain
+                # picked it first again. It costs a retry exactly like a
+                # rejection, so at MAX_RETRIES the item leaves the channel and
+                # the rest of the queue drains.
+                forward_failed_total.inc()
                 logging.warning(
-                    "[FORWARD] SOP %s: no C-STORE-RSP read - requeued (no burn)",
+                    "[FORWARD] SOP %s: no C-STORE-RSP read - requeued with "
+                    "a retry burn",
                     uid,
                 )
                 try:
-                    forward_outbox.requeue(uid, "no RSP")
+                    forward_outbox.mark_failed(uid, "no RSP")
                 except Exception:
                     pass
+                self_handled.add(uid)
             else:
-                # A real non-zero RSP (0xC000/0xA7xx/etc) - a per-instance status.
-                # mark_failed bumps the retry counter and (at MAX_RETRIES) calls
+                # A real FAILURE RSP (0xA7xx/0xC000/0x0122...). mark_failed
+                # bumps the retry counter and, at MAX_RETRIES, calls
                 # move_to_undelivered internally (outbox.py semantics).
-                msg = str(getattr(status, "Status", status))
+                msg = str(rsp_status)
                 forward_failed_total.inc()
                 forward_outbox.mark_failed(uid, f"C-STORE {msg}")
+                self_handled.add(uid)
                 logging.warning("[FORWARD] SOP %s rejected: %s", uid, msg)
         if delivered_any:
             try:
@@ -1986,6 +2353,10 @@ def _forward_process_batch(
                 pass
         return True
     finally:
+        # Published for the caller's requeue path (see the docstring): the
+        # UIDs this call already settled, whether it returned True or gave up
+        # on a lost association.
+        _forward_process_batch.handled = self_handled
         try:
             assoc.release()
         except Exception:
@@ -2046,21 +2417,40 @@ def _forward_worker(
             _shutdown_requested.wait(timeout=max(0.1, wait))
             continue
 
-        assoc_ok = _forward_process_batch(
-            forward_outbox,
-            items,
-            dest_ae,
-            calling_ae,
-            host,
-            port,
-            network_timeout,
-            dimse_timeout,
-            acse_timeout,
-        )
+        # A batch that raises must not kill this loop: the thread is the only
+        # thing draining the forward queue, so losing it leaves claimed items
+        # in forward/in_progress and forwarding silently stops until restart.
+        # Treat an escape as an association-level failure (requeue, no burn).
+        handled = set()
+        try:
+            assoc_ok = _forward_process_batch(
+                forward_outbox,
+                items,
+                dest_ae,
+                calling_ae,
+                host,
+                port,
+                network_timeout,
+                dimse_timeout,
+                acse_timeout,
+            )
+            handled = set(getattr(_forward_process_batch, "handled", set()))
+        except Exception as e:
+            logging.error(
+                "[FORWARD] batch processing raised %s: %s - requeueing %d item(s)",
+                type(e).__name__,
+                e,
+                len(items),
+            )
+            assoc_ok = False
         if not assoc_ok:
-            # Association-level failure: requeue the WHOLE already-claimed
-            # batch without burning retries, then pause (destination probe).
+            # Association-level failure: requeue the items that were never
+            # settled, without burning retries, then pause (destination probe).
+            # Items already delivered or failed are skipped - requeueing them
+            # moved a DELIVERED blob back into pending/.
             for uid, _sop, _ts, _bp in items:
+                if uid in handled:
+                    continue
                 try:
                     forward_outbox.requeue(uid, "association failed")
                 except Exception:
@@ -2265,193 +2655,25 @@ def _register_handlers(
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# SCP AE construction: contexts + handlers + shutdown monitor
 # ---------------------------------------------------------------------------
-def main():
-    # - Windows: disable Quick Edit mode (console Mark mode) -
-    # On Windows, clicking in a console window pauses ALL output
-    # (ENABLE_QUICK_EDIT_MODE). PyInstaller .exe has no Properties dialog
-    # to disable it manually, so we do it programmatically at startup.
-    # Without this, a single accidental click freezes the bridge.
-    if sys.platform == "win32" and sys.stdout is not None:
-        try:
-            kernel32 = ctypes.windll.kernel32
-            ENABLE_QUICK_EDIT_MODE = 0x0040
-            ENABLE_EXTENDED_FLAGS = 0x0080
-            STD_INPUT_HANDLE = -10
-            handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                new_mode = (
-                    mode.value & ~ENABLE_QUICK_EDIT_MODE
-                ) | ENABLE_EXTENDED_FLAGS
-                kernel32.SetConsoleMode(handle, new_mode)
-        except Exception:
-            pass  # Not a console (redirected output, no-pty, etc.)
+def _init_dimse_ae(
+    args,
+    sop_index,
+    move_jobs,
+    sop_registry,
+    outbox,
+    health_checker,
+    commit_tracker,
+    forward_outbox,
+):
+    """Build the SCP AE(s), register contexts and handlers, start the
+    shutdown monitor and the (optional) QA AE listener.
 
-    cli = _parse_args()
-
-    # CONFIG-DISCIPLINE: config file is the sole source of settings.
-    if not os.path.exists(cli.config):
-        logging.basicConfig(level=logging.INFO)
-        logging.error("Config file not found: %s", cli.config)
-        sys.exit(1)
-
-    cfg = ConfParser(cli.config)
-
-    # Validate before populating - fail fast on bad config.
-    try:
-        _validate_config(cfg)
-    except ValueError as e:
-        logging.basicConfig(level=logging.INFO)
-        logging.error("%s", e)
-        logging.debug("Config validation traceback:", exc_info=True)
-        sys.exit(1)
-
-    args = _populate_args(cfg)
-
-    # - Resolve relative paths against config file directory -
-    # Same as nginx: all relative paths in config are relative to the
-    # config file, NOT the CWD. Makes the entire folder portable.
-    _config_dir = os.path.dirname(os.path.abspath(cli.config))
-    # peers_file and printers_yaml are read by the C-MOVE peer lookup and the
-    # print registry; resolved from the CWD they point nowhere under a service
-    # manager, and both lookups then silently return nothing.
-    _path_keys = [
-        "log_file",
-        "sop_registry",
-        "sop_index_dir",
-        "outbox_dir",
-        "peers_file",
-        "printers_yaml",
-    ]
-    for key in _path_keys:
-        val = getattr(args, key, None)
-        if val and not os.path.isabs(val):
-            setattr(args, key, os.path.join(_config_dir, val))
-
-    # The patient-id masking key lives beside the outbox: the same directory
-    # the data it labels is written to, so moving the outbox moves the
-    # correlation with it. Set before the first log line that masks an id.
-    set_mask_key_dir(os.path.join(args.outbox_dir, "forward"))
-
-    # Bridge: initialize logging before any output
-    _setup_logging(args.log_level, args.log_file)
-
-    # Startup WARN: if worst-case association retry time (attempts x
-    # outbound_acse_timeout) reaches into the C-MOVE poll budget, the reactor
-    # could hit 0xB000 before a job finishes its association attempts. The
-    # standard (PS3.8 9.1.4 Note 2) gives no retry-count guidance, so surface
-    # the risk at config load - not at 0xB000 time.
-    _retry_total = args.outbound_assoc_attempts * args.outbound_acse_timeout
-    if args.move_poll_timeout and _retry_total >= args.move_poll_timeout:
-        logging.warning(
-            "[CONFIG-WARN] dimse.outbound_assoc_attempts=%d x "
-            "outbound_acse_timeout=%d = %ds reaches into "
-            "move_poll_timeout=%ds - a wedged target could exhaust the "
-            "C-MOVE poll budget across association retries (0xB000 before "
-            "delivery). Tune the attempts/timeouts down if this bites.",
-            args.outbound_assoc_attempts,
-            args.outbound_acse_timeout,
-            _retry_total,
-            args.move_poll_timeout,
-        )
-
-    # Bridge: load SOP class registry
-    sop_registry = _load_sop_registry(args.sop_registry)
-
-    # - Duplicate-instance and port checks BEFORE any component starts -
-    # `_init_components` calls `move_jobs.recover_in_progress_jobs()`, which
-    # resets every in-progress C-MOVE job in the shared database back to
-    # pending. A second instance would therefore steal the live first
-    # instance's running jobs and only afterwards discover that the ports are
-    # taken - the first instance's workers then re-claim the same jobs and
-    # both C-STORE them. Refusing before that write is what keeps the guard
-    # free of side effects.
-    _check_port_available(args.http_port, args.http_print_bind, "metrics HTTP")
-    _check_port_available(args.bridge_port, args.bridge_host, "DIMSE")
-    _check_dimse_unique(args.bridge_host, args.bridge_port, args.ae_title)
-
-    # PID file: `/var/run/clbridge-{port}.pid` on Linux, next to the script
-    # elsewhere, falling back to the script directory when the system
-    # location is not writable. Never fatal on a write error - see
-    # `_acquire_pid_file`. Named by DIMSE port so multiple bridge instances
-    # on the same machine don't clash.
-    _pid_path = _acquire_pid_file(args.bridge_port)
-    if _pid_path:
-        set_pid_path(_pid_path)
-
-    # initialize components
-    sop_index, move_jobs, printer_registry, driver_registry = _init_components(args)
-
-    # - Startup summary (INFO: key params; DEBUG: tuning) -
-    logging.info("clbridge v%s", VERSION)
-    logging.info("[CONFIG] file: %s", cli.config)
-    logging.info(
-        "[DIMSE] %s:%d AE=%s", args.bridge_host, args.bridge_port, args.ae_title
-    )
-    logging.info("[DICOMWEB] %s", args.clarus_url)
-    logging.info("[OUTBOX] dir=%s cleanup=%s", args.outbox_dir, args.outbox_cleanup)
-    # The patient-id masking key is a SECRET that lives on this host's file
-    # system: an operator who does not know it exists cannot back it up, and
-    # restoring an outbox without it silently breaks the correlation between
-    # old and new log tokens. Named here, at startup, next to the directory
-    # it sits in.
-    logging.info(
-        "[MASK] patient-id key: %s",
-        os.path.join(args.outbox_dir, "forward", ".patient_id_mask.key"),
-    )
-    logging.info("[SOP-INDEX] dir=%s", args.sop_index_dir)
-    logging.info("[METRICS] %s:%d", args.http_print_bind, args.http_port)
-    logging.info(
-        "[COERCION] fix_patient_id=%s fix_patient_name=%s id_prefix=%s",
-        args.fix_empty_patient_id,
-        args.fix_empty_patient_name,
-        args.bridge_id_prefix,
-    )
-    # - Tuning params (DEBUG only) -
-    logging.debug(
-        "[TUNING] c_find_max=%d c_move_workers=%d http_timeout=%ds "
-        "stow_queue_size=%d max_assoc=%d",
-        args.c_find_max_responses,
-        args.c_move_workers,
-        args.http_timeout,
-        args.stow_queue_size,
-        args.max_associations,
-    )
-    mx_cstore = getattr(args, "max_concurrent_cstore", None)
-    logging.debug(
-        "[TUNING] max_concurrent_cstore=%s",
-        str(mx_cstore) if mx_cstore else "unlimited",
-    )
-    # - SOP registry info (DEBUG) -
-    logging.debug("SOP registry: %s (%d classes)", args.sop_registry, len(sop_registry))
-    mx_store = f"{args.max_store_mb} MB" if args.max_store_mb > 0 else "unlimited"
-    logging.debug("C-STORE size limit: %s", mx_store)
-
-    # start background services (HTTP server, workers, cleanup)
-    (
-        http_server,
-        http_thread,
-        cmove_thread,
-        cleanup_thread,
-        sop_cleanup_thread,
-        outbox,
-        outbox_workers,
-        health_checker,
-        commit_tracker,
-        commit_thread,
-        forward_outbox,
-        forward_worker_thread,
-    ) = _start_background_services(
-        args,
-        driver_registry,
-        printer_registry,
-        move_jobs,
-        sop_index,
-        sop_registry,
-    )
-
+    Returns (ae, expose_ae, handlers). Kept out of main() so the caller can
+    wrap it in a shutdown guard: an exception here must not leave the already
+    started background threads holding the interpreter.
+    """
     ae = AE(ae_title=args.ae_title)
     # P1 (2608): answer associations ONLY for our own AE title. pynetdicom
     # default is False - any Called AE Title would be accepted, which let a
@@ -2529,10 +2751,16 @@ def main():
             # accepts the broad IMAGE_TS_INCOMING set - local files arrive in
             # their original TS, and a sender whose context is rejected
             # reports a failed export. The SCU proposal keeps IMAGE_TS.
+            #
+            # Only supported (SCP) contexts are registered here: this AE is
+            # a pure SCP and never initiates an outgoing association (the
+            # C-MOVE / N-EVENT / forward channels build their own AEs).
+            # add_requested_context on every registry UID both lied about the
+            # role and blew the 128-context UL limit for large registries,
+            # killing AE construction outright.
             target_ae.add_supported_context(
                 sop_uid, IMAGE_TS_INCOMING if ts_list is IMAGE_TS else NON_IMAGE_TS
             )
-            target_ae.add_requested_context(sop_uid, ts_list)
         target_ae.add_supported_context(
             PatientRootQueryRetrieveInformationModelFind, ImplicitVRLittleEndian
         )
@@ -2658,6 +2886,242 @@ def main():
     # Windows: Ctrl+Break - graceful shutdown (SIGBREAK)
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _signal_handler)
+
+    return ae, expose_ae, handlers
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+def main():
+    # - Windows: disable Quick Edit mode (console Mark mode) -
+    # On Windows, clicking in a console window pauses ALL output
+    # (ENABLE_QUICK_EDIT_MODE). PyInstaller .exe has no Properties dialog
+    # to disable it manually, so we do it programmatically at startup.
+    # Without this, a single accidental click freezes the bridge.
+    if sys.platform == "win32" and sys.stdout is not None:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            ENABLE_QUICK_EDIT_MODE = 0x0040
+            ENABLE_EXTENDED_FLAGS = 0x0080
+            STD_INPUT_HANDLE = -10
+            handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                new_mode = (
+                    mode.value & ~ENABLE_QUICK_EDIT_MODE
+                ) | ENABLE_EXTENDED_FLAGS
+                kernel32.SetConsoleMode(handle, new_mode)
+        except Exception:
+            pass  # Not a console (redirected output, no-pty, etc.)
+
+    cli = _parse_args()
+
+    # CONFIG-DISCIPLINE: config file is the sole source of settings.
+    if not os.path.exists(cli.config):
+        logging.basicConfig(level=logging.INFO)
+        logging.error("Config file not found: %s", cli.config)
+        sys.exit(1)
+
+    cfg = ConfParser(cli.config)
+
+    # Validate before populating - fail fast on bad config.
+    try:
+        _validate_config(cfg)
+    except ValueError as e:
+        logging.basicConfig(level=logging.INFO)
+        logging.error("%s", e)
+        logging.debug("Config validation traceback:", exc_info=True)
+        sys.exit(1)
+
+    args = _populate_args(cfg)
+
+    # - Resolve relative paths against config file directory -
+    # Same as nginx: all relative paths in config are relative to the
+    # config file, NOT the CWD. Makes the entire folder portable.
+    _config_dir = os.path.dirname(os.path.abspath(cli.config))
+    # peers_file and printers_yaml are read by the C-MOVE peer lookup and the
+    # print registry; resolved from the CWD they point nowhere under a service
+    # manager, and both lookups then silently return nothing.
+    _path_keys = [
+        "log_file",
+        "sop_registry",
+        "sop_index_dir",
+        "outbox_dir",
+        "peers_file",
+        "printers_yaml",
+    ]
+    for key in _path_keys:
+        val = getattr(args, key, None)
+        if val and not os.path.isabs(val):
+            setattr(args, key, os.path.join(_config_dir, val))
+
+    # The patient-id masking key lives beside the outbox: the same directory
+    # the data it labels is written to, so moving the outbox moves the
+    # correlation with it. Set before the first log line that masks an id.
+    set_mask_key_dir(os.path.join(args.outbox_dir, "forward"))
+
+    # Bridge: initialize logging before any output
+    _setup_logging(args.log_level, args.log_file)
+
+    # Startup WARN: if worst-case association retry time (attempts x
+    # outbound_acse_timeout) reaches into the C-MOVE poll budget, the reactor
+    # could hit 0xB000 before a job finishes its association attempts. The
+    # standard (PS3.8 9.1.4 Note 2) gives no retry-count guidance, so surface
+    # the risk at config load - not at 0xB000 time.
+    _retry_total = args.outbound_assoc_attempts * args.outbound_acse_timeout
+    if args.move_poll_timeout and _retry_total >= args.move_poll_timeout:
+        logging.warning(
+            "[CONFIG-WARN] dimse.outbound_assoc_attempts=%d x "
+            "outbound_acse_timeout=%d = %ds reaches into "
+            "move_poll_timeout=%ds - a wedged target could exhaust the "
+            "C-MOVE poll budget across association retries (0xB000 before "
+            "delivery). Tune the attempts/timeouts down if this bites.",
+            args.outbound_assoc_attempts,
+            args.outbound_acse_timeout,
+            _retry_total,
+            args.move_poll_timeout,
+        )
+
+    # Bridge: load SOP class registry
+    sop_registry = _load_sop_registry(args.sop_registry)
+
+    # - Duplicate-instance and port checks BEFORE any component starts -
+    # `_init_components` calls `move_jobs.recover_in_progress_jobs()`, which
+    # resets every in-progress C-MOVE job in the shared database back to
+    # pending. A second instance would therefore steal the live first
+    # instance's running jobs and only afterwards discover that the ports are
+    # taken - the first instance's workers then re-claim the same jobs and
+    # both C-STORE them. Refusing before that write is what keeps the guard
+    # free of side effects.
+    _check_port_available(args.http_port, args.http_print_bind, "metrics HTTP")
+    _check_port_available(args.bridge_port, args.bridge_host, "DIMSE")
+    # The QA (expose) listener is a third bind of the same shape. Without this
+    # a second instance sharing expose_port passed every pre-check, reset the
+    # live instance's in-progress C-MOVE jobs in _init_components, and only
+    # then lost its QA-AE thread - the same ordering hazard the two checks
+    # above exist to prevent.
+    #
+    # The probe mirrors the START condition: with `qa_url` empty the QA AE is
+    # never constructed and never binds the port, so a port held by an
+    # unrelated process must not abort startup for a listener that is not
+    # going to exist.
+    if _qa_port_will_bind(args):
+        _check_port_available(args.expose_port, args.bridge_host, "DIMSE QA")
+    _check_dimse_unique(args.bridge_host, args.bridge_port, args.ae_title)
+
+    # PID file: `/var/run/clbridge-{port}.pid` on Linux, next to the script
+    # elsewhere, falling back to the script directory when the system
+    # location is not writable. Never fatal on a write error - see
+    # `_acquire_pid_file`. Named by DIMSE port so multiple bridge instances
+    # on the same machine don't clash.
+    _pid_path = _acquire_pid_file(args.bridge_port)
+    if _pid_path:
+        set_pid_path(_pid_path)
+
+    # initialize components
+    sop_index, move_jobs, printer_registry, driver_registry = _init_components(args)
+
+    # - Startup summary (INFO: key params; DEBUG: tuning) -
+    logging.info("clbridge v%s", VERSION)
+    logging.info("[CONFIG] file: %s", cli.config)
+    logging.info(
+        "[DIMSE] %s:%d AE=%s", args.bridge_host, args.bridge_port, args.ae_title
+    )
+    logging.info("[DICOMWEB] %s", args.clarus_url)
+    logging.info("[OUTBOX] dir=%s cleanup=%s", args.outbox_dir, args.outbox_cleanup)
+    # The patient-id masking key is a SECRET that lives on this host's file
+    # system: an operator who does not know it exists cannot back it up, and
+    # restoring an outbox without it silently breaks the correlation between
+    # old and new log tokens. Named here, at startup, next to the directory
+    # it sits in.
+    logging.info(
+        "[MASK] patient-id key: %s",
+        os.path.join(args.outbox_dir, "forward", ".patient_id_mask.key"),
+    )
+    logging.info("[SOP-INDEX] dir=%s", args.sop_index_dir)
+    logging.info("[METRICS] %s:%d", args.http_print_bind, args.http_port)
+    logging.info(
+        "[COERCION] fix_patient_id=%s fix_patient_name=%s id_prefix=%s",
+        args.fix_empty_patient_id,
+        args.fix_empty_patient_name,
+        args.bridge_id_prefix,
+    )
+    # - Tuning params (DEBUG only) -
+    logging.debug(
+        "[TUNING] c_find_max=%d c_move_workers=%d http_timeout=%ds "
+        "stow_queue_size=%d max_assoc=%d",
+        args.c_find_max_responses,
+        args.c_move_workers,
+        args.http_timeout,
+        args.stow_queue_size,
+        args.max_associations,
+    )
+    mx_cstore = getattr(args, "max_concurrent_cstore", None)
+    logging.debug(
+        "[TUNING] max_concurrent_cstore=%s",
+        str(mx_cstore) if mx_cstore else "unlimited",
+    )
+    # - SOP registry info (DEBUG) -
+    logging.debug("SOP registry: %s (%d classes)", args.sop_registry, len(sop_registry))
+    mx_store = f"{args.max_store_mb} MB" if args.max_store_mb > 0 else "unlimited"
+    logging.debug("C-STORE size limit: %s", mx_store)
+
+    # start background services (HTTP server, workers, cleanup)
+    #
+    # This call starts NON-daemon threads - the HTTP server, the health
+    # checker, the outbox and C-MOVE workers - and later steps can still raise
+    # (opening commit_jobs.db, creating the forward queue). If one does, main()
+    # exits with the exception while those threads keep the interpreter alive:
+    # DIMSE never listens but /health keeps answering OK, so a liveness probe
+    # never restarts the process. A failure here therefore exits HARD.
+    try:
+        (
+            http_server,
+            http_thread,
+            cmove_thread,
+            cleanup_thread,
+            sop_cleanup_thread,
+            outbox,
+            outbox_workers,
+            health_checker,
+            commit_tracker,
+            commit_thread,
+            forward_outbox,
+            forward_worker_thread,
+        ) = _start_background_services(
+            args,
+            driver_registry,
+            printer_registry,
+            move_jobs,
+            sop_index,
+            sop_registry,
+        )
+    except Exception as e:
+        logging.error("[FATAL] background services failed to start: %s", e)
+        _shutdown_requested.set()
+        os._exit(1)
+
+    try:
+        ae, expose_ae, handlers = _init_dimse_ae(
+            args,
+            sop_index,
+            move_jobs,
+            sop_registry,
+            outbox,
+            health_checker,
+            commit_tracker,
+            forward_outbox,
+        )
+    except BaseException:
+        # A failure constructing the SCP AE / registering its handlers would
+        # otherwise leave the already-started non-daemon background threads
+        # (outbox / forward / commit workers) holding the interpreter: the
+        # process hangs "alive but dead". Set the shutdown flag so the workers
+        # drain and the HTTP server closes, then re-raise.
+        _shutdown_requested.set()
+        http_server.shutdown()
+        raise
 
     logging.info("Waiting for DICOM connections...")
 

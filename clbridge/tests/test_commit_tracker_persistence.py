@@ -14,10 +14,12 @@ now live in SQLite, and these tests pin both directions of that:
   - a batch whose verdict WAS delivered does not come back.
 """
 
+import json
 import sqlite3
 import threading
 
-from clean_code.commit_tracker import CommitTracker
+import pytest
+from clean_code.commit_tracker import MAX_REPORT_ATTEMPTS, CommitTracker
 
 
 class _Db:
@@ -178,3 +180,186 @@ def test_a_confirmed_sop_shrinks_the_persisted_pending_set(tmp_path):
         f"{job.pending}"
     )
     second.close()
+
+
+def test_a_failed_persist_keeps_the_earlier_job_in_the_working_set(tmp_path):
+    """A persist failure must not publish a job that has no row.
+
+    The old order wrote `_jobs[tx_uid] = job` first, then a failed persist
+    triggered a rollback `pop` - so the EARLIER job disappeared from the
+    working set while its database row survived. `_tick` iterates `_jobs`,
+    so that earlier commitment was never resolved until a restart.
+
+    R6 changed how a repeat is handled: a second N-ACTION for an ACTIVE
+    Transaction UID is now refused outright, so this test drives the same
+    invariant through the UID-free path - a failed persist of a NEW batch must
+    leave the working set empty and no row behind.
+    """
+    path = str(tmp_path / "commit.db")
+    tracker = _tracker(_Db(path))
+    first_sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.4.5.6.1")]
+    second_sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.4.5.6.2")]
+
+    tracker.register("1.2.3.9", "MODALITY", "10.0.0.5", 104, first_sops)
+    original = tracker._jobs["1.2.3.9"]
+
+    def boom(_job):
+        raise RuntimeError("disk full")
+
+    tracker._persist = boom
+    with pytest.raises(RuntimeError):
+        tracker.register("1.2.3.90", "MODALITY", "10.0.0.5", 104, second_sops)
+
+    assert "1.2.3.90" not in tracker._jobs, (
+        "a batch whose persist failed must not become visible to _tick"
+    )
+    surviving = tracker._jobs["1.2.3.9"]
+    assert surviving is original, "the earlier job must survive the failed persist"
+    assert surviving.sops == first_sops
+    assert tracker.pending_count() == 1
+    tracker.close()
+
+
+def test_a_second_naction_for_an_active_transaction_uid_is_refused(tmp_path):
+    """R6: PS3.4 J.3.2 - a Transaction UID names ONE transaction.
+
+    Re-registering it replaced the first batch's row and in-memory job, so the
+    first acknowledged commitment silently lost its N-EVENT-REPORT. The
+    handler turns the ValueError into 0x0110.
+    """
+    path = str(tmp_path / "commit.db")
+    tracker = _tracker(_Db(path))
+    tx = "1.2.3.10"
+    first_sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.10.1")]
+    new_sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.10.2")]
+
+    tracker.register(tx, "MODALITY", "10.0.0.5", 104, first_sops)
+    original = tracker._jobs[tx]
+
+    with pytest.raises(ValueError) as exc:
+        tracker.register(tx, "MODALITY", "10.0.0.5", 104, new_sops)
+    assert "already active" in str(exc.value)
+
+    # The FIRST batch is untouched, in memory and on disk.
+    assert tracker._jobs[tx] is original
+    assert tracker._jobs[tx].sops == first_sops
+    with tracker._db.locked() as conn:
+        row = conn.execute(
+            "SELECT sops FROM commit_jobs WHERE tx_uid = ?", (tx,)
+        ).fetchone()
+    assert json.loads(row[0]) == [list(s) for s in first_sops], (
+        "the refused duplicate must not have overwritten the first batch's row"
+    )
+    tracker.close()
+
+
+def test_a_stale_tick_does_not_retire_a_different_batch(tmp_path):
+    """R7/R9: the ownership test and the row delete are one locked step.
+
+    `_tick` walks a snapshot. A job registered for a DIFFERENT Transaction UID
+    while this one is in flight must not be touched by the stale iteration, and
+    the retiring job's own row must go with it.
+    """
+    path = str(tmp_path / "commit.db")
+    tracker = _tracker(_Db(path))
+    tx = "1.2.3.10"
+    other = "1.2.3.20"
+    first_sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.10.1")]
+    other_sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.20.1")]
+
+    tracker.register(tx, "MODALITY", "10.0.0.5", 104, first_sops)
+    old_job = tracker._jobs[tx]
+
+    def register_other(job):
+        assert job is old_job
+        tracker.register(other, "MODALITY", "10.0.0.5", 104, other_sops)
+        return True
+
+    tracker._resolve = register_other
+    tracker._tick()
+
+    assert tx not in tracker._jobs, "the resolved job leaves the working set"
+    other_job = tracker._jobs.get(other)
+    assert other_job is not None, "the unrelated batch must survive the tick"
+    assert other_job.sops == other_sops
+    with tracker._db.locked() as conn:
+        rows = dict(
+            (r[0], r[1]) for r in conn.execute("SELECT tx_uid, sops FROM commit_jobs")
+        )
+    assert tx not in rows, "the resolved batch's row must be deleted"
+    assert json.loads(rows[other]) == [list(s) for s in other_sops]
+    tracker.close()
+
+
+def test_an_abandoned_batch_stays_abandoned_across_a_restart(tmp_path):
+    """R8: an abandoned row reloaded as active granted the dead peer another
+    MAX_REPORT_ATTEMPTS rounds on the single commit worker at every restart."""
+    path = str(tmp_path / "commit.db")
+    tracker = _tracker(_Db(path))
+    tx = "1.2.3.11"
+    sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.11.1")]
+
+    tracker.register(tx, "MODALITY", "10.0.0.5", 104, sops)
+    job = tracker._jobs[tx]
+    tracker._resolve = lambda *a, **k: False
+    job.report_attempts = MAX_REPORT_ATTEMPTS - 1
+    tracker._tick()
+
+    assert tx not in tracker._jobs, "an abandoned batch leaves the working set"
+    with tracker._db.locked() as conn:
+        row = conn.execute(
+            "SELECT abandoned FROM commit_jobs WHERE tx_uid = ?", (tx,)
+        ).fetchone()
+    assert row is not None, "the abandoned row is kept for inspection"
+    assert row[0] == 1, "the row must record that it was abandoned"
+    tracker.close()
+
+    # Restart: the same database, a fresh tracker. R10 keeps the abandoned
+    # batch OUT of the working set (it is never ticked and never counted as
+    # pending) and in the inspection list instead.
+    restarted = _tracker(_Db(path))
+    try:
+        assert tx not in restarted._jobs, (
+            "an abandoned batch must not rejoin the working set"
+        )
+        assert restarted.pending_count() == 0
+        revived = restarted._abandoned.get(tx)
+        assert revived is not None, "the row is kept for inspection"
+        assert revived.abandoned is True
+        assert revived.report_attempts >= MAX_REPORT_ATTEMPTS, (
+            "a reloaded abandoned batch must not get a fresh report budget"
+        )
+    finally:
+        restarted.close()
+
+
+def test_a_stale_abandonment_does_not_retire_another_batch(tmp_path):
+    """R7/R9 on the abandonment path: the ownership test and the parked row
+    are one locked step, and an unrelated batch is left alone."""
+    path = str(tmp_path / "commit.db")
+    tracker = _tracker(_Db(path))
+    tx = "1.2.3.11"
+    other = "1.2.3.21"
+    first_sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.11.1")]
+    other_sops = [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.21.1")]
+
+    tracker.register(tx, "MODALITY", "10.0.0.5", 104, first_sops)
+    old_job = tracker._jobs[tx]
+
+    def re_register_then_fail(job):
+        assert job is old_job
+        tracker.register(other, "MODALITY", "10.0.0.5", 104, other_sops)
+        return False  # the report never got through
+
+    tracker._resolve = re_register_then_fail
+    old_job.report_attempts = MAX_REPORT_ATTEMPTS - 1
+    tracker._tick()
+
+    assert other in tracker._jobs, "the unrelated batch must survive"
+    with tracker._db.locked() as conn:
+        rows = dict(
+            (r[0], r[1]) for r in conn.execute("SELECT tx_uid, sops FROM commit_jobs")
+        )
+    assert tx in rows, "the abandoned row is kept"
+    assert json.loads(rows[other]) == [list(s) for s in other_sops]
+    tracker.close()

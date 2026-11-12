@@ -118,8 +118,18 @@ pub enum Scope<'a> {
 /// rename there is no manifest left to enumerate them from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StudyScope<'a> {
-    /// One series UID.
-    Series(&'a str),
+    /// One series UID, plus the SOP Instance UIDs that series held.
+    ///
+    /// The UID list is what makes an instance-only reference resolvable: a
+    /// PS/SEG names its source images by ReferencedSOPInstanceUID, and
+    /// without the list every such object survived its series' deletion and
+    /// kept pointing at an instance that no longer existed.
+    Series {
+        /// The series being deleted.
+        series_uid: &'a str,
+        /// SOP Instance UIDs the series contained, read before the rename.
+        instance_uids: std::collections::HashSet<String>,
+    },
     /// The deleted study's series and instance UIDs.
     Study {
         /// The deleted study UID (the derived workitem is keyed by it).
@@ -187,13 +197,16 @@ fn collect_strings(value: &AttrValue, into: &mut Vec<String>) {
 #[must_use]
 pub fn matches(entry: &ClassEntry, references: &References, scope: &StudyScope<'_>) -> bool {
     match scope {
-        StudyScope::Series(series_uid) => {
-            (entry.refs.series && references.series.iter().any(|s| s == series_uid))
+        StudyScope::Series {
+            series_uid,
+            instance_uids,
+        } => {
+            (entry.refs.series && references.series.iter().any(|s| s == *series_uid))
                 || (entry.refs.instances
                     && references
                         .instances
                         .iter()
-                        .any(|i| instance_belongs_to(i, series_uid)))
+                        .any(|i| instance_uids.contains(i)))
         }
         StudyScope::Study {
             series_uids,
@@ -208,18 +221,6 @@ pub fn matches(entry: &ClassEntry, references: &References, scope: &StudyScope<'
                         .any(|i| instance_uids.contains(i)))
         }
     }
-}
-
-/// Whether a referenced SOP Instance UID belongs to a series.
-///
-/// The capture resolves references to series UIDs, so a referenced instance
-/// is matched through its own series when the caller only has the instance.
-/// Without a manifest lookup the instance cannot be placed, and guessing
-/// would delete an object that annotates a *different* series - the one
-/// outcome the series rule exists to prevent. So an unmatched instance does
-/// not match.
-fn instance_belongs_to(_instance_uid: &str, _series_uid: &str) -> bool {
-    false
 }
 
 /// A derived object the cascade decided to remove.
@@ -400,6 +401,14 @@ mod tests {
         }
     }
 
+    /// A series scope whose series held `instances`.
+    fn series_scope<'a>(series: &'a str, instances: &[&str]) -> StudyScope<'a> {
+        StudyScope::Series {
+            series_uid: series,
+            instance_uids: instances.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
     #[test]
     fn the_table_names_both_derived_classes() {
         assert!(class_entry(SOP_GSPS).is_some());
@@ -481,7 +490,7 @@ mod tests {
         assert!(!matches(
             gsps,
             &References::default(),
-            &StudyScope::Series("1.2.3")
+            &series_scope("1.2.3", &[])
         ));
     }
 
@@ -505,24 +514,30 @@ mod tests {
             series: vec!["1.2.3".to_string()],
             instances: Vec::new(),
         };
-        assert!(matches(gsps, &refs, &StudyScope::Series("1.2.3")));
+        assert!(matches(gsps, &refs, &series_scope("1.2.3", &[])));
         // The same object, a different series: it annotates another series
         // and must survive.
-        assert!(!matches(gsps, &refs, &StudyScope::Series("4.5")));
+        assert!(!matches(gsps, &refs, &series_scope("4.5", &[])));
     }
 
+    /// An instance-only reference is claimed when the deleted series held
+    /// that instance.
+    ///
+    /// A PS or SEG names its source images individually, so resolving only
+    /// series UIDs left every such object behind after its series was deleted,
+    /// pointing at an instance that no longer existed. The series' own
+    /// instance UIDs are what place the reference.
     #[test]
-    fn an_instance_only_reference_does_not_match_a_series_scope() {
-        // An instance reference cannot be placed into a series without a
-        // manifest lookup, and guessing would delete an annotation of a
-        // different series. Not matching is the safe answer, and it is the
-        // one the series rule depends on.
+    fn an_instance_only_reference_matches_the_series_that_held_it() {
         let gsps = class_entry(SOP_GSPS).expect("gsps");
         let refs = References {
             series: Vec::new(),
             instances: vec!["6.7".to_string()],
         };
-        assert!(!matches(gsps, &refs, &StudyScope::Series("1.2.3")));
+        assert!(matches(gsps, &refs, &series_scope("1.2.3", &["6.7"])));
+        // The instance belongs to a DIFFERENT series, so this deletion must
+        // not claim the object.
+        assert!(!matches(gsps, &refs, &series_scope("1.2.3", &["8.9"])));
         // A study scope still claims it when the study owned that instance.
         assert!(matches(gsps, &refs, &study_scope("9.9", &[], &["6.7"])));
     }
@@ -541,7 +556,7 @@ mod tests {
             series: Vec::new(),
             instances: vec!["6.7".to_string()],
         };
-        assert!(!matches(&entry, &refs, &StudyScope::Series("1.2.3")));
+        assert!(!matches(&entry, &refs, &series_scope("1.2.3", &["6.7"])));
         assert!(!matches(&entry, &refs, &study_scope("9.9", &[], &["6.7"])));
     }
 }

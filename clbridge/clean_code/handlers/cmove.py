@@ -62,7 +62,7 @@ from clean_code.streaming import (
     SpilledPart,
     _stream_multipart_instances,
 )
-from clean_code.utils import _shutdown_requested, mask_patient_id
+from clean_code.utils import _shutdown_requested, mask_patient_id, normalize_host
 
 # TS-order constants (IMAGE_TS EVRLE-first etc.) live in clean_code.protocol
 # (single definition - the bundle warns on duplicate module-level names).
@@ -83,16 +83,19 @@ from clean_code.utils import _shutdown_requested, mask_patient_id
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# simple bool to suppress pynetdicom noise during streaming/SC
+# per-thread flag to suppress pynetdicom noise during streaming/SC
 # ---------------------------------------------------------------------------
-_suppress_pynetdicom = False
+# Thread-local, not a module global: the module global silenced pynetdicom
+# logs for EVERY thread (C-STORE, C-FIND, incoming associations) while any
+# single C-MOVE was streaming, hiding real errors from unrelated dialogs.
+_suppress_state = threading.local()
 
 
 class _SuppressPynetdicomFilter(logging.Filter):
-    """Simple filter: suppress pynetdicom logs when _suppress_pynetdicom is True."""
+    """Suppress pynetdicom logs only on the thread that requested it."""
 
     def filter(self, record):
-        return not _suppress_pynetdicom
+        return not getattr(_suppress_state, "suppress", False)
 
 
 _pynetdicom_suppress = _SuppressPynetdicomFilter()
@@ -125,6 +128,50 @@ _assoc_module.LOGGER.error = _patched_assoc_error
 # ---------------------------------------------------------------------------
 # Bridge: C-MOVE  -  extract MoveDestination from C-MOVE-RQ
 # ---------------------------------------------------------------------------
+def _parse_scoped_uid(ds, keyword, tag_text):
+    """One SINGLE-VALUE scoped UID from the C-MOVE identifier.
+
+    SeriesInstanceUID (0020,000E) and SOPInstanceUID (0008,0018) are Type 1
+    single-value keys in the C-MOVE identifier (PS3.4 C.4.2.1.2), but a
+    request can still carry several values. `str()` on a pydicom MultiValue
+    renders the Python list ("['1.2.3', '1.2.4']"), which then becomes a path
+    segment of the WADO-RS GET - an unroutable URL, a 404 and a failed job for
+    what was a legitimate request. Only the first value is used (the level
+    scopes ONE series / ONE instance); a value list is truncated rather than
+    collapsed into a string, and an unusable value is refused.
+    """
+    raw = getattr(ds, keyword, None)
+    if raw is None:
+        return ""
+    # pydicom's MultiValue is NOT a list/tuple subclass, so an isinstance test
+    # alone let it reach `str(raw)` and rendered "['1.2.3', '1.2.4']" into the
+    # URL path. Iterating on "has __iter__ and is not a str" covers both the
+    # decoded wire form and a plain container.
+    if not isinstance(raw, (str, bytes)) and hasattr(raw, "__iter__"):
+        values = [str(v).strip() for v in raw if v is not None and str(v).strip()]
+    else:
+        values = [str(raw).strip()]
+    values = [v for v in values if v]
+    if not values:
+        return ""
+    value = values[0]
+    if "[" in value or "]" in value or "," in value:
+        # A rendered container reached here (a caller stringified it before
+        # storing it): `str(MultiValue)` -> "['1.2.3', '1.2.4']". Never let
+        # that text into a URL path. A SINGLE-element container still scopes
+        # one series/instance, so its UID is recovered; two or more values are
+        # an identifier conflict the level cannot resolve, so they are refused
+        # rather than silently narrowed to the first.
+        inner = value.strip().strip("[]").strip()
+        if "," in inner:
+            raise ValueError(f"C-MOVE-RQ: invalid {keyword} ({tag_text})")
+        head = inner.strip("'\"").strip()
+        if not head or any(ch in head for ch in "[]'\" "):
+            raise ValueError(f"C-MOVE-RQ: invalid {keyword} ({tag_text})")
+        return head
+    return value
+
+
 def _parse_c_move_rq(event):
     """Extract StudyInstanceUID(s) and MoveDestination from C-MOVE-RQ.
 
@@ -161,7 +208,31 @@ def _parse_c_move_rq(event):
     if not study_uids:
         raise ValueError("C-MOVE-RQ: empty StudyInstanceUID list")
 
-    return study_uids, str(move_dest)
+    # PS3.4 C.4.2.1.2: the level decides the SCOPE. A SERIES-level C-MOVE must
+    # retrieve the named series, not the whole study - ignoring the level
+    # transferred every instance of the study to a viewer that asked for one
+    # series. The identifier carries SeriesInstanceUID (0020,000E) at SERIES
+    # and additionally SOPInstanceUID (0008,0018) at IMAGE.
+    level = str(getattr(ds, "QueryRetrieveLevel", "") or "").strip().upper()
+    series_uid = _parse_scoped_uid(ds, "SeriesInstanceUID", "0020,000E")
+    sop_instance_uid = _parse_scoped_uid(ds, "SOPInstanceUID", "0008,0018")
+
+    if level == "SERIES" and not series_uid:
+        raise ValueError(
+            "C-MOVE-RQ: SERIES level without SeriesInstanceUID (0020,000E)"
+        )
+    if level == "IMAGE" and not (series_uid and sop_instance_uid):
+        raise ValueError(
+            "C-MOVE-RQ: IMAGE level without SeriesInstanceUID and "
+            "SOPInstanceUID (0020,000E / 0008,0018)"
+        )
+    if level not in ("", "STUDY", "SERIES", "IMAGE"):
+        # An unknown level cannot be honoured; refuse rather than fall back to
+        # whole-study retrieval, which would hand the SCU data it did not ask
+        # for (PS3.4 Table C.4-2 'Unable to process').
+        raise ValueError(f"C-MOVE-RQ: unsupported QueryRetrieveLevel {level!r}")
+
+    return study_uids, str(move_dest), level, series_uid, sop_instance_uid
 
 
 def _json_loads(payload):
@@ -231,16 +302,17 @@ def split_multipart_parts(raw, boundary):
 # ---------------------------------------------------------------------------
 # R1 pre-flight (0609): learn each class's stored TS BEFORE the association.
 # Source: the standard per-instance metadata resource (PS3.18 10.4.4)
-# /studies/{study}/series/{series}/metadata, whose elements ALWAYS carry
-# (0002,0010) TransferSyntaxUID (and (0008,0016) SOPClassUID). Series are
-# enumerated via QIDO-RS /studies/{study}/series.
+# /studies/{study}/series/{series}/instances/{sop}/metadata, whose elements
+# ALWAYS carry (0002,0010) TransferSyntaxUID (and (0008,0016) SOPClassUID).
+# Series are enumerated via QIDO-RS /studies/{study}/series, and the probe
+# instance via QIDO-RS /studies/{study}/series/{series}/instances.
 # ---------------------------------------------------------------------------
 # TTL cache of successful pre-flights (0609 field): a repeated C-MOVE of
-# the same study skips the PS3.18 10.4.4 metadata walk (field: 2.3 s for a
-# 432-instance series + parse, plus the association waits on it). Failures
-# are NOT cached - the degrade path must retry. A new stored TS appearing
-# inside the TTL window stays deliverable: such an instance misses its
-# context and takes the legacy fallback path (spec R4 rule 3).
+# the same study skips the probe walk (one QIDO instance list + one metadata
+# GET per series) plus the association's wait on it. Failures are NOT cached
+# - the degrade path must retry. A new stored TS appearing inside the TTL
+# window stays deliverable: such an instance misses its context and takes the
+# legacy fallback path (spec R4 rule 3).
 _PREFLIGHT_TTL_S = 120.0
 _preflight_cache = {}  # study_uid -> (expires_monotonic, result dict)
 
@@ -256,14 +328,34 @@ def _cache_evict(cache, now):
     """Drop expired entries, then the oldest until the cache fits the cap."""
     for key, value in list(cache.items()):
         if now >= value[0]:
-            del cache[key]
+            # pop, not del: two workers can evict the same expired key, and a
+            # plain `del` on the second one raised KeyError (a race on shared
+            # mutable state with no lock). pop(key, None) is idempotent.
+            cache.pop(key, None)
     if len(cache) <= _CACHE_MAX_ENTRIES:
         return
     # Oldest-expiring first: those are the entries closest to being useless.
     for key, _value in sorted(cache.items(), key=lambda kv: kv[1][0])[
         : len(cache) - _CACHE_MAX_ENTRIES
     ]:
-        del cache[key]
+        cache.pop(key, None)
+
+
+def _split_preflight(result):
+    """Normalise a pre-flight answer into `(map_or_None, partial)`.
+
+    The walk returns `(map, partial)`. A caller (or a test) may hand back a
+    bare map or None, which is the pre-batch-8 shape: that result carried no
+    completeness signal, so it can only be treated as COMPLETE - filling in
+    the registry from an answer of unknown coverage is what spent the whole
+    context budget on classes the study does not hold.
+    """
+    if result is None:
+        return None, False
+    if isinstance(result, tuple):
+        value, partial = (result + (False,))[:2]
+        return value, bool(partial)
+    return result, False
 
 
 def _preflight_study_ts_by_class(
@@ -275,8 +367,14 @@ def _preflight_study_ts_by_class(
     expose_rejected=False,
     qa_url="",
 ):
-    """Return dict[sop_class -> set[stored transfer syntax UID]] for a
-    C-MOVE study, or None when pre-flight cannot be completed.
+    """Return (dict[sop_class -> set[stored transfer syntax UID]], partial).
+
+    `partial` is True when the walk could not cover every series (a timeout,
+    a budget stop, a failed probe), so the class map is a SUBSET of the study.
+    It is False for a complete walk, including the empty answer of a study
+    with no series.
+
+    The map is None when pre-flight cannot be completed at all.
 
     Used to shape the outbound association's per-TS contexts so the stored
     transfer syntax of every instance is PROPOSED and its acceptance is
@@ -285,9 +383,31 @@ def _preflight_study_ts_by_class(
     the fixed [EVRLE, IVRLE, 4.80, 4.70] proposal (today's behavior).
 
     1. QIDO series lookup /studies/{study}/series -> SeriesInstanceUIDs.
-    2. Per series, WADO metadata /studies/{study}/series/{series}/metadata
-       (Accept application/dicom+json) -> one JSON array; each element
-       contributes (SOPClassUID from 00080016, TS from 00020010).
+    2. Per series, QIDO instance list /studies/{study}/series/{series}/instances
+       -> the FIRST instance's SOP Instance UID.
+    3. Per series, WADO metadata for that ONE instance
+       /studies/{study}/series/{series}/instances/{sop}/metadata
+       (Accept application/dicom+json) -> (0008,0016) and (0002,0010).
+
+    The series-level metadata resource renders every non-PixelData element of
+    EVERY instance: measured on the stand, 432 instances answered 1.45 MB in
+    663 ms while the same two tags from one instance answered 3.5 KB in 26 ms
+    - about 100x the bytes and the time for the same answer, because the two
+    tags repeat on every instance. A series-level response also costs more
+    than the 2.0 s request timeout on the slow runs, which is why the old
+    pre-flight lost the race and the proposal fell back to registry-wide.
+
+    The probe is EVIDENCE BY CONVENTION, not by conformance: PS3.3 does not
+    require every instance of a series to share a transfer syntax. That is
+    acceptable because a wrong probe is RECOVERABLE - an instance whose
+    stored TS misses its context takes the existing per-instance refetch
+    path (R4 rule 3), which is unchanged. A probe that says nothing at all
+    (today's degrading behaviour) is strictly worse.
+
+    A series-level failure no longer abandons the study: a slow series 9 of
+    30 used to discard the 8 series already probed, which left the caller
+    with no stored-TS information at all. The probed series are returned and
+    the missed instances fall back to the refetch path.
 
     The metadata resource is answered with the mandatory media type
     multipart/related; type="application/dicom+json" (PS3.18 10.4.4) - the
@@ -308,7 +428,7 @@ def _preflight_study_ts_by_class(
             _PREFLIGHT_TTL_S,
             len(_hit[1]),
         )
-        return {k: set(v) for k, v in _hit[1].items()}
+        return {k: set(v) for k, v in _hit[1].items()}, False
     _preflight_cache.pop(_cache_key, None)
     base = service_base_url(clarus_url, qa_url, expose_rejected)
     start = time.monotonic()
@@ -392,9 +512,9 @@ def _preflight_study_ts_by_class(
             "contexts proposed",
             str(study_uid)[:50],
         )
-        return None
+        return None, False
     if _over_budget():
-        return None
+        return None, False
 
     series_uids = []
     for row in series_rows:
@@ -406,17 +526,56 @@ def _preflight_study_ts_by_class(
     if not series_uids:
         # Empty study (no series) - nothing to pre-liquidate; caller uses the
         # default proposal and the study stream will simply return 0 parts.
-        return {}
+        return {}, False
 
     result = {}
+    probed = 0
+    missed = 0
     for suid in series_uids:
         if _over_budget():
-            return None  # give up cleanly, degrade to default proposal
-        meta_url = (
-            f"{base}/studies/{_quote(study_uid, safe='')}"
-            f"/series/{_quote(suid, safe='')}/metadata"
-        )
+            # Circuit breaker only. With per-instance probes a 4.0 s budget
+            # fits ~180 series (measured 22-26 ms each), so this firing means
+            # the server is sick, not that the study is large.
+            logging.warning(
+                "[C-MOVE] pre-flight %s: budget %.1fs exhausted after %d/%d "
+                "series - returning what was probed",
+                str(study_uid)[:50],
+                budget_s,
+                probed,
+                len(series_uids),
+            )
+            break
         try:
+            inst_url = (
+                f"{base}/studies/{_quote(study_uid, safe='')}"
+                f"/series/{_quote(suid, safe='')}/instances"
+            )
+            inst_rows = _qido_request(
+                inst_url, {}, http_timeout, limit=None, tls=tls
+            )
+            if not isinstance(inst_rows, list) or not inst_rows:
+                missed += 1
+                continue
+            sop_uid = ""
+            for inst_row in inst_rows:
+                if not isinstance(inst_row, dict):
+                    continue
+                sop_uid = _json_first_value(inst_row, "00080018")
+                if sop_uid:
+                    # The first instance is the probe: measured 3.5 KB / 26 ms
+                    # against 1.45 MB / 663 ms for the whole series. A second
+                    # probe at the far end would catch a series mixed by two
+                    # acquisitions, but this one already removes the whole
+                    # reason the pre-flight was failing.
+                    break
+            if not sop_uid:
+                missed += 1
+                continue
+            meta_url = (
+                f"{base}/studies/{_quote(study_uid, safe='')}"
+                f"/series/{_quote(suid, safe='')}"
+                f"/instances/{_quote(sop_uid, safe='')}/metadata"
+            )
             mresp = requests.get(
                 meta_url,
                 headers={"Accept": "application/dicom+json"},
@@ -439,17 +598,22 @@ def _preflight_study_ts_by_class(
                     len(mresp.content) if hasattr(mresp, "content") else -1,
                     _mh.get("Content-Type", "?"),
                 )
+                missed += 1
                 continue
         except Exception as _pref_exc:
-            # Any series metadata failure -> abandon the whole pre-flight
-            # (partial data could shape a wrong proposal).
+            # ONE series failing must not discard the rest: the probed series
+            # are real information, and the missed ones take the per-instance
+            # refetch path (R4 rule 3) instead of costing the whole study its
+            # stored-TS contexts.
             logging.debug(
-                "[C-MOVE] pre-flight: metadata for series %s failed (%s) - "
-                "no stored-TS contexts proposed",
+                "[C-MOVE] pre-flight: probe for series %s failed (%s) - "
+                "skipped, its instances fall back to per-instance refetch",
                 str(suid)[:50],
                 _pref_exc,
             )
-            return None
+            missed += 1
+            continue
+        probed += 1
         for inst in rows:
             if not isinstance(inst, dict):
                 continue
@@ -462,19 +626,33 @@ def _preflight_study_ts_by_class(
     n_classes = len(result)
     n_ts = sum(len(v) for v in result.values())
     logging.info(
-        "[C-MOVE] pre-flight %s: %d class(es), %d stored TS total "
-        "(PS3.18 10.4.4 metadata)",
+        "[C-MOVE] pre-flight %s: %d class(es), %d stored TS total from %d/%d "
+        "probed series (%d not probed)",
         str(study_uid)[:50],
         n_classes,
         n_ts,
+        probed,
+        len(series_uids),
+        missed,
     )
-    if result:
+    # A partial walk must not be cached: the missed series would stay out of
+    # the proposal for the whole TTL, and every C-MOVE in that window falls
+    # back to the registry-wide set - the failure mode this probe exists to
+    # remove. The partial result is still RETURNED below; it is useful for
+    # this C-MOVE, it is just not remembered.
+    if result and not missed and probed == len(series_uids):
         _preflight_cache[(study_uid, bool(expose_rejected))] = (
             time.monotonic() + _PREFLIGHT_TTL_S,
             {k: set(v) for k, v in result.items()},
         )
         _cache_evict(_preflight_cache, time.monotonic())
-    return result
+    # `partial` is what decides the registry fill-in: a walk that missed a
+    # series has an INCOMPLETE class map, so the registry supplies the classes
+    # it could not learn. A COMPLETE walk already lists the study's real class
+    # set (PS3.18 10.4.4 metadata is per-instance), and adding the registry to
+    # it only spends the 128-context budget on classes the study does not hold.
+    partial = bool(missed) or probed != len(series_uids)
+    return result, partial
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +665,7 @@ def _preflight_study_ts_by_class(
 # SOP UIDs, or None when the study metadata cannot be enumerated (the worker
 # then degrades to the per-attempt failed list).
 # ---------------------------------------------------------------------------
-_study_sop_uids_cache = {}  # study_uid -> (expires_monotonic, list[uid])
+_study_sop_uids_cache = {}  # (study, expose, level, series, sop) -> (exp, uids)
 
 
 def _study_sop_uids(
@@ -498,10 +676,20 @@ def _study_sop_uids(
     budget_s=4.0,
     expose_rejected=False,
     qa_url="",
+    request_level="",
+    request_series_uid="",
+    request_sop_uid="",
 ):
     """Return ordered, de-duplicated SOP instance UID list of a study from
     the standard per-instance metadata resources (PS3.18 10.4.4), or None if
-    the study cannot be enumerated (best effort; the caller degrades)."""
+    the study cannot be enumerated (best effort; the caller degrades).
+
+    PS3.4 C.4.2.1.2: the list is filtered to the requested Query/Retrieve
+    SCOPE. A SERIES-level C-MOVE must not enumerate (and later report) the
+    study's other series, and an IMAGE-level one must not report its sibling
+    instances - this list is the authority for `total` and for the (0008,0058)
+    tail, so an unscoped list made a correctly-scoped transfer look partial.
+    """
 
     def _normalize(value):
         if isinstance(value, list):
@@ -536,10 +724,19 @@ def _study_sop_uids(
             return []
 
     now = time.monotonic()
-    hit = _study_sop_uids_cache.get((study_uid, bool(expose_rejected)))
+    # The cache key carries the SCOPE: a SERIES-scoped list must not be served
+    # to a whole-study C-MOVE of the same study.
+    _cache_key = (
+        study_uid,
+        bool(expose_rejected),
+        request_level,
+        request_series_uid,
+        request_sop_uid,
+    )
+    hit = _study_sop_uids_cache.get(_cache_key)
     if hit is not None and now < hit[0]:
         return list(hit[1])
-    _study_sop_uids_cache.pop((study_uid, bool(expose_rejected)), None)
+    _study_sop_uids_cache.pop(_cache_key, None)
     base = service_base_url(clarus_url, qa_url, expose_rejected)
     start = time.monotonic()
 
@@ -558,6 +755,15 @@ def _study_sop_uids(
                 s = _json_first_value(row, "0020000E")
                 if s:
                     series_uids.append(s)
+    # SERIES / IMAGE scope: only the series named in the request is walked.
+    if request_level in ("SERIES", "IMAGE") and request_series_uid:
+        series_uids = [s for s in series_uids if s == request_series_uid]
+        if not series_uids:
+            logging.info(
+                "[C-MOVE] requested series %s is not in study %s - empty scope",
+                str(request_series_uid)[:50],
+                str(study_uid)[:50],
+            )
     if not series_uids:
         return []
     uids = []
@@ -565,29 +771,48 @@ def _study_sop_uids(
     for suid in series_uids:
         if _over_budget():
             return None
-        meta_url = (
+        # Only the SOP Instance UIDs are needed, and the QIDO instance list
+        # returns exactly those: one row per instance with (0008,0018) plus
+        # InstanceNumber. The previous series-level /metadata call rendered
+        # every non-PixelData element of every instance (measured 1.4 MB /
+        # ~500 ms for a 432-instance series) and ran while the outbound
+        # association was already open, so the viewer waited on a rendering
+        # that carried nothing this function uses.
+        inst_url = (
             f"{base}/studies/{_quote(study_uid, safe='')}"
-            f"/series/{_quote(suid, safe='')}/metadata"
+            f"/series/{_quote(suid, safe='')}/instances"
         )
         try:
-            mresp = requests.get(
-                meta_url,
-                headers={"Accept": "application/dicom+json"},
-                timeout=http_timeout,
-                cert=tls,
+            inst_rows = _qido_request(
+                inst_url, {}, http_timeout, limit=None, tls=tls
             )
-            mresp.raise_for_status()
-            _mh = getattr(mresp, "headers", {}) or {}
-            rows = _parse_body(_mh.get("Content-Type", ""), mresp)
         except Exception:
             return None
-        for inst in rows:
+        if not isinstance(inst_rows, list):
+            return None
+        for inst in inst_rows:
+            if not isinstance(inst, dict):
+                continue
             sop = _json_first_value(inst, "00080018")
+            # IMAGE scope: exactly one instance.
+            if request_level == "IMAGE" and request_sop_uid:
+                if sop != request_sop_uid:
+                    continue
             if sop and sop not in seen:
                 seen.add(sop)
                 uids.append(sop)
     if uids:
-        _study_sop_uids_cache[(study_uid, bool(expose_rejected))] = (
+        # The cache key carries the SCOPE: a SERIES-scoped list must not be
+        # served to a whole-study C-MOVE of the same study.
+        _study_sop_uids_cache[
+            (
+                study_uid,
+                bool(expose_rejected),
+                request_level,
+                request_series_uid,
+                request_sop_uid,
+            )
+        ] = (
             time.monotonic() + _PREFLIGHT_TTL_S,
             list(uids),
         )
@@ -598,6 +823,12 @@ def _study_sop_uids(
 # ---------------------------------------------------------------------------
 # (2608): self-delivery guard  -  is the target the bridge's own listener?
 # ---------------------------------------------------------------------------
+# The comparison rule lives in utils so the peer lookup in move_jobs can use
+# the same one without importing a handler (manager -> handler is the wrong
+# direction). Re-exported here under the name this module has always used.
+_normalize_host = normalize_host
+
+
 def _is_self_delivery_target(
     target_host, target_port, bridge_dimse_host, bridge_dimse_port
 ):
@@ -613,16 +844,10 @@ def _is_self_delivery_target(
     if target_host is None:
         return False
 
-    def _normalize(host):
-        h = str(host).strip().lower()
-        if h in ("0.0.0.0", "::", "[::]"):
-            return "127.0.0.1"
-        return h
-
-    aliases = {"127.0.0.1", "localhost", "::1"}
+    aliases = {"127.0.0.1", "::1"}
     if bridge_dimse_host:
-        aliases.add(_normalize(bridge_dimse_host))
-    return _normalize(target_host) in aliases
+        aliases.add(_normalize_host(bridge_dimse_host))
+    return _normalize_host(target_host) in aliases
 
 
 def _failure_dataset(uids, error_comment=None):
@@ -631,18 +856,15 @@ def _failure_dataset(uids, error_comment=None):
     - (0008,0058) Failed SOP Instance UID List (UI, VM 1-n): the SOP instance
       UIDs that were attempted but not delivered - PS3.4 Table C.4-2 requires
       Cancel, Failure and Warning to contain it (PS3.4 C.4.2.1.4.2).
-    - (0000,0902) Error Comment (LO): honest reason, carried on a Failure
-      status when nothing conclusive was listed.
 
-    Both elements use add_new (keyword-independent) so the command/data set
-    round-trips regardless of pynetdicom property mapping.
+    `error_comment` is logged, NOT carried in the Identifier: (0000,0902)
+    Error Comment is a COMMAND-SET element (PS3.7 Table 9.1-1), and the
+    C-MOVE-RSP Identifier is a data set. A command element in a data set is
+    a protocol violation a strict SCU rejects.
     """
-    ds = Dataset()
     if error_comment:
-        try:
-            ds.add_new((0x0000, 0x0902), "LO", str(error_comment)[:64])
-        except Exception:
-            pass
+        logging.warning("[C-MOVE] %s", error_comment)
+    ds = Dataset()
     if uids:
         try:
             ds.add_new((0x0008, 0x0058), "UI", [str(u) for u in uids])
@@ -730,8 +952,17 @@ def handle_c_move(
     )
 
     try:
-        study_uids, move_dest_ae = _parse_c_move_rq(event)
+        (
+            study_uids,
+            move_dest_ae,
+            request_level,
+            request_series_uid,
+            request_sop_uid,
+        ) = _parse_c_move_rq(event)
     except ValueError as e:
+        # An unhonourable level (SERIES without a series UID, an unknown
+        # level) arrives here: refusing is right, because falling back to
+        # whole-study retrieval would send the viewer data it did not ask for.
         logging.warning("[C-MOVE] Parse error: %s", e)
         yield 0xC000, None
         return
@@ -783,12 +1014,15 @@ def handle_c_move(
         yield 0xA801, None
         return
 
-    if target_host != calling_ip:
+    if _normalize_host(target_host) != _normalize_host(calling_ip):
         logging.warning(
-            "[C-MOVE] IP MISMATCH: %s registered at %s but C-MOVE from %s.",
+            "[C-MOVE] IP MISMATCH: %s registered at %s but C-MOVE from %s "
+            "(normalised: %s vs %s).",
             move_dest_ae,
             target_host,
             calling_ip,
+            _normalize_host(target_host),
+            _normalize_host(calling_ip),
         )
         yield 0xA801, None
         return
@@ -803,13 +1037,17 @@ def handle_c_move(
             target_host,
             target_port,
             expose_rejected=expose_rejected,
+            request_level=request_level,
+            request_series_uid=request_series_uid,
+            request_sop_uid=request_sop_uid,
         )
         job_ids.append(job_id)
         logging.info(
-            "[C-MOVE] Job #%d created for Study %s -> %s",
+            "[C-MOVE] Job #%d created for Study %s -> %s (level=%s)",
             job_id,
             study_uid,
             move_dest_ae,
+            request_level or "STUDY",
         )
 
     logging.info(
@@ -862,11 +1100,24 @@ def handle_c_move(
         move_jobs.set_job_cancel_callback(job_id, _is_cancelled)
 
     def _clear_callbacks():
-        # The callback closes over `event` (and through it the association).
-        # Leaving it in the registry keeps the whole request object alive for
-        # the life of the process, so every cancel path drops it.
+        # Terminal cleanup: the callback closes over `event` (and through it
+        # the association). Leaving it in the registry keeps the whole
+        # request object alive for the life of the process, so the terminal
+        # path drops it once every job is finished and no worker will poll it
+        # again.
         for job_id in job_ids:
             move_jobs.clear_job_callback(job_id)
+
+    def _latch_cancelled():
+        # Cancel path: the callback also closes over `event`, so it must be
+        # dropped - but CLEARING it makes the worker's is_job_cancelled() see
+        # "no callback" -> False, so a worker mid-stream would keep sending
+        # the rest of the study (and push Storage Commitment) after the
+        # reactor already answered Cancel. The latch answers True forever and
+        # holds NO reference to `event`: the worker reads "cancelled", stops,
+        # and removes the latch itself in its own finally.
+        for job_id in job_ids:
+            move_jobs.set_job_cancel_callback(job_id, lambda: True)
 
     # yield 1: (addr, port)  -  pynetdicom primes store_assoc
     yield (target_host, target_port)
@@ -888,11 +1139,13 @@ def handle_c_move(
 
     def _finish_jobs_cancelled():
         for job_id in job_ids:
-            move_jobs.finish_job(
+            if move_jobs.finish_job(
                 job_id, success=False, error_message="Cancelled by SCU"
-            )
-            move_jobs_counter.labels(status="failed").inc()
-        _clear_callbacks()
+            ):
+                # Count only when THIS call finished the job: the worker can
+                # finish it first, and a second counter bump would double-count.
+                move_jobs_counter.labels(status="failed").inc()
+        _latch_cancelled()
 
     # yield 2+: hold the DIMSE dialog (0.5 s DB poll, bounded by
     # move_poll_timeout) until every job is terminal  -  the final response is
@@ -910,6 +1163,30 @@ def handle_c_move(
     # instead of a hung association.
     poll_started = time.monotonic()
 
+    # The bare count yielded just before a terminal status decides whether
+    # pynetdicom 3.0.4 reads that status at all. Its C-MOVE SCP branch
+    #
+    #     if nr_suboperations < 1:
+    #         rsp.Status = 0x0000
+    #         self.dimse.send_msg(rsp, cx_id)
+    #         return            # the generator is NOT read again
+    #
+    # sends 0x0000 Success and stops reading, so yielding 0 before an honest
+    # 0xB000/0xC000 replaced the failure with Success. The count is therefore
+    # derived from what the jobs actually did:
+    #
+    #     completed_total >= expected_total (and expected_total > 0) -> 0
+    #         every attempted instance was delivered: 0x0000 is truthful and
+    #         pynetdicom opens NO move-destination association (the 0909
+    #         policy, one association fewer per C-MOVE);
+    #     otherwise -> max(1, expected_total)
+    #         a non-zero count opens the move-destination association before
+    #         the status is read. That is accepted deliberately: if that
+    #         association fails, pynetdicom answers 0xA801 ("move destination
+    #         unreachable"), a truthful report - while 0x0000 on a failed
+    #         transfer is not.
+    #
+    # Evidence: tmp/1111_cmove_yield_probe.py (pynetdicom 3.0.4).
     while True:
         if _is_cancelled():
             _finish_jobs_cancelled()
@@ -923,30 +1200,33 @@ def handle_c_move(
 
         # Aggregate terminal state across all jobs
         total_completed = 0
+        expected_total = 0
         all_finished = True
         any_failed = False
         for job_id in job_ids:
-            completed, _total, status = move_jobs.get_job_progress(job_id)
+            completed, total, status = move_jobs.get_job_progress(job_id)
             total_completed += completed
+            expected_total += total
             if status not in ("success", "failed"):
                 all_finished = False
             if status == "failed":
                 any_failed = True
 
+        # 0 is reserved for a CONFIRMED all-success transfer. On a failure path
+        # the counters cannot prove completeness: `_stream_and_send_study`
+        # writes total = idx + 1 per instance as it streams, so
+        # completed == total holds for a job that delivered its last instance
+        # and then lost the association. A 0 there makes pynetdicom send 0x0000
+        # Success and stop reading, and the 0xB000/0xC000 never reaches the
+        # viewer. Keep the dialog open with a non-zero count.
+        failure_count = max(1, expected_total)
+
         if all_finished:
             if any_failed:
-                # A terminal status carries NO sub-operations: the count is
-                # what tells pynetdicom whether to open the move-destination
-                # association before it reads the failure, and a non-zero
-                # count there makes it associate once more - a failure of that
-                # association then replaces the honest 0xB000/0xC000 with
-                # 0xA801, and the (0008,0058) list never reaches the viewer.
-                # `0` is the truthful count: nothing is still in flight.
                 failed_uids = _agg_failed_uids()
                 # Two yields, not one tuple: the reactor protocol is a bare
-                # sub-operation count followed by (status, identifier), and a
-                # bare 0 is the truthful count here.
-                yield 0
+                # sub-operation count followed by (status, identifier).
+                yield failure_count
                 if total_completed == 0:
                     # Zero sub-operations completed: B000 ("Sub-operations
                     # Complete") would be a lie - say Failure (PS3.4 Table
@@ -980,11 +1260,12 @@ def handle_c_move(
             for job_id in job_ids:
                 _, _, job_status = move_jobs.get_job_progress(job_id)
                 if job_status not in ("success", "failed"):
-                    move_jobs.finish_job(
+                    if move_jobs.finish_job(
                         job_id, success=False, error_message="Move poll timeout"
-                    )
-                    move_jobs_counter.labels(status="failed").inc()
-                    timed_out_jobs.append(job_id)
+                    ):
+                        # Count only when THIS call finished the job.
+                        move_jobs_counter.labels(status="failed").inc()
+                        timed_out_jobs.append(job_id)
             # The worker streams instances and only finishes the job when it
             # runs out of them, so marking the row failed is not enough: it
             # would keep sending and then rewrite the row to success. The
@@ -1002,7 +1283,7 @@ def handle_c_move(
                 ),
                 "0xC000" if total_completed == 0 else "0xB000",
             )
-            yield 0
+            yield failure_count
             failed_uids = _agg_failed_uids()
             if total_completed == 0:
                 # Nothing delivered before the poll timeout -> Failure, not a
@@ -1013,7 +1294,7 @@ def handle_c_move(
                 )
             else:
                 yield 0xB000, _failure_dataset(failed_uids)
-            _clear_callbacks()
+            _latch_cancelled()
             return
 
         time.sleep(0.5)
@@ -1022,10 +1303,25 @@ def handle_c_move(
 # ---------------------------------------------------------------------------
 # Bridge: Storage Commitment push after C-MOVE (CMP-008)
 # ---------------------------------------------------------------------------
+# PS3.4 J.3.2: the N-ACTION primitive operates on the Storage Commitment
+# Push Model's CONSTANT well-known SOP Instance (conceptually created at SCP
+# startup). The Transaction UID is NOT the Affected SOP Instance UID - it
+# travels inside the data set as (0008,1195). Sending the Transaction UID as
+# the instance UID makes a strict SCP reject the request it cannot correlate.
+WELL_KNOWN_SOP_INSTANCE_UID = "1.2.840.10008.1.20.1.1"
+
+
 def _send_storage_commitment(
-    move_dest_ae, target_host, target_port, sop_list, bridge_ae_title
+    move_dest_ae, target_host, target_port, sop_list, bridge_ae_title, assoc=None
 ):
     """Send N-ACTION Storage Commitment Request to move destination AE.
+
+    `assoc` is the C-MOVE association that just delivered `sop_list`. It is
+    reused when Storage Commitment was negotiated on it, which is the normal
+    case: `_associate_for_move` proposes the push-model context up front, so
+    the N-ACTION rides a context that already exists instead of paying a
+    second ACSE round trip to the same peer. The old separate association is
+    kept only as the fallback for a caller that has no live association.
 
     Args:
         move_dest_ae: AE Title of the move destination (SCU)
@@ -1033,6 +1329,7 @@ def _send_storage_commitment(
         target_port: port of the move destination
         sop_list: list of (sop_class_uid, sop_instance_uid) tuples
         bridge_ae_title: Bridge's own AE Title
+        assoc: live association to the move destination, or None
 
     Returns:
         True if commitment request was sent successfully.
@@ -1045,27 +1342,35 @@ def _send_storage_commitment(
         len(sop_list),
     )
 
-    ae = AE(ae_title=bridge_ae_title)
-    # Storage Commitment is optional (PS3.4 sec.C.4.2.5). Fast-fail ACSE:
-    # if viewer doesn't respond in 3s, it doesn't support SC. Don't
-    # waste 10s on a feature that most viewers don't implement.
-    ae.network_timeout = 5
-    ae.acse_timeout = 3
-    ae.dimse_timeout = 30
-    ae.add_requested_context(StorageCommitmentPushModel)
-    ae.add_requested_context(
-        Verification
-    )  # Fallback: allows association even if no SC support
+    # `owned_assoc` is the association THIS call opened (fallback path); it is
+    # the only one this call may release. On the reuse path the caller still
+    # owns `assoc` and releases it itself.
+    owned_assoc = None
+    if assoc is None or not assoc.is_established:
+        ae = AE(ae_title=bridge_ae_title)
+        # Storage Commitment is optional (PS3.4 sec.C.4.2.5). Fast-fail ACSE:
+        # if viewer doesn't respond in 3s, it doesn't support SC. Don't
+        # waste 10s on a feature that most viewers don't implement.
+        ae.network_timeout = 5
+        ae.acse_timeout = 3
+        ae.dimse_timeout = 30
+        # Symmetric with nevent.py: bound the raw TCP connect too, or a
+        # black-hole peer holds this fallback association on the OS SYN
+        # timeout. 5 s matches the fast-fail ACSE posture below.
+        ae.connection_timeout = 5
+        ae.add_requested_context(StorageCommitmentPushModel)
+        ae.add_requested_context(
+            Verification
+        )  # Fallback: allows association even if no SC support
 
-    # suppress pynetdicom's "No accepted presentation contexts" ERROR  -
-    # it's normal for SCPs that don't support Storage Commitment.
-    global _suppress_pynetdicom
-    _suppress_pynetdicom = True
-    try:
-        assoc = ae.associate(target_host, target_port, ae_title=move_dest_ae)
-    finally:
-        _suppress_pynetdicom = False
-
+        # suppress pynetdicom's "No accepted presentation contexts" ERROR  -
+        # it's normal for SCPs that don't support Storage Commitment.
+        _suppress_state.suppress = True
+        try:
+            owned_assoc = ae.associate(target_host, target_port, ae_title=move_dest_ae)
+        finally:
+            _suppress_state.suppress = False
+        assoc = owned_assoc
     if not assoc.is_established:
         logging.info(
             "[C-MOVE-COMMIT] SCP %s:%d unavailable - skipping Storage Commitment",
@@ -1083,7 +1388,8 @@ def _send_storage_commitment(
             "[C-MOVE-COMMIT] SCP %s does not support Storage Commitment - skipping",
             move_dest_ae,
         )
-        _release_or_abort(assoc, timeout=2.0)
+        if owned_assoc is not None:
+            _release_or_abort(owned_assoc, timeout=2.0)
         return False
 
     try:
@@ -1103,31 +1409,42 @@ def _send_storage_commitment(
         # pynetdicom 3.x signature: send_n_action(dataset, action_type, class_uid,
         #   meta_uid=None, instance_uid=None)
         # action_type=1 (PS3.4 sec.J.3.1), class_uid=StorageCommitmentPushModel.
+        # instance_uid is the well-known constant (PS3.4 J.3.2); the
+        # Transaction UID already travels in the data set as (0008,1195).
         status, response = assoc.send_n_action(
             ds,
             1,  # action_type: Storage Commitment Request (PS3.4 sec.J.3.1)
             StorageCommitmentPushModel,
-            instance_uid=ds.TransactionUID,
+            instance_uid=WELL_KNOWN_SOP_INSTANCE_UID,
         )
 
         if status:
             status_code = status.Status if hasattr(status, "Status") else status
+            # PS3.4 J.3.2 + PS3.7: the Storage Commitment Push Model N-ACTION
+            # Response carries exactly two outcomes - 0x0000 (Success: the
+            # transaction was opened) and 0x0110 (Processing Failure). The
+            # Warning class there is 0x0107/0x0116 (attribute notes); 0x0001 and
+            # 0x0002 are the C-* space "warning - SOP class/instance not
+            # supported", which this service does not define at all. Claiming a
+            # commitment for them reported a transaction no SCP holds; only
+            # Success means the SCP accepted the request.
             if status_code == 0x0000:
                 logging.info(
                     "[C-MOVE-COMMIT] %s: Storage Commitment %s.",
                     move_dest_ae,
                     _dimse_status_name(status_code),
                 )
-            else:
-                # Any SC failure is non-fatal: the move already succeeded and
-                # Storage Commitment is optional (PS3.4 C.4.2.5).
-                logging.info(
-                    "[C-MOVE-COMMIT] %s: Storage Commitment %s. "
-                    "Non-fatal (SC optional, PS3.4 C.4.2.5).",
-                    move_dest_ae,
-                    _dimse_status_name(status_code),
-                )
-            return True
+                return True
+            # Any non-Success answer - warning included - is non-fatal: the move
+            # already succeeded and Storage Commitment is optional (PS3.4
+            # C.4.2.5). Non-fatal is not the same as successful, hence False.
+            logging.warning(
+                "[C-MOVE-COMMIT] %s: Storage Commitment %s - not committed. "
+                "Non-fatal (SC optional, PS3.4 C.4.2.5).",
+                move_dest_ae,
+                _dimse_status_name(status_code),
+            )
+            return False
         else:
             logging.warning(
                 "[C-MOVE-COMMIT] N-ACTION no status returned for %s",
@@ -1142,7 +1459,10 @@ def _send_storage_commitment(
         )
         return False
     finally:
-        _release_or_abort(assoc, timeout=2.0)
+        # Only an association this call opened is this call's to release: the
+        # caller's own association outlives the N-ACTION.
+        if owned_assoc is not None:
+            _release_or_abort(owned_assoc, timeout=2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1364,18 +1684,42 @@ def _trim_optional_ts(num_classes, has_sc, optional_tokens):
 # as the peer is free.
 # No client-specific logic involved - the gate applies equally to any peer.
 _ASSOC_GATE_LOCK = threading.Lock()
-_ASSOC_BUSY = set()  # peers with a job currently between gate-enter/exit
+_ASSOC_BUSY = {}  # peer -> (owner_thread_ident, acquisition_depth)
 # Peer -> monotonic time of the LAST "busy - waiting" DEBUG line (throttled
 # to at most one per _ASSOC_GATE_LOG_INTERVAL seconds, C3).
 _ASSOC_GATE_LOG_LAST = {}
 _ASSOC_GATE_LOG_INTERVAL = 10.0
 
 
-def _job_gate_enter(host, port, ae_title):
+class _AssocGateAborted(Exception):
+    """The peer gate was abandoned because the bridge is stopping or the job
+    was cancelled. Separate from RuntimeError so a caller can distinguish
+    "could not get the peer" from "we gave up waiting for it"."""
+
+    def __init__(self, host, port, ae_title):
+        super().__init__(f"{ae_title}@{host}:{port}: gate wait abandoned")
+        self.host = host
+        self.port = port
+        self.ae_title = ae_title
+
+
+def _job_gate_enter(host, port, ae_title, give_up=None):
     """Serialise concurrent jobs toward the same peer (busy exclusion).
 
     Waits until the peer has no actively running job, then marks it busy and
     returns; there is no post-job cooldown (immediate start once free).
+
+    RE-ENTRANT for the thread that already owns the peer: a worker that holds
+    a claimed job and reaches the gate again (the resume path re-associates,
+    and any helper that runs the same job re-takes the gate) used to block on
+    a gate it was holding itself - forever. The owner is recorded per peer and
+    the same thread passes straight through, with the acquisition counted so
+    the matching `_job_gate_exit` calls unwind it.
+
+    The wait is bounded by `give_up` (a zero-arg predicate): shutdown and
+    job cancellation both end a wait that could otherwise last as long as a
+    slow peer holds the gate, which is what made a stopped bridge hang on the
+    worker join. Raises `_AssocGateAborted` when the predicate fires.
 
     Logging: the per-tick "busy - waiting" DEBUG line is throttled to
     no more than one per _ASSOC_GATE_LOG_INTERVAL (default 10 s) seconds per
@@ -1383,12 +1727,16 @@ def _job_gate_enter(host, port, ae_title):
     the caller waited for the peer.
     """
     key = (host, port, ae_title)
+    me = threading.get_ident()
     started = time.monotonic()
     waited_any = False
+    if give_up is None:
+        give_up = _shutdown_requested.is_set
     while True:
         with _ASSOC_GATE_LOCK:
-            if key not in _ASSOC_BUSY:
-                _ASSOC_BUSY.add(key)
+            owner = _ASSOC_BUSY.get(key)
+            if owner is None:
+                _ASSOC_BUSY[key] = (me, 1)
                 if waited_any:
                     logging.info(
                         "[ASSOC-GATE] %s@%s:%s waited %.1fs for the peer",
@@ -1398,7 +1746,21 @@ def _job_gate_enter(host, port, ae_title):
                         time.monotonic() - started,
                     )
                 return
+            if owner[0] == me:
+                # Same thread, same peer: it already holds the claim, so
+                # waiting here would deadlock against itself.
+                _ASSOC_BUSY[key] = (me, owner[1] + 1)
+                return
             waited_any = True
+        if give_up():
+            logging.info(
+                "[ASSOC-GATE] %s@%s:%s abandoned after %.1fs (stopping)",
+                ae_title,
+                host,
+                port,
+                time.monotonic() - started,
+            )
+            raise _AssocGateAborted(host, port, ae_title)
         # Sleep OUTSIDE the lock so other workers can gate.
         now = time.monotonic()
         with _ASSOC_GATE_LOCK:
@@ -1414,11 +1776,35 @@ def _job_gate_enter(host, port, ae_title):
         time.sleep(0.05)
 
 
+def _peer_is_busy(host, port, ae_title):
+    """True when another thread holds the gate for this peer (R9).
+
+    The worker pool picks a job BEFORE it takes the gate, so with two workers
+    one of them could claim a second job for a peer the other one is already
+    streaming to and then sit blocked in the gate. That job is invisible to
+    the queue (already claimed) while it waits, and a different viewer's job
+    behind it waits too - a long transfer can push the second request past the
+    modality's own timeout. Asking before claiming keeps a gate-blocked job in
+    pending, where the other workers can see it.
+    """
+    key = (host, port, ae_title)
+    with _ASSOC_GATE_LOCK:
+        owner = _ASSOC_BUSY.get(key)
+        return owner is not None and owner[0] != threading.get_ident()
+
+
 def _job_gate_exit(host, port, ae_title):
     """Release the peer so the next queued job to it can start."""
     key = (host, port, ae_title)
     with _ASSOC_GATE_LOCK:
-        _ASSOC_BUSY.discard(key)
+        owner = _ASSOC_BUSY.get(key)
+        me = threading.get_ident()
+        if owner is not None and owner[0] == me:
+            # Nested acquisition by the owner: unwind one level.
+            if owner[1] > 1:
+                _ASSOC_BUSY[key] = (me, owner[1] - 1)
+                return
+        _ASSOC_BUSY.pop(key, None)
         # Drop the throttle timestamp so the next wait starts clean.
         _ASSOC_GATE_LOG_LAST.pop(key, None)
 
@@ -1434,6 +1820,7 @@ def _associate_for_move(
     acse_timeout=15,
     outbound_assoc_attempts=3,
     study_ts_by_class=None,
+    partial_preflight=False,
 ):
     """Establish C-STORE association with target SCP (multi-context).
 
@@ -1468,6 +1855,10 @@ def _associate_for_move(
         acse_timeout: A-ASSOCIATE negotiation.
         outbound_assoc_attempts: total A-ASSOCIATE attempts (main), immediate.
         study_ts_by_class: dict[sop_class -> set[ts]] from pre-flight, or None.
+        partial_preflight: True when `study_ts_by_class` covers only PART of
+            the study. The registry fill-in (proposing classes the pre-flight
+            could not learn) runs only then; a complete pre-flight already
+            names the study's real class set.
 
     Returns:
         (assoc, accepted_contexts_map) tuple.
@@ -1480,6 +1871,13 @@ def _associate_for_move(
     ae.network_timeout = network_timeout
     ae.acse_timeout = acse_timeout
     ae.dimse_timeout = dimse_timeout
+    # `connection_timeout` is the ONLY bound on the raw TCP connect:
+    # pynetdicom does `socket.settimeout(assoc.connection_timeout)` before
+    # `connect()`, and the AE default (None) leaves a black-hole peer parked
+    # on the OS SYN timeout for minutes per attempt - while this worker holds
+    # the per-peer gate, so two such jobs block every C-MOVE. The ACSE
+    # timeout is a sane connect bound (same order as the negotiation itself).
+    ae.connection_timeout = acse_timeout
 
     # Proposal is shaped from the canonical order: uncompressed family first,
     # then compressed in the taxonomy order (RLE, JPEG lossless, JPEG-LS,
@@ -1497,6 +1895,35 @@ def _associate_for_move(
     has_preflight = bool(study_ts_by_class)
     if has_preflight:
         class_uids = sorted(study_ts_by_class.keys())
+        # A pre-flight that timed out or answered only partly covers a SUBSET
+        # of the classes. Proposing just that subset made every unlearned
+        # class fail with "no presentation context" - a whole SOP class
+        # silently dropped from the move because of a partial answer. Learn
+        # what we can and fall back to the registry for the rest.
+        #
+        # The fill-in runs ONLY on a PARTIAL pre-flight. Keying it on "a
+        # registry was supplied" meant the full registry was added to EVERY
+        # move: with a 60+ class registry the baseline pairs alone then ate
+        # the 128-context budget, `_trim_optional_ts` was left with a
+        # non-positive budget, and the study's OWN stored syntaxes (RLE,
+        # JPEG-LS, J2K) were trimmed away - so a compressed study on a
+        # passthrough server proposed only EVRLE/IVRLE and every instance
+        # failed the send-path decision.
+        if sop_registry is not None and partial_preflight:
+            known = set(class_uids)
+            missing = sorted(
+                uid
+                for uid in _proposed_ts_per_class(sop_registry)
+                if uid not in known
+            )
+            if missing:
+                logging.info(
+                    "[C-MOVE] partial pre-flight covers %d class(es); "
+                    "proposing %d registry class(es) alongside",
+                    len(known),
+                    len(missing),
+                )
+                class_uids = sorted(known | set(missing))
     else:
         class_uids = _proposed_ts_per_class(sop_registry)
     # Per-class optional (non-baseline) TS, in canonical ascending order, each
@@ -1523,14 +1950,16 @@ def _associate_for_move(
                 if t not in (ExplicitVRLittleEndian, ImplicitVRLittleEndian)
             ]
     flat = [tok for cls in per_class_optional.values() for tok in cls]
-    kept_tokens = set(_trim_optional_ts(len(class_uids), True, flat))
+    # NOTE: the optional-TS trim runs AFTER the whole-class drop below. It used
+    # to run here, against the FULL class list: with a large registry the
+    # baselines alone exceeded the budget, `_trim_optional_ts` got a
+    # non-positive budget and dropped every stored token - and the class drop
+    # that followed removed fill-in classes but brought no stored token back.
+    # Trim what actually survived, so the syntaxes a class really needs are
+    # only sacrificed when the surviving classes genuinely do not fit.
     proposals = {}
     for sop_uid in class_uids:
-        ts_list = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
-        for tok in per_class_optional[sop_uid]:
-            if tok in kept_tokens and tok[1] not in ts_list:
-                ts_list.append(tok[1])
-        proposals[sop_uid] = ts_list
+        proposals[sop_uid] = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
 
     # PS3.8 7.1.1.13: PCIDs are the odd bytes 1..255 -> at most 128
     # contexts, one reserved for Storage Commitment. Baselines alone can
@@ -1538,11 +1967,27 @@ def _associate_for_move(
     # classes from the END of the list (reverse registry priority) until
     # the budget fits. Never truncate a class's own baseline pair -
     # EVRLE/IVRLE are the refetch targets (spec R2).
+    #
+    # A class the pre-flight actually SAW is never a drop candidate: it is
+    # known to be in the study, so dropping it makes the move silently
+    # incomplete. The registry fill-in classes (CM7) are the ones dropped.
     budget = _MAX_CONTEXTS - 1  # Storage Commitment slot
+    protected = set(study_ts_by_class.keys()) if has_preflight else set()
+    if len(protected) * 2 > budget:
+        logging.warning(
+            "[C-MOVE] %d class(es) known to be in the study need %d baseline "
+            "contexts, over the %d budget - the excess may be dropped",
+            len(protected),
+            len(protected) * 2,
+            budget,
+        )
+        protected = set()
     while sum(len(v) for v in proposals.values()) > budget:
-        if not proposals:
+        candidates = [uid for uid in proposals if uid not in protected]
+        if not candidates:
             raise RuntimeError("presentation-context budget cannot fit")
-        dropped_cls, dropped_ts = proposals.popitem()
+        dropped_cls = candidates[-1]
+        dropped_ts = proposals.pop(dropped_cls)
         logging.info(
             "[C-MOVE] 128-context budget (PS3.8 7.1.1.13): dropped class "
             "%s (%d TS contexts) from the proposal",
@@ -1550,13 +1995,34 @@ def _associate_for_move(
             len(dropped_ts),
         )
 
+    # Optional-TS trim, over what SURVIVED the class drop: the classes still
+    # proposed keep their stored syntaxes as far as the budget allows.
+    survivors = set(proposals)
+    flat = [
+        tok for cls_uid, toks in per_class_optional.items() if cls_uid in survivors
+        for tok in toks
+    ]
+    kept_tokens = set(_trim_optional_ts(len(survivors), True, flat))
+    for tok in flat:
+        if tok in kept_tokens:
+            sop_uid, ts_uid, _kind = tok
+            if ts_uid not in proposals[sop_uid]:
+                proposals[sop_uid].append(ts_uid)
+
     # ----- add requested contexts -----
     contexts_req = 0
     for sop_uid in proposals:
         for ts_uid in proposals[sop_uid]:
             ae.add_requested_context(sop_uid, ts_uid)
             contexts_req += 1
-    contexts_dropped = len(flat) - len(kept_tokens)
+    contexts_dropped = len(
+        [
+            tok
+            for cls_uid, toks in per_class_optional.items()
+            for tok in toks
+            if cls_uid not in survivors
+        ]
+    ) + (len(flat) - len(kept_tokens))
 
     # Storage Commitment on the main association, as today (a separate SC
     # association burned ACSE timeouts; see _send_storage_commitment).
@@ -1666,6 +2132,25 @@ _LONG_VRS = {
     b"UT",
 }
 
+# The VRs that use the 12-byte header inside the FILE META group. pydicom's
+# own writer emits (0002,0000) UL and (0002,0001) OB with the 8-byte SHORT
+# header (verified against a dcmwrite() Part 10 file), so the meta group uses
+# this narrower set - using `_LONG_VRS` here made the walk demand four bytes
+# that the writer never wrote and stop after the group length.
+_META_LONG_VRS = {
+    b"OB",
+    b"OD",
+    b"OF",
+    b"OL",
+    b"OV",
+    b"OW",
+    b"SQ",
+    b"UC",
+    b"UN",
+    b"UR",
+    b"UT",
+}
+
 
 def _meta_data_start(dicom_bytes):
     """Preamble-aware start of the meta group: 132 (full preamble), 4
@@ -1680,7 +2165,13 @@ def _meta_data_start(dicom_bytes):
 def _walk_meta(dicom_bytes):
     """Walk group 0002 (explicit VR LE); return (data_start, elements,
     meta_end). Reader-side tolerance: the value skip is vlen + (vlen % 2),
-    so old externally-padded files keep parsing."""
+    so old externally-padded files keep parsing.
+
+    A TRUNCATED group ends the walk at the last element that parsed instead
+    of discarding the group: the caller replaces the whole group anyway, and
+    returning `meta_end = data_start` made it splice its new group in front of
+    the OLD one - leaving two group 0002 blocks in the file.
+    """
     data_start = _meta_data_start(dicom_bytes)
     pos = data_start
     elems = []
@@ -1690,7 +2181,7 @@ def _walk_meta(dicom_bytes):
             break
         elem = struct.unpack_from("<H", dicom_bytes, pos + 2)[0]
         vr = dicom_bytes[pos + 4 : pos + 6]
-        if vr in _LONG_VRS:
+        if vr in _META_LONG_VRS:
             if pos + 12 > len(dicom_bytes):
                 break
             vlen = struct.unpack_from("<I", dicom_bytes, pos + 8)[0]
@@ -1853,6 +2344,13 @@ def _extract_dataset_ui(dicom_bytes, elem, group=0x0008, implicit_vr=False):
     return None
 
 
+# PS3.10 7.1 Table 7.1-1: (0002,0012) Implementation Class UID is Type 1 - it
+# names the implementation that wrote the file. A single constant keeps every
+# repaired instance in one implementation family without inventing a per-build
+# UID (the version element (0002,0013) is Type 3 and is not emitted).
+_BRIDGE_IMPLEMENTATION_CLASS_UID = "1.2.826.0.1.3680043.10.1316"
+
+
 def _ensure_file_meta_bytes(dicom_bytes, sop_class_uid, sop_uid, ts_uid):
     """Return bytes whose meta group is the canonical ascending trio -
     (0002,0002) MediaStorageSOPClassUID, (0002,0003)
@@ -1860,6 +2358,10 @@ def _ensure_file_meta_bytes(dicom_bytes, sop_class_uid, sop_uid, ts_uid):
     Explicit VR LE UI with an even value length and the trailing NULL
     INSIDE the length (PS3.5 sec 6.2).
 
+    The group also carries the other Table 7.1-1 Type 1 elements: Group Length
+    (0002,0000) as the first element, Version (0002,0001) after it and
+    Implementation Class UID (0002,0012) after the transfer syntax - ascending
+    order is the encoding requirement (PS3.5 7.1).
     cltranscode-stored files have NO group 0002 at
     all, and the server's transcoded WADO response copies that gap.
     pynetdicom `send_c_store` then refuses the file and the whole C-MOVE
@@ -1901,12 +2403,36 @@ def _ensure_file_meta_bytes(dicom_bytes, sop_class_uid, sop_uid, ts_uid):
     )
     ts = ts_uid or "1.2.840.10008.1.2.1"
 
-    trio = b""
-    if resolved_sc:
-        trio += _ui_elem(0x0002, resolved_sc)
-    if resolved_si:
-        trio += _ui_elem(0x0003, resolved_si)
-    trio += _ui_elem(0x0010, ts)
+    # PS3.10 7.1 Table 7.1-1 marks SIX elements Type 1 in the File Meta
+    # Information: (0002,0000) Group Length, (0002,0001) Version,
+    # (0002,0002) Media Storage SOP Class UID, (0002,0003) Media Storage SOP
+    # Instance UID, (0002,0010) Transfer Syntax UID and (0002,0012)
+    # Implementation Class UID. The writer used to emit only the SOP/TS trio,
+    # so every file it repaired was a non-conformant Part 10 file.
+    body = b""
+    # (0002,0001) Version: OB, two bytes, bit 0 of the first byte set. OB is a
+    # LONG-VR: 8-byte tag+VR header, 2 reserved bytes, 4-byte length
+    # (PS3.5 7.1.2 Table 7.1-2), then the value - byte-for-byte what pydicom's
+    # own writer emits for this element.
+    body += (
+        struct.pack("<HH2sH", 0x0002, 0x0001, b"OB", 0)
+        + struct.pack("<I", 2)
+        + b"\x00\x01"
+    )
+    # (0002,0002) and (0002,0003) are Type 1 as well, so they are emitted even
+    # when no source value could be resolved: a group 0002 that omits either
+    # is non-conformant exactly like one that omits the group length. The
+    # fallback is the caller's argument and, failing that, an empty UID value -
+    # a receiver can still identify the file by the dataset, whereas a missing
+    # element is a Part 10 conformance failure.
+    body += _ui_elem(0x0002, resolved_sc or sop_class_uid or "")
+    body += _ui_elem(0x0003, resolved_si or sop_uid or "")
+    body += _ui_elem(0x0010, ts)
+    body += _ui_elem(0x0012, _BRIDGE_IMPLEMENTATION_CLASS_UID)    # (0002,0000) is the number of bytes AFTER its own value field, so it is
+    # written last and computed from the body. Encoded exactly the way pydicom
+    # writes it: UL is a SHORT-VR element in this writer's grammar (see
+    # `_walk_meta`), so 8-byte header + 4-byte value.
+    trio = struct.pack("<HH2sHI", 0x0002, 0x0000, b"UL", 4, len(body)) + body
 
     if dicom_bytes[data_start:meta_end] == trio:
         return dicom_bytes
@@ -2032,6 +2558,12 @@ def _stream_and_send_study(
     _skip_ids=None,
     _resumed=False,
     _report_lost=False,
+    _prior_completed=0,
+    _prior_failed=0,
+    _prior_total=0,
+    request_level="",
+    request_series_uid="",
+    request_sop_uid="",
     expose_rejected=False,
     qa_url="",
 ):
@@ -2073,6 +2605,10 @@ def _stream_and_send_study(
     instance UIDs that were seen and not delivered in THIS pass (PS3.4
     C.4.2.1.4.2 material); the driver reconciles the (0008,0058) tail across
     passes from the study-level list.
+
+    The returned counters describe THIS pass. `_prior_*` carries what earlier
+    passes delivered and is used only for the LIVE progress row, so the
+    poller never sees a resumed pass reset the job to 0 of N.
     """
     completed = 0
     failed = 0
@@ -2133,17 +2669,39 @@ def _stream_and_send_study(
             "bytes only, not-accepted instances fail honestly",
         )
 
-    # ONE study-level streaming GET WITHOUT ?transferSyntax=.
+    # ONE streaming GET WITHOUT ?transferSyntax=, scoped to the requested
+    # level (PS3.4 C.4.2.1.2): STUDY fetches the study, SERIES the named
+    # series, IMAGE the single instance. Without the scope a SERIES C-MOVE
+    # pushed every instance of the study to the viewer.
     accept_value = "multipart/related; type=application/dicom"
-    # The study UID goes into the path through `_quote`: it is client input, and
+    _base = service_base_url(clarus_url, qa_url, expose_rejected)
+    # Every UID goes into the path through `_quote`: they are client input, and
     # `1.2?a=b` or `../x` in one would steer the GET at a different resource.
-    url = (
-        f"{service_base_url(clarus_url, qa_url, expose_rejected)}"
-        f"/studies/{_quote(study_uid, safe='')}"
-    )
+    _study_path = f"/studies/{_quote(study_uid, safe='')}"
+    if request_level == "IMAGE" and request_series_uid and request_sop_uid:
+        url = (
+            f"{_base}{_study_path}"
+            f"/series/{_quote(request_series_uid, safe='')}"
+            f"/instances/{_quote(request_sop_uid, safe='')}"
+        )
+    elif request_level == "SERIES" and request_series_uid:
+        url = f"{_base}{_study_path}/series/{_quote(request_series_uid, safe='')}"
+    else:
+        url = f"{_base}{_study_path}"
     headers = {"Accept": accept_value}
 
-    logging.info("[C-MOVE] Streaming study %s from DICOMweb server...", study_uid)
+    logging.info(
+        "[C-MOVE] Streaming %s from DICOMweb server...",
+        (
+            f"instance {request_sop_uid} of series {request_series_uid}"
+            if request_level == "IMAGE"
+            else (
+                f"series {request_series_uid}"
+                if request_level == "SERIES"
+                else f"study {study_uid}"
+            )
+        ),
+    )
     resp = requests.get(
         url, headers=headers, timeout=http_timeout, stream=True, cert=tls
     )
@@ -2155,7 +2713,10 @@ def _stream_and_send_study(
     # backpressure is the bounded queue (4 parts ~ 20 MB, FIFO). The sender
     # loop below is unchanged; every early return must stop the reader thread.
     prefetch = PartPrefetcher(
-        _stream_multipart_instances(resp, spill_threshold=spill_threshold)
+        _stream_multipart_instances(resp, spill_threshold=spill_threshold),
+        # Closing the response is what wakes a reader parked inside
+        # `iter_content`; draining the queue only frees one blocked in `put`.
+        on_stop=resp.close,
     ).start()
 
     import os as _os
@@ -2249,12 +2810,6 @@ def _stream_and_send_study(
                 rs_err,
             )
             status = None
-            _rtmp_size = None
-        else:
-            try:
-                _rtmp_size = _os.path.getsize(_rtmp)
-            except OSError:
-                _rtmp_size = None
         finally:
             try:
                 _os.unlink(_rtmp)
@@ -2264,10 +2819,12 @@ def _stream_and_send_study(
             cstore_outbound_duration.labels(peer=ae_label(peer_ae)).observe(
                 time.perf_counter() - _t0
             )
-            if _rtmp_size is not None:
-                bytes_total.labels(direction="tx", peer=ae_label(peer_ae)).inc(
-                    _rtmp_size
-                )
+            # bytes_total is NOT incremented here: the main send loop counts
+            # `part_size` once when the peer answers 0x0000, and that is the
+            # only place allowed to - a send-time count here double-counted
+            # every refetched instance (once with the refetched size, once
+            # with the stored size) and also counted instances the peer
+            # rejected. bytes_total describes accepted traffic.
         except Exception:
             pass
         if status is None:
@@ -2464,9 +3021,6 @@ def _stream_and_send_study(
                             cstore_outbound_duration.labels(
                                 peer=ae_label(peer_ae)
                             ).observe(time.perf_counter() - _t0)
-                            bytes_total.labels(
-                                direction="tx", peer=ae_label(peer_ae)
-                            ).inc(part_size)
                         except Exception:
                             pass
                     elif decision == "refetch_main":
@@ -2501,9 +3055,29 @@ def _stream_and_send_study(
                         )
                         failed += 1
                         continue
-                    if status is None:
-                        failed += 1
-                        continue
+                    if not status or "Status" not in status:
+                        # pynetdicom 3.0.4 `send_c_store` returns an EMPTY
+                        # Dataset (not None) when the association is gone. A
+                        # falsy status or one without a Status element says
+                        # nothing about the instance: counting it failed
+                        # reported a SOP the viewer may hold, and never armed
+                        # the resume the owner of this defect exists for.
+                        logging.warning(
+                            "[DIMSE-OUT] %s:%d: association LOST after %d/%d "
+                            "C-STORE (no response). %s",
+                            getattr(assoc, "ae_title", "?"),
+                            getattr(assoc, "port", 0),
+                            completed,
+                            total if total else idx + 1,
+                            (
+                                "Resuming once."
+                                if _report_lost and not _resumed
+                                else "Viewer must re-request or resume fails."
+                            ),
+                        )
+                        prefetch.stop()
+                        resp.close()
+                        return _out(lost=True)
                 except (TypeError, ValueError) as send_err:
                     err_msg = str(send_err)
                     if "presentation context" in err_msg.lower():
@@ -2582,12 +3156,46 @@ def _stream_and_send_study(
                     if spill_path is not None:
                         _unlink_quiet(spill_path)
 
-                if status and status.Status == 0x0000:
+                if not status or "Status" not in status:
+                    # Same reading as above: a falsy status or one without a
+                    # Status element is a lost association, not a rejected
+                    # instance. Leave it UNCOUNTED (neither completed nor
+                    # failed) and hand control to the resume driver, which
+                    # re-sends it while skipping the delivered prefix - so
+                    # nothing is lost and nothing is double counted.
+                    logging.warning(
+                        "[DIMSE-OUT] %s:%d: association LOST after %d/%d "
+                        "C-STORE (no response). %s",
+                        getattr(assoc, "ae_title", "?"),
+                        getattr(assoc, "port", 0),
+                        completed,
+                        total if total else idx + 1,
+                        (
+                            "Resuming once."
+                            if _report_lost and not _resumed
+                            else "Viewer must re-request or resume fails."
+                        ),
+                    )
+                    prefetch.stop()
+                    resp.close()
+                    return _out(lost=True)
+                if status.Status == 0x0000:
                     completed += 1
                     if sent_via_refetch:
                         transcoded += 1
                     else:
                         passthrough += 1
+                    # A-M-03: the byte counter describes bytes the peer ACCEPTED.
+                    # Counting at send time recorded attempts - a resumed instance
+                    # was counted again, and the ambiguous-timeout branch counted
+                    # a send whose outcome nobody observed - under a metric name
+                    # the dashboards read as delivered traffic.
+                    try:
+                        bytes_total.labels(
+                            direction="tx", peer=ae_label(peer_ae)
+                        ).inc(part_size)
+                    except Exception:
+                        pass
                     # Bridge: track successfully sent SOPs for Storage Commitment
                     if sop_uid:
                         sent_sop_uids.append((sop_class_uid, sop_uid))
@@ -2596,7 +3204,7 @@ def _stream_and_send_study(
                     logging.warning(
                         "[C-MOVE] C-STORE failed for instance %d: status=%s",
                         idx + 1,
-                        _dimse_status_name(status.Status if status else None),
+                        _dimse_status_name(status.Status),
                     )
             except (requests.RequestException, OSError, ValueError, KeyError) as e:
                 failed += 1
@@ -2617,8 +3225,48 @@ def _stream_and_send_study(
                     exc_info=True,
                 )
 
-            # Bridge: update job progress counters
-            move_jobs.update_job_progress(job_id, completed, failed, total)
+            # Bridge: update job progress counters.
+            #
+            # The RESUMED pass reports the UNION with what pass 1 delivered,
+            # not its own zero-based counters. A resumed pass restarts
+            # `completed` at 0 because it skips the delivered prefix, so
+            # writing it verbatim told the poller "0 of N delivered" - and a
+            # poll timeout there answered 0xC000 for a study whose first pass
+            # had delivered most of it. The driver still reconciles the final
+            # numbers; this only keeps the LIVE row honest, which is what the
+            # poller reads.
+            #
+            # `completed` sums because pass 2 counts only what it added; the
+            # resumed pass already covered the full study (`total = idx + 1`
+            # is set BEFORE the skip), so `total` and `failed` must not be
+            # SUMMED with the prior pass - a re-failed instance is the same
+            # failure, not a second one, and `total + prior` double-counts
+            # the skipped prefix.
+            move_jobs.update_job_progress(
+                job_id,
+                completed + _prior_completed,
+                max(failed, _prior_failed) if _resumed else failed,
+                max(total, _prior_total) if _resumed else total,
+            )
+
+    except (requests.RequestException, OSError, ValueError, KeyError) as _stream_err:
+        # The READ failed, not a single instance: `for part, idx, part_ts in
+        # prefetch` raises the reader thread's error here (a truncated chunked
+        # body, a missing Content-Length, a socket reset mid-part). Letting it
+        # escape to the driver cost it this pass's `sent_sop_uids`, so the
+        # resume re-sent everything already delivered and a pass without a
+        # resume answered 0xC000 ("nothing delivered") for a study that had
+        # moved most of its instances. Returning `_out(lost=True)` hands the
+        # partial delivered list to the caller, which reconciles by union.
+        logging.warning(
+            "[C-MOVE] Job #%d: stream read failed after %d delivered (%s) - "
+            "reporting the partial pass so the resume can continue",
+            job_id,
+            completed,
+            _stream_err,
+        )
+        logging.debug("[C-MOVE] stream read traceback:", exc_info=True)
+        return _out(lost=True)
 
     finally:
         prefetch.stop()
@@ -2719,6 +3367,9 @@ def _execute_cmove_job(
     spill_threshold=SPILL_THRESHOLD,
     expose_rejected=False,
     qa_url="",
+    request_level="",
+    request_series_uid="",
+    request_sop_uid="",
 ):
     """Execute C-MOVE: stream study from Clarus, send instances to target SCP.
 
@@ -2746,26 +3397,38 @@ def _execute_cmove_job(
                 "[C-MOVE] Unknown Move Destination: %s",
                 move_dest_ae,
             )
-            move_jobs.finish_job(
+            if move_jobs.finish_job(
                 job_id,
                 success=False,
                 error_message=f"Unknown Move Destination: {move_dest_ae}",
-            )
-            move_jobs_counter.labels(status="failed").inc()
+            ):
+                move_jobs_counter.labels(status="failed").inc()
             return
         target_host, target_port = target
 
     assoc = None
+    gate_held = False
     try:
         # Per-peer job gate: serialize jobs to the same peer (busy exclusion).
         # No post-job cooldown: the next job starts immediately once the
         # previous one to this peer ends. Taken inside the try so the
         # finally releases it on every path, including a pre-flight raise.
-        _job_gate_enter(target_host, target_port, move_dest_ae)
+        # The wait gives up on shutdown or on cancellation of THIS job: a
+        # stopped bridge must not block its worker join on a slow peer.
+        def _give_up_gate():
+            if _shutdown_requested.is_set():
+                return True
+            try:
+                return bool(move_jobs.is_job_cancelled(job_id))
+            except Exception:
+                return False
+
+        _job_gate_enter(target_host, target_port, move_dest_ae, _give_up_gate)
+        gate_held = True
 
         # -- Pre-flight: learn each class's stored TS BEFORE the association
         # (best effort - any failure degrades to the default proposal). --
-        study_ts_by_class = _preflight_study_ts_by_class(
+        _pre = _preflight_study_ts_by_class(
             study_uid,
             clarus_url,
             http_timeout=2.0,
@@ -2774,6 +3437,7 @@ def _execute_cmove_job(
             expose_rejected=expose_rejected,
             qa_url=qa_url,
         )
+        study_ts_by_class, partial_preflight = _split_preflight(_pre)
 
         try:
             assoc, accepted_contexts_map = _associate_for_move(
@@ -2787,19 +3451,19 @@ def _execute_cmove_job(
                 acse_timeout=outbound_acse_timeout,
                 outbound_assoc_attempts=outbound_assoc_attempts,
                 study_ts_by_class=study_ts_by_class,
+                partial_preflight=partial_preflight,
             )
         except RuntimeError as e:
             logging.error("[C-MOVE] %s", e)
             logging.debug("[C-MOVE] Association traceback:", exc_info=True)
             move_jobs.record_scp_failure(move_dest_ae, host=target_host)
-            move_jobs.finish_job(job_id, success=False, error_message=str(e))
-            move_jobs_counter.labels(status="failed").inc()
+            if move_jobs.finish_job(job_id, success=False, error_message=str(e)):
+                move_jobs_counter.labels(status="failed").inc()
             return
 
         server_ts_list = _get_clarus_transfer_syntaxes(clarus_url, tls=tls)
 
-        global _suppress_pynetdicom
-        _suppress_pynetdicom = True
+        _suppress_state.suppress = True
         # -- Resume driver: at most ONE resume. The whole study is
         # re-streamed on a FRESH GET for the resumed pass (a conformant
         # continuation; PS3.7 9.1.4.2(e) / PS3.8 9.1.4 Note 2 + 9.1.5), and
@@ -2808,13 +3472,17 @@ def _execute_cmove_job(
         # delivered sets at the end (never sum regression). --
         study_sop_uids = None
         try:
-            # Authoritative study SOP list for the (0008,0058) tail ++ total.
+            # Authoritative SOP list for the (0008,0058) tail ++ total, scoped
+            # to the requested level (PS3.4 C.4.2.1.2).
             study_sop_uids = _study_sop_uids(
                 study_uid,
                 clarus_url,
                 tls=tls,
                 expose_rejected=expose_rejected,
                 qa_url=qa_url,
+                request_level=request_level,
+                request_series_uid=request_series_uid,
+                request_sop_uid=request_sop_uid,
             )
         except Exception:
             study_sop_uids = None
@@ -2822,6 +3490,11 @@ def _execute_cmove_job(
         cancelled = False
         no_common_ts = False
         resumed_lost = False
+        # Bound BEFORE the passes: the reconciliation below reads it on every
+        # path, including a pass 2 that never ran (no resume, or a resume whose
+        # re-association failed). A name that only exists inside the pass-2
+        # try is read through a default and hides exactly this kind of gap.
+        _fs2 = []
 
         # Pass 1 (initial).
         try:
@@ -2841,6 +3514,9 @@ def _execute_cmove_job(
                 _skip_ids=None,
                 _resumed=False,
                 _report_lost=True,
+                request_level=request_level,
+                request_series_uid=request_series_uid,
+                request_sop_uid=request_sop_uid,
                 expose_rejected=expose_rejected,
                 qa_url=qa_url,
             )
@@ -2850,11 +3526,36 @@ def _execute_cmove_job(
             no_common_ts = _nc1
             resumed_lost = _lost1
         except Exception:
+            # A mid-stream raise does not undo what was already delivered. The
+            # counters live in `_c1`/`_f1`/`_t1` only once the call RETURNS, so
+            # resetting them to zero here threw away the progress pass 1 had
+            # made: the job then finished reporting 0 delivered and 0 failed
+            # for a study that had, in fact, moved. Read the partial counters
+            # back off the job record and keep them so the failure propagates
+            # with an honest tally.
+            logging.error(
+                "[C-MOVE] Job #%d: pass 1 raised mid-stream - preserving the "
+                "progress counted so far",
+                job_id,
+            )
+            try:
+                # (completed_instances, total_instances, status), the same
+                # counters the 0xFF00 poll reports and the final RSP sums.
+                _c1, _t1, _ = move_jobs.get_job_progress(job_id)
+                _f1 = max(0, _t1 - _c1)
+            except Exception:
+                _c1, _f1, _t1 = 0, 0, 0
             sent_sop_uids = []
+            _fs1 = []
             cancelled = False
             no_common_ts = False
-            resumed_lost = False
-            raise
+            # Do NOT re-raise: the bare `raise` let the worker's outer handler
+            # finish the job without `set_job_failed_sops`, so the final
+            # 0xB000/0xC000 carried an EMPTY (0008,0058) even though
+            # instances were lost. Marking the pass lost routes into the
+            # reconciliation below, which builds the failed list from the
+            # study SOP set and persists it.
+            resumed_lost = True
 
         # Resume ONCE on association loss (not on cancel/shutdown/no-common).
         if resumed_lost and not cancelled and not no_common_ts:
@@ -2880,6 +3581,7 @@ def _execute_cmove_job(
                     acse_timeout=outbound_acse_timeout,
                     outbound_assoc_attempts=outbound_assoc_attempts,
                     study_ts_by_class=study_ts_by_class,
+                    partial_preflight=partial_preflight,
                 )
             except RuntimeError as e:
                 # Resume's re-association failed -> GIVE_UP (honest partial).
@@ -2909,6 +3611,12 @@ def _execute_cmove_job(
                         _skip_ids=delivered1,
                         _resumed=True,
                         _report_lost=True,
+                        _prior_completed=_c1,
+                        _prior_failed=_f1,
+                        _prior_total=_t1,
+                        request_level=request_level,
+                        request_series_uid=request_series_uid,
+                        request_sop_uid=request_sop_uid,
                         expose_rejected=expose_rejected,
                         qa_url=qa_url,
                     )
@@ -2936,29 +3644,78 @@ def _execute_cmove_job(
         delivered = {u for _c, u in sent_sop_uids if u}
         completed = len(delivered)
         _obs_total_p1 = _t1 if not no_common_ts else 0
+        # The resumed pass observed the study AGAIN on a fresh GET. Its total
+        # is the widest view the job ever got, and on a failed re-association
+        # `_t2` was never assigned - the binding stays inside the `try` that
+        # raised, so it is read through a default instead of a NameError.
+        _obs_total_p2 = (locals().get("_t2", 0) or 0) if not no_common_ts else 0
         if study_sop_uids is not None and study_sop_uids:
             study_uids_set = set(study_sop_uids)
             total = len(study_uids_set)
             ordered_uids = study_sop_uids
         else:
             # No authoritative list (degradation): total = largest pass total.
-            total = max(_obs_total_p1, completed)
+            # Pass 2 is included ONLY when it actually ran: a resumed job that
+            # gave up mid-study still saw the rest of the study on its fresh
+            # GET, and ignoring that total reported 0 failures for a job whose
+            # GIVE_UP is the one thing we know about it (PS3.4 C.4.2.1.4.2:
+            # the final status must be honest about undelivered instances).
+            total = max(_obs_total_p1, _obs_total_p2, completed)
             ordered_uids = None
         if study_sop_uids is not None and study_sop_uids:
             failed_sop_uids = [u for u in ordered_uids if u not in delivered]
         else:
-            # Degrade to the per-attempt failed sets when present, else []. If
-            # a single (non-resumed) pass ran, use its per-instance failed
-            # list (exact); otherwise list nothing conclusive (honest).
-            failed_sop_uids = sorted(_fs1) if not resumed_lost else []
-        # PS3.4 C.4.2.1.4.2: the failure count is the number of instances that
-        # were seen and NOT delivered, which is exactly the (0008,0058) list.
-        # Deriving it as `total - completed` counted every instance that never
-        # reached this pass at all as a failure, so a resumed job reported
-        # failures it never observed.
+            # Degrade to the per-attempt failed sets when present, else [].
+            #
+            # Both passes lose instances: _fs1 and _fs2 still name what each
+            # pass OBSERVED as failed, so dropping them left (0008,0058) EMPTY
+            # on a 0xB000 - PS3.4 C.4.2.1.4.2 requires the list on a Failure,
+            # Warning or Cancel final. The union may be incomplete (an
+            # unobserved tail cannot be named), but it must not be empty when
+            # the status says instances were lost.
+            #
+            # Subtracting `delivered` is what makes the union honest: each
+            # pass reports `seen in THIS pass minus delivered in THIS pass`,
+            # so an instance lost in pass 1 and delivered in pass 2 is still
+            # in _fs1, and an instance delivered in pass 1 and skipped by
+            # pass 2 is in _fs2 (a skipped instance is not in pass 2's sent
+            # list). Naming either in (0008,0058) answered 0xB000 for a
+            # complete transfer and skipped Storage Commitment.
+            observed_failed = set(_fs1) | set(_fs2)
+            # If nothing was ever OBSERVED failing the list stays empty: no UID
+            # may be invented, and the floors below still keep the status
+            # honest. An empty list here is the best available answer, not an
+            # oversight.
+            failed_sop_uids = sorted(
+                u for u in observed_failed if u and u not in delivered
+            )
+        # PS3.4 C.4.2.1.4.2: the failure count is the number of instances
+        # that were seen and NOT delivered, which is exactly the (0008,0058)
+        # list. Deriving it as `total - completed` counted every instance
+        # that never reached this pass at all as a failure, so a resumed job
+        # reported failures it never observed.
         failed = len(failed_sop_uids)
         # Ensure total never falls below the delivered count.
         total = max(total, completed)
+        # Lower bound: an instance whose SOP UID never parsed (empty UID)
+        # never entered seen_sop_uids / _fs1, so len(failed_sop_uids) can be
+        # 0 while the study still holds more instances than were delivered -
+        # which would answer 0x0000 for a study with losses. The gap between
+        # what the study holds and what was delivered is the honest floor.
+        failed = max(failed, total - completed)
+
+        # Lower bound on the failure count. With no authoritative list the
+        # failed tail cannot be named from `_fs1`/`_fs2`, so the job could
+        # claim 0 failures while `resumed_lost` says the study was cut short:
+        # at least one instance is unaccounted for, and PS3.4 C.4.2.1.4.2
+        # forbids answering 0x0000 for a study with losses.
+        if resumed_lost and not failed and not (study_sop_uids or []):
+            failed = 1
+            logging.info(
+                "[C-MOVE] Job #%d: no authoritative SOP list and the resume "
+                "failed - reporting at least one undelivered instance",
+                job_id,
+            )
 
         # 0709: persist the (0008,0058) Failed SOP Instance UID List so the
         # C-MOVE generator can attach it to the final Failed/Warning/Cancel
@@ -2968,6 +3725,17 @@ def _execute_cmove_job(
         except Exception:
             # Best-effort: the progress/status path must not fail on logging.
             logging.debug("[C-MOVE] set_job_failed_sops failed for job #%d", job_id)
+
+        # Store the RECONCILED counters before the job is finished. The last
+        # write so far came from _stream_and_send_study, which reports the
+        # current pass only: after a resume pass 2 restarts `completed` at 0, so
+        # a job that delivered 100 instances and then failed its first unsent
+        # one was stored as completed=0 and the reactor answered 0xC000 ("no
+        # SOP instances delivered") although 100 had arrived.
+        try:
+            move_jobs.update_job_progress(job_id, completed, failed, total)
+        except Exception as e:
+            logging.debug("[C-MOVE] reconciled progress write failed: %s", e)
 
         if no_common_ts:
             # No common transfer syntax: the job ends failed with zero slices
@@ -2979,22 +3747,25 @@ def _execute_cmove_job(
                 "job ends failed, 0 slices, C-MOVE-RSP is a Failure (0xC000)",
                 job_id,
             )
-            move_jobs.finish_job(
+            if move_jobs.finish_job(
                 job_id,
                 success=False,
                 error_message="No common transfer syntax between viewer and server",
-            )
-            move_jobs_counter.labels(status="failed").inc()
+            ):
+                move_jobs_counter.labels(status="failed").inc()
             return
 
         if cancelled:
             if move_jobs.is_job_cancelled(job_id):
-                move_jobs.finish_job(
+                finished = move_jobs.finish_job(
                     job_id, success=False, error_message="Cancelled by SCU"
                 )
             else:
-                move_jobs.finish_job(job_id, success=False, error_message="Shutdown")
-            move_jobs_counter.labels(status="failed").inc()
+                finished = move_jobs.finish_job(
+                    job_id, success=False, error_message="Shutdown"
+                )
+            if finished:
+                move_jobs_counter.labels(status="failed").inc()
             return
 
         # -- Storage Commitment after successful C-MOVE --
@@ -3004,7 +3775,11 @@ def _execute_cmove_job(
         # negotiated in the MAIN association (_associate_for_move requests
         # it). Viewers without SC (MicroDicom) burned ACSE timeouts when a
         # separate SC-only association was opened - skip instead of trying.
-        if failed == 0 and total > 0:
+        # A failed re-association leaves `assoc` None (released above and only
+        # re-created on success), so reading `accepted_contexts` here would
+        # raise AttributeError out of the worker and lose the honest partial
+        # result the job already earned.
+        if failed == 0 and total > 0 and assoc is not None:
             if storage_commit_after_move and sent_sop_uids:
                 sc_negotiated = any(
                     str(ctx.abstract_syntax) == StorageCommitmentPushModel
@@ -3024,6 +3799,7 @@ def _execute_cmove_job(
                             target_port,
                             sent_sop_uids,
                             bridge_ae_title,
+                            assoc=assoc,
                         )
                     except Exception as e:
                         logging.warning(
@@ -3043,12 +3819,16 @@ def _execute_cmove_job(
 
         # -- Finish job --
         job_success = failed == 0 and total > 0
-        move_jobs.finish_job(
+        if move_jobs.finish_job(
             job_id,
             success=job_success,
             error_message=f"{completed} sent, {failed} failed" if failed > 0 else None,
-        )
-        move_jobs_counter.labels(status="completed" if job_success else "failed").inc()
+        ):
+            # Count only when THIS call finished the job: the poll reactor
+            # can finish it first, and a second bump would double-count.
+            move_jobs_counter.labels(
+                status="completed" if job_success else "failed"
+            ).inc()
         logging.info(
             "[C-MOVE] Job #%d finished: %d/%d success, %d failed",
             job_id,
@@ -3075,15 +3855,23 @@ def _execute_cmove_job(
         logging.debug(
             "[C-MOVE] Download/stream traceback for job #%d:", job_id, exc_info=True
         )
-        move_jobs.finish_job(
+        if move_jobs.finish_job(
             job_id, success=False, error_message=f"Download failed: {e}"
+        ):
+            move_jobs_counter.labels(status="failed").inc()
+    except _AssocGateAborted:
+        # Bridge stopping (or this job cancelled) while the peer was busy.
+        # Not a peer failure: the job stays resumable, so leave the
+        # consecutive-failure counter alone.
+        logging.info(
+            "[C-MOVE] Job #%d abandoned while waiting for %s", job_id, move_dest_ae
         )
-        move_jobs_counter.labels(status="failed").inc()
     finally:
-        _suppress_pynetdicom = False
+        _suppress_state.suppress = False
         _release_or_abort(assoc)
         # Release the peer gate so the next job to this peer can start.
-        _job_gate_exit(target_host, target_port, move_dest_ae)
+        if gate_held:
+            _job_gate_exit(target_host, target_port, move_dest_ae)
 
 
 # ---------------------------------------------------------------------------
@@ -3119,8 +3907,18 @@ def _cmove_worker(
         logging.info("[C-MOVE] Worker-%d started", worker_id)
 
         while not _shutdown_requested.is_set():
-            # Bridge: pick next pending job, LIMIT 1
-            job = move_jobs.pick_pending_job()
+            # Bridge: pick next pending job, LIMIT 1, skipping a peer another
+            # worker is already streaming to. Claiming a busy peer's job and
+            # handing it back parked every OTHER pending job behind it (the
+            # handback kept the row's created_at, so the next pick took the
+            # same busy peer again) and burned an UPDATE+commit twice a
+            # second for the whole transfer. Skipping at pick time leaves the
+            # row pending for the other workers to see.
+            job = move_jobs.pick_pending_job(
+                skip=lambda host, port, ae: bool(host)
+                and bool(port)
+                and _peer_is_busy(host, int(port), ae),
+            )
             if job is None:
                 # pick_pending_job() already waited via Condition
                 continue
@@ -3174,6 +3972,9 @@ def _cmove_worker(
                     tls=tls,
                     expose_rejected=job_expose_rejected,
                     qa_url=qa_url,
+                    request_level=job.get("request_level", ""),
+                    request_series_uid=job.get("request_series_uid", ""),
+                    request_sop_uid=job.get("request_sop_uid", ""),
                 )
             except Exception as e:
                 logging.error(
@@ -3182,8 +3983,8 @@ def _cmove_worker(
                     job_id,
                     e,
                 )
-                move_jobs.finish_job(job_id, success=False, error_message=str(e))
-                move_jobs_counter.labels(status="failed").inc()
+                if move_jobs.finish_job(job_id, success=False, error_message=str(e)):
+                    move_jobs_counter.labels(status="failed").inc()
             finally:
                 # Bridge: clear cancel callback after job completes
                 move_jobs.clear_job_callback(job_id)
@@ -3212,10 +4013,16 @@ def _cmove_worker(
 # ---------------------------------------------------------------------------
 # Bridge: periodic cleanup of old C-MOVE jobs
 # ---------------------------------------------------------------------------
-def _cmove_cleanup_worker(move_jobs, max_age_hours=24):
+def _cmove_cleanup_worker(move_jobs, max_age_hours=24, commit_tracker_holder=None):
     """Background thread: delete success/failed jobs older than max_age_hours.
 
-    Runs once per hour. Stops when _shutdown_requested is set.
+    Runs once per hour. Stops when _shutdown_requested is set. The same cycle
+    also expires abandoned Storage Commitment batches (R10): they can never be
+    delivered, so retaining them forever only grows `commit_jobs`.
+
+    `commit_tracker_holder` is a one-slot list, not the tracker itself: the
+    tracker is constructed after this thread starts, and re-reading the slot
+    each cycle is simpler than reordering the startup sequence around it.
     """
     max_age_seconds = max_age_hours * 3600
     logging.info(
@@ -3229,6 +4036,14 @@ def _cmove_cleanup_worker(move_jobs, max_age_hours=24):
         if _shutdown_requested.is_set():
             break
         move_jobs.cleanup_old_jobs(max_age_seconds)
+        tracker = commit_tracker_holder[0] if commit_tracker_holder else None
+        if tracker is not None:
+            try:
+                tracker.purge_abandoned()
+            except Exception as e:
+                # The retention sweep must not kill the C-MOVE cleanup that
+                # shares the cycle.
+                logging.error("[COMMIT] abandoned purge failed: %s", e)
         logging.debug("[C-MOVE] Old job cleanup completed")
 
     logging.info("[C-MOVE] Cleanup worker stopped")

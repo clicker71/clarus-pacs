@@ -10,6 +10,7 @@ RSP->report loop).
 """
 
 import logging
+from urllib.parse import quote
 
 import httpx
 
@@ -37,9 +38,15 @@ def _sop_confirm(sop_uid, sop_index, clarus_url, http_timeout, tls=None):
     study_uid = entry["study_uid"]
     series_uid = entry["series_uid"]
     base = dicomweb_base(clarus_url)
+    # `safe=""` per segment: a UID is one path element, so `/`, `?` and `#`
+    # inside it must not change which resource the GET addresses
+    # (PS3.18 10.1 resource paths). Unescaped, a crafted UID of `1.2?a=b`
+    # pointed the verification at a DIFFERENT resource, and a 200 there
+    # confirmed a SOP the server never stored.
     url = (
-        f"{base}/studies/{study_uid}"
-        f"/series/{series_uid}/instances/{sop_uid}/metadata"
+        f"{base}/studies/{quote(study_uid, safe='')}"
+        f"/series/{quote(series_uid, safe='')}/instances/{quote(sop_uid, safe='')}"
+        "/metadata"
     )
     try:
         resp = _wado_metadata_request(url, http_timeout, tls=tls)
@@ -82,6 +89,11 @@ def _register_commit(
     closes. The destination port therefore comes from the peer config (the same
     lookup C-MOVE uses) and nowhere else. A peer that cannot be resolved is
     reported as skipped rather than guessed at.
+
+    Returns True when the batch was registered (its N-EVENT-REPORT will be
+    pushed); False when there is no resolvable requestor address/port, so the
+    caller can refuse the request instead of acknowledging a commitment whose
+    report can never go out.
     """
     requestor = getattr(getattr(event, "assoc", None), "requestor", None)
     address = getattr(requestor, "address", None)
@@ -95,12 +107,23 @@ def _register_commit(
             logging.warning("[N-ACTION] resolve_scp for %s failed: %s", calling_ae, e)
 
     if address and port_:
-        commit_tracker.register(tx_uid, calling_ae, address, int(port_), sop_list)
-    else:
-        logging.warning(
-            "[N-ACTION] No requestor address/port for tx=%s - report skipped",
-            tx_uid,
-        )
+        try:
+            commit_tracker.register(tx_uid, calling_ae, address, int(port_), sop_list)
+        except Exception as e:
+            # Persistence failed, so the commitment cannot be honoured later.
+            # Answer Failure (0x0110) instead of acknowledging a request whose
+            # N-EVENT-REPORT would never be pushed (PS3.4 J.3.3.1).
+            logging.error(
+                "[N-ACTION] tx=%s could not be registered: %s", tx_uid, e
+            )
+            return False
+        return True
+
+    logging.warning(
+        "[N-ACTION] No requestor address/port for tx=%s - report skipped",
+        tx_uid,
+    )
+    return False
 
 
 def handle_n_action(
@@ -137,16 +160,16 @@ def handle_n_action(
         return 0xC000, None
 
     # Validate action_type (1 = Storage Commitment Request).
-    # 0x0122 "No such action" is part of the PS3.7 general-refusal set - a
-    # clean refusal, NOT an implementation 0xC2xx code a modality is not
-    # required to understand.
+    # 0x0123 "No Such Action" (PS3.7): this action_type is not one the bridge
+    # implements. 0x0122 would claim the SOP CLASS is unsupported - a different
+    # refusal - so it must not be used here.
     action_type = getattr(event, "action_type", None)
     if action_type is not None and action_type != 1:
         logging.warning(
             "[N-ACTION] Unsupported action_type=%s (only type 1 supported)",
             action_type,
         )
-        return 0x0122, None
+        return 0x0123, None
 
     calling_ae = event.assoc.requestor.ae_title
     logging.debug("[DIMSE] N-ACTION from %s", calling_ae)
@@ -164,10 +187,12 @@ def handle_n_action(
         logging.warning("[N-ACTION] Parse error: %s", e)
         return 0x0110, None
     except Exception as e:
-        # 0x0213 Processing Failure (general-refusal set).
+        # 0x0110 Processing Failure: the request cannot be parsed and will
+        # never succeed, so the SCU must not read this as a temporary
+        # condition (0x0213 Resource Limitation invites a retry).
         logging.error("[N-ACTION] Unexpected parse error: %s", e)
         logging.debug("[N-ACTION] Full traceback follows:", exc_info=True)
-        return 0x0213, None
+        return 0x0110, None
 
     logging.info(
         "[N-ACTION] TransactionUID: %s, SOPs to verify: %d", tx_uid, len(sop_list)
@@ -214,16 +239,36 @@ def handle_n_action(
             len(sop_list),
         )
 
-    # Register the batch for the async N-EVENT-REPORT.
-    if commit_tracker is not None and sop_list:
-        _register_commit(
+    # Register the batch for the async N-EVENT-REPORT. A batch that cannot be
+    # registered (no resolvable requestor address/port) would otherwise be
+    # answered 0x0000 while its N-EVENT-REPORT can never go out, leaving the
+    # Transaction UID hanging at the modality. Refuse with 0x0110 (Processing
+    # Failure) so the SCU knows the request is not being processed.
+    #
+    # A request that NAMES SOPs has committed the SCP to reporting on them, so
+    # it is refused when no tracker exists either: with `commit_tracker=None`
+    # nothing was registered and nothing guarantees the N-EVENT-REPORT
+    # (PS3.4 J.3.3.1 - the report IS the result), yet the request was
+    # acknowledged 0x0000. Answering success for work that was silently
+    # dropped is worse than refusing it.
+    if sop_list:
+        if commit_tracker is None:
+            logging.error(
+                "[N-ACTION] tx=%s references %d SOP(s) but no commitment "
+                "tracker is available - refusing (no N-EVENT-REPORT possible)",
+                tx_uid,
+                len(sop_list),
+            )
+            return 0x0110, None
+        if not _register_commit(
             commit_tracker,
             tx_uid,
             calling_ae,
             sop_list,
             event,
             resolve_scp=resolve_scp,
-        )
+        ):
+            return 0x0110, None
 
     # A correctly-parsed request is ALWAYS acknowledged 0x0000 (J.3.2.1.4: no
     # service-class specific values; RSP only says "received / not handling").

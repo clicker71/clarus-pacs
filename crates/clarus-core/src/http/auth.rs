@@ -40,24 +40,26 @@ pub enum Identity {
     UntrustedPeer { ip: Vec<u8> },
 }
 
-/// The first address of an `X-Forwarded-For` list, or the value unchanged when
-/// it carries no list.
+/// The address our own proxy appended to `X-Forwarded-For`, or the value
+/// unchanged when it carries no list.
 ///
-/// The header is `client, proxy1, proxy2`: each hop APPENDS, so the leftmost
-/// entry is the one the first proxy saw and the rest were added by parties
-/// between it and us. Keeping the whole string made the identity a comma-joined
-/// pseudo-address that no `trusted_proxies` check, access-log field or
-/// per-client rate limit can match - every client behind one nginx then shared
-/// a single identity bucket. `X-Real-IP` is a single address by definition, but
-/// the same parse is harmless there.
+/// The header is `client, proxy1, proxy2`: each hop APPENDS its peer, so the
+/// RIGHTMOST entry is the one the last proxy before us saw, and everything to
+/// its left is what an upstream party claimed. Taking the LEFTMOST entry made
+/// the identity whatever the client wrote there - a request carrying
+/// `X-Forwarded-For: 127.0.0.1` was resolved as loopback and reached the admin
+/// routes behind any proxy that forwards the header verbatim. nginx's
+/// `$proxy_add_x_forwarded_for` appends `$remote_addr`, so the rightmost entry
+/// is the only one this server can attribute to a peer it observed.
 ///
-/// The leftmost entry is only as trustworthy as the proxy chain that produced
-/// it; Clarus trusts headers solely from `trusted_proxies`, so a header that
-/// reached this function came through a peer we already decided to believe.
+/// `X-Real-IP` stays the preferred source where it is present: it is a single
+/// address the proxy sets from `$remote_addr`, with no list for a client to
+/// prepend to.
 fn first_forwarded_ip(raw: &[u8]) -> Option<&[u8]> {
     let text = std::str::from_utf8(raw).ok()?;
-    let first = text.split(',').next()?.trim();
-    (!first.is_empty()).then_some(first.as_bytes())
+    // `rsplit` walks from the end: the last element of a comma list.
+    let last = text.rsplit(',').next()?.trim();
+    (!last.is_empty()).then_some(last.as_bytes())
 }
 
 /// Resolve the client identity.
@@ -237,13 +239,12 @@ mod tests {
         }
     }
 
-    /// `X-Forwarded-For` is `client, proxy1, proxy2` and each hop APPENDS. Only
-    /// the leftmost entry is the client the first proxy saw; keeping the whole
-    /// list made the identity a comma-joined pseudo-address that no address
-    /// check or log field can match, so every client behind one nginx shared a
-    /// single bucket.
+    /// `X-Forwarded-For` is `client, proxy1, proxy2` and each hop APPENDS, so
+    /// the RIGHTMOST entry is the peer our own proxy observed. Taking the
+    /// leftmost one made the identity whatever the client wrote there - which
+    /// is a spoof, not an identity.
     #[test]
-    fn only_the_first_forwarded_address_is_the_client() {
+    fn only_the_last_forwarded_address_is_the_client() {
         let id = resolve_identity(
             b"127.0.0.1",
             true,
@@ -252,7 +253,10 @@ mod tests {
             Some(b"dr-smith"),
         );
         match id {
-            Identity::Proxied { ip, .. } => assert_eq!(ip, b"203.0.113.9"),
+            Identity::Proxied { ip, .. } => assert_eq!(
+                ip, b"172.16.0.5",
+                "the last entry is the one our proxy appended"
+            ),
             other => panic!("expected Proxied, got {other:?}"),
         }
         // A single address (the common case) and stray whitespace are unchanged.
@@ -271,6 +275,32 @@ mod tests {
         );
         match id {
             Identity::Proxied { ip, .. } => assert_eq!(ip, b"198.51.100.4"),
+            other => panic!("expected Proxied, got {other:?}"),
+        }
+    }
+
+    /// A client that WRITES `X-Forwarded-For: 127.0.0.1` must not be resolved
+    /// as loopback: every hop appends, so only the RIGHTMOST entry is a peer
+    /// this server's proxy observed. Reading the leftmost one handed the
+    /// identity to whatever the client sent, and a loopback identity reaches
+    /// the admin routes.
+    #[test]
+    fn a_spoofed_forwarded_address_does_not_make_the_client_local() {
+        let id = resolve_identity(
+            b"127.0.0.1",
+            true,
+            None,
+            // The client prepended a loopback claim; nginx appended the
+            // address it actually saw.
+            Some(b"127.0.0.1, 203.0.113.9"),
+            Some(b"someone"),
+        );
+        match id {
+            Identity::Proxied { ip, .. } => assert_eq!(
+                ip, b"203.0.113.9",
+                "the rightmost entry is the address our proxy observed, not the \
+                 loopback claim a client can write"
+            ),
             other => panic!("expected Proxied, got {other:?}"),
         }
     }

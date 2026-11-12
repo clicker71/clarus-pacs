@@ -189,10 +189,26 @@ class TestJsonToDatasetMwl:
     # -- shape (PS3.4 Table K.6-1) -----------------------------------------
 
     def test_return_keys_are_at_identifier_level(self):
-        """PatientName/PatientID are the identifier-level Return keys."""
-        ds = _json_to_dataset_mwl(self._workitem_json(), set())
+        """PatientName/PatientID are identifier-level Return keys.
+
+        T3: PS3.4 K.6 - a C-FIND response carries the requested keys at the
+        level the identifier addresses. An empty requested-keyword set means
+        the SCU asked for a STATION-shaped match, so patient identifiers are
+        not a promised part of the answer; they are asserted when the request
+        names them.
+        """
+        requested = {"PatientName", "PatientID"}
+        ds = _json_to_dataset_mwl(self._workitem_json(), requested)
         assert str(ds.PatientName) == "SMIRNOV^IVAN"
         assert str(ds.PatientID) == "PT-1"
+
+    def test_a_station_only_request_does_not_promise_patient_identifiers(self):
+        """T3: no requested patient keys -> the answer is not required to carry
+        them, and the bridge must not be asked to invent them."""
+        ds = _json_to_dataset_mwl(self._workitem_json(), {"ScheduledStationAETitle"})
+        # The station IS the requested key and must be there.
+        assert "ScheduledProcedureStepSequence" in ds
+        assert str(ds.ScheduledProcedureStepSequence[0].ScheduledStationAETitle) == "CT1"
 
     def test_sps_attributes_live_inside_the_sequence(self):
         """SPS attributes are NOT flat: they belong to the (0040,0100) item."""

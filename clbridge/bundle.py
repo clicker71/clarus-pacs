@@ -408,7 +408,7 @@ def bundle(version, output_path):
 
 
 if __name__ == "__main__":
-    version = sys.argv[1] if len(sys.argv) > 1 else "0.3.0-beta"
+    version = sys.argv[1] if len(sys.argv) > 1 else "0.3.1-beta"
     # Always write to the script's own directory, not CWD
     base_dir = os.path.dirname(os.path.abspath(__file__))
     default_output = os.path.join(base_dir, "clbridge.py")

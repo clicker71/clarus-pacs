@@ -67,15 +67,51 @@ pub fn spawn(idx_dir: PathBuf) {
         .spawn(move || {
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                    Ok(req) => {
-                        let _ = heal_one(&idx_dir, req);
-                    }
+                    Ok(req) => heal_with_retry(&idx_dir, req),
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
         })
         .expect("spawn idx-fixer thread");
+}
+
+/// How many times one request is retried before it is abandoned.
+///
+/// A transient `ENOSPC`/lock on the idx directory is the realistic failure, and
+/// those clear on their own. Three attempts spans roughly 300 ms - long enough
+/// to outlast a filesystem stall, short enough that a genuinely broken idx does
+/// not wedge the fixer thread behind one poison request. Abandoning keeps the
+/// gauge incremented (the staleness is real), and the next exact lookup of the
+/// same study re-pokes, so no repair is lost forever.
+const HEAL_ATTEMPTS: u32 = 3;
+
+/// Retry a failed heal with linear backoff before giving up.
+///
+/// The error was previously discarded (`let _ = heal_one(..)`), which lost the
+/// request outright: nothing in the channel could resend it, and because
+/// `record_idx_stale_detect` had already fired, `CLARUS_IDX_RUNTIME_STALE` kept
+/// a +1 that no later completion would ever close. That is the failure mode the
+/// gauge exists to show, so the request must be retried rather than dropped.
+fn heal_with_retry(idx_dir: &std::path::Path, req: HealRequest) {
+    for attempt in 1..=HEAL_ATTEMPTS {
+        match heal_one(idx_dir, req.clone()) {
+            Ok(_) => return,
+            Err(e) => {
+                if attempt == HEAL_ATTEMPTS {
+                    // The gauge stays counted: the row really is still stale,
+                    // and the next exact lookup re-pokes this study.
+                    crate::clog_warn!(
+                        modality = %req.modality,
+                        error = %e,
+                        "idx fixer: heal failed after {HEAL_ATTEMPTS} attempts"
+                    );
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)));
+            }
+        }
+    }
 }
 
 /// Append one request's missing row (idempotent). Returns the heal's outcome:
@@ -257,8 +293,69 @@ mod tests {
         assert!(bucket.iter().any(|u| u == uid));
     }
 
-    // -- Regression: detect only on CONFIRMED absence (owner Fix 1) --
+    // -- Regression: a failed heal is retried, not discarded --
 
+    /// A heal that fails must be RETRIED, because its detect was already
+    /// counted and nothing else can resend the request.
+    ///
+    /// The drain used to run `let _ = heal_one(..)`: a transient I/O failure
+    /// dropped the request while `record_idx_stale_detect` had already added a
+    /// +1 to `CLARUS_IDX_RUNTIME_STALE`. No later completion could close it, so
+    /// the gauge showed permanent staleness that no lookup would ever clear.
+    /// `heal_with_retry` re-attempts instead.
+    ///
+    /// The obstacle is a FILE where the modality-idx directory must be: the
+    /// first attempt fails, the test removes it, and a retry inside the same
+    /// call must then succeed. If the retry loop is removed, only the first
+    /// attempt runs and the row is never written.
+    #[test]
+    fn a_failed_heal_is_retried_and_then_succeeds() {
+        let _g = IDX_METRIC_LOCK.lock().unwrap();
+        crate::metrics::record_idx_stale_detect();
+        let dir = tempdir().expect("tempdir");
+        let day = *b"20240501";
+        let uid = "1.2.3.4.5.6.7";
+        // `modality/` as a regular FILE makes the append fail on the first try.
+        std::fs::write(dir.path().join("modality"), b"not a directory").expect("blocker");
+        assert!(
+            heal_one(
+                dir.path(),
+                HealRequest {
+                    modality: "CT".into(),
+                    day,
+                    study_uid: uid.into(),
+                }
+            )
+            .is_err(),
+            "the blocker must make the first attempt fail"
+        );
+
+        // Clear the obstacle from another thread so a later attempt succeeds:
+        // this is what a transient filesystem stall looks like.
+        let path = dir.path().to_path_buf();
+        let clearer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::remove_file(path.join("modality")).expect("clear blocker");
+        });
+
+        heal_with_retry(
+            dir.path(),
+            HealRequest {
+                modality: "CT".into(),
+                day,
+                study_uid: uid.into(),
+            },
+        );
+        clearer.join().expect("clearer");
+
+        let bucket = modality::read_study_uids(dir.path(), "CT", &day).expect("bucket");
+        assert!(
+            bucket.iter().any(|u| u == uid),
+            "the retried heal must have written the row"
+        );
+    }
+
+    // -- Regression: detect only on CONFIRMED absence (owner Fix 1) --
     #[test]
     fn needs_heal_healthy_study_is_false() {
         // A study whose modality-idx row IS present is healthy: the exact-UID

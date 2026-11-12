@@ -349,14 +349,18 @@ impl DualEventSink {
         }
     }
 
-    /// Event-bus subscription - returns a synchronous mpsc receiver.
+    /// Event-bus subscription - returns a guarded subscription handle.
     ///
     /// NOTE: nothing in production calls this. The only live SSE route
     /// (`GET /dicomweb/workitems/{uid}/events`) uses [`Self::fanout_try_subscribe`]
     /// below; this accessor exists for the unit tests that pin the broadcast
     /// bus. `UpsEventBus` is therefore TEST-ONLY wiring, and the orphan risk
-    /// that matters in production lives in `MpscFanoutBus`.
-    pub fn subscribe(&self, workitem_uid: &str) -> mpsc::Receiver<UpsEvent> {
+    /// that matters in production lives in `MpscFanoutBus`, which carries the
+    /// same token-matched `Drop` this handle now has.
+    pub fn subscribe(
+        &self,
+        workitem_uid: &str,
+    ) -> crate::handlers::ups::event_bus::UpsSubscription {
         self.broadcast.subscribe(workitem_uid)
     }
 

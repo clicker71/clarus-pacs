@@ -188,6 +188,7 @@ enum ChunkState {
     Data,
     DataCrlf,
     Trailer,
+    Done,
 }
 
 impl<R: Read> ChunkedReader<R> {
@@ -204,7 +205,7 @@ impl<R: Read> ChunkedReader<R> {
 
     /// True once the message (including trailers) is fully read.
     pub fn is_message_complete(&self) -> bool {
-        self.state == ChunkState::Trailer && self.trailer_used == 0
+        self.state == ChunkState::Done
     }
 }
 
@@ -212,6 +213,7 @@ impl<R: Read> Read for ChunkedReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         loop {
             match self.state {
+                ChunkState::Done => return Ok(0),
                 ChunkState::Size => {
                     // Parse `<hexdigits> CR LF`.
                     self.hex_len = 0;
@@ -292,6 +294,7 @@ impl<R: Read> Read for ChunkedReader<R> {
                     // A line is empty when it contains exactly `\r` before `\n`.
                     // Budget-bounded by TRAILER_LIMIT.
                     let mut line_len = 0usize; // bytes on the current line (incl `\r`)
+                    let mut prev = 0u8; // byte seen before the current one
                     loop {
                         let b = match self.src.read_byte()? {
                             None => {
@@ -310,12 +313,27 @@ impl<R: Read> Read for ChunkedReader<R> {
                         }
                         line_len += 1;
                         if b == b'\n' {
-                            // Line ended. Empty line == exactly `\r\n`.
-                            if line_len == 2 {
+                            // Line ended. Empty line == exactly `\r\n`: a bare
+                            // LF leaves `line_len == 1` and therefore does NOT
+                            // terminate, it only ends a non-empty line. Testing
+                            // the length alone accepted `X\n`, whose second
+                            // byte is the LF, as the terminator.
+                            if line_len == 2 && prev == b'\r' {
+                                // The terminating CRLF is the END of the body;
+                                // a read after it must answer clean EOF (0),
+                                // not re-enter the trailer scan and then fail
+                                // on the missing trailer byte. The `Done` state
+                                // is what makes `read` after completion a
+                                // no-op instead of an error.
+                                self.state = ChunkState::Done;
                                 return Ok(0); // message complete
                             }
                             line_len = 0;
                         }
+                        // Remember this byte for the next iteration's CR test.
+                        // Must stay INSIDE the loop: the terminator check above
+                        // reads it on the very next byte.
+                        prev = b;
                     }
                 }
             }
@@ -407,6 +425,20 @@ mod tests {
         assert_eq!(drain(&mut cr), b"hi");
     }
 
+    /// After the terminating CRLF the body is DONE: a further read must answer
+    /// clean EOF (Ok(0)) and the message must report complete. Without the
+    /// `Done` state a post-completion read re-entered the trailer scan, hit the
+    /// empty source and returned EOF-mid-trailer (`is_message_complete` never
+    /// true, because `trailer_used == 0` could not hold after the scan).
+    #[test]
+    fn a_completed_body_reads_eof_and_reports_complete() {
+        let chunked = b"2\r\nhi\r\n0\r\n\r\n";
+        let mut cr = ChunkedReader::new(ByteReader(chunked));
+        assert_eq!(drain(&mut cr), b"hi");
+        assert!(cr.is_message_complete());
+        assert_eq!(cr.read(&mut [0u8; 4]).expect("eof"), 0);
+    }
+
     #[test]
     fn chunked_bad_hex_rejected() {
         let chunked = b"zz\r\nhi\r\n0\r\n\r\n";
@@ -441,5 +473,48 @@ mod tests {
         assert_eq!(framing(Some(5), Some(b"chunked")), Framing::Chunked);
         assert_eq!(framing(Some(5), None), Framing::Length(5));
         assert_eq!(framing(None, None), Framing::Length(0));
+    }
+
+    /// RFC 9112 7.1: the last-chunk is followed by `trailer-section CRLF`, and
+    /// the trailer section ends with an EMPTY line, i.e. exactly `CRLF`. A line
+    /// of length two measures the same whether or not its first byte was `CR`,
+    /// so `X\n` was read as the terminator and the body reported complete.
+    #[test]
+    fn a_bare_lf_trailer_terminator_is_not_completion() {
+        let mut cr = ChunkedReader::new(ByteReader(b"0\r\nX\n"));
+        let mut buf = [0u8; 16];
+        // Drive to exhaustion: the only honest outcomes are an error. Without
+        // the fix the LF at index 4 was read as the terminator and this read
+        // returned Ok(0) from a Done state, claiming a properly ended body.
+        loop {
+            match cr.read(&mut buf) {
+                Ok(0) => panic!("a bare LF must not complete the body"),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !cr.is_message_complete(),
+            "b\"0\\r\\nX\\n\" must never report a complete body"
+        );
+    }
+
+    /// A trailer line that happens to be two bytes long is NOT the terminator.
+    #[test]
+    fn a_two_byte_trailer_line_is_not_completion() {
+        let chunked = b"0\r\nX: y\r\n\r\n";
+        let mut cr = ChunkedReader::new(ByteReader(chunked));
+        assert_eq!(drain(&mut cr), b"");
+        assert!(cr.is_message_complete());
+    }
+
+    /// The strict terminator still completes and the post-completion read is a
+    /// no-op (the `Done` state's reason for existing).
+    #[test]
+    fn the_crlf_terminator_still_completes() {
+        let mut cr = ChunkedReader::new(ByteReader(b"0\r\n\r\n"));
+        assert_eq!(cr.read(&mut [0u8; 16]).expect("complete"), 0);
+        assert!(cr.is_message_complete());
+        assert_eq!(cr.read(&mut [0u8; 16]).expect("done no-op"), 0);
     }
 }

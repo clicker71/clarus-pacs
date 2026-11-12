@@ -20,9 +20,9 @@
 use jpegls;
 
 use super::{
-    CodecError, DecodedPixels, DicomCodec, DicomMeta, TAG_BITS_ALLOCATED, TAG_COLUMNS,
-    TAG_NUMBER_OF_FRAMES, TAG_PHOTOMETRIC_INTERPRETATION, TAG_PIXEL_DATA, TAG_PIXEL_REPRESENTATION,
-    TAG_ROWS, TAG_SAMPLES_PER_PIXEL,
+    CodecError, DecodedPixels, DicomCodec, DicomMeta, TAG_BITS_ALLOCATED, TAG_BITS_STORED,
+    TAG_COLUMNS, TAG_NUMBER_OF_FRAMES, TAG_PHOTOMETRIC_INTERPRETATION, TAG_PIXEL_DATA,
+    TAG_PIXEL_REPRESENTATION, TAG_ROWS, TAG_SAMPLES_PER_PIXEL,
 };
 
 /// Transfer Syntax UID for JPEG-LS Lossless.
@@ -226,6 +226,16 @@ fn jpegls_decode(dicom_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
         return Err(CodecError::InvalidMetadata(
             "JPEG-LS: bits_allocated must be ≥ 8".into(),
         ));
+    }
+    // PS3.3 C.7.6.3.1.1: SamplesPerPixel (0028,0002) is 1 for grayscale and 3
+    // for colour. A crafted instance declaring 0 reached the fragment count
+    // division below and panicked, which under `panic = abort` ends the
+    // process for the whole server.
+    if num_components != 1 && num_components != 3 {
+        return Err(CodecError::InvalidMetadata(format!(
+            "JPEG-LS: SamplesPerPixel must be 1 or 3, got {}",
+            meta.samples_per_pixel
+        )));
     }
 
     // Decode frames. Fragments are frame-major: per frame, one codestream
@@ -465,14 +475,8 @@ pub(crate) fn extract_encapsulated_fragments(data: &[u8]) -> Result<Vec<Vec<u8>>
     let mut fragments = Vec::new();
     let end = data.len();
 
-    // BOT detection: the Basic Offset Table, when present, is the FIRST
-    // item. Empty BOT (len 0) is common; a filled BOT for an N-frame image
-    // carries N u32 offsets (len = 4*N). A 1-entry BOT (len 4, value
-    // 00000000) is disambiguated by its zero prefix - a JPEG stream never
-    // starts with 00 00 00 00 (01.09 field, ATLAS 4.70 slices).
-    let declared_frames: Option<u32> = find_tag_str(data, TAG_NUMBER_OF_FRAMES)
-        .and_then(|s| s.trim().trim_end_matches('\0').parse().ok())
-        .filter(|f| *f > 1);
+    // The FIRST item of an encapsulated value is the Basic Offset Table
+    // (PS3.5 A.4), so nothing about its content has to be guessed.
     let mut is_first_item = true;
 
     while pos + 8 <= end {
@@ -491,17 +495,22 @@ pub(crate) fn extract_encapsulated_fragments(data: &[u8]) -> Result<Vec<Vec<u8>>
             // Item (FFFE,E000)
             (0xFFFE, 0xE000) => {
                 if is_first_item {
+                    // PS3.5 A.4: in an encapsulated Pixel Data value the FIRST
+                    // item is the Basic Offset Table, whatever it contains -
+                    // an empty table is a table with no offsets, not a
+                    // fragment. Deciding by content guessed wrong both ways: a
+                    // fragment whose length happened to be
+                    // 4 * NumberOfFrames was skipped as a table, and a table
+                    // whose first offset was non-zero was returned as a
+                    // fragment.
                     is_first_item = false;
-                    let is_bot = item_len == 0
-                        || (item_len.is_multiple_of(4)
-                            && pos + 4 <= end
-                            && data[pos..pos + 4] == [0, 0, 0, 0])
-                        || (item_len.is_multiple_of(4)
-                            && declared_frames.is_some_and(|f| item_len / 4 == f as usize));
-                    if is_bot {
-                        pos = pos.saturating_add(item_len); // skip the offsets
-                        continue; // BOT -- not a data fragment
+                    if item_len == 0xFFFF_FFFF {
+                        // Undefined length is not a legal table item, but the
+                        // walk must not consume the whole stream either.
+                        continue;
                     }
+                    pos = pos.saturating_add(item_len); // skip the offsets
+                    continue; // BOT -- not a data fragment
                 }
                 if item_len == 0xFFFF_FFFF {
                     // Undefined length item - skip
@@ -564,8 +573,13 @@ pub(crate) fn parse_jpegls_meta(data: &[u8]) -> Result<DicomMeta, CodecError> {
     let bits_allocated: u8 = find_tag_u16(data, TAG_BITS_ALLOCATED)
         .map(|v| v as u8)
         .unwrap_or(8);
-    let bits_stored: u8 = find_tag_u16(data, TAG_BITS_ALLOCATED)
+    // PS3.5 8.1.1: BitsStored (0028,0101) is the count of bits that actually
+    // carry signal and shall never exceed BitsAllocated (0028,0100). Reading
+    // BitsAllocated here declared a 12-bit-in-16 CT as 16-bit, so the
+    // re-encoded output carried BitsStored=16 / HighBit=15.
+    let bits_stored: u8 = find_tag_u16(data, TAG_BITS_STORED)
         .map(|v| v as u8)
+        .filter(|v| *v > 0 && *v <= bits_allocated)
         .unwrap_or(bits_allocated);
     let photometric_interpretation = find_tag_str(data, TAG_PHOTOMETRIC_INTERPRETATION)
         .unwrap_or_else(|| "MONOCHROME2".to_string());
@@ -952,6 +966,51 @@ mod tests {
         assert_eq!(fragments[0], frag.to_vec());
     }
 
+    /// The first item is the table, and the table's own offsets say nothing
+    /// about whether it is a table.
+    ///
+    /// A legal two-frame instance has two offsets, and the second frame of a
+    /// normal file starts at `8 + len(frame0)` - never at zero. A heuristic
+    /// keyed on "the first four bytes are zero" therefore failed on the
+    /// ordinary case, and one keyed on `len / 4 == NumberOfFrames` failed on
+    /// any first fragment whose length was four bytes per frame.
+    #[test]
+    fn extract_encapsulated_fragments_reads_a_non_zero_first_offset_table() {
+        let frame0 = [0xFF, 0xD8, 0xFF, 0xF7, 0x00, 0x0B, 0x11, 0x22];
+        let frame1 = [0xFF, 0xD8, 0xFF, 0xF7, 0x00, 0x0B, 0x33, 0x44];
+        let second_offset = (8 + frame0.len()) as u32;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 128]);
+        out.extend_from_slice(b"DICM");
+        append_dicom_tag_str(&mut out, (0x0002, 0x0010), "UI", TS_JPEGLS_LOSSLESS);
+        // Two frames, which the old length clause compared the table against.
+        append_dicom_tag_str(&mut out, (0x0028, 0x0008), "IS", "2 ");
+
+        out.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(b"OB");
+        out.extend_from_slice(&[0x00, 0x00]);
+        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Two-offset table whose first entry is NOT zero.
+        out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        out.extend_from_slice(&8u32.to_le_bytes());
+        out.extend_from_slice(&8u32.to_le_bytes());
+        out.extend_from_slice(&second_offset.to_le_bytes());
+        for frag in [&frame0, &frame1] {
+            out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            out.extend_from_slice(&(frag.len() as u32).to_le_bytes());
+            out.extend_from_slice(frag);
+        }
+        out.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+
+        let fragments = extract_encapsulated_fragments(&out).expect("fragments");
+        assert_eq!(fragments.len(), 2, "the table is not a fragment");
+        assert_eq!(fragments[0], frame0.to_vec());
+        assert_eq!(fragments[1], frame1.to_vec());
+    }
+
     fn append_dicom_tag_u16(out: &mut Vec<u8>, tag: (u16, u16), val: u16) {
         out.extend_from_slice(&tag.0.to_le_bytes());
         out.extend_from_slice(&tag.1.to_le_bytes());
@@ -1078,6 +1137,64 @@ mod tests {
         );
     }
 
+    /// R-01: BitsStored (0028,0101) is what the codec reports, not
+    /// BitsAllocated (0028,0100) - a 12-bit-in-16 CT declares 16 there.
+    ///
+    /// PS3.5 8.1.1 makes BitsStored the count of bits that carry signal and
+    /// forbids it from exceeding BitsAllocated. Reading the container width
+    /// made the transcode write BitsStored=16 / HighBit=15 for a 12-bit
+    /// source, so a viewer rendered four uninitialised bits as signal.
+    #[test]
+    fn the_codec_reports_bits_stored_not_bits_allocated() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 128]);
+        out.extend_from_slice(b"DICM");
+        append_dicom_tag_str(&mut out, (0x0002, 0x0010), "UI", TS_JPEGLS_LOSSLESS);
+        append_dicom_tag_u16(&mut out, TAG_ROWS, 2);
+        append_dicom_tag_u16(&mut out, TAG_COLUMNS, 2);
+        append_dicom_tag_u16(&mut out, TAG_SAMPLES_PER_PIXEL, 1);
+        append_dicom_tag_u16(&mut out, TAG_BITS_ALLOCATED, 16);
+        append_dicom_tag_u16(&mut out, TAG_BITS_STORED, 12);
+        append_dicom_tag_u16(&mut out, TAG_PIXEL_REPRESENTATION, 1);
+        append_dicom_tag_str(
+            &mut out,
+            TAG_PHOTOMETRIC_INTERPRETATION,
+            "CS",
+            "MONOCHROME2",
+        );
+
+        let meta = parse_jpegls_meta(&out).expect("metadata");
+        assert_eq!(meta.bits_allocated, 16);
+        assert_eq!(
+            meta.bits_stored, 12,
+            "BitsStored decides, not BitsAllocated"
+        );
+
+        // A BitsStored above BitsAllocated is not a legal declaration, so it
+        // is clamped rather than believed (PS3.5 8.1.1).
+        let wider = replace_u16_value(&out, TAG_BITS_STORED, 20).expect("replace");
+        let meta = parse_jpegls_meta(&wider).expect("metadata");
+        assert_eq!(meta.bits_stored, 16, "clamped to BitsAllocated");
+    }
+
+    /// Overwrite a US element's value in place (same length, so every offset
+    /// after it stays valid).
+    fn replace_u16_value(data: &[u8], tag: (u16, u16), value: u16) -> Option<Vec<u8>> {
+        let mut out = data.to_vec();
+        let at = out.windows(4).position(|w| {
+            w == [
+                tag.0 as u8,
+                (tag.0 >> 8) as u8,
+                tag.1 as u8,
+                (tag.1 >> 8) as u8,
+            ]
+        })?;
+        // tag(4) + VR(2) + length(2), then the value.
+        let value_at = at + 8;
+        out[value_at..value_at + 2].copy_from_slice(&value.to_le_bytes());
+        Some(out)
+    }
+
     #[test]
     fn jpegls_empty_data_rejected() {
         let empty = vec![0u8; 140]; // preamble + DICM only, no PixelData
@@ -1188,6 +1305,49 @@ mod tests {
         // Pure garbage.
         let garbage = vec![0xABu8; 64];
         let wrapper = build_minimal_dicom_wrapper(&garbage, w, h, 8, 1);
+        assert!(JpeglsLosslessCodec.decode(&wrapper).is_err());
+    }
+
+    /// SamplesPerPixel is validated before it divides the fragment count.
+    ///
+    /// A crafted instance declaring 0 reached `fragments.len() / 0` and
+    /// panicked; under `panic = abort` that ends the process serving every
+    /// other request. The refusal has to name the tag, not trap.
+    #[test]
+    fn a_zero_sample_count_is_refused_not_divided_by() {
+        let w = 16u16;
+        let h = 16u16;
+        let px = ramp_u16(w, h);
+        let mut enc = jpegls::EncodeOptions::default();
+        enc.profile = jpegls::Profile::T87;
+        let mut frag = Vec::new();
+        jpegls::encode_with_options(&px, w as u32, h as u32, &enc, &mut frag)
+            .expect("encode failed");
+
+        let wrapper = build_minimal_dicom_wrapper(&frag, w, h, 8, 0);
+        let err = JpeglsLosslessCodec
+            .decode(&wrapper)
+            .expect_err("SamplesPerPixel = 0 cannot describe an image");
+        assert!(
+            err.to_string().contains("SamplesPerPixel"),
+            "the refusal names the offending tag, got: {err}"
+        );
+    }
+
+    /// SamplesPerPixel = 2 is equally meaningless for JPEG-LS and must be
+    /// refused rather than treated as a two-plane frame.
+    #[test]
+    fn a_two_sample_colour_count_is_refused() {
+        let w = 8u16;
+        let h = 8u16;
+        let px = ramp_u16(w, h);
+        let mut enc = jpegls::EncodeOptions::default();
+        enc.profile = jpegls::Profile::T87;
+        let mut frag = Vec::new();
+        jpegls::encode_with_options(&px, w as u32, h as u32, &enc, &mut frag)
+            .expect("encode failed");
+
+        let wrapper = build_minimal_dicom_wrapper(&frag, w, h, 8, 2);
         assert!(JpeglsLosslessCodec.decode(&wrapper).is_err());
     }
 

@@ -3,7 +3,7 @@
 
 """Clarus Bridge  -  SOP Class and Printer registries.
 
-YAML-driven SOP class acceptance. 11 built-in fallback classes.
+YAML-driven SOP class acceptance. 13 built-in fallback classes.
 Printer registry for C-PRINT (P22c).
 """
 
@@ -38,9 +38,17 @@ def _parse_simple_yaml(path):
                 # Top-level section: "sop_classes:" or "printers:"
                 current_section = stripped[:-1].strip()
                 result[current_section] = {}
-            elif indent == 2 and stripped.endswith(":"):
-                # UID/name key: "  1.2.840...:"
-                current_uid = stripped[:-1].strip().strip("\"'")
+            elif indent == 2:
+                # UID/name key: "  1.2.840...:". An inline comment after the
+                # colon ("  1.2.840...:  # MR") is documentation, not part of
+                # the key: strip it BEFORE the `endswith(":")` test, otherwise
+                # the line ends on the comment, the header is skipped and the
+                # NEXT `accept:` line lands on the PREVIOUS UID - re-enabling
+                # a class the operator switched off.
+                header = stripped.split("#", 1)[0].rstrip()
+                if not header.endswith(":"):
+                    continue
+                current_uid = header[:-1].strip().strip("\"'")
                 current_entry = {}
                 if current_section:
                     result[current_section][current_uid] = current_entry
@@ -77,28 +85,93 @@ def _load_sop_registry(yaml_path="sop_classes.yaml"):
     try:
         data = _parse_simple_yaml(yaml_path)
         registry = data.get("sop_classes", {}) if data else {}
-        if registry:
-            logging.info(
-                "[SOP-REG] Loaded %d SOP classes from %s", len(registry), yaml_path
-            )
-            return registry
     except FileNotFoundError:
         logging.info("[SOP-REG] Using built-in SOP defaults (no custom %s)", yaml_path)
+        return _BUILTIN_SOP_CLASSES()
     except Exception as e:
         logging.info(
             "[SOP-REG] Using built-in SOP defaults: %s parse error - %s", yaml_path, e
         )
+        return _BUILTIN_SOP_CLASSES()
 
+    if registry:
+        # A file that parses but yields an entry without `accept` means the
+        # parser desynchronised for THAT entry. Accepting it as-is silently
+        # turns an unreadable class into an accepted one, so the entry is
+        # dropped and reported. Replacing the WHOLE registry with the built-ins
+        # (the old behaviour) threw away every correct line as well - an
+        # operator's `accept: false` was replaced by a built-in `accept: true`,
+        # so a class they switched off came back on.
+        broken = sorted(uid for uid, entry in registry.items() if "accept" not in entry)
+        if broken:
+            logging.error(
+                "[SOP-REG] %s: %d SOP class entr%s without `accept` (%s) - "
+                "those entries are ignored, the rest of the file is used",
+                yaml_path,
+                len(broken),
+                "y" if len(broken) == 1 else "ies",
+                ", ".join(broken[:3]) + (", ..." if len(broken) > 3 else ""),
+            )
+            for uid in broken:
+                registry.pop(uid, None)
+        # `accept` must be a real boolean. `_parse_simple_yaml` already turns
+        # the two literals into bools, so anything else got here as a STRING
+        # (`accept: yes`, `accept: 1`, `accept: on`) and `bool("no")` is True.
+        # Coercing it would accept a class the operator wrote as refused, which
+        # is the same silent-wrong-answer failure as a missing key, so such an
+        # entry is dropped rather than corrected - never the whole file.
+        mistyped = sorted(
+            uid for uid, entry in registry.items() if not isinstance(entry["accept"], bool)
+        )
+        if mistyped:
+            for uid in mistyped:
+                logging.error(
+                    "[SOP-REG] %s: SOP class %s has non-boolean accept=%r - "
+                    "expected true or false; entry ignored",
+                    yaml_path,
+                    uid,
+                    registry[uid]["accept"],
+                )
+            logging.error(
+                "[SOP-REG] %d SOP class entr%s with a non-boolean `accept` - "
+                "ignored; the other %d entr%s of the file are still used",
+                len(mistyped),
+                "y" if len(mistyped) == 1 else "ies",
+                len(registry) - len(mistyped),
+                "y" if len(registry) - len(mistyped) == 1 else "ies",
+            )
+            for uid in mistyped:
+                registry.pop(uid, None)
+        if not registry:
+            logging.error(
+                "[SOP-REG] %s yielded no usable SOP class - using built-in defaults",
+                yaml_path,
+            )
+            return _BUILTIN_SOP_CLASSES()
+        logging.info(
+            "[SOP-REG] Loaded %d SOP classes from %s", len(registry), yaml_path
+        )
+        return registry
+
+    logging.info(
+        "[SOP-REG] %s parsed to zero SOP classes - using built-in defaults", yaml_path
+    )
     return _BUILTIN_SOP_CLASSES()
 
 
 def _BUILTIN_SOP_CLASSES():
-    """Return 11 built-in SOP classes  -  always available, no dependencies (CMP-006).
+    """Return 13 built-in SOP classes  -  always available, no dependencies (CMP-006).
 
-    Includes 3 legacy Retired classes still in active use on pre-2006 equipment:
-    - MG For Processing (Retired): replaced by 1.2.840.10008.5.1.4.1.1.1.2.1
-    - US Multi-frame (Retired): replaced by 1.2.840.10008.5.1.4.1.1.6.1
-    - NM (Retired): replaced by 1.2.840.10008.5.1.4.1.1.20
+    Both the current and the Retired UID are listed for the two classes whose
+    UID was re-issued, because the fallback runs precisely when no
+    sop_classes.yaml exists and the installed base is unknown: a cine loop
+    arrives as 1.2.840.10008.5.1.4.1.1.3.1 on current equipment and as
+    1.2.840.10008.5.1.4.1.1.3 on pre-2006 equipment.
+
+    Retired classes kept for pre-2006 equipment still in active use:
+    - MG For Processing (Retired): 1.2.840.10008.5.1.4.1.1.1.2.1
+    - US Multi-frame (Retired): 1.2.840.10008.5.1.4.1.1.3, superseded by ...3.1
+    - NM (Retired): 1.2.840.10008.5.1.4.1.1.5, superseded by ...20
     """
     return {
         "1.2.840.10008.1.1": {"name": "Verification", "accept": True},
@@ -135,6 +208,15 @@ def _BUILTIN_SOP_CLASSES():
         },
         "1.2.840.10008.5.1.4.1.1.5": {
             "name": "Nuclear Medicine Image Storage (Retired)",
+            "accept": True,
+        },
+        # Current UIDs of the same two classes (PS3.6 Table A-1).
+        "1.2.840.10008.5.1.4.1.1.3.1": {
+            "name": "Ultrasound Multi-frame Image Storage",
+            "accept": True,
+        },
+        "1.2.840.10008.5.1.4.1.1.20": {
+            "name": "Nuclear Medicine Image Storage",
             "accept": True,
         },
     }

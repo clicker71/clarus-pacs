@@ -297,13 +297,17 @@ fn extract_jpeg_data(dicom_bytes: &[u8]) -> Option<Vec<u8>> {
             pos += if ob_like { 4 } else { 2 };
 
             if len == 0xFFFF_FFFF {
-                // Encapsulated: extract first non-empty fragment.
+                // Encapsulated: coalesce ALL non-empty fragments. A JPEG
+                // codestream may be split across multiple Items (PS3.5 A.4),
+                // and a decoder fed only the FIRST fragment sees a truncated
+                // stream. The fragments are concatenated in item order.
                 // BOT handling (01.09 field, ATLAS 4.70 slices): the
                 // Basic Offset Table, when present, is the FIRST item - an
                 // empty item (len 0) or N u32 offsets (len = 4*N, first
                 // offset always 0). A 1-entry BOT is disambiguated by its
                 // zero prefix: a JPEG stream never starts with 00 00 00 00.
                 let mut is_first_item = true;
+                let mut jpeg = Vec::new();
                 while pos + 8 <= dicom_bytes.len() {
                     let ig = u16_le(dicom_bytes, pos);
                     let ie = u16_le(dicom_bytes, pos + 2);
@@ -328,14 +332,19 @@ fn extract_jpeg_data(dicom_bytes: &[u8]) -> Option<Vec<u8>> {
                         if ilen == 0xFFFF_FFFF || pos + ilen > dicom_bytes.len() {
                             return None;
                         }
-                        return Some(dicom_bytes[pos..pos + ilen].to_vec());
+                        jpeg.extend_from_slice(&dicom_bytes[pos..pos + ilen]);
+                        pos += ilen;
+                        continue;
                     }
                     if (ig, ie) == (0xFFFE, 0xE0DD) {
                         break;
                     }
                     pos += ilen;
                 }
-                return None;
+                if jpeg.is_empty() {
+                    return None;
+                }
+                return Some(jpeg);
             } else {
                 if pos + len > dicom_bytes.len() {
                     return None;
@@ -591,5 +600,18 @@ mod tests {
         let frag = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
         let data = build_pixeldata(std::slice::from_ref(&frag));
         assert_eq!(extract_jpeg_data(&data).unwrap(), frag);
+    }
+
+    /// A codestream split across multiple fragments (PS3.5 A.4) must be
+    /// coalesced in item order - returning only the first fragment fed the
+    /// decoder a truncated stream.
+    #[test]
+    fn extract_coalesces_multiple_fragments() {
+        let frag1 = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        let frag2 = vec![0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02];
+        let data = build_pixeldata(&[frag1.clone(), frag2.clone()]);
+        let mut expected = frag1.clone();
+        expected.extend_from_slice(&frag2);
+        assert_eq!(extract_jpeg_data(&data).unwrap(), expected);
     }
 }

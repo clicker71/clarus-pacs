@@ -277,11 +277,17 @@ pub fn subscribe_scoped(
     // parameter name is: `Filter=` spelling the same parameter differently
     // slipped past an exact comparison and registered exactly the unfiltered
     // subscription this guard exists to refuse.
+    // The parameter is also legal as a BODY member on the Filtered resource
+    // (11.11), so the plain resource must refuse it there too: checking only
+    // the query string let `{"filter":{...}}` register an UNFILTERED
+    // subscription while the caller believed it had asked for a subset - and
+    // it answered 201, so nothing signalled the mismatch.
     if !filtered
-        && query.split('&').any(|kv| {
-            let key = kv.split_once('=').map_or(kv, |(k, _)| k);
-            key.eq_ignore_ascii_case("filter")
-        })
+        && (obj.obj_get("filter").is_some()
+            || query.split('&').any(|kv| {
+                let key = kv.split_once('=').map_or(kv, |(k, _)| k);
+                key.eq_ignore_ascii_case("filter")
+            }))
     {
         return bad_request("filter is only valid on the Filtered Worklist Subscription resource");
     }
@@ -341,6 +347,28 @@ pub fn unsubscribe(subscriber: &str) -> SubscribeResp {
     }
     let removed = subscriptions().unsubscribe(subscriber);
     crate::clog_info!(subscriber = %subscriber, removed = removed, "UPS unsubscribe");
+    SubscribeResp {
+        status: 204,
+        body: Vec::new(),
+    }
+}
+
+/// Remove one scope of `subscriber`, leaving its other subscriptions alone.
+///
+/// The Workitem Subscription template addresses one workitem, so its DELETE
+/// removes that scope only. The whole-AE form ([`unsubscribe`]) would also drop
+/// the subscriber's Worklist subscription, which the requester never named.
+pub fn unsubscribe_scoped(subscriber: &str, workitem_uid: &str) -> SubscribeResp {
+    if subscriber.is_empty() {
+        return bad_request("Empty subscriber AE Title");
+    }
+    let removed = subscriptions().unsubscribe_scoped(subscriber, Some(workitem_uid));
+    crate::clog_info!(
+        subscriber = %subscriber,
+        workitem = %workitem_uid,
+        removed = removed,
+        "UPS unsubscribe (scoped)"
+    );
     SubscribeResp {
         status: 204,
         body: Vec::new(),

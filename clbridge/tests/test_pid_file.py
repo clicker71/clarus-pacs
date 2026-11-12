@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 
+import clean_code.main as _main_mod
 import pytest
 from clean_code.main import (
     _acquire_pid_file,
@@ -78,22 +79,28 @@ def test_stale_pid_is_overwritten(tmp_path, caplog):
 
 
 def test_live_foreign_pid_is_fatal(tmp_path, monkeypatch):
-    """A live pid that is NOT us must abort the process."""
+    """A live pid that is NOT us must abort the process.
+
+    The pid has to be genuinely different from ours: a file naming the CURRENT
+    process is not a competing instance (that is the restart-in-a-container
+    case), so main only refuses a FOREIGN live pid.
+    """
     target = tmp_path / "clbridge-1.pid"
-    # Our own pid is guaranteed alive and (by construction) foreign to the
-    # os.kill check because the file says "another instance".
-    target.write_text(str(os.getpid()))
+    target.write_text("999999")
 
     calls = {}
 
-    def fake_kill(pid, sig):
-        calls["pid"] = pid  # alive -> no exception
+    def fake_is_alive(pid):
+        calls["pid"] = pid
+        return True  # alive -> the file names a running FOREIGN process
 
     def fake_exit(code):
         calls["exit"] = code
         raise SystemExit(code)
 
-    monkeypatch.setattr(os, "kill", fake_kill)
+    # Patch the module's own probe: `_pid_is_alive` uses ctypes on Windows and
+    # os.kill elsewhere, so patching os.kill only works on one platform.
+    monkeypatch.setattr(_main_mod, "_pid_is_alive", fake_is_alive)
     monkeypatch.setattr(os, "_exit", fake_exit)
 
     with pytest.raises(SystemExit) as excinfo:
@@ -101,6 +108,29 @@ def test_live_foreign_pid_is_fatal(tmp_path, monkeypatch):
 
     assert excinfo.value.code == 1
     assert calls["exit"] == 1
+
+
+def test_pid_file_naming_this_process_is_not_fatal(tmp_path, monkeypatch, caplog):
+    """A PID file holding OUR pid must not abort startup.
+
+    After a crash / SIGKILL the file survives, and in a container with a stable
+    filesystem across `docker restart` the new process gets the same pid - the
+    liveness probe then answered "alive" for the CURRENT process and the bridge
+    refused to start on every restart.
+    """
+    target = tmp_path / "clbridge-1.pid"
+    target.write_text(str(os.getpid()))
+
+    def fake_exit(code):
+        raise AssertionError(f"refused to start with our own pid (exit {code})")
+
+    monkeypatch.setattr(_main_mod, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(os, "_exit", fake_exit)
+
+    with caplog.at_level(logging.WARNING):
+        _write_pid_file(str(target))  # must not raise
+
+    assert target.read_text().strip() == str(os.getpid())
 
 
 def test_unwritable_directory_warns_and_does_not_raise(caplog, monkeypatch):

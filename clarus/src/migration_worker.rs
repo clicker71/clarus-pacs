@@ -31,16 +31,47 @@ use crate::storage_tiers::CronSchedule;
 /// blob (matched by BLAKE3, the CAS key). The physical file relocation
 /// (copy->verify) happens in the caller; this only updates the manifest
 /// metadata so reads (WADO/QIDO) resolve the new tier.
-fn set_storage_tier(state: &AppState, blake3: &str, tier: &str) {
+///
+/// Returns the number of manifests that CHANGED on disk. A rewrite that failed
+/// is not counted: the caller decides durability from this number, so counting
+/// an intent rather than a completed write made a batch loop forever on the
+/// ENOSPC path - the blob was reported migrated, the tier never changed, and the
+/// next tick selected it again.
+fn set_storage_tier(state: &AppState, blake3: &str, tier: &str) -> usize {
+    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
+    set_storage_tier_in(manifest_dir, blake3, tier)
+}
+
+/// Does a failed tier rewrite for `tier_byte` belong in the S3 error counter?
+///
+/// Only for S3. `set_storage_tier_for_patient` writes BOTH the cold and the S3
+/// tier, so an unconditional `record_s3_migration_error()` filed COLD write
+/// failures (ENOSPC on the cold volume, most often) under a cloud metric: the
+/// S3 error rate would climb while S3 was healthy, and nothing would ever clear
+/// it because no S3 retry touches a failed cold write.
+///
+/// Not feature-gated so the rule stays testable in a build without `s3`; the
+/// counter call itself is the gated part, so in that build the only callers are
+/// the tests below.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+fn a_failed_rewrite_is_an_s3_error(tier_byte: u8) -> bool {
+    tier_byte == clarus_core::manifest::TIER_S3
+}
+
+/// The scan itself, over an explicit manifest directory.
+///
+/// Split out so the durability rule is testable from a temp directory: whether
+/// a failed rewrite is COUNTED is the whole finding, and a test that had to
+/// build an `AppState` to reach it would not be written at all.
+fn set_storage_tier_in(manifest_dir: &std::path::Path, blake3: &str, tier: &str) -> usize {
     let tier_byte = match tier {
         "cold" => clarus_core::manifest::TIER_COLD,
         "s3" => clarus_core::manifest::TIER_S3,
         _ => clarus_core::manifest::TIER_COLD,
     };
-    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let mut matched = 0usize;
     let Ok(rd) = std::fs::read_dir(manifest_dir) else {
-        return;
+        return 0;
     };
     for ent in rd.flatten() {
         let name = ent.file_name();
@@ -68,19 +99,30 @@ fn set_storage_tier(state: &AppState, blake3: &str, tier: &str) {
             let Ok(mut fresh) = read_manifest(&ent.path()) else {
                 continue;
             };
+            // Count what THIS manifest contributed and only publish it once the
+            // write lands. Counting the intent made a failed rewrite (the
+            // ENOSPC case) look like a completed migration, so the caller
+            // deleted the hot copy and the next tick selected the blob again.
+            let mut changed = 0usize;
             for inst in fresh.series.iter_mut().flat_map(|s| s.instances.iter_mut()) {
                 let b3 = clarus_adapters::hex_encode(&inst.blake3);
                 if b3 == blake3 && inst.storage_tier != tier_byte {
                     inst.storage_tier = tier_byte;
-                    matched += 1;
+                    changed += 1;
                 }
             }
             // B3: drop the cached entry BEFORE the rewrite; reinstall after.
             let study_uid = name.trim_end_matches(".manifest");
             let (cache_v, _taken) = clarus_core::manifest_cache::begin_write(study_uid);
             if let Err(e) = write_manifest(&ent.path(), &fresh) {
+                // O1: the tier did NOT change on disk, so this manifest is not
+                // migrated. Reporting it as migrated hides an ENOSPC and makes
+                // the batch re-select the same blob forever; the count below
+                // stays at zero so the caller can fail the blob instead.
                 crate::clog_warn!(blake3, tier, error = %e, "Migration: manifest tier rewrite failed");
+                continue;
             } else {
+                matched += changed;
                 clarus_core::manifest_cache::end_write(
                     study_uid,
                     cache_v,
@@ -100,6 +142,7 @@ fn set_storage_tier(state: &AppState, blake3: &str, tier: &str) {
             "Migration: no manifest instance matched for retier"
         );
     }
+    matched
 }
 
 // -- Public entry point --------------------------------------------------
@@ -305,13 +348,22 @@ fn emergency_loop(state: AppState, free_gb_threshold: u32, check_secs: u64) {
 // -- Free space check -----------------------------------------------------
 
 /// Get free disk space in GB for the given path.
-/// Delegates to `crate::disk_utils::available_disk_mb`.
+///
+/// `disk_space_mb` is used rather than `available_disk_mb` because the latter
+/// collapses "the stat failed" and "the volume is full" into the same `0.0`.
+/// Here the two mean opposite things: a full volume is a LOW-SPACE answer the
+/// caller acts on, while a failed stat is a genuine error. Treating zero as an
+/// error made a full disk look like a broken one and stopped the migration
+/// with the wrong message.
 fn get_free_space_gb(path: &std::path::Path) -> Result<u64, String> {
-    let mb = crate::disk_utils::available_disk_mb(path);
-    if mb <= 0.0 {
+    let (_total_mb, available_mb) = crate::disk_utils::disk_space_mb(path)
+        .ok_or_else(|| "Cannot determine free disk space".to_string())?;
+    if available_mb < 0.0 {
         return Err("Cannot determine free disk space".to_string());
     }
-    Ok((mb / 1024.0) as u64)
+    // Zero available is a real answer: "no space left", which the caller's
+    // low-space check has to see.
+    Ok((available_mb / 1024.0) as u64)
 }
 
 // -- Migration batch: cold (NAS/HDD) --------------------------------------
@@ -350,10 +402,16 @@ fn migrate_batch_cold(state: &AppState, min_age_days: u32) -> Result<(), String>
 
     let cutoff_date = cutoff_date_str(min_age_days);
 
+    // O3: patients that aborted in THIS tick. It lives outside the chunk loop
+    // on purpose: `collect_migration_patients` re-derives the same candidates
+    // from the same cutoff every round, so a tick-scoped set is what stops the
+    // head-of-queue patients from being handed out again and starving the rest.
+    let mut tick_aborted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     loop {
         // The cap counts PATIENTS. It cannot count blobs: truncating a patient
         // batch is exactly the partial migration the invariant forbids.
-        let batches = collect_migration_patients(state, &cutoff_date, 50)?;
+        let batches = collect_migration_patients(state, &cutoff_date, 50, &tick_aborted)?;
         if batches.is_empty() {
             break;
         }
@@ -361,10 +419,6 @@ fn migrate_batch_cold(state: &AppState, min_age_days: u32) -> Result<(), String>
         let chunk_start = std::time::Instant::now();
         let mut chunk_migrated = 0u64;
         let mut chunk_skipped = 0u64;
-        // Patients that aborted in THIS chunk. `collect_migration_patients`
-        // re-derives the same candidates from the same cutoff, so without this
-        // set an aborted patient is handed out again on the very next round -
-        // the loop rewrote it every chunk until the age cutoff moved.
         let mut chunk_aborted: Vec<String> = Vec::new();
 
         for batch in &batches {
@@ -402,6 +456,10 @@ fn migrate_batch_cold(state: &AppState, min_age_days: u32) -> Result<(), String>
             }
             break;
         }
+
+        // O3: carry this chunk's aborts into the tick-scoped exclusion so the
+        // next collect skips them and reaches younger patients.
+        tick_aborted.extend(chunk_aborted.iter().cloned());
 
         tick_migrated += chunk_migrated;
         tick_skipped += chunk_skipped;
@@ -516,20 +574,25 @@ pub fn collect_migration_patients_for_test(
     cutoff_date: &str,
     max_patients: usize,
 ) -> Vec<(String, Vec<BlobTriple>)> {
-    collect_migration_patients(state, cutoff_date, max_patients)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|batch| {
-            (
-                batch.patient_id,
-                batch
-                    .blobs
-                    .into_iter()
-                    .map(|b| (b.blake3, b.file_size, b.study_uid))
-                    .collect(),
-            )
-        })
-        .collect()
+    collect_migration_patients(
+        state,
+        cutoff_date,
+        max_patients,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|batch| {
+        (
+            batch.patient_id,
+            batch
+                .blobs
+                .into_iter()
+                .map(|b| (b.blake3, b.file_size, b.study_uid))
+                .collect(),
+        )
+    })
+    .collect()
 }
 
 /// Whether a blob's hot file is absent but its cold copy is present.
@@ -560,13 +623,20 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
     let mut already_cold = 0u64;
     for blob in &batch.blobs {
         match copy_hot_to_cold_streaming(state, &blob.blake3, blob.file_size, cold) {
-            Ok(_) => {
+            Ok(created) => {
                 copied.push(blob);
-                written.push(PatientBlob {
-                    blake3: blob.blake3.clone(),
-                    file_size: blob.file_size,
-                    study_uid: blob.study_uid.clone(),
-                });
+                // Only a file THIS pass created is cleaned up on an abort. A
+                // blob that was already in the cold tier belongs to some
+                // earlier pass - or to a different hot study that shares the
+                // bytes - and unlinking it would delete a shared copy the
+                // other tier still points at.
+                if created {
+                    written.push(PatientBlob {
+                        blake3: blob.blake3.clone(),
+                        file_size: blob.file_size,
+                        study_uid: blob.study_uid.clone(),
+                    });
+                }
             }
             Err(e) if e == "__hot_missing__" => {
                 if hot_missing_is_resume(state, &blob.blake3, cold) {
@@ -576,7 +646,7 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
                 } else {
                     // DAMAGED: declared HOT, absent from both tiers. Do not
                     // complete this patient - see hot_missing_is_resume.
-                    cleanup_cold_copies(&written, cold);
+                    cleanup_cold_copies(state, &written, cold);
                     return PatientOutcome::Aborted(format!(
                         "hot copy of {} is missing and no cold copy exists",
                         blob.blake3
@@ -586,7 +656,7 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
             Err(e) => {
                 // ABORT: discard this pass's cold partials and leave the hot
                 // side and the tiers exactly as they were.
-                cleanup_cold_copies(&written, cold);
+                cleanup_cold_copies(state, &written, cold);
                 return PatientOutcome::Aborted(format!("copy failed: {e}"));
             }
         }
@@ -595,7 +665,7 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
     // -- Phase 2: VERIFY ---------------------------------------------------
     for blob in &copied {
         if let Err(e) = verify_cold_copy(&blob.blake3, blob.file_size, cold) {
-            cleanup_cold_copies(&written, cold);
+            cleanup_cold_copies(state, &written, cold);
             return PatientOutcome::Aborted(format!("verify failed: {e}"));
         }
     }
@@ -605,6 +675,19 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
     let flipped = set_storage_tier_for_patient(state, batch, "cold");
 
     // -- Phase 4: DELETE hot (only now) ------------------------------------
+    // O1: the delete is gated on the flip having LANDED. When the manifest
+    // rewrite failed (the ENOSPC emergency path) the archives still point at
+    // the hot tier, so removing the hot bytes would delete the only copy the
+    // server knows how to resolve. The copies stay; the patient is reported
+    // aborted so the batch does not count it as migrated and the next tick can
+    // retry once space is available.
+    if flipped == 0 {
+        cleanup_cold_copies(state, &written, cold);
+        return PatientOutcome::Aborted(
+            "manifest tier flip did not reach disk - hot copies kept".to_string(),
+        );
+    }
+
     // Every blob is deleted, including the ones copied in an earlier pass: the
     // whole patient is COLD at this point, which is the precondition for
     // removing ANY of its hot copies.
@@ -666,23 +749,41 @@ fn set_storage_tier_for_patient(state: &AppState, batch: &PatientBatch, tier: &s
         let Ok(mut fresh) = read_manifest(&ent.path()) else {
             continue;
         };
+        // Count what THIS manifest contributed, and only publish it once the
+        // write lands. Counting the intent made a failed rewrite (the ENOSPC
+        // case) look like a completed migration, so the caller deleted the hot
+        // copies and the next tick selected the same blob again.
+        let mut changed = 0u64;
         for inst in fresh.series.iter_mut().flat_map(|s| s.instances.iter_mut()) {
             let b3 = clarus_adapters::hex_encode(&inst.blake3);
             if inst.storage_tier != tier_byte && wanted.contains(b3.as_str()) {
                 inst.storage_tier = tier_byte;
-                matched += 1;
+                changed += 1;
             }
         }
         let study_uid = name.trim_end_matches(".manifest");
         let (cache_v, _taken) = clarus_core::manifest_cache::begin_write(study_uid);
         if let Err(e) = write_manifest(&ent.path(), &fresh) {
+            // O1: not durable, so not migrated. The cache entry stays dropped,
+            // which is correct - the file on disk is the authority.
             crate::clog_warn!(
                 study = %study_uid,
                 tier,
                 error = %e,
                 "Migration: patient tier rewrite failed"
             );
+            // The counter is `S3_MIGRATION_ERRORS`, so it may only move for an
+            // S3 failure: this function serves `"cold"` too, and a COLD rewrite
+            // failure filed under the S3 counter would report a cloud problem
+            // that did not happen. The call itself is gated because the metric
+            // only exists with the feature; the tier decision is not gated, so
+            // it stays testable in a build without `s3`.
+            #[cfg(feature = "s3")]
+            if a_failed_rewrite_is_an_s3_error(tier_byte) {
+                crate::metrics::record_s3_migration_error();
+            }
         } else {
+            matched += changed;
             clarus_core::manifest_cache::end_write(
                 study_uid,
                 cache_v,
@@ -718,7 +819,17 @@ fn migrate_batch_s3(state: &AppState, min_age_days: u32) -> Result<(), String> {
     let has_cold = state.cold_cas.is_some();
 
     loop {
-        let candidates = collect_migration_candidates(state, &cutoff_date, 500)?;
+        // Blobs a cold pass already moved are still part of the archive and
+        // are the prime S3 candidates once they age past the cutoff.
+        let candidates = collect_migration_candidates(
+            state,
+            &cutoff_date,
+            500,
+            &[
+                clarus_core::manifest::TIER_HOT,
+                clarus_core::manifest::TIER_COLD,
+            ],
+        )?;
         if candidates.is_empty() {
             break;
         }
@@ -732,7 +843,18 @@ fn migrate_batch_s3(state: &AppState, min_age_days: u32) -> Result<(), String> {
             let s3_key = s3_store.s3_key(blake3);
             if let Ok(_meta) = s3_store.head_object(&s3_key) {
                 crate::clog_debug!(blake3, "Already in S3 - skipping upload");
-                set_storage_tier(state, blake3, "s3");
+                // O1: the object is in the bucket, but the blob is only
+                // migrated once the manifest says so. A failed flip leaves the
+                // hot copy in place and the blob counted as skipped.
+                if set_storage_tier(state, blake3, "s3") == 0 {
+                    crate::clog_warn!(
+                        blake3 = %blake3,
+                        "S3 migration: tier flip did not reach disk - hot copy kept"
+                    );
+                    chunk_skipped += 1;
+                    tick_errors += 1;
+                    continue;
+                }
                 cleanup_hot_file_cas_safe(state, blake3);
                 chunk_migrated += 1;
                 continue;
@@ -779,7 +901,20 @@ fn migrate_batch_s3(state: &AppState, min_age_days: u32) -> Result<(), String> {
             match s3_store.put_object(&s3_key, bytes, "application/dicom") {
                 Ok(_etag) => {
                     crate::clog_debug!(blake3, s3_key, "Uploaded to S3");
-                    set_storage_tier(state, blake3, "s3");
+                    // O1: only a tier that reached disk makes this blob
+                    // migrated. A failed rewrite still holds the hot copy, so
+                    // deleting it would strand the object behind a manifest
+                    // that names a tier nothing was moved to.
+                    if set_storage_tier(state, blake3, "s3") == 0 {
+                        crate::clog_warn!(
+                            blake3 = %blake3,
+                            "S3 migration: tier flip did not reach disk - hot copy kept"
+                        );
+                        crate::metrics::record_s3_migration_error();
+                        chunk_skipped += 1;
+                        tick_errors += 1;
+                        continue;
+                    }
                     crate::metrics::record_s3_migration();
                     // Step D - CAS-safe cleanup
                     cleanup_hot_file_cas_safe(state, blake3);
@@ -880,7 +1015,12 @@ fn migrate_batch_emergency(state: &AppState, free_gb_threshold: u32) -> Result<(
     let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
-        let candidates = collect_migration_candidates(state, &cutoff_date, 500)?;
+        let candidates = collect_migration_candidates(
+            state,
+            &cutoff_date,
+            500,
+            &[clarus_core::manifest::TIER_HOT],
+        )?;
 
         let chunk_start = std::time::Instant::now();
         let mut chunk_migrated = 0u64;
@@ -933,7 +1073,17 @@ fn migrate_batch_emergency(state: &AppState, free_gb_threshold: u32) -> Result<(
                 match s3_store.put_object(&s3_key, bytes, "application/dicom") {
                     Ok(_etag) => {
                         crate::clog_debug!(blake3, "Emergency: uploaded to S3");
-                        set_storage_tier(state, blake3, "s3");
+                        // O1: `success` means "the archive now resolves this
+                        // blob from the new tier". A failed flip keeps that
+                        // false, so the hot copy survives and the blob is
+                        // retried instead of being counted as migrated.
+                        if set_storage_tier(state, blake3, "s3") == 0 {
+                            crate::clog_warn!(
+                                blake3 = %blake3,
+                                "Emergency: tier flip did not reach disk - hot copy kept"
+                            );
+                            continue;
+                        }
                         cleanup_hot_file_cas_safe(state, blake3);
                         success = true;
                     }
@@ -1025,7 +1175,14 @@ fn migrate_one_to_filesystem(
     }
 
     // Update the manifest tier (manifest-rewrite, no SQLite).
-    set_storage_tier(state, blake3, "cold");
+    //
+    // O1: a rewrite that did not reach disk is a FAILURE, not a success. The
+    // caller treats `Ok(true)` as "migrated" and proceeds to delete the hot
+    // copy, so reporting success here on an ENOSPC would remove the only copy
+    // the manifests still point at.
+    if set_storage_tier(state, blake3, "cold") == 0 {
+        return Err("tier flip did not reach disk".to_string());
+    }
 
     Ok(true)
 }
@@ -1101,11 +1258,17 @@ fn copy_hot_to_cold_streaming(
     blake3: &str,
     file_size: i64,
     cold: &ContentAddressedStorage,
-) -> Result<u64, String> {
+) -> Result<bool, String> {
     use std::io::{Read, Write};
 
     let hot_path = state.cas.cas_path(blake3);
     let target_path = cold.cas_path(blake3);
+
+    // CAS dedup: the same bytes are stored once per tier, so a blob another
+    // patient (or an earlier pass) already migrated is present here. Recording
+    // that in the caller's cleanup list would unlink a shared file, so the
+    // answer is reported instead of assumed.
+    let created_by_this_pass = !target_path.exists();
 
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
@@ -1205,7 +1368,10 @@ fn copy_hot_to_cold_streaming(
     }
 
     crate::metrics::STORAGE_WRITE_BYTES.fetch_add(written, std::sync::atomic::Ordering::Relaxed);
-    Ok(written)
+    // `true` means this pass created the cold file; `false` means the bytes
+    // were already there (CAS dedup) and the caller must not treat it as its
+    // own to delete.
+    Ok(created_by_this_pass)
 }
 
 /// Make a directory entry durable.
@@ -1251,13 +1417,62 @@ fn verify_cold_copy(
     Ok(())
 }
 
+/// Count live-manifest instances referencing `blake3` in a NON-hot tier.
+///
+/// `u64::MAX` on a read error: the file cannot be verified, so the caller must
+/// treat it as referenced and keep it. Any non-zero answer means the archive
+/// resolves this blob from somewhere other than hot.
+fn count_non_hot_refs(manifest_dir: &std::path::Path, blake3: &str) -> u64 {
+    let Ok(rd) = std::fs::read_dir(manifest_dir) else {
+        return u64::MAX; // cannot verify - keep the file
+    };
+    let mut n = 0u64;
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".manifest") {
+            continue;
+        }
+        let Ok(m) = read_manifest(&ent.path()) else {
+            // A manifest that will not decode might name this blob; treat it
+            // like an unreadable directory rather than assuming it does not.
+            n = n.saturating_add(1);
+            continue;
+        };
+        for inst in m.series.iter().flat_map(|s| &s.instances) {
+            if inst.storage_tier == clarus_core::manifest::TIER_HOT {
+                continue;
+            }
+            if clarus_adapters::hex_encode(&inst.blake3) == blake3 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Remove cold copies of `blobs` (the ABORT path's cleanup).
 ///
 /// Only the COLD side is touched: the abort contract is "hot untouched, tier
 /// untouched", so a failed patient leaves the hot originals exactly as they
 /// were and only discards the partial cold work.
-fn cleanup_cold_copies(blobs: &[PatientBlob], cold: &ContentAddressedStorage) {
+///
+/// O2: a copy is kept when ANY live manifest references the blob in a non-hot
+/// tier. The abort cleanup runs concurrently with the emergency worker, which
+/// may have flipped a manifest onto this very copy in the meantime; deleting it
+/// then would remove the only bytes the archive can resolve.
+fn cleanup_cold_copies(state: &AppState, blobs: &[PatientBlob], cold: &ContentAddressedStorage) {
+    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     for blob in blobs {
+        let refs = count_non_hot_refs(manifest_dir, &blob.blake3);
+        if refs > 0 {
+            crate::clog_debug!(
+                blake3 = %blob.blake3,
+                refs,
+                "Abort cleanup: cold copy kept (a live manifest now points at it)"
+            );
+            continue;
+        }
         let path = cold.cas_path(&blob.blake3);
         if path.exists() {
             let _ = std::fs::remove_file(&path);
@@ -1313,23 +1528,44 @@ fn cutoff_date_str(days_ago: u32) -> String {
 
 // -- Database query ------------------------------------------------------
 
-/// Collect migration candidates from live manifests: instances
-/// currently in the `hot` tier whose study date precedes `cutoff_date`,
-/// ordered by study date ascending, limited to `limit`.
+/// Collect migration candidates from live manifests: instances in one of the
+/// `wanted` tiers whose study date precedes `cutoff_date`, ordered by study
+/// date ascending, limited to `limit`.
 ///
 /// Returns `(blake3_hex, file_size, study_uid)` - the CAS key is BLAKE3.
+///
+/// The tier set is a parameter because the targets differ: the planned cold
+/// copy only takes blobs still in `hot`, while the S3 copy must also take the
+/// blobs a previous cold pass already moved - after `min_age_days` the cold
+/// tier holds exactly the studies S3 was asked for, and a hot-only collector
+/// left them on the NAS forever.
 fn collect_migration_candidates(
     state: &AppState,
     cutoff_date: &str,
     limit: u32,
+    wanted: &[u8],
 ) -> Result<Vec<(String, i64, String)>, String> {
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
-    let cutoff: i64 = cutoff_date.parse().unwrap_or(i64::MAX);
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    Ok(collect_candidates_in(manifest_dir, cutoff_date, wanted)
+        .into_iter()
+        .take(limit as usize)
+        .collect())
+}
 
+/// The scan behind [`collect_migration_candidates`], over a manifest directory.
+///
+/// Split out so the tier selection and the cutoff boundary are testable
+/// without an `AppState` (which owns the CAS, the index and the config): the
+/// two rules a wrong migration rests on are exactly those.
+fn collect_candidates_in(
+    manifest_dir: &std::path::Path,
+    cutoff_date: &str,
+    wanted: &[u8],
+) -> Vec<(String, i64, String)> {
+    let cutoff: i64 = cutoff_date.parse().unwrap_or(i64::MAX);
+    let mut seen = std::collections::HashSet::new();
     let Ok(rd) = std::fs::read_dir(manifest_dir) else {
-        return Ok(out);
+        return Vec::new();
     };
     let mut entries: Vec<(i64, (String, i64, String))> = Vec::new();
     for ent in rd.flatten() {
@@ -1355,7 +1591,7 @@ fn collect_migration_candidates(
         }
         let study_uid = name.trim_end_matches(".manifest").to_string();
         for inst in m.series.iter().flat_map(|s| &s.instances) {
-            if inst.storage_tier != clarus_core::manifest::TIER_HOT {
+            if !wanted.contains(&inst.storage_tier) {
                 continue;
             }
             let b3 = clarus_adapters::hex_encode(&inst.blake3);
@@ -1366,10 +1602,7 @@ fn collect_migration_candidates(
     }
 
     entries.sort_by_key(|(d, _)| *d);
-    for (_, cand) in entries.into_iter().take(limit as usize) {
-        out.push(cand);
-    }
-    Ok(out)
+    entries.into_iter().map(|(_, cand)| cand).collect()
 }
 
 // -- Patient-atomic collection (OWNER INVARIANT 12.09) -------------------
@@ -1415,8 +1648,27 @@ fn collect_migration_patients(
     state: &AppState,
     cutoff_date: &str,
     max_patients: usize,
+    exclude: &std::collections::HashSet<String>,
 ) -> Result<Vec<PatientBatch>, String> {
-    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
+    collect_migration_patients_in(
+        std::path::Path::new(&state.config.btree.manifest_dir),
+        cutoff_date,
+        max_patients,
+        exclude,
+    )
+}
+
+/// The scan itself, over an explicit manifest directory.
+///
+/// Split out so the grouping and exclusion rules are testable from a temp
+/// directory: they are the part that decides which patients a tick touches, and
+/// a test that had to build an `AppState` to reach them would test less.
+fn collect_migration_patients_in(
+    manifest_dir: &std::path::Path,
+    cutoff_date: &str,
+    max_patients: usize,
+    exclude: &std::collections::HashSet<String>,
+) -> Result<Vec<PatientBatch>, String> {
     let cutoff: i64 = cutoff_date.parse().unwrap_or(i64::MAX);
     // patient_id -> (earliest study date for ordering, blobs)
     let mut by_patient: std::collections::HashMap<String, (i64, Vec<PatientBlob>)> =
@@ -1487,6 +1739,11 @@ fn collect_migration_patients(
     let mut batches: Vec<(i64, PatientBatch)> = by_patient
         .into_iter()
         .filter(|(_, (_, blobs))| !blobs.is_empty())
+        // O3: a patient that aborted earlier in THIS tick is not a candidate
+        // again. Without this the same head-of-queue patients are re-collected
+        // every chunk (they sort first by study date), and younger patients
+        // never reach the `take(max_patients)` cap - they starve.
+        .filter(|(patient_id, _)| !exclude.contains(patient_id))
         .map(|(patient_id, (date, mut blobs))| {
             // Deterministic order inside a batch: the same manifests must
             // always produce the same sequence, or a resume would reorder.
@@ -1613,6 +1870,272 @@ mod tests {
         assert_eq!(
             count_hot_refs(dir.path(), &clarus_adapters::hex_encode(&b)),
             0
+        );
+    }
+
+    /// The tier set decides what a target sees, and the S3 target must see the
+    /// blobs a cold pass already moved.
+    ///
+    /// Falsification anchor: the same store scanned with the hot-only set
+    /// returns the HOT instance and not the COLD one. A collector that ignored
+    /// its tier set would return both, and the S3 pass would never pick up a
+    /// study the NAS already holds - which is the whole point of the tier
+    /// after `min_age_days`.
+    #[test]
+    fn a_cold_instance_is_a_candidate_for_the_cloud_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut hot = [0u8; 32];
+        hot[0] = 0x11;
+        let mut cold = [0u8; 32];
+        cold[0] = 0x22;
+        write_one_manifest(
+            dir.path(),
+            "1.2.7",
+            hot,
+            clarus_core::manifest::TIER_HOT,
+            Some("20200101"),
+        );
+        write_one_manifest(
+            dir.path(),
+            "1.2.8",
+            cold,
+            clarus_core::manifest::TIER_COLD,
+            Some("20200102"),
+        );
+
+        // `collect_migration_candidates` only needs the manifest directory, so
+        // the scan is exercised through a state-free helper below.
+        let both = collect_candidates_in(
+            dir.path(),
+            "99991231",
+            &[
+                clarus_core::manifest::TIER_HOT,
+                clarus_core::manifest::TIER_COLD,
+            ],
+        );
+        let hashes: Vec<&str> = both.iter().map(|(h, _, _)| h.as_str()).collect();
+        assert!(
+            hashes.contains(&clarus_adapters::hex_encode(&cold).as_str()),
+            "a blob already in cold is still a cloud candidate"
+        );
+        assert_eq!(both.len(), 2, "both tiers contribute");
+
+        let hot_only =
+            collect_candidates_in(dir.path(), "99991231", &[clarus_core::manifest::TIER_HOT]);
+        assert_eq!(hot_only.len(), 1, "the hot-only set excludes the cold blob");
+        assert_eq!(
+            hot_only[0].0,
+            clarus_adapters::hex_encode(&hot),
+            "the hot instance is the one the cold pass selected"
+        );
+    }
+
+    /// Cutoff boundary: a study dated exactly on the cutoff is NOT old enough.
+    #[test]
+    fn a_study_dated_on_the_cutoff_is_not_a_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_one_manifest(
+            dir.path(),
+            "1.2.9",
+            [0x33; 32],
+            clarus_core::manifest::TIER_HOT,
+            Some("20260101"),
+        );
+        assert!(
+            collect_candidates_in(dir.path(), "20260101", &[clarus_core::manifest::TIER_HOT])
+                .is_empty(),
+            "the cutoff is exclusive, so the pass never races a same-day study"
+        );
+        assert_eq!(
+            collect_candidates_in(dir.path(), "20260102", &[clarus_core::manifest::TIER_HOT]).len(),
+            1,
+            "one day past the cutoff the study is eligible"
+        );
+    }
+
+    /// O1: a manifest whose rewrite did not land is NOT counted as migrated.
+    ///
+    /// The count is what the caller uses to decide whether to delete the hot
+    /// copy. Counting the intent made a failed write (the ENOSPC path) look
+    /// successful: the hot bytes were removed while every manifest still named
+    /// the hot tier, and the batch re-selected the same blob forever.
+    #[test]
+    fn a_failed_manifest_rewrite_is_not_counted_as_migrated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut b = [0u8; 32];
+        b[0] = 0x91;
+        write_one_manifest(
+            dir.path(),
+            "1.2.30",
+            b,
+            clarus_core::manifest::TIER_HOT,
+            Some("20260101"),
+        );
+        let hex = clarus_adapters::hex_encode(&b);
+
+        // The happy path counts the manifest it actually changed.
+        assert_eq!(
+            set_storage_tier_in(dir.path(), &hex, "cold"),
+            1,
+            "one manifest changed on disk"
+        );
+        // Re-running it changes nothing, so it counts nothing.
+        assert_eq!(
+            set_storage_tier_in(dir.path(), &hex, "cold"),
+            0,
+            "an already-flipped manifest is not a change"
+        );
+
+        // Now make the rewrite impossible: a DIRECTORY sits where the atomic
+        // writer wants to put its temp sibling, so `write_manifest` fails. The
+        // tier cannot change on disk, so the count must stay zero - this is the
+        // ENOSPC shape without needing a full filesystem.
+        let mut c = [0u8; 32];
+        c[0] = 0x92;
+        write_one_manifest(
+            dir.path(),
+            "1.2.31",
+            c,
+            clarus_core::manifest::TIER_HOT,
+            Some("20260101"),
+        );
+        let blocked = dir.path().join("1.2.31.manifest.tmp");
+        std::fs::create_dir_all(&blocked).expect("create the blocking directory");
+        assert_eq!(
+            set_storage_tier_in(dir.path(), &clarus_adapters::hex_encode(&c), "cold"),
+            0,
+            "a rewrite that did not reach disk is not a migration"
+        );
+        // The record on disk still says HOT, which is why the caller must not
+        // delete the hot copy.
+        let m = clarus_core::manifest::read_manifest(&dir.path().join("1.2.31.manifest"))
+            .expect("manifest still readable");
+        assert_eq!(
+            m.series[0].instances[0].storage_tier,
+            clarus_core::manifest::TIER_HOT,
+            "the tier is unchanged when the write fails"
+        );
+    }
+
+    /// O2: a blob a live manifest references in a NON-hot tier is not free to
+    /// delete from cold.
+    ///
+    /// The abort cleanup and the emergency worker run concurrently: the worker
+    /// can flip a manifest onto the very cold copy the aborting patient just
+    /// wrote, and the old unconditional unlink then removed the archive's only
+    /// remaining bytes. The count answers "does anything resolve this from a
+    /// non-hot tier".
+    #[test]
+    fn count_non_hot_refs_sees_a_flipped_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut b = [0u8; 32];
+        b[0] = 0x77;
+
+        // A manifest that has been FLIPPED to cold for this blob.
+        write_one_manifest(
+            dir.path(),
+            "1.2.20",
+            b,
+            clarus_core::manifest::TIER_COLD,
+            Some("20260101"),
+        );
+        assert_eq!(
+            count_non_hot_refs(dir.path(), &clarus_adapters::hex_encode(&b)),
+            1,
+            "the flipped manifest means the cold copy is the live one"
+        );
+        // It is NOT a hot ref, which is why `count_hot_refs` could not answer
+        // this question on its own.
+        assert_eq!(
+            count_hot_refs(dir.path(), &clarus_adapters::hex_encode(&b)),
+            0
+        );
+
+        // A blob referenced only from hot is safe to drop from cold.
+        let mut only_hot = [0u8; 32];
+        only_hot[0] = 0x78;
+        write_one_manifest(
+            dir.path(),
+            "1.2.21",
+            only_hot,
+            clarus_core::manifest::TIER_HOT,
+            Some("20260101"),
+        );
+        assert_eq!(
+            count_non_hot_refs(dir.path(), &clarus_adapters::hex_encode(&only_hot)),
+            0,
+            "nothing resolves it from a non-hot tier"
+        );
+    }
+
+    /// O3: a patient excluded from the collect is not handed out again.
+    ///
+    /// `collect_migration_patients` re-derives candidates from the same cutoff
+    /// every chunk, and the ordering is by earliest study date - so the patients
+    /// that aborted are exactly the ones at the head of the queue. Without the
+    /// exclusion set they are collected again immediately and the younger
+    /// patients never reach the `take(max_patients)` cap.
+    #[test]
+    fn an_excluded_patient_is_not_collected_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Two patients: PAT-OLD sorts first, PAT-NEW second.
+        write_one_manifest_for(
+            dir.path(),
+            "1.2.10",
+            [0x41; 32],
+            clarus_core::manifest::TIER_HOT,
+            Some("20200101"),
+            "PAT-OLD",
+        );
+        write_one_manifest_for(
+            dir.path(),
+            "1.2.11",
+            [0x42; 32],
+            clarus_core::manifest::TIER_HOT,
+            Some("20200601"),
+            "PAT-NEW",
+        );
+
+        let all = collect_migration_patients_in(dir.path(), "99991231", 10, &Default::default())
+            .expect("collect");
+        let all: Vec<String> = all.into_iter().map(|b| b.patient_id).collect();
+        assert_eq!(all.len(), 2, "both patients are candidates");
+        assert_eq!(all[0], "PAT-OLD", "the oldest patient sorts first");
+
+        // Excluding the head-of-queue patient must expose the next one, which
+        // is what stops it starving behind a patient that keeps aborting.
+        let mut exclude: std::collections::HashSet<String> = std::collections::HashSet::new();
+        exclude.insert("PAT-OLD".to_string());
+        let after = collect_migration_patients_in(dir.path(), "99991231", 10, &exclude)
+            .expect("collect with exclusion");
+        let after: Vec<String> = after.into_iter().map(|b| b.patient_id).collect();
+        assert_eq!(
+            after,
+            vec!["PAT-NEW".to_string()],
+            "the aborted patient is skipped"
+        );
+    }
+
+    /// A failed COLD rewrite must not move the S3 error counter.
+    ///
+    /// `set_storage_tier_for_patient` serves both tiers, but the metric it used
+    /// to call unconditionally is `S3_MIGRATION_ERRORS`. A cold-volume ENOSPC
+    /// therefore reported a cloud fault, and no S3 retry could ever clear it.
+    #[test]
+    fn a_cold_rewrite_failure_is_not_an_s3_error() {
+        assert!(
+            !a_failed_rewrite_is_an_s3_error(clarus_core::manifest::TIER_COLD),
+            "a COLD write failure must not be counted as an S3 error"
+        );
+        assert!(
+            a_failed_rewrite_is_an_s3_error(clarus_core::manifest::TIER_S3),
+            "an S3 write failure must be counted"
+        );
+        // HOT is not rewritten by this path at all; if it ever is, filing it
+        // under S3 would be the same category error.
+        assert!(
+            !a_failed_rewrite_is_an_s3_error(clarus_core::manifest::TIER_HOT),
+            "a HOT write failure must not be counted as an S3 error"
         );
     }
 }

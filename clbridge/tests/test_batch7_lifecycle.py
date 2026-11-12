@@ -237,12 +237,16 @@ class TestNEVENTEmptyResponse:
 
 
 class TestNeventLevelLock:
-    def test_the_restore_is_serialised(self):
-        """The save/raise/restore triple is not atomic, so two reporters could
-        leave the library silenced for the life of the process."""
+    def test_suppression_is_per_thread_not_a_level_change(self):
+        """R12: silencing the pynetdicom LOGGER changes one object shared by
+        the whole process, so every other thread's C-STORE/C-MOVE records were
+        dropped for the duration of the association - seconds, times the
+        retries. Suppression must be scoped to the reporting thread."""
         import clean_code.nevent as nevent
 
-        assert hasattr(nevent, "_LEVEL_LOCK"), "the level window has no lock"
+        assert not hasattr(nevent, "_LEVEL_LOCK"), (
+            "the level window is gone: suppression is a per-thread filter now"
+        )
         source = open(os.path.join(CLEAN_CODE, "nevent.py"), encoding="utf-8").read()
         tree = ast.parse(source)
         fn = next(
@@ -250,16 +254,51 @@ class TestNeventLevelLock:
             for n in ast.walk(tree)
             if isinstance(n, ast.FunctionDef) and n.name == "send_n_event_report"
         )
-        guarded = any(
-            isinstance(n, ast.With)
-            and any(
-                isinstance(item.context_expr, ast.Name)
-                and item.context_expr.id == "_LEVEL_LOCK"
-                for item in n.items
-            )
+        assert not any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "setLevel"
             for n in ast.walk(fn)
-        )
-        assert guarded, "associate() is not called under _LEVEL_LOCK"
+        ), "send_n_event_report must not move the process-wide logger level"
+        assert any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "addFilter"
+            for n in ast.walk(fn)
+        ), "associate() must run behind a per-thread filter"
+
+    def test_suppression_does_not_reach_another_thread(self):
+        """A record logged by a DIFFERENT thread while one reporter is inside
+        associate() must still be emitted."""
+        import logging
+
+        import clean_code.nevent as nevent
+
+        pn = logging.getLogger("pynetdicom")
+        if nevent._pn_quiet_filter not in pn.filters:
+            pn.addFilter(nevent._pn_quiet_filter)
+
+        captured = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+
+        handler = _Capture()
+        pn.addHandler(handler)
+        previous = pn.level
+        pn.setLevel(logging.DEBUG)
+        try:
+            nevent._PN_QUIET.on = True
+            pn.info("from the silenced reporter")
+            nevent._PN_QUIET.on = False
+            pn.info("from another reporter")
+        finally:
+            pn.removeHandler(handler)
+            pn.setLevel(previous)
+
+        assert "from the silenced reporter" not in captured
+        assert "from another reporter" in captured
 
     def test_two_reporters_leave_the_level_restored(self):
         import logging
@@ -298,3 +337,6 @@ class TestNeventLevelLock:
         assert (
             pn.level == original
         ), f"the pynetdicom level stayed at {pn.level} instead of {original}"
+        assert getattr(nevent._PN_QUIET, "on", False) is False, (
+            "the suppression flag must be reset when the association returns"
+        )

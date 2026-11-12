@@ -499,9 +499,17 @@ pub(crate) fn collect_referenced_counted(
             continue;
         }
         let path = entry.path();
-        let Ok(m) = read_manifest(&path) else {
-            continue; // corrupt live manifest - leave CAS files alone
-        };
+        // A manifest that cannot be decoded stops the whole scan instead of
+        // being skipped: returning a set that is missing one study's hashes
+        // makes every blob of that study look unreferenced, and the erase pass
+        // would then unlink images of a study still in the archive. Deferring
+        // costs an erase pass; guessing costs an instance.
+        let m = read_manifest(&path).map_err(|e| {
+            std::io::Error::other(format!(
+                "erase worker: unreadable live manifest {}: {e}",
+                path.display()
+            ))
+        })?;
         for series in &m.series {
             instances += series.instances.len() as u64;
             for i in &series.instances {
@@ -529,7 +537,20 @@ fn set_pending_gauge(n: u64) {
 /// correction), or `None` when the pass aborted (manifests dir unreadable) -
 /// in that case the caller must leave the gauge untouched.
 pub fn gc_orphans(state: &AppState, manifest_dir: &Path) -> Option<(u64, u64)> {
-    let referenced = collect_referenced(manifest_dir).ok()?;
+    // A skipped pass must NEVER fall back to an empty reference set: every
+    // recorded blob would look unreferenced and be unlinked. Abort instead and
+    // let the caller keep the gauge where it is.
+    let referenced = match collect_referenced(manifest_dir) {
+        Ok(set) => set,
+        Err(e) => {
+            crate::clog_warn!(
+                manifest_dir = %manifest_dir.display(),
+                error = %e,
+                "orphan GC: reference scan failed, pass skipped"
+            );
+            return None;
+        }
+    };
     let entries = std::fs::read_dir(manifest_dir).ok()?;
     let mut stats = EraseStats::default();
     for entry in entries.flatten() {
@@ -718,5 +739,43 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// A live manifest that cannot be decoded must fail the scan, not thin it.
+    ///
+    /// A skipped manifest answers "no blob is referenced by this study", so
+    /// the erase pass would unlink the stored pixels of a study the archive
+    /// still lists - the delete was asked for one study, the unlink would take
+    /// another. The scan has to refuse instead.
+    #[test]
+    fn an_unreadable_live_manifest_fails_the_reference_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("1.2.3.study.manifest"), b"\xFF\xFF\xFF\xFF")
+            .expect("corrupt manifest");
+        std::fs::write(dir.path().join("1.2.4.study.manifest"), b"\xFF\xFF\xFF\xFF")
+            .expect("corrupt manifest");
+
+        let err = collect_referenced_counted(dir.path())
+            .expect_err("a corrupt live manifest must fail the scan");
+        assert!(
+            err.to_string().contains("unreadable live manifest"),
+            "the error names the cause, got: {err}"
+        );
+        assert!(
+            collect_referenced(dir.path()).is_err(),
+            "the set-returning form must not answer with a partial set"
+        );
+    }
+
+    /// An empty store is still a successful scan (no tombstones, nothing
+    /// referenced) - the refusal above must not turn "nothing stored" into an
+    /// error.
+    #[test]
+    fn an_empty_manifest_directory_is_a_complete_answer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (set, instances) =
+            collect_referenced_counted(dir.path()).expect("an empty store scans cleanly");
+        assert!(set.is_empty());
+        assert_eq!(instances, 0);
     }
 }

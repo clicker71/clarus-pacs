@@ -72,6 +72,19 @@ const K_PERFORMED_END_DATETIME: u64 = 30;
 // not know, so a new key must be written LAST and must never renumber.
 const K_SCHEDULED_PROCESSING_PARAMETERS: u64 = 31;
 const K_REASON_FOR_REQUESTED_PROCEDURE: u64 = 32;
+// Added with the nested-references pass (0911). Append-only as above: these
+// carry the full (0040,4021) Input Information Sequence and (0074,1216)
+// Unified Procedure Step Performed Procedure Sequence as canonical DICOM JSON
+// info objects, so the requester's unchanged inputs and the performer's full
+// report survive a round trip that the typed projection would flatten.
+const K_INPUT_INFORMATION: u64 = 33;
+const K_PERFORMED_PROCEDURE_INFORMATION: u64 = 34;
+// Added with the batch-3 conformance pass (1112). Append-only as above. Key 35
+// carries (0074,1202) Worklist Label, which PS3.4 Table CC.2.5-3 types 2/1 and
+// makes a matching key; key 36 carries the DATASET-ROOT (0020,000D), a different
+// fact from key 20 (the input study inside the Referenced Request Sequence).
+const K_WORKLIST_LABEL: u64 = 35;
+const K_OUTPUT_STUDY_UID: u64 = 36;
 
 /// A single UPS workitem, as persisted in `workitems/{uid}.cbor`.
 ///
@@ -127,6 +140,15 @@ pub struct WorkItemRecord {
     /// (0074,1204) Procedure Step Label - type 1 at N-CREATE, and a matching
     /// key for UPS-RS search (PS3.4 Table CC.2.5-3).
     pub step_label: Option<String>,
+    /// (0074,1202) Worklist Label - type 2/1 at N-CREATE (PS3.4 Table
+    /// CC.2.5-3) and a matching key, so a search may filter on it.
+    pub worklist_label: Option<String>,
+    /// (0020,000D) Study Instance UID at DATASET ROOT - the study assigned to
+    /// the output instances.
+    ///
+    /// Distinct from `input_study_uid`, which is the study inside (0040,A370)
+    /// and (0040,4021). PS3.4 Table CC.2.5-1 lists both, as separate rows.
+    pub output_study_uid: Option<String>,
     /// (0040,4041) Input Readiness State - type 1 at N-CREATE.
     pub input_readiness: Option<String>,
     /// (0040,4005) Scheduled Procedure Step Start DateTime - type 1 at
@@ -208,6 +230,25 @@ pub struct WorkItemRecord {
     /// (0040,4051) Performed Procedure Step End DateTime - when the performer
     /// finished. Same item and same discipline as the start above.
     pub performed_end_datetime: Option<String>,
+    /// (0040,4021) Input Information Sequence, stored as the canonical DICOM
+    /// JSON of the element (key 33).
+    ///
+    /// OPAQUE here for the same reason as (0074,1210): the item may carry the
+    /// full Referenced Instances and Access Macro (PS3.3 Table 10-3b) -
+    /// (0008,1199) Referenced SOP Sequence, (0008,1150)/(0008,1155) and
+    /// (0020,000D)/(0020,000E) - which the typed `input_study_uid` flattens to
+    /// one scalar. Storing the serialized element is what makes "the requester
+    /// can verify its unchanged inputs" true.
+    pub input_information: Option<String>,
+    /// (0074,1216) Unified Procedure Step Performed Procedure Sequence,
+    /// stored as the canonical DICOM JSON of the element (key 34).
+    ///
+    /// OPAQUE for the same reason: the performer report may carry children the
+    /// typed projection does not model ((0040,4029) Performed Station Class
+    /// Code Sequence, for one), and a partial N-SET must merge rather than
+    /// replace them. The typed performed-* fields stay as the searchable
+    /// projection; this field is the lossless one.
+    pub performed_procedure_information: Option<String>,
     /// (0074,1210) Scheduled Processing Parameters Sequence, stored as the
     /// canonical JSON of the element (key 31).
     ///
@@ -239,6 +280,9 @@ pub struct WorkItemRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputReference {
     pub sop_class_uid: String,
+    /// (0020,000D) Study Instance UID of the output object, empty when the
+    /// performer named none (the macro types it 1C).
+    pub study_instance_uid: String,
     pub series_instance_uid: String,
     pub sop_instance_uid: String,
 }
@@ -320,6 +364,10 @@ impl WorkItemRecord {
             self.performed_end_datetime.is_some(),
             self.scheduled_processing_parameters.is_some(),
             self.reason_for_requested_procedure.is_some(),
+            self.input_information.is_some(),
+            self.performed_procedure_information.is_some(),
+            self.worklist_label.is_some(),
+            self.output_study_uid.is_some(),
         ]
         .iter()
         .filter(|p| **p)
@@ -431,6 +479,7 @@ impl WorkItemRecord {
                 // caller error, not a storage condition, and it must not be
                 // stored silently.
                 if has_unit_separator(&out.sop_class_uid)
+                    || has_unit_separator(&out.study_instance_uid)
                     || has_unit_separator(&out.series_instance_uid)
                     || has_unit_separator(&out.sop_instance_uid)
                 {
@@ -442,6 +491,8 @@ impl WorkItemRecord {
                     joined.push('\u{1e}');
                 }
                 joined.push_str(&out.sop_class_uid);
+                joined.push('\u{1f}');
+                joined.push_str(&out.study_instance_uid);
                 joined.push('\u{1f}');
                 joined.push_str(&out.series_instance_uid);
                 joined.push('\u{1f}');
@@ -483,6 +534,20 @@ impl WorkItemRecord {
             K_REASON_FOR_REQUESTED_PROCEDURE,
             self.reason_for_requested_procedure.as_deref(),
         )?;
+        // Keys 33 and 34 close the set, LAST so the map keys stay ascending.
+        write_opt_str(
+            writer,
+            K_INPUT_INFORMATION,
+            self.input_information.as_deref(),
+        )?;
+        write_opt_str(
+            writer,
+            K_PERFORMED_PROCEDURE_INFORMATION,
+            self.performed_procedure_information.as_deref(),
+        )?;
+        // Keys 35 and 36 close the set, LAST so the map keys stay ascending.
+        write_opt_str(writer, K_WORKLIST_LABEL, self.worklist_label.as_deref())?;
+        write_opt_str(writer, K_OUTPUT_STUDY_UID, self.output_study_uid.as_deref())?;
 
         Ok(())
     }
@@ -623,6 +688,19 @@ impl WorkItemRecord {
                     rec.reason_for_requested_procedure =
                         Some(read_text(&mut reader, "reason_for_requested_procedure")?)
                 }
+                K_INPUT_INFORMATION => {
+                    rec.input_information = Some(read_text(&mut reader, "input_information")?)
+                }
+                K_PERFORMED_PROCEDURE_INFORMATION => {
+                    rec.performed_procedure_information =
+                        Some(read_text(&mut reader, "performed_procedure_information")?)
+                }
+                K_WORKLIST_LABEL => {
+                    rec.worklist_label = Some(read_text(&mut reader, "worklist_label")?)
+                }
+                K_OUTPUT_STUDY_UID => {
+                    rec.output_study_uid = Some(read_text(&mut reader, "output_study_uid")?)
+                }
                 K_OUTPUT_INFORMATION => {
                     let joined = read_text(&mut reader, "output_information")?;
                     // An empty value decodes to an EMPTY list, not `None`:
@@ -636,19 +714,23 @@ impl WorkItemRecord {
                             continue;
                         }
                         let parts: Vec<&str> = item.split('\u{1f}').collect();
-                        // Three fields is the current shape (class, series,
-                        // instance); two is the pre-series record shape
-                        // (class, instance) with the series unknown. The
-                        // count, not the emptiness of a field, tells them
-                        // apart: a current record legitimately carries an
-                        // empty series when the performer named none.
-                        let (class, series, instance) = match parts.as_slice() {
-                            [class, series, instance] => (*class, *series, *instance),
-                            [class, instance, ..] => (*class, "", *instance),
-                            _ => ("", "", ""),
+                        // Four fields is the current shape (class, study, series,
+                        // instance); three is the pre-study shape (class, series,
+                        // instance); two is the pre-series shape (class, instance).
+                        // The COUNT, not the emptiness of a field, tells them apart: a
+                        // current record legitimately carries an empty study or series
+                        // when the performer named none.
+                        let (class, study, series, instance) = match parts.as_slice() {
+                            [class, study, series, instance] => {
+                                (*class, *study, *series, *instance)
+                            }
+                            [class, series, instance] => (*class, "", *series, *instance),
+                            [class, instance, ..] => (*class, "", "", *instance),
+                            _ => ("", "", "", ""),
                         };
                         outputs.push(OutputReference {
                             sop_class_uid: class.to_string(),
+                            study_instance_uid: study.to_string(),
                             series_instance_uid: series.to_string(),
                             sop_instance_uid: instance.to_string(),
                         });
@@ -856,6 +938,30 @@ mod tests {
         }
     }
 
+    /// The two nested-reference fields survive the CBOR round trip verbatim:
+    /// a field the encoder wrote but the decoder dropped would be invisible
+    /// until a restart, and a flattened re-read would defeat the lossless
+    /// round trip this record exists to provide.
+    #[test]
+    fn roundtrip_preserves_nested_reference_elements() {
+        let input = r#"{"Value":[{"0040E020":{"vr":"CS","Value":["DICOM"]},"0020000D":{"vr":"UI","Value":["1.2.3.4"]},"00081199":{"vr":"SQ","Value":[{"00081150":{"vr":"UI","Value":["1.2.840.10008.5.1.4.1.1.2"]},"00081155":{"vr":"UI","Value":["1.2.3.4.5"]}}]}}],"vr":"SQ"}"#;
+        let performed =
+            r#"{"Value":[{"00404050":{"vr":"DT","Value":["20261109T100000"]}}],"vr":"SQ"}"#;
+        let rec = WorkItemRecord {
+            input_information: Some(input.to_string()),
+            performed_procedure_information: Some(performed.to_string()),
+            ..sample()
+        };
+        let bytes = rec.encode().expect("encode");
+        let decoded = WorkItemRecord::decode(&bytes).expect("decode");
+        assert_eq!(decoded.input_information.as_deref(), Some(input));
+        assert_eq!(
+            decoded.performed_procedure_information.as_deref(),
+            Some(performed)
+        );
+        assert_eq!(decoded, rec);
+    }
+
     /// An output list must survive encode: the separators it joins with are
     /// structure, not data, so a guard that scans the joined buffer rejects
     /// every record that has one.
@@ -865,11 +971,13 @@ mod tests {
         rec.output_information = Some(vec![
             OutputReference {
                 sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
+                study_instance_uid: "1.2.3".to_string(),
                 series_instance_uid: "1.2.3.4".to_string(),
                 sop_instance_uid: "1.2.3.4.5".to_string(),
             },
             OutputReference {
                 sop_class_uid: "1.2.840.10008.5.1.4.1.1.4".to_string(),
+                study_instance_uid: "1.2.3".to_string(),
                 series_instance_uid: "1.2.3.6".to_string(),
                 sop_instance_uid: "1.2.3.6.7".to_string(),
             },
@@ -884,6 +992,7 @@ mod tests {
         let mut rec = sample();
         rec.output_information = Some(vec![OutputReference {
             sop_class_uid: "1.2.3".to_string(),
+            study_instance_uid: "1.2.3".to_string(),
             series_instance_uid: "4.5\u{1f}6".to_string(),
             sop_instance_uid: "7".to_string(),
         }]);

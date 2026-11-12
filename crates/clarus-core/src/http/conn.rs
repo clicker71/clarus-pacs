@@ -68,14 +68,17 @@ impl Timeouts {
     }
 }
 
-/// Set the socket receive/send timeouts (audited FFI in `crate::ffi`).
-#[cfg(unix)]
-pub fn set_timeouts(stream: &TcpStream, recv: Duration, send: Duration) -> io::Result<()> {
-    crate::ffi::set_socket_timeouts(stream, recv, send)
-}
-
-/// Set the socket receive/send timeouts (std `TcpStream` setters on Windows).
-#[cfg(windows)]
+/// Set the socket receive/send timeouts.
+///
+/// `set_read_timeout`/`set_write_timeout` are `setsockopt(SO_RCVTIMEO)` and
+/// `setsockopt(SO_SNDTIMEO)` on unix, so the std spelling is the same call we
+/// made by hand - and it returns the error instead of discarding it, which is
+/// the difference that matters here: a timeout that was never applied turns a
+/// stalled peer into a permanent parked worker rather than an idle phase.
+///
+/// A zero duration is rejected by std (`Duration::ZERO` cannot be represented as
+/// "wait forever" through this API, only as "block"); callers derive the value
+/// from `[server] *_timeout_secs`, whose parser has a floor of 1.
 pub fn set_timeouts(stream: &TcpStream, recv: Duration, send: Duration) -> io::Result<()> {
     stream.set_read_timeout(Some(recv))?;
     stream.set_write_timeout(Some(send))?;
@@ -559,6 +562,30 @@ mod tests {
             conn.send_timeout(),
             Duration::from_secs(42),
             "updated value"
+        );
+    }
+
+    /// `set_timeouts` reports what the kernel refused instead of swallowing it.
+    ///
+    /// `SO_RCVTIMEO` cannot express "wait forever" as a duration, so std rejects
+    /// `Duration::ZERO` outright. The previous hand-rolled `setsockopt` ignored
+    /// both return values and answered `Ok(())`, which made a misconfigured
+    /// connection indistinguishable from a configured one: the worker would park
+    /// on a silent peer until the process died.
+    #[test]
+    fn set_timeouts_reports_a_zero_duration_instead_of_discarding_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let _client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+
+        assert!(
+            set_timeouts(&server, Duration::ZERO, Duration::from_secs(30)).is_err(),
+            "a zero receive timeout must not be reported as applied"
+        );
+        assert!(
+            set_timeouts(&server, Duration::from_secs(30), Duration::from_secs(30)).is_ok(),
+            "a positive pair must be applied"
         );
     }
 

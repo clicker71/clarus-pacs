@@ -64,6 +64,25 @@ pub struct UpsQuery {
     /// Patient ID (0010,0020).
     pub patient_id: Option<String>,
 
+    /// Scheduled Procedure Step Start DateTime (0040,0405) - a REQUIRED
+    /// matching key (PS3.4 Table CC.2.5-3, matchType "Single Value or
+    /// Range").
+    ///
+    /// A DT value, so a query states either one instant or a range
+    /// (`20260917-20260918`), which is what the standard's matchType allows.
+    pub sps_start_datetime: Option<String>,
+
+    /// Scheduled Procedure Step Priority (0074,1200) - a REQUIRED matching
+    /// key (PS3.4 Table CC.2.5-3, matchType "Single Value").
+    pub sps_priority: Option<String>,
+
+    /// Patient's Name (0010,0010) - a REQUIRED matching key (PS3.4 Table
+    /// CC.2.5-3).
+    ///
+    /// A PN value; the comparison is the literal stored string, the same
+    /// convention the sibling LO/SH keys use on this server.
+    pub patient_name: Option<String>,
+
     /// (0008,0060) Modality - a VENDOR matching key.
     ///
     /// The UPS IOD defines no Modality, so this is not a standard UPS matching
@@ -99,6 +118,9 @@ impl Default for UpsQuery {
             scheduled_workitem_code_value: None,
             requested_procedure_id: None,
             patient_id: None,
+            sps_start_datetime: None,
+            sps_priority: None,
+            patient_name: None,
             modality: None,
             workflow_state: None,
             limit: None,
@@ -115,6 +137,17 @@ impl Default for UpsQuery {
 /// refused: see the `_` arm below for why silence is the wrong answer here.
 pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
     let mut q = UpsQuery::default();
+    // Fields already assigned by a previous parameter, so a repeated matching
+    // attribute can be refused rather than silently replaced.
+    //
+    // PS3.18 8.3.4.1: `normal-match = 1*("&" attribute "=" value)` - the
+    // grammar has no production for one attribute twice, and DICOM matching is
+    // conjunctive, so two values for one attribute would have to hold at once.
+    // The old last-wins rule discarded the first constraint without saying so,
+    // and the caller could not tell a filtered answer from an unfiltered one.
+    // Aliases count as the same field: `PatientID` and `00100020` name one
+    // attribute, so sending both is the same repetition.
+    let mut seen: Vec<&'static str> = Vec::new();
     for pair in query_str.split('&') {
         if pair.is_empty() {
             continue;
@@ -131,13 +164,30 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
         // Decoding first is also why the key may carry an encoded `.`
         // (`%2E`): the key is matched after this decode, so it sees the
         // literal spelling. The value therefore gets NO second decode.
-        let pair = crate::handlers::json_common::form_decode_str(pair);
+        let pair = crate::handlers::json_common::form_decode_query_str(pair);
         let (k, v) = match pair.split_once('=') {
             Some((k, v)) => (k, v),
             None => (pair.as_str(), ""),
         };
         let key = k.to_string();
         let val = v.to_string();
+        // Assign one matching-key field, refusing a second assignment.
+        //
+        // `field` is the canonical attribute name, not the spelling the caller
+        // used, so the two spellings of one attribute collide as they should.
+        macro_rules! set_match {
+            ($field:literal, $target:expr) => {{
+                if seen.contains(&$field) {
+                    return Err(format!(
+                        "Repeated matching attribute '{key}': query parameter '{}' was already \
+                         given (PS3.18 8.3.4.1 defines one value per attribute)",
+                        $field
+                    ));
+                }
+                seen.push($field);
+                $target = Some(val);
+            }};
+        }
         // PS3.18 8.3.4 (and 11.10.1.2, which cross-references it) defines the
         // matching keys as attribute KEYWORDS, e.g. `PatientID` or
         // `ReferencedRequestSequence.AccessionNumber` - that is what a
@@ -152,12 +202,10 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
         // standard fixes the case, and matching it exactly means a wrong-case
         // key is a miss rather than a second, accidentally-working spelling.
         //
-        // When one request carries two spellings of ONE fact, the LAST
-        // assignment wins - the same rule this match already applies to the two
-        // study spellings (`0020000D` and `0040A370.0020000D`), which write the
-        // same field.
+        // When one request carries two spellings of ONE fact, the request is
+        // refused (see `set_match` above) rather than resolved by position.
         match key.as_str() {
-            "0020000D" | "StudyInstanceUID" => q.study_uid = Some(val),
+            "0020000D" | "StudyInstanceUID" => set_match!("StudyInstanceUID", q.study_uid),
             // PS3.4 Table CC.2.5-3 writes both study and accession as a path
             // through the Referenced Request Sequence; the sequence segment
             // lives in the parameter NAME on this server. The two forms name
@@ -165,7 +213,7 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
             // is the whole statement and the sequence form is an alias rather
             // than a second field.
             "0040A370.0020000D" | "ReferencedRequestSequence.StudyInstanceUID" => {
-                q.study_uid = Some(val);
+                set_match!("StudyInstanceUID", q.study_uid);
             }
             // PS3.4 Table CC.2.5-3 writes the key as a path through the
             // Referenced Request Sequence; the sequence segment lives in the
@@ -176,37 +224,62 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
             "0040A370.00080050"
             | "00080050"
             | "AccessionNumber"
-            | "ReferencedRequestSequence.AccessionNumber" => q.accession_number = Some(val),
-            "00741204" | "ProcedureStepLabel" => q.step_label = Some(val),
+            | "ReferencedRequestSequence.AccessionNumber" => {
+                set_match!("AccessionNumber", q.accession_number);
+            }
+            "00741204" | "ProcedureStepLabel" => {
+                set_match!("ProcedureStepLabel", q.step_label);
+            }
             // (0040,4025) travels as a Sequence in the standard, so a client
             // that spells the key the way dcm4chee does writes the path form
             // `00404025.00080100`; the bare sequence tag names the same fact
             // and is accepted beside it. PS3.18 8.3.4 allows a tag path in a
             // matching key, so both are the standard's own spellings.
             "00404025" | "ScheduledStationNameCodeSequence.CodeValue" | "00404025.00080100" => {
-                q.scheduled_station_code_value = Some(val);
+                set_match!(
+                    "ScheduledStationNameCodeSequence.CodeValue",
+                    q.scheduled_station_code_value
+                );
             }
             // (0040,4018) Scheduled Workitem Code Sequence > (0008,0100) Code
             // Value - a REQUIRED matching key (PS3.4 Table CC.2.5-3).
             "00404018.00080100" | "ScheduledWorkitemCodeSequence.CodeValue" => {
-                q.scheduled_workitem_code_value = Some(val);
+                set_match!(
+                    "ScheduledWorkitemCodeSequence.CodeValue",
+                    q.scheduled_workitem_code_value
+                );
             }
             // (0040,A370) > (0040,1001) - a REQUIRED matching key. The
             // sequence-qualified keyword is the standard's spelling and the
             // dotted tag is the same path written in hex (PS3.18 8.3.4).
             "0040A370.00401001" | "ReferencedRequestSequence.RequestedProcedureID" => {
-                q.requested_procedure_id = Some(val);
+                set_match!("RequestedProcedureID", q.requested_procedure_id);
             }
-            "00100020" | "PatientID" => q.patient_id = Some(val),
+            "00100020" | "PatientID" => set_match!("PatientID", q.patient_id),
+            // (0040,0405), (0074,1200) and (0010,0010) are REQUIRED matching
+            // keys in PS3.4 Table CC.2.5-3 and had no branch at all, so every
+            // search that used one was refused as unknown. A DT key accepts
+            // the standard's range form as well as one instant, which is what
+            // its "Single Value or Range" matchType states.
+            "00404005" | "ScheduledProcedureStepStartDateTime" => {
+                set_match!("ScheduledProcedureStepStartDateTime", q.sps_start_datetime);
+            }
+            "00741200" | "ScheduledProcedureStepPriority" => {
+                set_match!("ScheduledProcedureStepPriority", q.sps_priority);
+            }
+            "00100010" | "PatientName" => set_match!("PatientName", q.patient_name),
             // Modality is a documented vendor extension, not a UPS attribute
             // (PS3.4 Table CC.2.5-3 defines none), so only this server and its
             // clients know the keyword - it is spelled after the DICOM attribute
             // it mirrors.
-            "00080060" | "Modality" => q.modality = Some(val),
-            "00741000" | "ProcedureStepState" => q.workflow_state = Some(val),
-            // PS3.18 8.3.4 Table 8.3.4-1: limit/offset are uint. A present
-            // value that is not an unsigned integer is an invalid query
-            // parameter (400, PS3.18 8.5), not a silently ignored one.
+            "00080060" | "Modality" => set_match!("Modality", q.modality),
+            "00741000" | "ProcedureStepState" => {
+                set_match!("ProcedureStepState", q.workflow_state);
+            }
+            // PS3.18 8.3.4 Table 8.3.4-1: limit/offset are uint, and the
+            // grammar is closed - a value that is not an unsigned integer is
+            // an invalid query parameter (400, PS3.18 8.5), not a silently
+            // ignored one.
             "limit" => {
                 q.limit =
                     Some(val.parse::<u64>().map_err(|_| {
@@ -226,16 +299,27 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
             // below does not reach them: refusing one is a conformance defect,
             // not a safety measure.
             //
-            // `fuzzymatching=false` is the substring semantics this server
-            // already applies, and a true value asks for a Person Name match
-            // the origin may perform or decline (8.3.4.2 makes it a request,
-            // not a guarantee); `includefield=all` is satisfied by
-            // construction because write_workitem_json returns every attribute
-            // the store holds; the two *valuematching parameters are the
-            // default behaviour of this parser, which matches a value literally
-            // and treats a repeated key as a union. Each is accepted and
-            // ignored only where ignoring it cannot change the answer.
-            "fuzzymatching" | "includefield" | "emptyvaluematching" | "multiplevaluematching" => {}
+            // Their VALUE grammar is closed all the same: `fuzzymatching` and
+            // the two *valuematching parameters take `true` or `false` and
+            // `includefield` takes one or more attributes or `all`. Accepting
+            // `fuzzymatching=banana` or an empty `includefield=` would answer a
+            // search whose stated semantics the server did not apply, so both
+            // are refused as malformed (PS3.18 8.5).
+            "fuzzymatching" | "emptyvaluematching" | "multiplevaluematching" => {
+                if val != "true" && val != "false" {
+                    return Err(format!(
+                        "'{key}' must be true or false (got \"{val}\"): PS3.18 Table 8.3.4-1"
+                    ));
+                }
+            }
+            "includefield" => {
+                if val.is_empty() {
+                    return Err(
+                        "'includefield' needs at least one attribute or 'all': PS3.18 Table 8.3.4-1"
+                            .to_string(),
+                    );
+                }
+            }
             // PS3.18 8.3.4 defines the matching keys exhaustively: a key that
             // is neither a PS3.6 keyword nor an 8HEXDIG tag is not a filter this
             // server can honour, and DROPPING it would answer with the
@@ -256,13 +340,18 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
 
 /// Encode an [`UpsQuery`] back to a form-urlencoded query string (native
 /// percent-encoder; replaces `serde_urlencoded::to_string`).
+///
+/// Spaces travel as `%20`, not `+`: PS3.18 8.3.1 lists `+` in `qp-special`, so
+/// a `+` in a query value means a literal plus and a space must be
+/// percent-encoded. Encoding a space as `+` would decode back as `+` on any
+/// conformant reader, so the encoder and `parse_form_query` would disagree.
 pub fn form_urlencode_query(q: &UpsQuery) -> String {
     let mut parts: Vec<String> = Vec::new();
     let push = |parts: &mut Vec<String>, key: &str, val: &str| {
         parts.push(format!(
             "{}={}",
-            crate::handlers::json_common::form_encode_str(key),
-            crate::handlers::json_common::form_encode_str(val)
+            crate::handlers::json_common::form_encode_query_str(key),
+            crate::handlers::json_common::form_encode_query_str(val)
         ));
     };
     if let Some(v) = &q.study_uid {
@@ -285,6 +374,15 @@ pub fn form_urlencode_query(q: &UpsQuery) -> String {
     }
     if let Some(v) = &q.patient_id {
         push(&mut parts, "00100020", v);
+    }
+    if let Some(v) = &q.sps_start_datetime {
+        push(&mut parts, "00404005", v);
+    }
+    if let Some(v) = &q.sps_priority {
+        push(&mut parts, "00741200", v);
+    }
+    if let Some(v) = &q.patient_name {
+        push(&mut parts, "00100010", v);
     }
     if let Some(v) = &q.modality {
         push(&mut parts, "00080060", v);
@@ -363,6 +461,9 @@ mod tests {
                     scheduled_workitem_code_value: None,
                     requested_procedure_id: None,
                     patient_id: None,
+                    sps_start_datetime: None,
+                    sps_priority: None,
+                    patient_name: None,
                     modality: None,
                     workflow_state: None,
                     limit: Some(5),
@@ -370,7 +471,7 @@ mod tests {
                 },
             ),
             (
-                "00741000=IN+PROGRESS&offset=10",
+                "00741000=IN%20PROGRESS&offset=10",
                 UpsQuery {
                     study_uid: None,
                     accession_number: None,
@@ -379,6 +480,9 @@ mod tests {
                     scheduled_workitem_code_value: None,
                     requested_procedure_id: None,
                     patient_id: None,
+                    sps_start_datetime: None,
+                    sps_priority: None,
+                    patient_name: None,
                     modality: None,
                     workflow_state: Some("IN PROGRESS".into()),
                     limit: None,
@@ -454,6 +558,125 @@ mod tests {
             assert_eq!(got.limit, expected.limit);
             assert_eq!(got.offset, expected.offset);
         }
+
+        // A space travels as %20. The form-urlencoded `+` escape is NOT used:
+        // PS3.18 8.3.1 makes `+` a literal `qp-special` character, so `+`
+        // means plus and decoding it to a space would corrupt any value that
+        // carries one.
+        let plus = parse_form_query("00741000=IN+PROGRESS").expect("a literal plus is legal");
+        assert_eq!(
+            plus.workflow_state.as_deref(),
+            Some("IN+PROGRESS"),
+            "a raw + is a literal plus, not a space (PS3.18 8.3.1)"
+        );
+    }
+
+    /// G1: a repeated matching attribute is refused, never resolved by
+    /// position.
+    ///
+    /// PS3.18 8.3.4.1 defines a match as a SEQUENCE of `attribute=value`
+    /// pairs and has no production for one attribute twice; DICOM matching is
+    /// conjunctive, so two values for one attribute could never both hold. The
+    /// old last-wins rule silently dropped the first constraint, and the
+    /// caller could not tell a filtered answer from an unfiltered one.
+    #[test]
+    fn a_repeated_matching_attribute_is_refused() {
+        let err = parse_form_query("PatientID=PT-1&PatientID=PT-2")
+            .expect_err("a repeated matching attribute must be refused");
+        assert!(
+            err.contains("PatientID") && err.contains("Repeated"),
+            "the message names the attribute: {err}"
+        );
+
+        // An ALIAS is the same attribute: the hex tag and the keyword name one
+        // fact, so sending both is the same repetition.
+        let alias = parse_form_query("00100020=PT-1&PatientID=PT-2")
+            .expect_err("the hex tag and the keyword are one attribute");
+        assert!(alias.contains("Repeated"), "alias refused: {alias}");
+
+        // The same holds for the two study spellings, which used to be
+        // documented as resolving last-wins.
+        let study =
+            parse_form_query("0020000D=1.2.3&ReferencedRequestSequence.StudyInstanceUID=1.2.4")
+                .expect_err("the two study spellings are one attribute");
+        assert!(study.contains("Repeated"), "study refused: {study}");
+
+        // Distinct attributes in one request are still fine.
+        let ok = parse_form_query("PatientID=PT-1&PatientName=SMITH^JOHN")
+            .expect("two different attributes are two constraints");
+        assert_eq!(ok.patient_id.as_deref(), Some("PT-1"));
+        assert_eq!(ok.patient_name.as_deref(), Some("SMITH^JOHN"));
+    }
+
+    /// G2: a recognized search control with an out-of-grammar value is
+    /// refused (PS3.18 Table 8.3.4-1 closes every one of them).
+    #[test]
+    fn search_controls_are_validated() {
+        for bad in [
+            "fuzzymatching=banana",
+            "emptyvaluematching=yes",
+            "multiplevaluematching=1",
+            "includefield=",
+        ] {
+            let err = parse_form_query(bad).expect_err("out of grammar");
+            assert!(
+                err.contains("8.3.4-1"),
+                "the message cites the table for {bad}: {err}"
+            );
+        }
+        // The legal values still parse.
+        for good in [
+            "fuzzymatching=true",
+            "fuzzymatching=false",
+            "includefield=all",
+            "includefield=PatientID",
+            "emptyvaluematching=false",
+            "multiplevaluematching=true",
+        ] {
+            parse_form_query(good).unwrap_or_else(|e| panic!("{good} must parse: {e}"));
+        }
+    }
+
+    /// G3: a literal plus in a value survives, and a value with a space
+    /// round-trips through the encoder as %20.
+    #[test]
+    fn a_literal_plus_survives_and_spaces_round_trip() {
+        let plus = parse_form_query("PatientID=A+B").expect("a literal plus is legal");
+        assert_eq!(
+            plus.patient_id.as_deref(),
+            Some("A+B"),
+            "PS3.18 8.3.1 lists + in qp-special, so it means a plus"
+        );
+
+        // A space travels as %20 in both directions.
+        let spaced = parse_form_query("PatientID=A%20B").expect("percent-encoded space");
+        assert_eq!(spaced.patient_id.as_deref(), Some("A B"));
+
+        let encoded = form_urlencode_query(&UpsQuery {
+            patient_id: Some("A B".into()),
+            ..UpsQuery::default()
+        });
+        assert_eq!(
+            encoded, "00100020=A%20B&offset=0",
+            "a space is %20, never +"
+        );
+        assert_eq!(
+            parse_form_query(&encoded).expect("own output").patient_id,
+            Some("A B".to_string())
+        );
+
+        // And a literal plus round-trips as %2B.
+        let encoded_plus = form_urlencode_query(&UpsQuery {
+            patient_id: Some("A+B".into()),
+            ..UpsQuery::default()
+        });
+        assert_eq!(encoded_plus, "00100020=A%2BB&offset=0");
+        assert_eq!(
+            parse_form_query(&encoded_plus)
+                .expect("own output")
+                .patient_id,
+            Some("A+B".to_string())
+        );
     }
 
     #[test]
@@ -469,6 +692,9 @@ mod tests {
             scheduled_workitem_code_value: None,
             requested_procedure_id: None,
             patient_id: Some("PT-1".into()),
+            sps_start_datetime: None,
+            sps_priority: None,
+            patient_name: None,
             modality: Some("CT".into()),
             workflow_state: Some("SCHEDULED".into()),
             limit: Some(100),
@@ -523,6 +749,9 @@ mod tests {
             scheduled_workitem_code_value: Some("CT-ORGAN-SEG".into()),
             requested_procedure_id: Some("RP-1".into()),
             patient_id: Some("SMIRNOV^IVAN".into()),
+            sps_start_datetime: None,
+            sps_priority: None,
+            patient_name: None,
             modality: Some("CT".into()),
             workflow_state: Some("IN PROGRESS".into()),
             limit: Some(5),
@@ -612,41 +841,92 @@ mod tests {
         );
     }
 
-    /// RED FACT. Every matching key is accepted in its PS3.6 KEYWORD spelling,
-    /// which is what PS3.18 8.3.4 defines and what a conformant user agent
-    /// sends - not only in this server's hex-tag spelling.
+    /// B: the three REQUIRED matching keys that had no branch at all.
+    ///
+    /// PS3.4 Table CC.2.5-3 marks ScheduledProcedureStepStartDateTime
+    /// (0040,0405), ScheduledProcedureStepPriority (0074,1200) and Patient's
+    /// Name (0010,0010) as matching keys (R). Before this, every one of them
+    /// fell through to the unknown-key arm and the request was refused as a
+    /// misspelled parameter - so a conformant search using any of the three
+    /// could not be answered at all.
+    #[test]
+    fn parse_form_query_accepts_the_three_missing_matching_keys() {
+        let q = parse_form_query(
+            "ScheduledProcedureStepStartDateTime=20260917&\
+             ScheduledProcedureStepPriority=HIGH&PatientName=SMITH^JOHN",
+        )
+        .expect("all three are spelled as PS3.6 defines them");
+        assert_eq!(q.sps_start_datetime.as_deref(), Some("20260917"));
+        assert_eq!(q.sps_priority.as_deref(), Some("HIGH"));
+        assert_eq!(q.patient_name.as_deref(), Some("SMITH^JOHN"));
+
+        // The hex spelling of each writes the same field.
+        let hex = parse_form_query("00404005=20260917-20260918&00741200=LOW&00100010=DOE^JANE")
+            .expect("hex tags are the other accepted spelling");
+        assert_eq!(
+            hex.sps_start_datetime.as_deref(),
+            Some("20260917-20260918"),
+            "the range form survives parsing; the store expands it"
+        );
+        assert_eq!(hex.sps_priority.as_deref(), Some("LOW"));
+        assert_eq!(hex.patient_name.as_deref(), Some("DOE^JANE"));
+
+        // L1: (0040,4005) is the tag, so `00404005` is the hex spelling. The
+        // transposed `00400405` parses as group 0040 element 0405 only by
+        // accident of this server's own history; the registry's tag is the
+        // authority and the renderers already emit `00404005`, so a search
+        // written from the spec must reach the same field.
+        let spec = parse_form_query("00404005=20260917")
+            .expect("the registry tag is the hex spelling a client sends");
+        assert_eq!(spec.sps_start_datetime.as_deref(), Some("20260917"));
+        let wrong = parse_form_query("00400405=20260917")
+            .expect_err("00400405 is not a PS3.6 tag for this attribute");
+        assert!(
+            wrong.contains("00400405"),
+            "the refusal names the offending key: {wrong}"
+        );
+    }
+
+    /// B: an unknown key is still an error, not a silently wider search.
+    #[test]
+    fn parse_form_query_still_refuses_an_unknown_key() {
+        let err = parse_form_query("PatientName=SMITH^JOHN&NotAKey=x")
+            .expect_err("an unknown parameter must be refused");
+        assert!(
+            err.contains("NotAKey"),
+            "the message must name the offending key: {err}"
+        );
+    }
+
+    /// Every matching key is accepted in its PS3.6 KEYWORD spelling, which is
+    /// what PS3.18 8.3.4 defines and what a conformant user agent sends - not
+    /// only in this server's hex-tag spelling.
     ///
     /// Before this a keyword key fell through the match's `_` arm and set
     /// nothing, so the search returned the WHOLE worklist: a silent privacy
     /// leak rather than an error a caller could notice.
+    ///
+    /// One key per attribute: a request naming the same attribute twice is
+    /// refused (see `a_repeated_matching_attribute_is_refused`), so this checks
+    /// the keyword spelling against its hex twin on SEPARATE requests.
     #[test]
     fn parse_form_query_accepts_the_keyword_spellings() {
-        // Keyword -> the field the hex twin writes.
         let keyword = parse_form_query(
             "PatientID=PT-1&StudyInstanceUID=1.2.3&AccessionNumber=ACC-1&\
-             ReferencedRequestSequence.StudyInstanceUID=1.2.4&\
-             ReferencedRequestSequence.AccessionNumber=ACC-2&\
              ProcedureStepLabel=CAD&\
              ScheduledStationNameCodeSequence.CodeValue=STATION01&\
              ProcedureStepState=SCHEDULED&Modality=CT&\
-             ScheduledWorkitemCodeSequence.CodeValue=CT-ORGAN-SEG",
+             ScheduledWorkitemCodeSequence.CodeValue=CT-ORGAN-SEG&\
+             ReferencedRequestSequence.RequestedProcedureID=RP-1",
         )
         .expect("every key here is spelled as PS3.6 defines it");
         assert_eq!(keyword.patient_id.as_deref(), Some("PT-1"));
-        assert_eq!(
-            keyword.study_uid.as_deref(),
-            Some("1.2.4"),
-            "the sequence spelling wins when both study spellings are sent \
-             (last assignment, the file's existing rule)"
-        );
-        assert_eq!(
-            keyword.accession_number.as_deref(),
-            Some("ACC-2"),
-            "same for the two accession spellings"
-        );
+        assert_eq!(keyword.study_uid.as_deref(), Some("1.2.3"));
+        assert_eq!(keyword.accession_number.as_deref(), Some("ACC-1"));
         assert_eq!(keyword.step_label.as_deref(), Some("CAD"));
         assert_eq!(keyword.workflow_state.as_deref(), Some("SCHEDULED"));
         assert_eq!(keyword.modality.as_deref(), Some("CT"));
+        assert_eq!(keyword.requested_procedure_id.as_deref(), Some("RP-1"));
         assert_eq!(
             keyword.scheduled_station_code_value.as_deref(),
             Some("STATION01")
@@ -656,7 +936,18 @@ mod tests {
             Some("CT-ORGAN-SEG")
         );
 
-        // The hex twin of each single-fact key parses to the SAME query.
+        // The sequence-qualified spellings reach the same fields as the bare
+        // ones.
+        let qualified = parse_form_query(
+            "ReferencedRequestSequence.StudyInstanceUID=1.2.4&\
+             ReferencedRequestSequence.AccessionNumber=ACC-2",
+        )
+        .expect("the sequence-qualified spellings");
+        assert_eq!(qualified.study_uid.as_deref(), Some("1.2.4"));
+        assert_eq!(qualified.accession_number.as_deref(), Some("ACC-2"));
+
+        // The hex twin of each key parses to the SAME query as the
+        // sequence-qualified spelling above (1.2.4 / ACC-2).
         let hex = parse_form_query(
             "00100020=PT-1&0040A370.0020000D=1.2.4&0040A370.00080050=ACC-2&\
              00741204=CAD&00404025.00080100=STATION01&00741000=SCHEDULED&\
@@ -664,8 +955,8 @@ mod tests {
         )
         .expect("the hex twin of the same keys");
         assert_eq!(hex.patient_id, keyword.patient_id);
-        assert_eq!(hex.study_uid, keyword.study_uid);
-        assert_eq!(hex.accession_number, keyword.accession_number);
+        assert_eq!(hex.study_uid, qualified.study_uid);
+        assert_eq!(hex.accession_number, qualified.accession_number);
         assert_eq!(hex.step_label, keyword.step_label);
         assert_eq!(hex.workflow_state, keyword.workflow_state);
         assert_eq!(hex.modality, keyword.modality);

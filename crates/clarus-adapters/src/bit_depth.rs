@@ -81,6 +81,9 @@ pub fn reduce_bit_depth_16to8(
         intercept,
         slope,
         signed,
+        // PS3.5 7.1: sample values follow the transfer syntax's byte order,
+        // so a Big Endian source must not be read little-endian.
+        big_endian: is_big_endian(dicom_bytes),
     };
 
     // Process each component independently
@@ -176,17 +179,25 @@ struct ModalityValues {
     intercept: f64,
     slope: f64,
     signed: bool,
+    /// The source's sample byte order (PS3.5 7.1).
+    big_endian: bool,
 }
 
 impl ModalityValues {
     /// Stored sample -> modality value.
     fn value(&self, chunk: &[u8; 2]) -> f64 {
-        let raw = if self.signed {
-            // Two's complement: the high bit is the sign, so the same 16 bits
-            // read as a negative number.
-            i16::from_le_bytes(*chunk) as f64
+        let bits = if self.big_endian {
+            u16::from_be_bytes(*chunk)
         } else {
-            u16::from_le_bytes(*chunk) as f64
+            u16::from_le_bytes(*chunk)
+        };
+        // Two's complement: the high bit is the sign, so the same bits read as
+        // a negative number. The byte order was settled above, so the cast is
+        // the whole of the signedness decision.
+        let raw = if self.signed {
+            bits as i16 as f64
+        } else {
+            bits as f64
         };
         self.slope * raw + self.intercept
     }
@@ -486,11 +497,19 @@ fn dicom_data_start(data: &[u8]) -> Option<usize> {
 fn skip_element(data: &[u8], pos: &mut usize, grammar: Grammar) -> bool {
     match element_header(data, grammar, *pos) {
         Some((len, vstart)) => {
-            // An undefined length is not a skip distance: the value is a
-            // sequence whose extent is not known here. Stop rather than walk
-            // into it with a four-million-byte leap.
             if len == 0xFFFF_FFFF {
-                return false;
+                // PS3.5 7.5: an undefined-length element carries an item
+                // stream closed by a Sequence Delimitation Item. Refusing
+                // here ended the whole walk, so every attribute after such a
+                // sequence became invisible - a signed CT whose
+                // RescaleIntercept / VOI LUT lived past a referenced series
+                // was then mapped as unsigned. Step over the stream instead.
+                let mut at = vstart;
+                if !skip_undefined_item_stream(data, &mut at, grammar) {
+                    return false;
+                }
+                *pos = at;
+                return true;
             }
             *pos = vstart;
             // `skip_value` already steps over the odd-length pad byte
@@ -499,6 +518,69 @@ fn skip_element(data: &[u8], pos: &mut usize, grammar: Grammar) -> bool {
             *pos <= data.len()
         }
         None => false,
+    }
+}
+
+/// Step past an undefined-length element's item stream.
+///
+/// `pos` points at the first item tag. `depth` counts the undefined-length
+/// elements still open, so a NESTED sequence's (FFFE,E0DD) closes the nested
+/// element rather than the one being skipped - the same rule
+/// `transcode::skip_undefined_element` follows.
+fn skip_undefined_item_stream(data: &[u8], pos: &mut usize, grammar: Grammar) -> bool {
+    let end = data.len();
+    let mut depth: u32 = 0;
+    loop {
+        if *pos + 8 > end {
+            return false;
+        }
+        let g = grammar.u16(data, *pos);
+        let e = grammar.u16(data, *pos + 2);
+        *pos += 4;
+        match (g, e) {
+            (0xFFFE, 0xE000) => {
+                let len = grammar.u32(data, *pos) as usize;
+                *pos += 4;
+                if len == 0xFFFF_FFFF {
+                    depth += 1;
+                } else if *pos + len > end {
+                    return false;
+                } else {
+                    *pos += len + (len % 2);
+                }
+            }
+            (0xFFFE, 0xE00D) => {
+                *pos += 4;
+                depth = depth.saturating_sub(1);
+            }
+            (0xFFFE, 0xE0DD) => {
+                *pos += 4;
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            _ => {
+                // A plain element inside an item: the tag has already been
+                // consumed, so advance from its value header - the same
+                // contract the caller of this function follows.
+                match element_header(data, grammar, *pos) {
+                    Some((len, vstart)) => {
+                        if len == 0xFFFF_FFFF {
+                            *pos = vstart;
+                            depth += 1;
+                        } else {
+                            *pos = vstart;
+                            skip_value(pos, len);
+                            if *pos > end {
+                                return false;
+                            }
+                        }
+                    }
+                    None => return false,
+                }
+            }
+        }
     }
 }
 
@@ -617,6 +699,74 @@ mod tests {
     }
 
     // -- Unit tests ----------------------------------------------------
+
+    /// Insert an undefined-length sequence with one empty item right after the
+    /// meta header, so every attribute the reducer reads follows it.
+    ///
+    /// PS3.5 7.5: the item stream ends at the Sequence Delimitation Item. A
+    /// walk that refused to enter it answered "not found" for Rows, Columns
+    /// and the window attributes all at once.
+    fn with_leading_undefined_sq(dicom: Vec<u8>) -> Vec<u8> {
+        let sq_at = dicom_data_start(&dicom).expect("dataset start");
+        let mut sq = Vec::new();
+        sq.extend_from_slice(&0x0008u16.to_le_bytes());
+        sq.extend_from_slice(&0x1115u16.to_le_bytes());
+        sq.extend_from_slice(b"SQ");
+        sq.extend_from_slice(&[0u8, 0u8]);
+        sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Item with a nested undefined-length sequence inside it.
+        sq.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        sq.extend_from_slice(&0x0008u16.to_le_bytes());
+        sq.extend_from_slice(&0x1140u16.to_le_bytes());
+        sq.extend_from_slice(b"SQ");
+        sq.extend_from_slice(&[0u8, 0u8]);
+        sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        sq.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        sq.extend_from_slice(&0u32.to_le_bytes());
+        sq.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        sq.extend_from_slice(&0u32.to_le_bytes());
+        sq.extend_from_slice(&[0xFE, 0xFF, 0x0D, 0xE0]);
+        sq.extend_from_slice(&0u32.to_le_bytes());
+        sq.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        sq.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut out = dicom[..sq_at].to_vec();
+        out.extend_from_slice(&sq);
+        out.extend_from_slice(&dicom[sq_at..]);
+        out
+    }
+
+    /// An undefined-length sequence must not hide the attributes after it.
+    ///
+    /// The reducer reads Rows, Columns and the window attributes by walking
+    /// the dataset. Refusing to enter an item stream made the walk fail at
+    /// the first sequence, so a signed CT with a referenced series before
+    /// its windowing lost the window and was mapped with the min/max
+    /// fallback instead - visibly different from the source.
+    #[test]
+    fn an_undefined_sequence_does_not_hide_the_window_attributes() {
+        let pixels_16 = vec![0u16, 100, 1000, 10000];
+        let plain = build_test_dicom(&pixels_16, 2, 2, Some((5000.0, 100.0)), "MONOCHROME2");
+        let gated = with_leading_undefined_sq(plain.clone());
+
+        let decoded_of = |_dicom: &[u8]| DecodedPixels {
+            data: pixels_16.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            rows: 2,
+            columns: 2,
+            samples_per_pixel: 1,
+            bits_allocated: 16,
+            photometric_interpretation: "MONOCHROME2".into(),
+        };
+
+        let want = reduce_bit_depth_16to8(&decoded_of(&plain), &plain).expect("plain reduces");
+        let got = reduce_bit_depth_16to8(&decoded_of(&gated), &gated)
+            .expect("the sequence is walked, not refused");
+        assert_eq!(
+            got.data, want.data,
+            "the window attributes after the sequence are still honoured"
+        );
+    }
 
     #[test]
     fn reduce_min_max_monochrome2() {
@@ -798,5 +948,128 @@ mod tests {
             Some(16),
             "implicit Bits"
         );
+    }
+
+    /// The same samples, stored once little-endian and once big-endian, must
+    /// reduce to the same 8-bit image.
+    ///
+    /// PS3.5 7.1 puts the sample byte order under the transfer syntax's
+    /// control, while the reducer read every sample little-endian - so a Big
+    /// Endian source had its bytes swapped and windowed against a window
+    /// expressed in modality units that no sample could reach.
+    #[test]
+    fn a_big_endian_source_reduces_to_the_same_image_as_a_little_endian_one() {
+        // Values either side of a 40/400 window, so a swapped read lands on
+        // the opposite side of it rather than somewhere harmless.
+        let samples: [u16; 8] = [0, 100, 300, 1000, 2000, 4000, 65000, 32768];
+        let dim = 4u16; // 4 x 1 waits: 8 samples in 2 columns x 4 rows
+
+        let le = build_test_dicom(&samples, 2, dim, Some((40.0, 400.0)), "MONOCHROME2");
+        let be = build_be_test_dicom(&samples, 2, dim, (40.0, 400.0));
+
+        let pixels_le = raw_pixels(&samples, false);
+        let pixels_be = raw_pixels(&samples, true);
+
+        let reduced_le = reduce_bit_depth_16to8(&pixels_le, &le).expect("LE reduced");
+        let reduced_be = reduce_bit_depth_16to8(&pixels_be, &be).expect("BE reduced");
+
+        assert!(
+            is_big_endian(&be),
+            "the fixture has to be recognised as Big Endian"
+        );
+        assert_eq!(
+            reduced_be.data, reduced_le.data,
+            "byte order must not change the rendered image"
+        );
+        // Not vacuous: the samples span more than one output level.
+        assert!(
+            reduced_le.data.iter().any(|&b| b != reduced_le.data[0]),
+            "the fixture has to produce a gradient, not one flat value"
+        );
+    }
+
+    /// `DecodedPixels` carrying the stored samples in the given byte order.
+    fn raw_pixels(samples: &[u16], big_endian: bool) -> DecodedPixels {
+        let mut data = Vec::with_capacity(samples.len() * 2);
+        for v in samples {
+            data.extend_from_slice(&if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            });
+        }
+        DecodedPixels {
+            data,
+            rows: 4,
+            columns: 2,
+            samples_per_pixel: 1,
+            bits_allocated: 16,
+            photometric_interpretation: "MONOCHROME2".to_string(),
+        }
+    }
+
+    /// A minimal 16-bit Explicit VR BIG ENDIAN instance.
+    fn build_be_test_dicom(samples: &[u16], w: u16, h: u16, window: (f64, f64)) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 128]);
+        out.extend_from_slice(b"DICM");
+        // PS3.10 7.1: the meta group stays Explicit VR Little Endian even when
+        // the dataset is Big Endian.
+        let ts = b"1.2.840.10008.1.2.2";
+        out.extend_from_slice(&0x0002u16.to_le_bytes());
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(b"UI");
+        out.extend_from_slice(&(ts.len() as u16).to_le_bytes());
+        out.extend_from_slice(ts);
+        // PS3.5 7.1: an odd-length value carries a pad byte, so the meta walk
+        // finds the dataset at the right offset.
+        if !ts.len().is_multiple_of(2) {
+            out.push(0x00);
+        }
+
+        let us = |out: &mut Vec<u8>, elem: u16, value: u16| {
+            out.extend_from_slice(&0x0028u16.to_be_bytes());
+            out.extend_from_slice(&elem.to_be_bytes());
+            out.extend_from_slice(b"US");
+            out.extend_from_slice(&2u16.to_be_bytes());
+            out.extend_from_slice(&value.to_be_bytes());
+        };
+        us(&mut out, 0x0010, h);
+        us(&mut out, 0x0011, w);
+        us(&mut out, 0x0002, 1);
+        us(&mut out, 0x0100, 16);
+
+        let pi = b"MONOCHROME2";
+        out.extend_from_slice(&0x0028u16.to_be_bytes());
+        out.extend_from_slice(&0x0004u16.to_be_bytes());
+        out.extend_from_slice(b"CS");
+        out.extend_from_slice(&(pi.len() as u16).to_be_bytes());
+        out.extend_from_slice(pi);
+        if !pi.len().is_multiple_of(2) {
+            out.push(b' ');
+        }
+
+        for (elem, value) in [(0x1050u16, window.0), (0x1051u16, window.1)] {
+            let text = format!("{value}");
+            let bytes = text.as_bytes();
+            out.extend_from_slice(&0x0028u16.to_be_bytes());
+            out.extend_from_slice(&elem.to_be_bytes());
+            out.extend_from_slice(b"DS");
+            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(bytes);
+            if !bytes.len().is_multiple_of(2) {
+                out.push(b' ');
+            }
+        }
+
+        out.extend_from_slice(&0x7FE0u16.to_be_bytes());
+        out.extend_from_slice(&0x0010u16.to_be_bytes());
+        out.extend_from_slice(b"OW");
+        out.extend_from_slice(&[0u8, 0]);
+        out.extend_from_slice(&((samples.len() * 2) as u32).to_be_bytes());
+        for v in samples {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out
     }
 }

@@ -113,19 +113,41 @@ impl CommitmentStore {
     /// Insert a new result. Fails with [`StoreError::Duplicate`] when the
     /// Transaction UID is already recorded - the 409 of Table 13.4.3-1.
     ///
-    /// The existence test and the write are not one atomic operation, so two
-    /// simultaneous Commits with the same UID could both pass the test. That
-    /// is acceptable and deliberate: the loser is overwritten by an identical
-    /// answer for the same UID, and serialising it would need a lock file for
-    /// a case the standard already asks the CLIENT to avoid (a Transaction UID
-    /// is a request identity, so a client that reuses one is out of bounds
-    /// either way). The single-threaded reference path never races.
+    /// The install is an atomic create-if-absent (`hard_link` from a private
+    /// temp file), not a check followed by a write. The old `find()`-then-write
+    /// pair had a window in which two concurrent Commits carrying one UID could
+    /// both observe "absent" and both rename over the target, so the request
+    /// that PS3.18 defines as the conflict answered success with whichever
+    /// record landed last. `hard_link` fails with `AlreadyExists` in the kernel,
+    /// which is the same primitive [`crate::ups::store`] uses for the identical
+    /// problem.
     pub fn insert(&self, rec: &CommitmentRecord) -> Result<(), StoreError> {
-        if self.find(&rec.transaction_uid)?.is_some() {
-            return Err(StoreError::Duplicate(rec.transaction_uid.clone()));
-        }
         let bytes = rec.encode().map_err(StoreError::Decode)?;
-        self.write_atomic(&rec.transaction_uid, &bytes)
+        self.write_if_absent(&rec.transaction_uid, &bytes)
+    }
+
+    /// Create the record only if no file exists at its path.
+    ///
+    /// `hard_link` is the affordable atomic create-if-absent: it fails with
+    /// `AlreadyExists` when the target is taken, in the kernel, so a second
+    /// writer cannot slip between a check and an install.
+    fn write_if_absent(&self, transaction_uid: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        std::fs::create_dir_all(&self.root)?;
+        let target = self.path_for(transaction_uid);
+        let tmp = self.tmp_path(&target);
+        if let Err(e) = std::fs::write(&tmp, bytes) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(StoreError::Io(e));
+        }
+        let linked = std::fs::hard_link(&tmp, &target);
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                Err(StoreError::Duplicate(transaction_uid.to_string()))
+            }
+            Err(e) => Err(StoreError::Io(e)),
+        }
     }
 
     /// Delete one result. Returns `true` when a file was removed.
@@ -137,16 +159,13 @@ impl CommitmentStore {
         }
     }
 
-    /// Write `bytes` to the transaction's path via tmp + rename.
+    /// A unique temporary path beside `target`.
     ///
-    /// The temporary name carries the pid and a counter rather than being a
-    /// fixed `{uid}.tmp`: two processes writing the same UID would otherwise
-    /// share a temp file and could interleave into a torn record. The rename
-    /// is what makes the record appear whole or not at all.
-    fn write_atomic(&self, transaction_uid: &str, bytes: &[u8]) -> Result<(), StoreError> {
-        std::fs::create_dir_all(&self.root)?;
-        let target = self.path_for(transaction_uid);
-        let tmp = self.root.join(format!(
+    /// The name carries the pid and a counter rather than being a fixed
+    /// `{uid}.tmp`: two processes writing the same UID would otherwise share a
+    /// temp file and could interleave into a torn record.
+    fn tmp_path(&self, target: &Path) -> std::path::PathBuf {
+        self.root.join(format!(
             "{}.{}.{}.tmp",
             target
                 .file_stem()
@@ -154,20 +173,14 @@ impl CommitmentStore {
                 .unwrap_or("commitment"),
             std::process::id(),
             TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        if let Err(e) = std::fs::write(&tmp, bytes) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(StoreError::Io(e));
-        }
-        if let Err(e) = std::fs::rename(&tmp, &target) {
-            // A leftover temp is not a committed record (the sweep skips
-            // `.tmp`), but it would accumulate forever if nobody removed it.
-            let _ = std::fs::remove_file(&tmp);
-            return Err(StoreError::Io(e));
-        }
-        Ok(())
+        ))
     }
 
+    /// Write `bytes` to the transaction's path via tmp + rename.
+    ///
+    /// The rename is what makes the record appear whole or not at all. Used by
+    /// callers that intend to REPLACE an existing record; [`Self::insert`] must
+    /// not, which is why it goes through [`Self::write_if_absent`] instead.
     /// Every recorded Transaction UID, for the sweep and for diagnostics.
     ///
     /// A missing directory is an empty store, not an error: the store is
@@ -197,20 +210,24 @@ impl CommitmentStore {
 
 /// Delete result files whose `requested_at` is older than `retention_days`.
 ///
-/// Returns the UIDs that were removed. `retention_days == 0` means KEEP
+/// Returns `(removed_uids, failed_deletes)`. `retention_days == 0` means KEEP
 /// FOREVER and the sweep does nothing - the same "0 disables" semantics the
 /// UPS deletion-lock TTL uses, so an operator has one convention to remember.
 ///
 /// The comparison is on the record's own `requested_at` rather than the file's
 /// mtime: a backup restore or a filesystem copy rewrites mtimes, and retention
 /// must follow the answer's age, not the file's.
+///
+/// A failed delete is COUNTED, not propagated: one unremovable file must not
+/// stop retention for every other expired transaction. The caller surfaces the
+/// count (a stuck file keeps failing every pass until it is cleared).
 pub fn sweep_expired(
     store: &CommitmentStore,
     retention_days: u64,
     now_epoch_secs: i64,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<(Vec<String>, u64), StoreError> {
     if retention_days == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     // Checked: a huge `retention_days` used to overflow the multiplication and
     // wrap `cutoff` FORWARD, which made every record look expired - one
@@ -222,15 +239,16 @@ pub fn sweep_expired(
     // the cutoff in the FUTURE - the same wrap-forward the multiplication check
     // guards against, reached one step earlier.
     let Ok(days) = i64::try_from(retention_days) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     let Some(retention_secs) = days.checked_mul(86_400) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     let Some(cutoff) = now_epoch_secs.checked_sub(retention_secs) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     let mut removed = Vec::new();
+    let mut failed: u64 = 0;
     for uid in store.transaction_uids()? {
         // A record that will not decode is LEFT IN PLACE and the sweep keeps
         // going. Propagating the error stopped the whole pass on the first
@@ -247,11 +265,18 @@ pub fn sweep_expired(
             // formatting problem into data loss.
             continue;
         };
-        if age < cutoff && store.delete(&uid)? {
-            removed.push(uid);
+        if age < cutoff {
+            match store.delete(&uid) {
+                Ok(true) => removed.push(uid),
+                Ok(false) => {}
+                // A delete that fails is COUNTED, not silent: one stuck file
+                // must not stop retention for every other expired
+                // transaction. The caller surfaces the count.
+                Err(_) => failed += 1,
+            }
         }
     }
-    Ok(removed)
+    Ok((removed, failed))
 }
 
 /// Parse the `requested_at` timestamps this store writes.
@@ -338,6 +363,54 @@ mod tests {
         assert!(store.find("9.9.9").expect("find").is_none());
     }
 
+    /// C6: the install primitive refuses an occupied path.
+    ///
+    /// Testing "insert twice, expect Duplicate" does NOT discriminate the fix:
+    /// the old `find()`-then-`write` answered `Duplicate` there too, because the
+    /// first insert had already committed. The defect lives in the window
+    /// BETWEEN the check and the install, so this drives `write_if_absent` with
+    /// the target already present - the exact state a racing winner produces.
+    /// On the old path this was a `rename`/`write` over the target and returned
+    /// `Ok`; now the kernel refuses with `AlreadyExists`.
+    #[test]
+    fn an_install_onto_an_occupied_path_is_refused_and_keeps_the_winner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CommitmentStore::new(dir.path().join("commitments"));
+        let uid = "1.2.3.9";
+
+        let winner = record(uid, "2026-09-23T10:00:00Z");
+        let bytes = winner.encode().expect("encode winner");
+        store.write_if_absent(uid, &bytes).expect("winner installs");
+
+        // A different payload for the same UID: what a replace would publish.
+        let loser = record(uid, "2026-09-23T11:11:11Z");
+        let loser_bytes = loser.encode().expect("encode loser");
+        match store.write_if_absent(uid, &loser_bytes) {
+            Err(StoreError::Duplicate(x)) => assert_eq!(x, uid),
+            other => panic!("the install must refuse an occupied path, got {other:?}"),
+        }
+
+        let back = store.find(uid).expect("find").expect("present");
+        assert_eq!(
+            back.requested_at, "2026-09-23T10:00:00Z",
+            "an occupied path must not be replaced"
+        );
+    }
+
+    /// C6 end-to-end: `insert` surfaces the refusal as `Duplicate`.
+    #[test]
+    fn a_second_insert_of_one_transaction_uid_is_a_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CommitmentStore::new(dir.path().join("commitments"));
+        store
+            .insert(&record("1.2.3.9", "2026-09-23T10:00:00Z"))
+            .expect("first insert wins");
+        match store.insert(&record("1.2.3.9", "2026-09-23T11:11:11Z")) {
+            Err(StoreError::Duplicate(uid)) => assert_eq!(uid, "1.2.3.9"),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_duplicate_transaction_uid_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -405,8 +478,9 @@ mod tests {
             .insert(&record("1.2.3.2", "2027-01-15T07:00:00Z"))
             .expect("new");
 
-        let removed = sweep_expired(&store, 30, now).expect("sweep");
+        let (removed, failed) = sweep_expired(&store, 30, now).expect("sweep");
         assert_eq!(removed, vec!["1.2.3.1".to_string()]);
+        assert_eq!(failed, 0);
         assert!(
             store.find("1.2.3.1").expect("find").is_none(),
             "an expired result is gone, which is what makes Check answer 404"
@@ -417,6 +491,42 @@ mod tests {
         );
     }
 
+    /// A delete failure is COUNTED and the sweep goes on.
+    ///
+    /// One unremovable expired file used to abort the whole pass via `?`, so
+    /// retention stopped at the first stuck file and every later expired
+    /// transaction stayed past its window. The sweep now counts the failure
+    /// and still removes the files it can.
+    ///
+    /// The unremovable case is a DIRECTORY in the record's place: `find`
+    /// cannot decode it (so the record is skipped), which is exactly the
+    /// "one bad file must not stop the others" contract.
+    #[test]
+    fn a_stuck_record_does_not_stop_the_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CommitmentStore::new(dir.path().join("commitments"));
+        let now = 1_800_000_000i64;
+        store
+            .insert(&record("1.2.3.1", "2026-09-23T10:00:00Z"))
+            .expect("expired");
+        store
+            .insert(&record("1.2.3.2", "2026-09-23T10:00:00Z"))
+            .expect("also expired");
+        // Replace the first record's file with a DIRECTORY: it cannot be read
+        // as a record, so the sweep skips it instead of failing the pass.
+        let stuck = store.path_for("1.2.3.1");
+        std::fs::remove_file(&stuck).expect("remove file");
+        std::fs::create_dir(&stuck).expect("plant a directory");
+
+        let (removed, _failed) = sweep_expired(&store, 30, now).expect("sweep");
+        assert_eq!(
+            removed,
+            vec!["1.2.3.2".to_string()],
+            "the removable expired file still goes"
+        );
+        assert!(stuck.is_dir(), "the stuck record stays for the next pass");
+    }
+
     #[test]
     fn a_retention_of_zero_keeps_results_forever() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -424,7 +534,7 @@ mod tests {
         store
             .insert(&record("1.2.3.1", "1999-01-01T00:00:00Z"))
             .expect("ancient");
-        let removed = sweep_expired(&store, 0, 1_800_000_000).expect("sweep");
+        let (removed, _) = sweep_expired(&store, 0, 1_800_000_000).expect("sweep");
         assert!(removed.is_empty(), "0 means keep forever");
         assert!(store.find("1.2.3.1").expect("find").is_some());
     }
@@ -441,7 +551,7 @@ mod tests {
             .insert(&record("1.2.3.1", "2026-09-23T10:00:00Z"))
             .expect("insert");
         for days in [i64::MAX as u64, u64::MAX, u64::MAX / 2] {
-            let removed = sweep_expired(&store, days, 1_800_000_000).expect("sweep");
+            let (removed, _) = sweep_expired(&store, days, 1_800_000_000).expect("sweep");
             assert!(removed.is_empty(), "retention {days} must not delete");
             assert!(
                 store.find("1.2.3.1").expect("find").is_some(),
@@ -459,7 +569,7 @@ mod tests {
         store
             .insert(&record("1.2.3.1", "not a timestamp"))
             .expect("insert");
-        let removed = sweep_expired(&store, 1, 1_800_000_000).expect("sweep");
+        let (removed, _) = sweep_expired(&store, 1, 1_800_000_000).expect("sweep");
         assert!(removed.is_empty());
         assert!(store.find("1.2.3.1").expect("find").is_some());
     }

@@ -107,11 +107,17 @@ pub fn sweep_final_workitems(state: &AppState) -> usize {
         if let Some(horizon) = lock_horizon
             && horizon.is_locked_at(now_secs())
         {
-            crate::clog_info!(
-                workitem_uid = %rec.workitem_uid,
-                state = %rec.workflow_state,
-                lock_age_hours = horizon.age_hours(now_secs()),
-                "UPS retention sweep: kept a final workitem under a Deletion Lock"
+            // Tagged so a RELEASE build keeps the line: a workitem the sweep
+            // declined to delete is the question an operator asks first when a
+            // locked step outlives its retention horizon.
+            crate::clog_event!(
+                crate::clog::Level::Info,
+                "UPS_RETENTION",
+                "",
+                "kept={} state={} lock_age_hours={}",
+                rec.workitem_uid,
+                rec.workflow_state,
+                horizon.age_hours(now_secs())
             );
             continue;
         }
@@ -136,10 +142,16 @@ pub fn sweep_final_workitems(state: &AppState) -> usize {
                         );
                     }
                     _ => {
-                        crate::clog_info!(
-                            workitem_uid = %rec.workitem_uid,
-                            state = %rec.workflow_state,
-                            "UPS retention sweep removed a final workitem"
+                        // Tagged so a RELEASE build records the deletion: a
+                        // line dropped at INFO leaves a removed workitem with
+                        // no trace at all.
+                        crate::clog_event!(
+                            crate::clog::Level::Info,
+                            "UPS_RETENTION",
+                            "",
+                            "removed={} state={}",
+                            rec.workitem_uid,
+                            rec.workflow_state
                         );
                     }
                 }
@@ -228,7 +240,13 @@ pub fn spawn_ups_retention(state: AppState) {
             loop {
                 let deleted = sweep_final_workitems(&state);
                 if deleted > 0 {
-                    crate::clog_info!(deleted, "UPS retention sweep finished");
+                    crate::clog_event!(
+                        crate::clog::Level::Info,
+                        "UPS_RETENTION",
+                        "",
+                        "sweep finished deleted={}",
+                        deleted
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
             }

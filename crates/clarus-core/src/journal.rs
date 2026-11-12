@@ -21,13 +21,27 @@
 //!
 //! ```text
 //! 0..2   event_code (u16)
-//! 2..3   level (u8, EventLevel as u8)
+//! 2..3   level (u8, EventLevel as u8) | 0x80 when the payload is a digest
 //! 3..7   user_token (u32, from auth::UserRegistry)
 //! 7      ip_len (4 or 16)
 //! 8..24  ip (16 bytes, zero-padded)
+//! 20..24 epoch_secs (u32 LE) - IPv4 only, see below
 //! 24..26 payload_len (u16, 0..=38)
 //! 26..64 payload (38 bytes, e.g. study UID)
 //! ```
+//!
+//! Bit 7 of the level byte marks a payload that is NOT the original bytes: a
+//! value too long for the cell is stored as its digest, and the reader says so.
+//! Truncating instead made two accepted 64-character UIDs that share a 38-byte
+//! prefix indistinguishable in the audit trail - the log claimed to name a
+//! study while naming a prefix of two different ones.
+//!
+//! `epoch_secs` shares bytes 20..24 with the tail of the address field, which
+//! IPv4 leaves as zero padding (`ip` is written at 8..12). An IPv6 address uses
+//! all sixteen bytes, so on that path the stamp is stored as 0 and the renderer
+//! falls back to the drain time - see [`JournalToken::epoch_secs`]. The stamp is
+//! taken when the event is QUEUED, not when the reader drains it: a backlog that
+//! spans midnight otherwise logs tomorrow's date for yesterday's event.
 //!
 //! The 38-byte payload carries one short field (a study UID or an error
 //! reason). Longer data never enters the ring - it is the journal's contract
@@ -42,6 +56,12 @@
 /// never straddle two lines. Both are layout facts, checkable by the
 /// `ap101_cacheline` gate; a timing bench would not defend either.
 pub const TOKEN_LEN: usize = 64;
+
+/// Bit 7 of the level byte: the payload holds a digest, not the original bytes.
+///
+/// `EventLevel` occupies 1..=4, so the high bit is free and keeps the flag
+/// inside the existing 64-byte cell.
+const PAYLOAD_IS_DIGEST: u8 = 0x80;
 
 /// Maximum payload bytes inside a token.
 pub const MAX_PAYLOAD: usize = 38;
@@ -318,20 +338,67 @@ impl<'a> RingReader<'a> {
 /// Allocates nothing: the payload slice is copied (up to [`MAX_PAYLOAD`]).
 /// `ip` must be 4 (IPv4) or 16 (IPv6) bytes; anything else is stored empty.
 pub fn make_token(code: EventCode, user_token: u32, ip: &[u8], payload: &[u8]) -> JournalToken {
+    make_token_at(code, user_token, ip, payload, epoch_now())
+}
+
+/// Epoch seconds from the system clock, or 0 when the clock is before the
+/// epoch.
+///
+/// Saturating rather than panicking: a journal stamp of 0 is a visible
+/// "unknown", and the renderer falls back to the drain time for it, which is
+/// strictly better than losing the event.
+fn epoch_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
+/// [`make_token`] with an explicit epoch second.
+///
+/// Exists so tests can pin the stamp without touching the process clock; the
+/// hotpath calls [`make_token`].
+pub fn make_token_at(
+    code: EventCode,
+    user_token: u32,
+    ip: &[u8],
+    payload: &[u8],
+    epoch_secs: u32,
+) -> JournalToken {
     let mut t = JournalToken::default();
     t.bytes[0..2].copy_from_slice(&code.code.to_le_bytes());
     t.bytes[2] = code.level as u8;
     t.bytes[3..7].copy_from_slice(&user_token.to_le_bytes());
     match ip.len() {
-        4 | 16 => {
-            t.bytes[7] = ip.len() as u8;
-            t.bytes[8..8 + ip.len()].copy_from_slice(ip);
+        4 => {
+            t.bytes[7] = 4;
+            t.bytes[8..12].copy_from_slice(ip);
+            // Bytes 12..20 stay zero padding, so 20..24 holds the stamp
+            // without overlapping the address.
+            t.bytes[20..24].copy_from_slice(&epoch_secs.to_le_bytes());
+        }
+        16 => {
+            t.bytes[7] = 16;
+            // The address owns all of 8..24: no room for a stamp in this cell.
+            // Recorded as 0 so `epoch_secs` reports "unknown" rather than
+            // reading address bytes as a time.
+            t.bytes[8..24].copy_from_slice(ip);
         }
         _ => t.bytes[7] = 0,
     }
     let n = payload.len().min(MAX_PAYLOAD);
     t.bytes[24..26].copy_from_slice(&(n as u16).to_le_bytes());
     t.bytes[26..26 + n].copy_from_slice(&payload[..n]);
+    // A payload that did not fit is recorded by DIGEST rather than by prefix:
+    // a prefix is not an identifier, and two UIDs sharing one are otherwise
+    // indistinguishable in the audit trail. The digest is a property of the
+    // whole value, so distinct inputs stay distinct.
+    if payload.len() > MAX_PAYLOAD {
+        let digest = crate::hash::cas_hash_one(payload);
+        t.bytes[26..26 + 32].copy_from_slice(&digest);
+        t.bytes[24..26].copy_from_slice(&32u16.to_le_bytes());
+        t.bytes[2] |= PAYLOAD_IS_DIGEST;
+    }
     t
 }
 
@@ -344,13 +411,23 @@ pub struct DecodedEvent {
     pub ip_len: u8,
     pub payload: [u8; MAX_PAYLOAD],
     pub payload_len: usize,
+    /// The instant the event was QUEUED, or `None` when the token carries no
+    /// stamp (an IPv6 event, whose address consumes the slot, or a clock before
+    /// the epoch). `format_plaintext` then falls back to the drain time.
+    pub epoch_secs: Option<u32>,
+    /// True when `payload` is a digest of a value too long for the cell, not
+    /// the value itself. The renderer must say so rather than print 32 hash
+    /// bytes as if they were a UID.
+    pub payload_is_digest: bool,
 }
 
 impl JournalToken {
     /// Decode a token back into its logical fields.
     pub fn decode(&self) -> DecodedEvent {
         let code = u16::from_le_bytes([self.bytes[0], self.bytes[1]]);
-        let level = match self.bytes[2] {
+        let level_byte = self.bytes[2];
+        let payload_is_digest = level_byte & PAYLOAD_IS_DIGEST != 0;
+        let level = match level_byte & !PAYLOAD_IS_DIGEST {
             2 => EventLevel::Info,
             3 => EventLevel::Warn,
             4 => EventLevel::Error,
@@ -365,6 +442,20 @@ impl JournalToken {
         let payload_len = payload_len.min(MAX_PAYLOAD);
         let mut payload = [0u8; MAX_PAYLOAD];
         payload[..payload_len].copy_from_slice(&self.bytes[26..26 + payload_len]);
+        // Read the stamp only for an IPv4 token: on the IPv6 path those bytes
+        // are address, and reporting them as a time would produce a date
+        // derived from an address.
+        let epoch_secs = if ip_len == 4 {
+            let s = u32::from_le_bytes([
+                self.bytes[20],
+                self.bytes[21],
+                self.bytes[22],
+                self.bytes[23],
+            ]);
+            (s != 0).then_some(s)
+        } else {
+            None
+        };
         DecodedEvent {
             code: EventCode::from_code(code, level),
             user_token,
@@ -372,6 +463,8 @@ impl JournalToken {
             ip_len,
             payload,
             payload_len,
+            epoch_secs,
+            payload_is_digest,
         }
     }
 }
@@ -384,8 +477,15 @@ pub fn format_plaintext(ev: &DecodedEvent, user_name: Option<&str>, out: &mut Ve
     out.clear();
     // Timestamp - LOCAL wall clock, the same source clog uses
     // (clarus_core::time::local_now), so every line in clarus.log shares one
-    // timezone. The CBOR token is unaffected (epoch-based, no stamp).
-    let now = crate::time::local_now();
+    // timezone. The CBOR token carries the queue instant, and THAT is what is
+    // rendered when present: a backlog drained after midnight would otherwise
+    // stamp yesterday's events with today's date. Tokens without a stamp (IPv6
+    // events) fall back to the drain time, which is the closest instant the
+    // token still knows.
+    let now = match ev.epoch_secs {
+        Some(secs) => crate::time::from_epoch_secs(secs as i64),
+        None => crate::time::local_now(),
+    };
     fmt_date(
         out,
         now.year as u32,
@@ -414,9 +514,17 @@ pub fn format_plaintext(ev: &DecodedEvent, user_name: Option<&str>, out: &mut Ve
         out.extend_from_slice(b" idempotent=");
         push_dec(out, idempotent);
     } else if ev.payload_len > 0 {
-        // Payload (study UID / reason).
-        out.push(b' ');
-        out.extend_from_slice(&ev.payload[..ev.payload_len]);
+        // Payload (study UID / reason). A digest is labelled as such: printing
+        // 32 hash bytes bare would read as the identifier itself.
+        if ev.payload_is_digest {
+            out.extend_from_slice(b" digest=");
+            for &b in &ev.payload[..ev.payload_len] {
+                push_hex(out, b);
+            }
+        } else {
+            out.push(b' ');
+            out.extend_from_slice(&ev.payload[..ev.payload_len]);
+        }
     }
 
     // Client IP - dotted-quad for IPv4, colon-form for IPv6.
@@ -500,6 +608,133 @@ fn push_two(out: &mut Vec<u8>, v: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1: the rendered line carries the instant the event was QUEUED.
+    ///
+    /// The reader drains a backlog whenever it runs, so reading the clock at
+    /// drain time stamps a pre-midnight event with the next day's date. The
+    /// token now carries the queue instant and the renderer uses it.
+    #[test]
+    fn the_rendered_timestamp_is_the_queue_instant_not_the_drain_instant() {
+        // 2001-09-09T01:46:40Z, and one second later. Neither is "now", so a
+        // renderer that read the clock would produce a different date.
+        let queued = 1_000_000_000u32;
+        let t = make_token_at(EventCode::STOW_REJECTED, 7, &[10, 0, 0, 1], b"x", queued);
+        let d = t.decode();
+        assert_eq!(
+            d.epoch_secs,
+            Some(queued),
+            "the stamp survives the round trip"
+        );
+
+        let mut out = Vec::new();
+        format_plaintext(&d, None, &mut out);
+        let line = String::from_utf8_lossy(&out);
+        let expected = crate::time::from_epoch_secs(queued as i64);
+        let prefix = format!(
+            "{:04}/{:02}/{:02}",
+            expected.year, expected.month, expected.day
+        );
+        assert!(
+            line.starts_with(&prefix),
+            "expected the queued date {prefix}, got: {line}"
+        );
+    }
+
+    /// An IPv6 event has no room for a stamp in the 64-byte cell, so it must
+    /// report "unknown" and fall back - never read address bytes as a time.
+    #[test]
+    fn an_ipv6_token_reports_no_stamp_rather_than_a_time_derived_from_an_address() {
+        let mut ip = [0u8; 16];
+        ip[15] = 1;
+        // Bytes 20..24 fall inside the address field; a naive reader would
+        // report these as epoch seconds.
+        let t = make_token_at(EventCode::STOW_ACCEPTED, 1, &ip, b"", 1_000_000_000);
+        let d = t.decode();
+        assert_eq!(d.ip_len, 16);
+        assert_eq!(&d.ip[..16], &ip, "the address must survive intact");
+        assert_eq!(d.epoch_secs, None, "no stamp is available for IPv6");
+    }
+
+    /// C2: two accepted study UIDs sharing a 38-byte prefix must stay
+    /// distinguishable.
+    ///
+    /// `validate_path_uid` accepts 64-character UIDs, but the cell holds 38
+    /// payload bytes. Keeping the first 38 made two different studies log the
+    /// same identifier - an audit line that names neither. A payload that does
+    /// not fit is now recorded by digest.
+    #[test]
+    fn long_uids_sharing_a_prefix_do_not_collide_in_the_journal() {
+        // A 40-character common prefix, then one differing character, so the
+        // two values are identical across the whole 38-byte cell.
+        let prefix = "1.2.840.10008.5.1.4.1.1.2.0.1111111111111111";
+        let a = format!("{prefix}A");
+        let b = format!("{prefix}B");
+        assert_eq!(a.len(), b.len(), "same length, same prefix");
+        assert!(
+            a.len() > MAX_PAYLOAD,
+            "must exceed the cell to be interesting"
+        );
+        assert_eq!(
+            &a[..MAX_PAYLOAD],
+            &b[..MAX_PAYLOAD],
+            "prefixes are identical"
+        );
+
+        let da = make_token_at(
+            EventCode::STUDY_UID_GENERATED,
+            1,
+            &[10, 0, 0, 1],
+            a.as_bytes(),
+            1,
+        )
+        .decode();
+        let db = make_token_at(
+            EventCode::STUDY_UID_GENERATED,
+            1,
+            &[10, 0, 0, 1],
+            b.as_bytes(),
+            1,
+        )
+        .decode();
+
+        assert!(da.payload_is_digest, "an over-long payload must be marked");
+        assert_eq!(da.payload_len, 32, "a digest, not a prefix");
+        assert_ne!(
+            &da.payload[..da.payload_len],
+            &db.payload[..db.payload_len],
+            "distinct UIDs must not share a journal payload"
+        );
+
+        // And the line says it is a digest rather than printing hash bytes as
+        // though they were the UID.
+        let mut out = Vec::new();
+        format_plaintext(&da, None, &mut out);
+        let line = String::from_utf8_lossy(&out);
+        assert!(
+            line.contains(" digest="),
+            "the digest must be labelled: {line}"
+        );
+        assert!(
+            !line.contains("1.2.840"),
+            "no truncated prefix in the line: {line}"
+        );
+    }
+
+    /// A payload that fits is stored verbatim and carries no digest flag, so
+    /// the common case is unchanged.
+    #[test]
+    fn a_payload_that_fits_is_stored_verbatim() {
+        let t = make_token_at(EventCode::STOW_REJECTED, 1, &[10, 0, 0, 1], b"disk full", 1);
+        let d = t.decode();
+        assert!(!d.payload_is_digest);
+        assert_eq!(&d.payload[..d.payload_len], b"disk full");
+        let mut out = Vec::new();
+        format_plaintext(&d, None, &mut out);
+        let line = String::from_utf8_lossy(&out);
+        assert!(line.contains(" disk full"), "verbatim payload: {line}");
+        assert!(!line.contains("digest="), "no digest marker: {line}");
+    }
 
     #[test]
     fn token_roundtrip() {

@@ -166,7 +166,12 @@ class TestRefetchUrlQuoting:
             if isinstance(node, ast.Assign):
                 targets = [getattr(t, "id", None) for t in node.targets]
                 if "inst_url" in targets:
-                    target = node
+                    # `inst_url` names the REFETCH url, which always carries
+                    # ?transferSyntax=; the pre-flight also builds an
+                    # `inst_url` (the instance-list probe), so key on the
+                    # query rather than on the first match.
+                    if "transferSyntax" in ast.dump(node.value):
+                        target = node
         assert target is not None, "the refetch URL assignment moved"
         dumped = ast.dump(target.value)
         assert dumped.count("_quote") >= 4, (

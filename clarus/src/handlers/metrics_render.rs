@@ -75,15 +75,15 @@ pub fn render_metrics() -> String {
         CAD_WORKITEM_FAILURES_TOTAL, CAS_BLOBS_CORRUPTED, CAS_BLOBS_UNREADABLE, CAS_WRITE_BYTES,
         CLARUS_CHUNKS_TOTAL, CLARUS_CHUNKS_UNIQUE, CLARUS_IDX_DETECTED_TOTAL,
         CLARUS_IDX_HEALED_TOTAL, CLARUS_IDX_STALE_OBJECTS, CLARUS_LOG_DROPPED, COMMITMENT_GET,
-        COMMITMENT_POST, DICOM_STOW_PARSE_ERRORS, ERASE_PENDING, HTTP_DURATION_COUNT,
-        HTTP_DURATION_SUM_US, HTTP_REQUESTS_ACTIVE, HTTP_REQUESTS_TOTAL, INSTANCES_STORED_TOTAL,
-        IOCM_ANYCLASS_IGNORED_TOTAL, MANIFEST_CORRUPT, MANIFEST_DEGRADED, MANIFEST_MISSING,
-        NUM_STATUS_CLASSES, ORPHANS_PENDING, PROCESS_RSS_BYTES, REJECTED_BY_REASON,
-        REJECTED_INSTANCES_TOTAL, REQUEST_DURATION, RESTORED_BY_REASON, ROUTE_COUNTERS,
-        ROUTE_DURATION_COUNT, ROUTE_DURATION_SUM_US, STATUS_2XX, STATUS_4XX, STATUS_5XX,
-        STORAGE_BYTES_TOTAL, STORAGE_INSTANCES_TOTAL, STORAGE_OBJECTS_TOTAL, STORAGE_READ_BYTES,
-        STORAGE_UNREFERENCED_TOTAL, STORAGE_WRITE_BYTES, STOW_DUPLICATES_TOTAL, UPS_PUSH_DROPPED,
-        UPS_PUSH_RETRIES, UPS_PUSHED,
+        COMMITMENT_POST, DICOM_STOW_PARSE_ERRORS, DISK_FREE_GB, DISK_FREE_PCT, ERASE_PENDING,
+        HTTP_DURATION_COUNT, HTTP_DURATION_SUM_US, HTTP_REQUESTS_ACTIVE, HTTP_REQUESTS_TOTAL,
+        INSTANCES_STORED_TOTAL, IOCM_ANYCLASS_IGNORED_TOTAL, MANIFEST_CORRUPT, MANIFEST_DEGRADED,
+        MANIFEST_MISSING, NUM_STATUS_CLASSES, ORPHANS_PENDING, PROCESS_RSS_BYTES,
+        REJECTED_BY_REASON, REJECTED_INSTANCES_TOTAL, REQUEST_DURATION, RESTORED_BY_REASON,
+        ROUTE_COUNTERS, ROUTE_DURATION_COUNT, ROUTE_DURATION_SUM_US, STATUS_2XX, STATUS_4XX,
+        STATUS_5XX, STORAGE_BYTES_TOTAL, STORAGE_INSTANCES_TOTAL, STORAGE_OBJECTS_TOTAL,
+        STORAGE_READ_BYTES, STORAGE_UNREFERENCED_TOTAL, STORAGE_WRITE_BYTES, STOW_DUPLICATES_TOTAL,
+        UPS_PUSH_DROPPED, UPS_PUSH_RETRIES, UPS_PUSHED,
     };
     use std::sync::atomic::Ordering;
 
@@ -445,6 +445,28 @@ pub fn render_metrics() -> String {
         push_metric(&mut out, "clarus_disk_probe_latency_ms", None, disk_ms);
     }
 
+    // --- clarus_disk_free_bytes ---
+    out.push_str(
+        "# HELP clarus_disk_free_bytes Free space on the hot-storage partition, in bytes.\n",
+    );
+    out.push_str("# TYPE clarus_disk_free_bytes gauge\n");
+    // Whole GiB only: the source gauge is a floored integer (`DISK_FREE_GB`,
+    // metrics.rs) so the byte value inherits 1 GiB granularity - it is not
+    // byte-precise. An exact byte gauge would need a third atomic fed by the
+    // `disk-free-probe` thread; alerting rules trigger on 1 GiB steps anyway.
+    let free_bytes = DISK_FREE_GB.load(Ordering::Relaxed) * 1024 * 1024 * 1024;
+    push_metric(&mut out, "clarus_disk_free_bytes", None, free_bytes);
+
+    // --- clarus_disk_free_percent ---
+    // Published alongside the probe latency so an operator can ALERT on a
+    // filling volume: latency alone reports a healthy disk until the first 507.
+    // Read from the atomics the `disk-free-probe` thread refreshes (main.rs) -
+    // a statvfs here would block the scrape path it exists to keep cheap.
+    out.push_str("# HELP clarus_disk_free_percent Free space on the hot-storage partition, in percent (0-100).\n");
+    out.push_str("# TYPE clarus_disk_free_percent gauge\n");
+    let free_pct = DISK_FREE_PCT.load(Ordering::Relaxed);
+    push_metric(&mut out, "clarus_disk_free_percent", None, free_pct);
+
     // -- B-tree index staleness ----------------------------------------------
     // 0 = the B-tree `.idx` is fully consistent with the store.
 
@@ -684,5 +706,69 @@ fn push_metric_i64(buf: &mut String, name: &str, labels: Option<&str>, value: i6
         None => {
             let _ = writeln!(buf, "{name} {value}");
         }
+    }
+}
+
+// -- Tests ----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // The gauges are imported inside `render_metrics` for scrape locality, so
+    // the test module reaches them through their full path.
+    use crate::metrics::{DISK_FREE_GB, DISK_FREE_PCT};
+    use std::sync::atomic::Ordering;
+
+    /// Borrow the process-global free-space gauges and put them back on drop.
+    ///
+    /// The atomics are shared with the `disk-free-probe` thread and with the
+    /// `/health/status` reader, so a test that left them non-zero would leak a
+    /// false reading into every other test in this binary.
+    struct DiskGaugesGuard {
+        gb: u64,
+        pct: u64,
+    }
+
+    impl DiskGaugesGuard {
+        fn set(gb: u64, pct: u64) -> Self {
+            let guard = DiskGaugesGuard {
+                gb: DISK_FREE_GB.load(Ordering::Relaxed),
+                pct: DISK_FREE_PCT.load(Ordering::Relaxed),
+            };
+            DISK_FREE_GB.store(gb, Ordering::Relaxed);
+            DISK_FREE_PCT.store(pct, Ordering::Relaxed);
+            guard
+        }
+    }
+
+    impl Drop for DiskGaugesGuard {
+        fn drop(&mut self) {
+            DISK_FREE_GB.store(self.gb, Ordering::Relaxed);
+            DISK_FREE_PCT.store(self.pct, Ordering::Relaxed);
+        }
+    }
+
+    /// `/metrics` must publish the free-space gauges that `/health/status`
+    /// colours its DISK indicator from: the write-probe latency cannot tell a
+    /// nearly-full volume apart from a healthy one.
+    #[test]
+    fn disk_free_gauges_are_rendered() {
+        const GB: u64 = 42;
+        let _guard = DiskGaugesGuard::set(GB, 37);
+        let out = render_metrics();
+
+        assert!(out.contains("# TYPE clarus_disk_free_bytes gauge\n"));
+        assert!(out.contains("# TYPE clarus_disk_free_percent gauge\n"));
+        assert!(
+            out.contains(&format!(
+                "\nclarus_disk_free_bytes {}\n",
+                GB * 1024 * 1024 * 1024
+            )),
+            "missing clarus_disk_free_bytes sample:\n{out}"
+        );
+        assert!(
+            out.contains("\nclarus_disk_free_percent 37\n"),
+            "missing clarus_disk_free_percent sample:\n{out}"
+        );
     }
 }

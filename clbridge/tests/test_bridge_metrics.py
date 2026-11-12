@@ -80,10 +80,25 @@ def test_naction_request_counter_counts_the_acknowledgement(monkeypatch):
 
     monkeypatch.setattr(naction, "_sop_confirm", fake_confirm)
 
+    # R5: a request that names SOPs must have a tracker, or the handler
+    # refuses it (no N-EVENT-REPORT could ever be pushed). The counter under
+    # test is the acknowledgement, so the batch must genuinely be accepted.
+    from clean_code.commit_tracker import CommitTracker
+
+    tracker = CommitTracker(verify=lambda c, u: True, report=lambda *a, **k: None)
+
     event = make_fake_naction_event(
         sop_list=[(CT, "1.2.3.1"), (CT, "1.2.3.2")],
     )
-    status, _rsp = naction.handle_n_action(event, "http://x", False, None)
+    status, _rsp = naction.handle_n_action(
+        event,
+        "http://x",
+        False,
+        None,
+        commit_tracker=tracker,
+        resolve_scp=lambda ae, addr: ("10.0.0.5", 11112),
+    )
+    tracker.close()
     assert status == 0x0000
 
     assert counter_value("clarus_bridge_naction_requests_total") == before_req + 1
@@ -114,7 +129,11 @@ def test_naction_verdict_counters_are_bumped_by_the_tracker():
     tracker.register(
         "1.2.3.9", "SCU", "10.0.0.5", 11112, [(CT, stored), (CT, "1.2.3.2")]
     )
-    # Deadline expiry turns the unconfirmed SOP into a failure.
+    # Let the tracker learn which SOPs the origin holds, THEN expire the
+    # deadline: expiry is what turns the still-unconfirmed SOP into a
+    # failure, and the verification walk is bounded by the same deadline so
+    # it has to happen while the deadline is still in the future.
+    tracker._tick()
     for job in list(tracker._jobs.values()):
         job.deadline = 0.0
     tracker._tick()
@@ -138,7 +157,7 @@ def test_naction_rejected_action_type_does_not_count(monkeypatch):
     before = counter_value("clarus_bridge_naction_requests_total")
     event = make_fake_naction_event(action_type=99)
     status, _rsp = naction.handle_n_action(event, "http://x", False, None)
-    assert status == 0x0122
+    assert status == 0x0123
     assert counter_value("clarus_bridge_naction_requests_total") == before
 
 
@@ -157,6 +176,10 @@ def test_nevent_delivered_counter(monkeypatch):
 
     class _Ctx:
         abstract_syntax = StorageCommitmentPushModel
+        # PS3.7 D.3.3.4: the report can only be pushed back if the peer
+        # GRANTED the requestor the SCP role for this context, which the
+        # acceptor reports here (a real PresentationContext always has it).
+        as_scp = True
 
     class _Assoc:
         is_established = True

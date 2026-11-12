@@ -54,10 +54,10 @@ class TestBuildNActionRsp:
 
 
 class TestHandleNActionUnsupported:
-    """Unit tests for handle_n_action - unsupported action types (0x0122)."""
+    """Unit tests for handle_n_action - unsupported action types (0x0123)."""
 
-    def test_unsupported_action_type_returns_0122(self):
-        """N-ACTION with action_type != 1 returns 0x0122 (no-such-action)."""
+    def test_unsupported_action_type_returns_0123(self):
+        """N-ACTION with action_type != 1 returns 0x0123 (No Such Action)."""
         from clean_code.handlers.naction import handle_n_action
 
         # Minimal mock: only the attributes checked before parsing
@@ -79,5 +79,5 @@ class TestHandleNActionUnsupported:
             verbose=False,
             sop_index=None,
         )
-        assert status == 0x0122
+        assert status == 0x0123
         assert rsp is None

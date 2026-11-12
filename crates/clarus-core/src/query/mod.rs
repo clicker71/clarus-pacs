@@ -54,4 +54,9 @@ pub use series::{
     GlobalInstance, InstanceFilter, SeriesFilter, search_all_instances, search_all_series,
     search_instances, search_series,
 };
+// The allocation-free glob the manifest matchers walk. Re-exported so a
+// benchmark can reach the SAME function the hot path uses - `filter::glob_match`
+// is a different (allocating) matcher and measuring it proves nothing about the
+// wildcard walk's per-step cost. See `benches/glob_worst_case_bench.rs`.
+pub use series::glob_match_bytes;
 pub use study_index::StudyQidoIndex;

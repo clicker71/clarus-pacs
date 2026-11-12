@@ -242,11 +242,24 @@ pub fn search_all_instances<'a>(
     manifests: &'a [Manifest],
     filter: &InstanceFilter,
     series_filter: &SeriesFilter,
+    study_filter: Option<&crate::query::filter::QueryFilter>,
     out: &mut Vec<GlobalInstance<'a>>,
     expose: bool,
 ) {
     out.clear();
+    // P1: the GLOBAL /instances route accepts Study IE keys (PS3.18 10.6.1.2.1),
+    // and accepting a key without applying it answers a filtered query with
+    // every patient's instances - strictly wider than the ask. The study gate
+    // runs FIRST, on `StudyQido.attrs`, through the same `QueryFilter` the
+    // study route uses, so both routes agree on what a key means.
+    let study_expected = study_filter.map(|f| f.build_expected());
     for manifest in manifests {
+        if let (Some(sf), Some(expected)) = (study_filter, study_expected.as_ref())
+            && !expected.is_empty()
+            && !sf.matches_prebuilt(&manifest.study.attrs, expected)
+        {
+            continue;
+        }
         let study_uid =
             text_attr(&manifest.study.attrs, crate::query::tag::STUDY_INSTANCE_UID).unwrap_or("");
         for series in &manifest.series {
@@ -630,7 +643,13 @@ fn date_matches(v: u64, want: &str) -> bool {
 /// first was the obvious way to do this and broke the ap101 zero-allocation
 /// gate on the user-supplied `Modality`/`SOPClassUID` search path, so the two
 /// sides advance with `char_indices`-style stepping over the borrowed slices.
-fn glob_match_bytes(pat: &str, text: &str) -> bool {
+/// Glob match over a stored text value, one scalar at a time.
+///
+/// Public so the worst-case bench can drive THIS walk rather than the
+/// allocating `filter::glob_match`: the quadratic cost lived in the per-step
+/// scalar read, and a benchmark that exercised a different matcher would
+/// measure nothing.
+pub fn glob_match_bytes(pat: &str, text: &str) -> bool {
     let p = pat.as_bytes();
     let t = text.as_bytes();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -681,22 +700,39 @@ fn glob_match_bytes(pat: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// The next scalar at `bytes[pos]` and its UTF-8 length, without allocating.
-///
+/// The next scalar at `bytes[pos]` and its UTF-8 length, without allocating.///
 /// Falls back to "one byte, as a scalar" for an invalid sequence: the caller
 /// compares scalars, and a malformed value should compare literally rather than
 /// vanish from the walk.
+///
+/// Only the scalar's OWN bytes are validated. This used to call
+/// `str::from_utf8(bytes[pos..])`, i.e. it re-validated the whole remaining
+/// value on every step of the wildcard walk - quadratic in the value length,
+/// and the walk retries positions ("let that `*` swallow one more scalar"), so
+/// a long Patient Name with an early `*` made the pattern check cost
+/// O(len^2). The lead byte says how many bytes the scalar occupies, and that
+/// window is all this function needs.
 fn next_scalar(bytes: &[u8], pos: usize) -> Option<(char, usize)> {
     let rest = bytes.get(pos..)?;
-    let s = std::str::from_utf8(rest).ok();
-    match s.and_then(|s| s.chars().next()) {
-        Some(ch) => Some((ch, ch.len_utf8())),
-        None => {
-            // Invalid UTF-8 from here on: compare the byte as Latin-1.
-            let b = *rest.first()?;
-            Some((b as char, 1))
-        }
+    let first = *rest.first()?;
+    // PS/UTF-8: a continuation byte cannot start a scalar, so it is malformed
+    // at this position regardless of what follows.
+    let width = match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 0,
+    };
+    if width > 0
+        && let Some(window) = rest.get(..width)
+        && let Ok(s) = std::str::from_utf8(window)
+        && let Some(ch) = s.chars().next()
+    {
+        return Some((ch, width));
     }
+    // Invalid UTF-8 at this position: compare the byte as Latin-1.
+    Some((first as char, 1))
 }
 
 #[cfg(test)]
@@ -1380,6 +1416,65 @@ mod tests {
         assert!(glob_match_bytes("", ""));
     }
 
+    /// `next_scalar` decodes ONE scalar from its own bytes.
+    ///
+    /// The step must not depend on the rest of the value: the wildcard walk
+    /// re-reads the text from a `*` once per extra scalar it swallows, so a
+    /// step that validated the whole remaining slice turned the pattern check
+    /// into O(len^2) on a long Patient Name with an early wildcard. The
+    /// assertion is on the step itself rather than on elapsed time, because a
+    /// timing bound is machine-dependent and would pass a slow-but-quadratic
+    /// implementation on a fast host.
+    #[test]
+    fn a_scalar_step_reads_only_its_own_bytes() {
+        // A value whose tail is INVALID UTF-8 must still yield the valid lead
+        // scalar: reading only the scalar's window is what makes that
+        // possible, and it is also what keeps the step O(1).
+        let mut bytes = b"A".to_vec();
+        bytes.push(0xFF);
+        bytes.extend(std::iter::repeat_n(b'\xD0', 4096));
+        assert_eq!(next_scalar(&bytes, 0), Some(('A', 1)));
+
+        // And a well-formed scalar in the middle of a long value is decoded
+        // without regard to what precedes or follows it.
+        let text = format!("{}Аx", "A".repeat(4096));
+        assert_eq!(
+            next_scalar(text.as_bytes(), 4096),
+            Some(('А', 2)),
+            "the Cyrillic scalar is decoded from its own two bytes"
+        );
+    }
+
+    /// Multi-byte scalars are still decoded one at a time.
+    #[test]
+    fn a_multibyte_scalar_is_one_step_of_the_walk() {
+        assert_eq!(next_scalar("АБ".as_bytes(), 0), Some(('А', 2)));
+        assert_eq!(next_scalar("АБ".as_bytes(), 2), Some(('Б', 2)));
+        // A lone continuation byte is malformed where it sits.
+        assert_eq!(next_scalar(&[0x91, 0x92], 0), Some(('\u{91}', 1)));
+        // A truncated sequence falls back to the lead byte.
+        assert_eq!(next_scalar(&[0xD0], 0), Some(('\u{D0}', 1)));
+    }
+
+    /// A scalar step must not look at what follows the scalar.
+    ///
+    /// The decoded scalar and its width are the whole observable contract, and
+    /// neither can depend on the tail. With the old `str::from_utf8(bytes[pos..])`
+    /// probe this test still PASSES - both calls return the same value - but it
+    /// takes milliseconds instead of microseconds, because every step validated
+    /// the entire remaining value. Its value is that it makes the defect cheap
+    /// to see: one megabyte of tail is either scanned on each step or not
+    /// touched at all. The durable cost proof is the criterion bench
+    /// (`benches/glob_worst_case_bench.rs`), not a wall-clock assertion here.
+    #[test]
+    fn a_scalar_step_does_not_scan_the_tail() {
+        let short = b"A";
+        let mut long = b"A".to_vec();
+        long.extend(std::iter::repeat_n(b'\xD0', 1_000_000));
+        assert_eq!(next_scalar(short, 0), next_scalar(&long, 0));
+        assert_eq!(next_scalar(&long, 0), Some(('A', 1)));
+    }
+
     #[test]
     fn non_numeric_number_sorts_last() {
         let m = manifest_with(vec![
@@ -1521,6 +1616,75 @@ mod tests {
         assert_eq!(all.len(), 1, "expose returns it despite the filter");
     }
 
+    /// P1: a Study IE key on the GLOBAL /instances route narrows the scan.
+    ///
+    /// PS3.18 10.6.1.2.1 makes those keys legal here. Accepting one without
+    /// applying it answered `?PatientID=P1` with every patient's instances -
+    /// strictly wider than the ask, and the client could not tell its filter
+    /// never ran. The study gate runs on `StudyQido.attrs` through the same
+    /// `QueryFilter` the study route uses, so both routes agree on what the key
+    /// means.
+    #[test]
+    fn a_study_key_narrows_the_global_instance_scan() {
+        let mk = |study_uid: &str, patient: &str| Manifest {
+            sys: SysHeader {
+                version: 1,
+                storage_tier: TIER_HOT,
+                total_pixel_bytes: 0,
+                arrived_at: 0,
+            },
+            study: StudyQido {
+                attrs: vec![
+                    (tag::STUDY_INSTANCE_UID, AttrValue::Text(study_uid.into())),
+                    (tag::PATIENT_ID, AttrValue::Text(patient.into())),
+                ],
+                ..Default::default()
+            },
+            series: vec![series(study_uid, Some("1"), None, None)],
+        };
+        let mut a = mk("1.2.840.9.1", "P1");
+        a.series[0].instances = vec![instance_with_flag("1.2.840.9.1.1", Some("1"), false)];
+        let mut b = mk("1.2.840.9.2", "P2");
+        b.series[0].instances = vec![instance_with_flag("1.2.840.9.2.1", Some("1"), false)];
+        let manifests = [a, b];
+
+        // No study filter: both patients' instances come back.
+        let mut all = Vec::new();
+        search_all_instances(
+            &manifests,
+            &InstanceFilter::default(),
+            &SeriesFilter::default(),
+            None,
+            &mut all,
+            false,
+        );
+        assert_eq!(all.len(), 2, "an unfiltered global scan sees everything");
+
+        // PatientID narrows it to the one patient.
+        let filter = crate::query::filter::QueryFilter {
+            patient_id: Some("P1".to_string()),
+            ..Default::default()
+        };
+        let mut narrowed = Vec::new();
+        search_all_instances(
+            &manifests,
+            &InstanceFilter::default(),
+            &SeriesFilter::default(),
+            Some(&filter),
+            &mut narrowed,
+            false,
+        );
+        assert_eq!(
+            narrowed.len(),
+            1,
+            "?PatientID=P1 must not answer with P2's instances"
+        );
+        assert_eq!(
+            text_attr(&narrowed[0].instance.attrs, tag::SOP_INSTANCE_UID),
+            Some("1.2.840.9.1.1")
+        );
+    }
+
     /// Global instance QIDO hides sequestered instances, and the study/series
     /// levels are NOT filtered (a rejected AI result must not hide its study).
     #[test]
@@ -1538,6 +1702,7 @@ mod tests {
             &manifests,
             &InstanceFilter::default(),
             &SeriesFilter::default(),
+            None,
             &mut out,
             false,
         );
@@ -1548,6 +1713,7 @@ mod tests {
             &manifests,
             &InstanceFilter::default(),
             &SeriesFilter::default(),
+            None,
             &mut all,
             true,
         );

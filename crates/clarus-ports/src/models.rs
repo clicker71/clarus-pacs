@@ -122,6 +122,22 @@ pub struct WorkItem {
     pub updated_at: Option<String>,
     /// (0074,1204) Procedure Step Label - type 1 at N-CREATE.
     pub step_label: Option<String>,
+    /// (0074,1202) Worklist Label - type 2/1 in PS3.4 Table CC.2.5-3 and a
+    /// REQUIRED matching key.
+    ///
+    /// "2/1" means the attribute is present at N-CREATE (so a retrieval always
+    /// states it) while the value may be supplied by the SCP: when the creator
+    /// sends none, the SCP fills one, as this server does at creation.
+    pub worklist_label: Option<String>,
+    /// (0020,000D) Study Instance UID at DATASET ROOT - the study assigned to
+    /// the output instances the performer creates.
+    ///
+    /// A different fact from `input_study_uid`: PS3.4 Table CC.2.5-1 lists
+    /// 'Study Instance UID (top level)' and 'Study Instance UID (Referenced
+    /// Request Sequence)' as separate rows, the first Type 2 and the second
+    /// Type 1 nested. The top-level one names where the OUTPUT goes; the nested
+    /// one names the INPUT the step operates on.
+    pub output_study_uid: Option<String>,
     /// (0040,4041) Input Readiness State - type 1 at N-CREATE.
     pub input_readiness: Option<String>,
     /// (0040,4005) Scheduled Procedure Step Start DateTime - type 1 at
@@ -130,6 +146,16 @@ pub struct WorkItem {
     /// The Study Instance UID of the input study (the first item's
     /// (0020,000D) inside (0040,4021) Input Information Sequence).
     pub input_study_uid: Option<String>,
+    /// (0040,4021) Input Information Sequence, stored as the canonical DICOM
+    /// JSON of the element (the `{"Value":...,"vr":"SQ"}` info object).
+    ///
+    /// The sequence item may carry the full Referenced Instances and Access
+    /// Macro (PS3.3 Table 10-3b): (0008,1150)/(0008,1155), a nested
+    /// (0008,1199) Referenced SOP Sequence, and (0020,000D)/(0020,000E) -
+    /// none of which the typed `input_study_uid` projection models. The
+    /// opaque element is what lets the requester verify the unchanged inputs
+    /// round-trip byte-for-byte. `None` falls back to the typed projection.
+    pub input_information: Option<String>,
     /// (0074,1238) Reason For Cancellation.
     pub reason_for_cancellation: Option<String>,
     /// (0040,4052) Procedure Step Cancellation DateTime.
@@ -167,6 +193,17 @@ pub struct WorkItem {
     /// (0040,4051) Performed Procedure Step End DateTime - when the performer
     /// finished; the same item and the same discipline as the start above.
     pub performed_end_datetime: Option<String>,
+    /// (0074,1216) Unified Procedure Step Performed Procedure Sequence, stored
+    /// as the canonical DICOM JSON of the element (the `{"Value":...,"vr":"SQ"}`
+    /// info object).
+    ///
+    /// PS3.3 Table C.30.3-1 nests the whole performer report inside this one
+    /// item, including children the typed projection does not model (e.g.
+    /// (0040,4029) Performed Station Class Code Sequence). The opaque element
+    /// is what lets a partial N-SET merge its children without erasing the
+    /// ones a previous update stored. `None` falls back to the typed
+    /// projection of the modelled children.
+    pub performed_procedure_information: Option<String>,
     /// (0074,1210) Scheduled Processing Parameters Sequence, as opaque JSON.
     ///
     /// The element belongs to the performing system (PS3.3 Table C.30.2-1:
@@ -191,6 +228,9 @@ pub struct WorkItem {
 pub struct OutputReference {
     /// (0008,1150) Referenced SOP Class UID.
     pub sop_class_uid: String,
+    /// (0020,000D) Study Instance UID of the output object, empty when the
+    /// performer named none. The macro types it 1C.
+    pub study_instance_uid: String,
     /// (0020,000E) Series Instance UID, empty when the performer named none.
     pub series_instance_uid: String,
     /// (0008,1155) Referenced SOP Instance UID.

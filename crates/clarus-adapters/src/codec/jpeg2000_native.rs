@@ -45,6 +45,11 @@ fn extract_codestream(data: &[u8]) -> Result<Vec<u8>, CodecError> {
     );
     if ext {
         pos += 2; // reserved
+        if pos + 4 > data.len() {
+            return Err(CodecError::DecodeFailed(
+                "Truncated at PixelData length".into(),
+            ));
+        }
         let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
         if len != 0xFFFF_FFFF {
@@ -53,6 +58,11 @@ fn extract_codestream(data: &[u8]) -> Result<Vec<u8>, CodecError> {
             )));
         }
     } else {
+        if pos + 2 > data.len() {
+            return Err(CodecError::DecodeFailed(
+                "Truncated at PixelData length".into(),
+            ));
+        }
         let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as u32;
         pos += 2;
         if len != 0xFFFF {
@@ -162,6 +172,9 @@ fn find_tag_position(data: &[u8], (target_g, target_e): (u16, u16)) -> Option<us
             }
             l
         } else {
+            if pos + 2 > data.len() {
+                break;
+            }
             let l = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
             l
@@ -512,6 +525,31 @@ mod tests {
         let encoded = j2k::encode_j2k_lossless(samples, &J2kLosslessEncodeOptions::default())
             .expect("j2k encode");
         encoded.codestream
+    }
+
+    /// Every truncation of the PixelData header must return Ok or Err, never
+    /// an index-out-of-bounds panic. The length reads after the VR/reserved
+    /// bytes used to index the buffer without checking the slice end. A cut
+    /// past the fragment is still a valid extraction, so Ok is acceptable per
+    /// cut - the property under test is "no panic", plus that the full buffer
+    /// decodes and some cut is an error (so the loop is not vacuous).
+    #[test]
+    fn a_truncated_pixel_data_header_is_an_error_not_a_panic() {
+        let codestream = encode_j2k(&[0u8; 4], 2, 2, 1, 8, false);
+        let full = wrap_j2k("MONOCHROME2", 1, &codestream);
+        assert!(
+            extract_codestream(&full).is_ok(),
+            "the full buffer extracts"
+        );
+        let mut saw_err = false;
+        for cut in 0..full.len() {
+            let truncated = &full[..cut];
+            match extract_codestream(truncated) {
+                Ok(_) => {}
+                Err(_) => saw_err = true,
+            }
+        }
+        assert!(saw_err, "at least one truncation must be an error");
     }
 
     /// A 5-component MONOCHROME codestream with SPP=1 has no legal DICOM

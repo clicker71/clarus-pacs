@@ -405,13 +405,29 @@ fn acquire_data_dir_guard(data_root: &std::path::Path, port: u16) -> DataDirGuar
                         old.trim()
                     );
                     let _ = std::fs::remove_file(&guard_path);
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                    // `create_new` is the whole point of this guard: it is an
+                    // atomic test-and-set. Two instances starting at the same
+                    // moment after a crash both see a stale file and both
+                    // remove it, so swallowing the error here let BOTH take
+                    // the lock and write to one CAS. The loser has to stop.
+                    match std::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&guard_path)
                     {
-                        use std::io::Write;
-                        let _ = writeln!(f, "{payload}");
+                        Ok(mut f) => {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{payload}");
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[FATAL] Another instance took the data-dir guard {} \
+                                 while this one was replacing the stale file: {}",
+                                guard_path.display(),
+                                e
+                            );
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -1424,6 +1440,40 @@ mod tests {
             pid,
             std::process::id(),
             "stale guard taken over with our pid"
+        );
+    }
+
+    /// A guard that reappears between "stale" and "take it" must stop startup.
+    ///
+    /// The takeover is `remove` then `create_new`; two instances starting at
+    /// once after a crash both observe the stale file, both remove, and the
+    /// loser's `create_new` reports `AlreadyExists`. Retrying the remove, or
+    /// treating the error as success, put two writers in one CAS. The loser
+    /// must exit, so this asserts the takeover attempt itself is a
+    /// test-and-set rather than a blind write.
+    #[test]
+    fn a_guard_taken_during_the_takeover_is_not_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard_path = dir.path().join(".clarus-data.lock");
+        std::fs::write(&guard_path, format!("{}:9999", dead_pid())).expect("plant stale");
+
+        // The rival instance wins the race: it replaces the stale file with
+        // its own guard before our `create_new` runs.
+        let rival = format!("{}:8025", std::process::id());
+        std::fs::write(&guard_path, &rival).expect("rival guard");
+
+        let taken = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&guard_path);
+        assert!(
+            matches!(&taken, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "a guard that reappeared during the takeover must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&guard_path).expect("guard intact"),
+            rival,
+            "the rival's guard survives: the loser never truncates it"
         );
     }
 

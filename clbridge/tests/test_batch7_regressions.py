@@ -357,6 +357,11 @@ class TestCp1251PatientIdMasking:
         text = "\n".join(r.getMessage() for r in caplog.records)
         assert "[CP1251]" in text, f"the fixer logged nothing: {text!r}"
         assert str(ds.PatientID) not in text, f"the raw PatientID leaked: {text}"
+        # The fixer logs BOTH values it touches - the pre-repair `garbled` and
+        # the repaired id - and masks each one. Asserting only the repaired
+        # value leaves the leak half-guarded: a regression that logged the
+        # original unmasked would still pass.
+        assert garbled not in text, f"the pre-repair PatientID leaked: {text}"
 
 
 # ---------------------------------------------------------------------------

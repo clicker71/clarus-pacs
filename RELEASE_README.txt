@@ -1,4 +1,4 @@
-Clarus PACS v0.3.0-beta - Quick Start
+Clarus PACS v0.3.1-beta - Quick Start
 =====================================
 
 COMPONENTS IN THIS PACKAGE

@@ -115,10 +115,10 @@ and anything else the processor wants to leave beside them.
 
 ```json
 {
-  "protocol": { "name": "clinfer-abi", "version": 1 },
+  "protocol": { "name": "clinfer-abi", "version": 2 },
   "clinfer_version": "0.3.0-alpha",
   "profile_version": 2,
-  "parameters": { "CLIP_LIMIT": 2.0 },
+  "parameters": { "CLIP_LIMIT": [2.0] },
   "study": {
     "uid": "1.2.840.113857.1.1",
     "description": "CHEST PA AND LAT",
@@ -187,7 +187,7 @@ source data or in the configuration. Editing a manifest to add it is
 editing the run's own question, and the frames and manifest are written
 once and never modified.
 
-The protocol version stays `1` for these keys. The document is
+The protocol version stays `2` for these keys. The document is
 additive: a reader that does not know a key ignores it, which is what
 lets an existing producer keep working unchanged.
 
@@ -200,9 +200,10 @@ flattens them into an object and hands them to the script.
 
 ```json
 "parameters": {
-  "ALGORITHM": "clahe",
-  "CLIP_LIMIT": 2.5,
-  "BODY_SITE": "SRT:T-D0050"
+  "ALGORITHM": ["clahe"],
+  "CLIP_LIMIT": [2.5],
+  "BODY_SITE": ["SRT:T-D0050"],
+  "Selected Organ Class": ["SRT:T-D0050", "SRT:T-D0075", "SRT:T-D0090"]
 }
 ```
 
@@ -211,11 +212,22 @@ parameters, so a script reads `manifest["parameters"]` without a
 presence check and gets "the requester stated nothing", not a lookup
 error.
 
+**Every value is a list, and a single-valued parameter is a list of
+one.** A JSON object key cannot repeat (RFC 8259 4), while (0074,1210)
+is a sequence in which two items may carry the same Concept Name and
+different values - that is how a requester states a multi-valued
+selection such as three organ classes. The writer therefore collects
+the values of one Concept Name into one array, in sequence order. A
+scalar under an array-valued key would have needed a second reader path
+in every script, and the shape before version 2 was worse than either:
+three items under one name became three duplicate keys, and every reader
+keeps only the last, so three selected organs arrived as one.
+
 The key of each entry is the parameter's **Concept Name Code Value**
 (0008,0100). It is a stable machine key; the Concept Name Code Meaning
 is display text a site may translate, and is not used as a key.
 
-The JSON type of the value is the parameter's Value Type:
+The JSON type of each element is the parameter's Value Type:
 
 | Value Type (0040,A040) | Rendered as | Source |
 |---|---|---|
@@ -251,9 +263,10 @@ The warning names the parameter's **name only**, never its value: a
 parameter list is requester-supplied text and may carry anything the
 site typed into it.
 
-`profile_version` and `protocol.version` are unaffected. The key is
-additive - a producer written before it existed ignores it, and a
-producer that reads it works against every manifest clinfer writes.
+`profile_version` is unaffected; `protocol.version` is `2`, because the
+shape of this key changed. A producer that read version 1 must see the
+bump rather than silently reading the first element of an unfamiliar
+array.
 
 ##### Reading the parameters
 
@@ -267,6 +280,7 @@ import params
 manifest = json.loads((workdir / "manifest.json").read_text())
 clip_limit = params.number(manifest, "CLIP_LIMIT", 2.0)
 tile_grid = params.grid(manifest, "TILE_GRID", (8, 8))
+organs = params.value_list(manifest, "Selected Organ Class")
 ```
 
 | Helper | Returns | Used for |
@@ -275,8 +289,14 @@ tile_grid = params.grid(manifest, "TILE_GRID", (8, 8))
 | `params.count(manifest, key, default)` | `int` | a NUMERIC count or slice length |
 | `params.grid(manifest, key, default)` | `(n, n)` | a square OpenCV grid size |
 | `params.text(manifest, key, default)` | `str` | a TEXT tunable |
-| `params.raw(manifest, key, default)` | as stored | anything else |
 | `params.code(manifest, key, default)` | `str` | the value part of a CODE |
+| `params.value_list(manifest, key, default)` | a new `list` | every value of a parameter |
+| `params.raw(manifest, key, default)` | as stored | anything else |
+
+The scalar helpers read the **first** element of the parameter's list,
+so a parameter the requester stated once reads exactly as it did before
+version 2. A script that wants a multi-valued selection reads the whole
+list with `value_list`.
 
 **The fallback rule: a missing key, a value of the wrong JSON type, or an
 unparseable value returns the default and never raises.** A manifest
@@ -925,3 +945,13 @@ their failures, not to sandbox their privileges.**
   such attribute carries no key at all rather than a default. Absent is a
   fact about the source, and the contract's rule for a producer that needs
   the geometry anyway is to stop rather than to assume.
+- **version 2** (section 3.1.2) - every value in `parameters` is an array,
+  one element per Content Item of (0074,1210) with that Concept Name, and a
+  single-valued parameter is an array of one. This is the one breaking
+  change since version 1: the previous shape wrote a bare scalar per item,
+  so several items under one Concept Name became duplicate keys and a
+  reader kept only the last, silently dropping a multi-valued selection.
+  The bump is deliberate - a producer that only knows version 1 has to see
+  it rather than mis-read an array. Readers in `params.py` take the first
+  element for their scalar helpers, so no example script's behaviour
+  changes.

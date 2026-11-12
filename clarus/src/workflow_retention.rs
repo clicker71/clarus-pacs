@@ -12,8 +12,11 @@
 //!
 //! - An MPPS record whose status is `COMPLETED` or `DISCONTINUED` and whose
 //!   `updated_at` is older than `[workflow] retention_days`.
-//! - An MWL SPS record whose `updated_at` is older than the same window. An
-//!   MWL row has no state machine, so age is the whole predicate.
+//! - An MWL SPS record whose age is past the same window. An MWL row has no
+//!   state machine, so age is the whole predicate - where the age is measured
+//!   from the LATER of the record stamp and the scheduled start date, so an
+//!   order filed today for a slot next month is not swept before the
+//!   procedure.
 //!
 //! `IN PROGRESS` MPPS records are NEVER swept: a step that never finished is
 //! the stuck-performer case, which an operator resolves explicitly rather than
@@ -58,6 +61,13 @@ pub fn sweep_workflow(state: &AppState) -> (usize, usize) {
 }
 
 /// Sweep the expired MWL rows (age only - an MWL row has no state machine).
+///
+/// The age reference is the LATER of the record stamp and the scheduled start,
+/// because a worklist row's useful life ends when the procedure happens, not
+/// when the order was filed. An order imported today for a slot 45 days out has
+/// `updated_at` = today, so an age-only rule deleted it long before the
+/// modality would ever query for it - the row disappeared exactly when it
+/// became the thing the worklist exists to return.
 fn sweep_mwl(store: &WorkflowStore, cutoff: u64) -> usize {
     let records = match store.all_sps() {
         Ok(r) => r,
@@ -74,7 +84,12 @@ fn sweep_mwl(store: &WorkflowStore, cutoff: u64) -> usize {
         let Some(updated_secs) = parse_stamp_secs(updated) else {
             continue;
         };
-        if updated_secs >= cutoff {
+        // A future start date holds the row past its filing age. A start date
+        // in the past is already covered by the stamp, so `max` never shortens
+        // a row's life.
+        let age_secs = scheduled_start_secs(&rec.sps_start_date, &rec.sps_start_time)
+            .map_or(updated_secs, |start| updated_secs.max(start));
+        if age_secs >= cutoff {
             continue;
         }
         match store.delete_sps(&rec.sps_uid) {
@@ -87,6 +102,51 @@ fn sweep_mwl(store: &WorkflowStore, cutoff: u64) -> usize {
         }
     }
     deleted
+}
+
+/// Convert an MWL `(sps_start_date, sps_start_time)` pair into epoch seconds.
+///
+/// The stored forms are the DICOM ones - `DA` `YYYYMMDD` and `TM` `HHMMSS`
+/// (PS3.4 K.6-1 / PS3.3 C.4.1). `TM` may carry a fractional part
+/// (`HHMMSS.FFFFFF`); the fraction is dropped because retention works in days.
+/// A malformed or empty pair is `None`, so a row whose schedule cannot be read
+/// falls back to the stamp rather than being kept or dropped on a guess.
+fn scheduled_start_secs(date: &str, time: &str) -> Option<u64> {
+    let date = date.trim();
+    let time = time.trim();
+    if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = date.get(0..4)?.parse().ok()?;
+    let month: u32 = date.get(4..6)?.parse().ok()?;
+    let day: u32 = date.get(6..8)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // `TM` is optional in a worklist query; an absent time means midnight,
+    // which can only make the row look OLDER - never newer than it is.
+    let hhmmss = time.split('.').next().unwrap_or("");
+    let (hour, minute, second) = match hhmmss.len() {
+        6 => (
+            hhmmss.get(0..2)?.parse::<u64>().ok()?,
+            hhmmss.get(2..4)?.parse::<u64>().ok()?,
+            hhmmss.get(4..6)?.parse::<u64>().ok()?,
+        ),
+        // A partial TM (`HH`, `HHMM`) is legal DICOM; fill the rest with zero.
+        4 => (
+            hhmmss.get(0..2)?.parse::<u64>().ok()?,
+            hhmmss.get(2..4)?.parse::<u64>().ok()?,
+            0,
+        ),
+        2 => (hhmmss.parse::<u64>().ok()?, 0, 0),
+        0 => (0, 0, 0),
+        _ => return None,
+    };
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some((days as u64) * SECS_PER_DAY + hour * 3600 + minute * 60 + second)
 }
 
 /// Sweep the FINAL MPPS rows that are past the window.
@@ -137,7 +197,17 @@ pub fn spawn_workflow_retention(state: AppState) {
             loop {
                 let (mwl, mpps) = sweep_workflow(&state);
                 if mwl + mpps > 0 {
-                    crate::clog_info!(mwl, mpps, "workflow retention sweep finished");
+                    // Tagged so a RELEASE build keeps the line: MWL and MPPS
+                    // deletions are exactly what an operator has to be able
+                    // to account for later, and a bare INFO tag is dropped.
+                    crate::clog_event!(
+                        crate::clog::Level::Info,
+                        "WORKFLOW_RETENTION",
+                        "",
+                        "mwl={} mpps={}",
+                        mwl,
+                        mpps
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
             }
@@ -202,5 +272,124 @@ mod tests {
         assert_eq!(parse_stamp_secs("not a stamp"), None);
         assert_eq!(parse_stamp_secs("2026-13-01 00:00:00"), None);
         assert_eq!(parse_stamp_secs("2026-10-11"), None);
+    }
+
+    #[test]
+    fn scheduled_start_secs_reads_the_dicom_forms() {
+        // Midnight on a known day, and the same day with a time.
+        assert_eq!(scheduled_start_secs("19700101", ""), Some(0));
+        assert_eq!(scheduled_start_secs("19700101", "000000"), Some(0));
+        assert_eq!(scheduled_start_secs("19700102", "000000"), Some(86_400));
+        assert_eq!(
+            scheduled_start_secs("19700101", "013000"),
+            Some(3600 + 1800)
+        );
+        // A fractional TM keeps the whole-second part.
+        assert_eq!(
+            scheduled_start_secs("19700101", "013000.500"),
+            Some(3600 + 1800)
+        );
+        // Partial TM is legal DICOM (PS3.3 C.4.1) and pads with zero.
+        assert_eq!(scheduled_start_secs("19700101", "01"), Some(3600));
+        assert_eq!(scheduled_start_secs("19700101", "0130"), Some(3600 + 1800));
+    }
+
+    #[test]
+    fn scheduled_start_secs_rejects_what_it_cannot_read() {
+        assert_eq!(scheduled_start_secs("", ""), None);
+        assert_eq!(scheduled_start_secs("1970-1-1", "000000"), None);
+        assert_eq!(scheduled_start_secs("19701301", "000000"), None);
+        assert_eq!(scheduled_start_secs("19700101", "250000"), None);
+        assert_eq!(scheduled_start_secs("19700101", "xx"), None);
+    }
+
+    /// A worklist row scheduled in the FUTURE must outlive its filing age.
+    ///
+    /// The sweep aged every MWL row by `updated_at`/`created_at` alone, so an
+    /// order imported today for a slot 45 days out was deleted after
+    /// `retention_days` - gone exactly when the modality would query for it,
+    /// and before the procedure even happened. Age is now measured from the
+    /// later of the stamp and the scheduled start.
+    ///
+    /// `sweep_mwl` is exercised directly: it takes an explicit cutoff, so the
+    /// test does not need to wait on the clock or touch `AppState`.
+    #[test]
+    fn a_future_scheduled_mwl_row_is_not_swept_before_its_procedure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = WorkflowStore::new(dir.path().to_path_buf());
+        let now = now_secs();
+        // Filed 60 days ago (older than a 7-day window) but scheduled 45 days
+        // from now: the procedure has not happened yet.
+        let filed = now.saturating_sub(60 * SECS_PER_DAY);
+        let future = now + 45 * SECS_PER_DAY;
+        let rec = clarus_core::workflow::SpsRecord {
+            sps_uid: "1.2.840.9.5.1".to_string(),
+            sps_start_date: format_stamp_date(future),
+            sps_start_time: "090000".to_string(),
+            modality: "CT".to_string(),
+            scheduled_performing_physician: "SMITH^JOHN".to_string(),
+            patient_name: "IVANOV^IVAN".to_string(),
+            patient_id: "PAT-T1".to_string(),
+            accession_number: Some("ACC-T1".to_string()),
+            created_at: Some(format_stamp(filed)),
+            updated_at: Some(format_stamp(filed)),
+            ..Default::default()
+        };
+        store.put_sps(&rec).expect("seed future row");
+
+        // A second row, filed long ago AND scheduled long ago: control.
+        let past = now.saturating_sub(90 * SECS_PER_DAY);
+        let old = clarus_core::workflow::SpsRecord {
+            sps_uid: "1.2.840.9.5.2".to_string(),
+            sps_start_date: format_stamp_date(past),
+            sps_start_time: "090000".to_string(),
+            patient_id: "PAT-T1-OLD".to_string(),
+            created_at: Some(format_stamp(past)),
+            updated_at: Some(format_stamp(past)),
+            ..Default::default()
+        };
+        store.put_sps(&old).expect("seed old row");
+
+        let cutoff = now.saturating_sub(7 * SECS_PER_DAY);
+        let deleted = sweep_mwl(&store, cutoff);
+        assert_eq!(deleted, 1, "only the genuinely old row is swept");
+
+        let left = store.all_sps().expect("scan");
+        assert_eq!(left.len(), 1, "the future row must survive");
+        assert_eq!(left[0].sps_uid, "1.2.840.9.5.1");
+    }
+
+    /// Render epoch seconds as a `YYYY-MM-DD` `DA` value.
+    fn format_stamp_date(secs: u64) -> String {
+        let days = (secs / SECS_PER_DAY) as i64;
+        let (y, m, d) = civil_from_days(days);
+        format!("{y:04}{m:02}{d:02}")
+    }
+
+    /// Render epoch seconds as the `YYYY-MM-DD HH:MM:SS` record stamp.
+    fn format_stamp(secs: u64) -> String {
+        let days = (secs / SECS_PER_DAY) as i64;
+        let (y, m, d) = civil_from_days(days);
+        let rem = secs % SECS_PER_DAY;
+        format!(
+            "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        )
+    }
+
+    /// The inverse of [`days_from_civil`] (Hinnant's algorithm).
+    fn civil_from_days(z: i64) -> (i64, u32, u32) {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        (if m <= 2 { y + 1 } else { y }, m, d)
     }
 }

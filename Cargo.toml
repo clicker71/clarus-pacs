@@ -5,6 +5,7 @@ members = [
     # Products live at the repository top level; crates/ holds shared
     # libraries only.
     "clarus",
+    "cltranscode",
     "clinfer",
 ]
 default-members = [
@@ -12,12 +13,14 @@ default-members = [
     "crates/clarus-ports",
     "crates/clarus-adapters",
     "clarus",
-    # clinfer is excluded from the default build: a standalone sidecar binary,
+    # cltranscode excluded from the default build (owner 22.08) - standalone
+    # binary, built explicitly with `cargo build --release -p cltranscode`.
+    # clinfer is excluded for the same reason: a standalone sidecar binary,
     # built explicitly with `cargo build --release -p clinfer`.
 ]
 
 [workspace.package]
-version = "0.3.0-beta"
+version = "0.3.1-beta"
 edition = "2024"
 license = "LGPL-3.0-only"
 authors = ["Daniel Solgalov <daniel.solgalov@gmail.com>"]

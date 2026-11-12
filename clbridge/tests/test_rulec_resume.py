@@ -92,6 +92,12 @@ def test_resume_reassociates_once_and_delivers_each_once(monkeypatch):
         _skip_ids=None,
         _resumed=False,
         _report_lost=False,
+        _prior_completed=0,
+        _prior_failed=0,
+        _prior_total=0,
+        request_level="",
+        request_series_uid="",
+        request_sop_uid="",
         expose_rejected=False,
         qa_url="",
     ):
@@ -185,6 +191,12 @@ def test_resume_second_loss_gives_honest_partial_with_tail(monkeypatch):
         _skip_ids=None,
         _resumed=False,
         _report_lost=False,
+        _prior_completed=0,
+        _prior_failed=0,
+        _prior_total=0,
+        request_level="",
+        request_series_uid="",
+        request_sop_uid="",
         expose_rejected=False,
         qa_url="",
     ):
@@ -256,7 +268,7 @@ def test_preflight_failure_releases_peer_gate(monkeypatch):
     preflight = Mock(side_effect=RuntimeError("boom"))
 
     monkeypatch.setattr(cm, "_preflight_study_ts_by_class", preflight)
-    cm._ASSOC_BUSY.discard(key)
+    cm._ASSOC_BUSY.pop(key, None)
 
     # Direct call: through `_cmove_worker` the except Exception would swallow
     # the raise and tell us nothing about the gate.

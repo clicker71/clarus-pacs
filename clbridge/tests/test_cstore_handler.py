@@ -79,17 +79,18 @@ class TestHandleCStoreFlow:
         )
         assert status == 0x0122
 
-    def test_missing_sop_instance_uid_still_attempts_stow(
+    def test_missing_sop_instance_uid_rejected_a900(
         self, mock_shutdown_not_set, mock_stow_success
     ):
-        """Missing SOPInstanceUID should not crash — still attempts STOW."""
+        """Missing SOPInstanceUID (Type 1) -> 0xA900, NOT enqueued/acknowledged.
+
+        Enqueueing an instance without its SOP Instance UID produced an empty
+        outbox key (perpetual "duplicate", never persisted) while the modality
+        still got 0x0000. The instance must be refused before it reaches STOW."""
         event = make_fake_cstore_event(sop_instance_uid="")
         status = handle_c_store(event, URL, False)
-        # `status in (0x0000, 0xC000)` accepted both outcomes, so it could not
-        # tell a successful store from a failed one. The fixture's STOW mock
-        # succeeds, so the handler must have reached it and returned Success.
-        assert status == 0x0000
-        mock_stow_success.assert_called_once()
+        assert status == 0xA900
+        mock_stow_success.assert_not_called()
 
     def test_max_store_bytes_zero_allows_any_size(
         self, mock_shutdown_not_set, mock_stow_success

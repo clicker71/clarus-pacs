@@ -116,26 +116,30 @@ pub fn bitap_match(pattern: &str, text: &str) -> bool {
         // pattern scalar may be wrong (W2: first-letter edits) - e.g. the
         // query "ononymo" can reach a stored name starting "...Anonymo".
         //
-        // The terms:
-        //   (prev_r0 << 1) & m  substitution - this text scalar is wrong.
-        //   (prev_r0 << 2) & m  deletion     - the alignment skips ONE pattern
-        //                       scalar and then matches this text scalar
-        //                       against the NEXT one, so the state advances
-        //                       two bits; the scalar still has to match.
-        //   (r1 << 1) & m       keep going with the error already spent.
-        //   (prev_r0 << 1)      insertion    - the text gained a scalar the
-        //                       pattern does not have: the pattern position
-        //                       stands still and the error is spent on it.
+        // The terms (Wu-Manber k=1 with the W2 seed):
+        //   prev_r0            insertion    - the TEXT gained one scalar the
+        //                      pattern does not have, so the pattern position
+        //                      stands still (no shift) and the error is spent
+        //                      on the extra text scalar. Unshifted is the
+        //                      point: a shifted term would consume a pattern
+        //                      position that was never matched.
+        //   (prev_r0 << 1)     substitution - this text scalar is wrong; the
+        //                      state advances one bit on the pattern.
+        //   ((prev_r0 << 2) & m) deletion   - skip ONE pattern scalar, then
+        //                      this text scalar must match the NEXT one, so
+        //                      the state advances two bits and is masked.
+        //   ((r1 << 1) & m)    keep going with the error already spent.
         //
-        // The insertion term used to stand in for the deletion one, which is
-        // why "abcd" could not match "abd": dropping a pattern scalar is the
-        // deletion case, and it is the one the fuzzy PatientName search hits
-        // in practice ("Atroschenko" typed as "Atroshko").
+        // The masked single-shift term that previously stood here duplicated
+        // `r0` (a subset of the no-error state) and is dropped; it is NOT the
+        // substitution, and the unshifted insertion term is the member that
+        // was missing - which is why "abcd" could not match "abxcd" (text
+        // gained a scalar in the MIDDLE).
         r1 = ((r1 << 1) & m)
             | 1 // fresh start may carry one error (first scalar may differ)
-            | ((prev_r0 << 1) & m) // substitution
-            | ((prev_r0 << 2) & m) // deletion (one pattern scalar skipped)
-            | (prev_r0 << 1); // insertion (an extra scalar in the text)
+            | prev_r0 // insertion (an extra scalar in the text, pattern stands)
+            | (prev_r0 << 1) // substitution (this text scalar is wrong)
+            | ((prev_r0 << 2) & m); // deletion (one pattern scalar skipped)
 
         // Early exit: if no state can possibly reach the finish line,
         // further characters cannot create a match.
@@ -194,6 +198,23 @@ mod tests {
     #[test]
     fn one_extra_scalar_in_the_text_matches() {
         assert!(bitap_match("abc", "abcd"));
+    }
+
+    /// The reported M12 case: the text gained a scalar in the MIDDLE, not at
+    /// the tail. The alignment must spend the single error on the insertion
+    /// (pattern stands still at "c" while the text passes "x") and then resume
+    /// matching "cd". A shifted insertion term consumed a pattern position
+    /// that was never matched, so this read as dist=2 and failed.
+    #[test]
+    fn one_extra_scalar_in_the_middle_matches() {
+        assert!(
+            bitap_match("abcd", "abxcd"),
+            "\"abxcd\" is \"abcd\" plus one middle scalar"
+        );
+        assert!(
+            bitap_match("abc", "abxcd"),
+            "\"abc\" occurs in \"abxcd\" within one edit"
+        );
     }
 
     #[test]

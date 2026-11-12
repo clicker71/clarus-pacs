@@ -219,7 +219,13 @@ def make_fake_naction_event(
         ds.ReferencedSOPSequence = ref_seq
 
     class FakeRequestor:
+        # A real association always carries the peer's socket address, and the
+        # N-ACTION handler needs it: the report destination is resolved FROM
+        # that address through the peer config (the ephemeral source port is
+        # never used). Without it every request looks unresolvable.
         ae_title = calling_ae
+        address = "10.0.0.5"
+        port = 11112
 
     class FakeAssoc:
         requestor = FakeRequestor()

@@ -90,6 +90,12 @@ impl DicomParser for DicomRsParser {
 
             // INV-001: never read the pixel value (next_element skipped it).
             if tag == tags::PIXEL_DATA {
+                // The element's TAG offset, not its value: a caller that must
+                // insert header attributes has to land before the tag itself,
+                // and this is the only place the parser knows that position.
+                // Taken from the walk rather than a byte search, so a value
+                // that happens to look like the tag cannot fool it.
+                meta.pixel_data_offset = Some(element_start as u64);
                 past_pixels = true;
                 continue;
             }
@@ -141,6 +147,7 @@ impl DicomParser for DicomRsParser {
                             element.value_start,
                             element.value_end,
                             &mut pairs,
+                            reader.syntax,
                         );
                         step_id = pairs[0].1.take();
                         procedure_id = pairs[1].1.take();
@@ -152,6 +159,7 @@ impl DicomParser for DicomRsParser {
                             element.value_end,
                             tags::PATIENT_ID,
                             &mut other_patient_ids,
+                            reader.syntax,
                         );
                     }
                     tags::CONCEPT_NAME_CODE_SEQUENCE => {
@@ -164,6 +172,7 @@ impl DicomParser for DicomRsParser {
                                 reader.data,
                                 element.value_start,
                                 element.value_end,
+                                reader.syntax,
                             );
                         }
                     }
@@ -175,6 +184,7 @@ impl DicomParser for DicomRsParser {
                             element.value_start,
                             element.value_end,
                             &mut rejection_sops,
+                            reader.syntax,
                         );
                     }
                     _ => {}
@@ -559,13 +569,17 @@ fn collect_scalars_in_first_item(
     mut pos: usize,
     end: usize,
     wanted: &mut [(DicomTag, Option<String>)],
+    syntax: TransferSyntax,
 ) {
     // Descend to the first item; everything before it is item headers of
     // nested sequences the caller did not ask about.
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
         if tag == tags::ITEM {
-            let length = read_u32_le(data, pos + 4);
+            let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
                 undefined_extent(data, pos, end).unwrap_or(end)
@@ -574,14 +588,14 @@ fn collect_scalars_in_first_item(
             };
             // Read the elements of this item; the first match wins, so a
             // repeated element cannot overwrite the value the key names.
-            read_scalars_in_range(data, pos, item_end, wanted);
+            read_scalars_in_range(data, pos, item_end, wanted, syntax);
             return;
         }
         if tag == tags::ITEM_DELIMITATION || tag == tags::SEQUENCE_DELIMITATION {
             return;
         }
         // An element before the first item: step over its value.
-        let Some(next) = element_extent_end(data, pos, end) else {
+        let Some(next) = element_extent_end(data, pos, end, syntax) else {
             return;
         };
         pos = next;
@@ -600,14 +614,18 @@ fn collect_scalars_in_all_items(
     end: usize,
     wanted: DicomTag,
     values: &mut Vec<String>,
+    syntax: TransferSyntax,
 ) {
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
         if tag == tags::SEQUENCE_DELIMITATION {
             return;
         }
         if tag == tags::ITEM {
-            let length = read_u32_le(data, pos + 4);
+            let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
                 undefined_extent(data, pos, end).unwrap_or(end)
@@ -615,14 +633,14 @@ fn collect_scalars_in_all_items(
                 pos.saturating_add(length as usize).min(end)
             };
             let mut pairs = [(wanted, None)];
-            read_scalars_in_range(data, pos, item_end, &mut pairs);
+            read_scalars_in_range(data, pos, item_end, &mut pairs, syntax);
             if let Some(v) = pairs[0].1.take() {
                 values.push(v);
             }
             pos = item_end;
             continue;
         }
-        let Some(next) = element_extent_end(data, pos, end) else {
+        let Some(next) = element_extent_end(data, pos, end, syntax) else {
             return;
         };
         pos = next;
@@ -639,21 +657,34 @@ fn read_scalars_in_range(
     mut pos: usize,
     end: usize,
     wanted: &mut [(DicomTag, Option<String>)],
+    syntax: TransferSyntax,
 ) {
+    let implicit = syntax == TransferSyntax::ImplicitVrLE;
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
         if tag == tags::ITEM_DELIMITATION || tag == tags::SEQUENCE_DELIMITATION {
             return;
         }
-        let vr = [data[pos + 4], data[pos + 5]];
-        let extended = is_extended_vr(vr);
-        let (length, value_start) = if extended {
-            if pos + 12 > end {
-                return;
-            }
-            (read_u32_le(data, pos + 8), pos + 12)
+        // PS3.5 6.2: Implicit VR carries NO VR field - the four bytes after
+        // the tag are the length. Reading them as a VR took the low half of
+        // that length as VR letters, so the walk landed in the middle of the
+        // value and every nested scalar came back empty: QIDO returned
+        // nothing for an Implicit VR instance that states its keys.
+        let (length, value_start) = if implicit {
+            (read_u32_syntax(data, pos + 4, syntax), pos + 8)
         } else {
-            (u32::from(read_u16_le(data, pos + 6)), pos + 8)
+            let vr = [data[pos + 4], data[pos + 5]];
+            if is_extended_vr(vr) {
+                if pos + 12 > end {
+                    return;
+                }
+                (read_u32_syntax(data, pos + 8, syntax), pos + 12)
+            } else {
+                (u32::from(read_u16_syntax(data, pos + 6, syntax)), pos + 8)
+            }
         };
         // A nested sequence's extent is skipped whole, whatever its length
         // form; only scalars at this level are candidates.
@@ -695,11 +726,19 @@ fn read_scalars_in_range(
 /// detector matches one title at a time. Either half may be absent, in which
 /// case the pair is `None` and the note is treated as an unknown title rather
 /// than guessed at.
-fn first_code_item(data: &[u8], mut pos: usize, end: usize) -> Option<(String, String)> {
+fn first_code_item(
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    syntax: TransferSyntax,
+) -> Option<(String, String)> {
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
         if tag == tags::ITEM {
-            let length = read_u32_le(data, pos + 4);
+            let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
                 undefined_extent(data, pos, end).unwrap_or(end)
@@ -710,7 +749,7 @@ fn first_code_item(data: &[u8], mut pos: usize, end: usize) -> Option<(String, S
                 (tags::CODE_VALUE, None),
                 (tags::CODING_SCHEME_DESIGNATOR, None),
             ];
-            read_scalars_in_range(data, pos, item_end, &mut pair);
+            read_scalars_in_range(data, pos, item_end, &mut pair, syntax);
             return match (pair[0].1.take(), pair[1].1.take()) {
                 (Some(value), Some(scheme)) => Some((value, scheme)),
                 _ => None,
@@ -719,7 +758,7 @@ fn first_code_item(data: &[u8], mut pos: usize, end: usize) -> Option<(String, S
         if tag == tags::ITEM_DELIMITATION || tag == tags::SEQUENCE_DELIMITATION {
             return None;
         }
-        pos = element_extent_end(data, pos, end)?;
+        pos = element_extent_end(data, pos, end, syntax)?;
     }
     None
 }
@@ -743,23 +782,28 @@ fn collect_referenced_sops_in_range(
     mut pos: usize,
     end: usize,
     out: &mut Vec<(String, String)>,
+    syntax: TransferSyntax,
 ) {
+    let implicit = syntax == TransferSyntax::ImplicitVrLE;
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
         if tag == tags::SEQUENCE_DELIMITATION || tag == tags::ITEM_DELIMITATION {
             return;
         }
         // An item: descend into it and keep looking for Referenced SOP
         // Sequences (they sit two levels down).
         if tag == tags::ITEM {
-            let length = read_u32_le(data, pos + 4);
+            let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
                 undefined_extent(data, pos, end).unwrap_or(end)
             } else {
                 pos.saturating_add(length as usize).min(end)
             };
-            collect_referenced_sops_in_range(data, pos, item_end, out);
+            collect_referenced_sops_in_range(data, pos, item_end, out, syntax);
             pos = item_end;
             continue;
         }
@@ -768,22 +812,27 @@ fn collect_referenced_sops_in_range(
         // It has to be descended into like an item, otherwise the walker steps
         // over the series sequence and never sees the SOP items inside it.
         if tag == tags::REFERENCED_SERIES_SEQUENCE {
-            let vr = [data[pos + 4], data[pos + 5]];
-            let extended = is_extended_vr(vr);
-            let (length, value_start) = if extended {
-                if pos + 12 > end {
-                    return;
-                }
-                (read_u32_le(data, pos + 8), pos + 12)
+            // PS3.5 6.2: in Implicit VR there is no VR field at all, so the
+            // 4-byte length sits directly after the tag.
+            let (length, value_start) = if implicit {
+                (read_u32_syntax(data, pos + 4, syntax), pos + 8)
             } else {
-                (u32::from(read_u16_le(data, pos + 6)), pos + 8)
+                let vr = [data[pos + 4], data[pos + 5]];
+                if is_extended_vr(vr) {
+                    if pos + 12 > end {
+                        return;
+                    }
+                    (read_u32_syntax(data, pos + 8, syntax), pos + 12)
+                } else {
+                    (u32::from(read_u16_syntax(data, pos + 6, syntax)), pos + 8)
+                }
             };
             let value_end = if length == tags::UNDEFINED_LENGTH {
                 undefined_extent(data, value_start, end).unwrap_or(end)
             } else {
                 value_start.saturating_add(length as usize).min(end)
             };
-            collect_referenced_sops_in_range(data, value_start, value_end, out);
+            collect_referenced_sops_in_range(data, value_start, value_end, out, syntax);
             pos = value_end;
             continue;
         }
@@ -792,26 +841,30 @@ fn collect_referenced_sops_in_range(
             // an extended-VR element, so its 4-byte length sits AFTER the two
             // reserved bytes (pos + 8) and the value starts at pos + 12.
             // Reading the length at pos + 4 would take the reserved bytes.
-            let vr = [data[pos + 4], data[pos + 5]];
-            let extended = is_extended_vr(vr);
-            let (length, value_start) = if extended {
-                if pos + 12 > end {
-                    return;
-                }
-                (read_u32_le(data, pos + 8), pos + 12)
+            // Implicit VR has neither, so the length is at pos + 4.
+            let (length, value_start) = if implicit {
+                (read_u32_syntax(data, pos + 4, syntax), pos + 8)
             } else {
-                (u32::from(read_u16_le(data, pos + 6)), pos + 8)
+                let vr = [data[pos + 4], data[pos + 5]];
+                if is_extended_vr(vr) {
+                    if pos + 12 > end {
+                        return;
+                    }
+                    (read_u32_syntax(data, pos + 8, syntax), pos + 12)
+                } else {
+                    (u32::from(read_u16_syntax(data, pos + 6, syntax)), pos + 8)
+                }
             };
             let value_end = if length == tags::UNDEFINED_LENGTH {
                 undefined_extent(data, value_start, end).unwrap_or(end)
             } else {
                 value_start.saturating_add(length as usize).min(end)
             };
-            collect_sop_items(data, value_start, value_end, out);
+            collect_sop_items(data, value_start, value_end, out, syntax);
             pos = value_end;
             continue;
         }
-        match element_extent_end(data, pos, end) {
+        match element_extent_end(data, pos, end, syntax) {
             Some(next) => pos = next,
             None => return,
         }
@@ -820,14 +873,23 @@ fn collect_referenced_sops_in_range(
 
 /// Read the (0008,1150)/(0008,1155) pairs out of the items of one Referenced
 /// SOP Sequence value region.
-fn collect_sop_items(data: &[u8], mut pos: usize, end: usize, out: &mut Vec<(String, String)>) {
+fn collect_sop_items(
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    out: &mut Vec<(String, String)>,
+    syntax: TransferSyntax,
+) {
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
         if tag == tags::SEQUENCE_DELIMITATION {
             return;
         }
         if tag == tags::ITEM {
-            let length = read_u32_le(data, pos + 4);
+            let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
                 undefined_extent(data, pos, end).unwrap_or(end)
@@ -838,14 +900,14 @@ fn collect_sop_items(data: &[u8], mut pos: usize, end: usize, out: &mut Vec<(Str
                 (tags::REFERENCED_SOP_CLASS_UID, None),
                 (tags::REFERENCED_SOP_INSTANCE_UID, None),
             ];
-            read_scalars_in_range(data, pos, item_end, &mut pair);
+            read_scalars_in_range(data, pos, item_end, &mut pair, syntax);
             if let (Some(class_uid), Some(instance_uid)) = (pair[0].1.take(), pair[1].1.take()) {
                 out.push((class_uid, instance_uid));
             }
             pos = item_end;
             continue;
         }
-        match element_extent_end(data, pos, end) {
+        match element_extent_end(data, pos, end, syntax) {
             Some(next) => pos = next,
             None => return,
         }
@@ -857,19 +919,33 @@ fn collect_sop_items(data: &[u8], mut pos: usize, end: usize, out: &mut Vec<(Str
 /// Used to step over an element the caller does not want without reading its
 /// value: an ordinary element ends after its value, an undefined-length one
 /// after its SequenceDelimitationItem.
-fn element_extent_end(data: &[u8], pos: usize, end: usize) -> Option<usize> {
+///
+/// `syntax` decides the header shape, exactly as [`read_scalars_in_range`]
+/// does. Reading a VR from an Implicit VR element took the low half of the
+/// length as VR letters, so a single unrelated element before the sequence
+/// item desynchronised the walk and the wanted scalar came back empty.
+fn element_extent_end(
+    data: &[u8],
+    pos: usize,
+    end: usize,
+    syntax: TransferSyntax,
+) -> Option<usize> {
     if pos + 8 > end {
         return None;
     }
-    let vr = [data[pos + 4], data[pos + 5]];
-    let extended = is_extended_vr(vr);
-    let (length, value_start) = if extended {
-        if pos + 12 > end {
-            return None;
-        }
-        (read_u32_le(data, pos + 8), pos + 12)
+    // PS3.5 6.2: an Implicit VR element has no VR field at all.
+    let (length, value_start) = if syntax == TransferSyntax::ImplicitVrLE {
+        (read_u32_syntax(data, pos + 4, syntax), pos + 8)
     } else {
-        (u32::from(read_u16_le(data, pos + 6)), pos + 8)
+        let vr = [data[pos + 4], data[pos + 5]];
+        if is_extended_vr(vr) {
+            if pos + 12 > end {
+                return None;
+            }
+            (read_u32_syntax(data, pos + 8, syntax), pos + 12)
+        } else {
+            (u32::from(read_u16_syntax(data, pos + 6, syntax)), pos + 8)
+        }
     };
     if length == tags::UNDEFINED_LENGTH {
         let sq_end = undefined_extent(data, value_start, end)?;
@@ -1306,46 +1382,67 @@ impl<'a> DicomReader<'a> {
     }
 
     /// Read the next dataset element.
+    ///
+    /// A LOOP, not recursion. The two cases below both "skip and try again",
+    /// and a crafted instance can consist of nothing but those: 8-byte
+    /// delimiters repeat 130k times in a one-megabyte upload, which as
+    /// recursion exhausted the stack and aborted the process (`panic =
+    /// abort`). The read helpers therefore return `None` for a delimiter
+    /// instead of calling back into this function, and the loop continues.
     fn next_element(&mut self) -> Result<Option<ElementRange>, DicomError> {
-        if self.pos + 4 > self.data.len() {
-            return Ok(None);
-        }
+        loop {
+            if self.pos + 4 > self.data.len() {
+                return Ok(None);
+            }
 
-        let tag = self.read_tag();
+            let tag = self.read_tag();
 
-        // 0310 F3: bounded-header mode - return PixelData with a synthetic
-        // empty value range instead of validating its declared length against
-        // `data`. The caller breaks here, so the (possibly multi-GB) value is
-        // never needed and a head slice that excludes it parses cleanly.
-        if self.stop_at_pixel_data && tag == tags::PIXEL_DATA {
-            let here = self.pos;
-            return Ok(Some(ElementRange {
-                tag,
-                vr: None,
-                value_start: here,
-                value_end: here,
-            }));
-        }
+            // 0310 F3: bounded-header mode - return PixelData with a synthetic
+            // empty value range instead of validating its declared length
+            // against `data`. The caller breaks here, so the (possibly
+            // multi-GB) value is never needed and a head slice that excludes
+            // it parses cleanly.
+            if self.stop_at_pixel_data && tag == tags::PIXEL_DATA {
+                let here = self.pos;
+                return Ok(Some(ElementRange {
+                    tag,
+                    vr: None,
+                    value_start: here,
+                    value_end: here,
+                }));
+            }
 
-        // DEV-009: DICOM PS3.5 Section 7.1 - skip reserved command groups
-        if tag.0 == 0x0000 || tag.0 == 0x0004 {
-            log::warn!(
-                "Skipping reserved DICOM group ({:04X},{:04X}) at offset {}",
-                tag.0,
-                tag.1,
-                self.pos - 4
-            );
-            // Read and discard the element to maintain correct position
-            let _ = match self.syntax {
+            // DEV-009: DICOM PS3.5 Section 7.1 - skip reserved command groups
+            if tag.0 == 0x0000 || tag.0 == 0x0004 {
+                log::warn!(
+                    "Skipping reserved DICOM group ({:04X},{:04X}) at offset {}",
+                    tag.0,
+                    tag.1,
+                    self.pos - 4
+                );
+                // Read and discard the element to maintain correct position.
+                let skipped = match self.syntax {
+                    TransferSyntax::ImplicitVrLE => self.read_implicit_le(tag)?,
+                    _ => self.read_explicit_vr(tag)?,
+                };
+                // A delimiter consumed inside the skipped element leaves the
+                // cursor on the next real element; a plain element is the
+                // answer itself.
+                if let Some(element) = skipped {
+                    return Ok(Some(element));
+                }
+                continue;
+            }
+
+            let element = match self.syntax {
                 TransferSyntax::ImplicitVrLE => self.read_implicit_le(tag)?,
                 _ => self.read_explicit_vr(tag)?,
             };
-            return self.next_element();
-        }
-
-        match self.syntax {
-            TransferSyntax::ImplicitVrLE => self.read_implicit_le(tag),
-            _ => self.read_explicit_vr(tag),
+            // `None` means the helper consumed a delimiter: keep walking.
+            match element {
+                Some(element) => return Ok(Some(element)),
+                None => continue,
+            }
         }
     }
 
@@ -1617,9 +1714,12 @@ impl<'a> DicomReader<'a> {
             if length == 0xFFFF_FFFF {
                 // Undefined length: Item with nested content or delimiter.
                 // (FFFE,E00D) and (FFFE,E0DD) never have undefined length,
-                // but handle anyway for robustness.
+                // but handle anyway for robustness. The value is consumed and
+                // the caller's loop moves on - returning `None` rather than
+                // calling back into `next_element` is what keeps a crafted
+                // instance from recursing once per delimiter.
                 self.skip_undefined_element(false)?;
-                return self.next_element();
+                return Ok(None);
             }
 
             let vs = self.pos;
@@ -1633,10 +1733,10 @@ impl<'a> DicomReader<'a> {
             let ve = self.set_pos_after_value(vs, length);
 
             // Item/Sequence Delimiters (FFFE,E00D) and (FFFE,E0DD)
-            // carry no metadata - skip to next real element.
-            // Items (FFFE,E000) are returned as regular elements.
+            // carry no metadata - the caller's loop skips to the next real
+            // element. Items (FFFE,E000) are returned as regular elements.
             if tag == (0xFFFE, 0xE00D) || tag == (0xFFFE, 0xE0DD) {
-                return self.next_element();
+                return Ok(None);
             }
 
             return Ok(Some(ElementRange {
@@ -1822,9 +1922,11 @@ impl<'a> DicomReader<'a> {
         }
         let ve = self.set_pos_after_value(vs, length);
 
-        // Skip sequence delimiters
+        // Skip sequence delimiters: the caller's loop moves on to the next
+        // real element, so a buffer full of delimiters costs iterations
+        // rather than stack frames.
         if tag == (0xFFFE, 0xE00D) || tag == (0xFFFE, 0xE0DD) {
-            return self.next_element();
+            return Ok(None);
         }
 
         Ok(Some(ElementRange {
@@ -5411,5 +5513,161 @@ mod tests {
             .extract_metadata(&file)
             .expect("the synthetic SR parses");
         assert!(meta.rejection_referenced_sops.is_empty());
+    }
+
+    /// An Implicit VR instance still yields its nested KEY scalars.
+    ///
+    /// PS3.18 Table 10.6.1-5 makes `00400275.00400009` and
+    /// `00400275.00401001` REQUIRED series matching attributes. PS3.5 6.2
+    /// gives an Implicit VR element no VR field, so a walker that read
+    /// `pos+4..pos+6` as a VR consumed the low half of the length and landed
+    /// inside the value: the nested scalars came back empty and QIDO matched
+    /// nothing for those instances.
+    #[test]
+    fn an_implicit_instance_yields_its_nested_request_attributes() {
+        // Request Attributes Sequence, one item, written IMPLICIT VR LE.
+        let mut item = Vec::new();
+        // (0040,0009) ScheduledProcedureStepID SH
+        item.extend_from_slice(&0x0040u16.to_le_bytes());
+        item.extend_from_slice(&0x0009u16.to_le_bytes());
+        item.extend_from_slice(&4u32.to_le_bytes());
+        item.extend_from_slice(b"SPS1");
+        // (0040,1001) RequestedProcedureID SH
+        item.extend_from_slice(&0x0040u16.to_le_bytes());
+        item.extend_from_slice(&0x1001u16.to_le_bytes());
+        item.extend_from_slice(&4u32.to_le_bytes());
+        item.extend_from_slice(b"RP01");
+
+        let mut file = DicomBuilder::new().meta_header("1.2.840.10008.1.2").build();
+        // The meta group is Explicit VR LE; everything below it is Implicit VR
+        // LE, so every element is tag + 4-byte length + value.
+        let mut push = |g: u16, e: u16, v: &[u8]| {
+            file.extend_from_slice(&g.to_le_bytes());
+            file.extend_from_slice(&e.to_le_bytes());
+            file.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            file.extend_from_slice(v);
+            if !v.len().is_multiple_of(2) {
+                file.push(0);
+            }
+        };
+        push(0x0010, 0x0010, b"IMPL^NESTED");
+        push(0x0010, 0x0020, b"PAT-9");
+        push(0x0020, 0x000D, b"1.2.840.10008.9.11");
+        push(0x0020, 0x000E, b"1.2.840.10008.9.11.1");
+        push(0x0008, 0x0018, b"1.2.840.10008.9.11.1.1");
+        push(0x0008, 0x0060, b"CT");
+        // (0040,0275) SQ, defined length, one item.
+        file.extend_from_slice(&0x0040u16.to_le_bytes());
+        file.extend_from_slice(&0x0275u16.to_le_bytes());
+        let sq_value_len = 8 + item.len();
+        file.extend_from_slice(&(sq_value_len as u32).to_le_bytes());
+        file.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        file.extend_from_slice(&0xE000u16.to_le_bytes());
+        file.extend_from_slice(&(item.len() as u32).to_le_bytes());
+        file.extend_from_slice(&item);
+
+        let meta = DicomRsParser
+            .extract_metadata(&file)
+            .expect("an implicit instance parses");
+        assert_eq!(
+            meta.scheduled_procedure_step_id.as_deref(),
+            Some("SPS1"),
+            "the nested step id is read in implicit VR"
+        );
+        assert_eq!(meta.requested_procedure_id.as_deref(), Some("RP01"));
+    }
+
+    /// An unrelated element BEFORE the sequence item must not end the walk.
+    ///
+    /// The step-over helper read a VR from every element it passed, which an
+    /// Implicit VR element (PS3.5 6.2) does not carry: the low half of its
+    /// 4-byte length became "VR letters" and the walk landed inside the value,
+    /// so a single plain LO ahead of the sequence swallowed the nested scalars
+    /// the sequence holds.
+    #[test]
+    fn an_unrelated_implicit_element_before_the_sequence_does_not_end_the_walk() {
+        let mut item = Vec::new();
+        item.extend_from_slice(&0x0040u16.to_le_bytes());
+        item.extend_from_slice(&0x0009u16.to_le_bytes());
+        item.extend_from_slice(&4u32.to_le_bytes());
+        item.extend_from_slice(b"SPS7");
+
+        let mut file = DicomBuilder::new().meta_header("1.2.840.10008.1.2").build();
+        let mut push = |g: u16, e: u16, v: &[u8]| {
+            file.extend_from_slice(&g.to_le_bytes());
+            file.extend_from_slice(&e.to_le_bytes());
+            file.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            file.extend_from_slice(v);
+            if !v.len().is_multiple_of(2) {
+                file.push(0);
+            }
+        };
+        push(0x0010, 0x0010, b"IMPL^SKIP");
+        push(0x0010, 0x0020, b"PAT-10");
+        push(0x0020, 0x000D, b"1.2.840.10008.9.21");
+        push(0x0020, 0x000E, b"1.2.840.10008.9.21.1");
+        push(0x0008, 0x0018, b"1.2.840.10008.9.21.1.1");
+        push(0x0008, 0x0060, b"CT");
+        // (0040,0275) Request Attributes Sequence, DEFINED length, whose value
+        // holds a plain LO before its item - the element the walk has to step
+        // over. Implicit VR gives it no VR field, so a step-over that reads
+        // one consumes the low half of the length as VR letters.
+        let mut sq_value = Vec::new();
+        sq_value.extend_from_slice(&0x0008u16.to_le_bytes());
+        sq_value.extend_from_slice(&0x1030u16.to_le_bytes());
+        sq_value.extend_from_slice(&(b"ROUTINE CHEST ".len() as u32).to_le_bytes());
+        sq_value.extend_from_slice(b"ROUTINE CHEST ");
+        sq_value.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq_value.extend_from_slice(&0xE000u16.to_le_bytes());
+        sq_value.extend_from_slice(&(item.len() as u32).to_le_bytes());
+        sq_value.extend_from_slice(&item);
+        file.extend_from_slice(&0x0040u16.to_le_bytes());
+        file.extend_from_slice(&0x0275u16.to_le_bytes());
+        file.extend_from_slice(&(sq_value.len() as u32).to_le_bytes());
+        file.extend_from_slice(&sq_value);
+
+        let meta = DicomRsParser
+            .extract_metadata(&file)
+            .expect("an implicit instance parses");
+        assert_eq!(
+            meta.scheduled_procedure_step_id.as_deref(),
+            Some("SPS7"),
+            "the walk survives the unrelated element ahead of the sequence"
+        );
+    }
+
+    /// A stream of delimiters must not consume the stack.    ///
+    /// PS3.5 Section 7.5 lets a Sequence Delimiter (FFFE,E0DD) appear without
+    /// a matching opener, and nothing bounds how many an upload may contain:
+    /// 8 bytes each, so a 1 MiB part holds ~130k of them. The walk has to stay
+    /// a loop - one stack frame per delimiter aborts the process under
+    /// `panic = abort`, which is a remote kill on a single crafted request.
+    #[test]
+    fn a_stream_of_delimiters_does_not_exhaust_the_stack() {
+        const DELIMITERS: usize = 200_000;
+        let mut body = Vec::with_capacity(DELIMITERS * 8);
+        for _ in 0..DELIMITERS {
+            body.extend_from_slice(&0xFFFEu16.to_le_bytes());
+            body.extend_from_slice(&0xE00Du16.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let file = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0010, 0x0010, b"PN", b"DELIM^TEST")
+            .add_element(0x0010, 0x0020, b"LO", b"PAT-1")
+            .add_element(0x0020, 0x000D, b"UI", b"1.2.840.10008.9.7")
+            .add_element(0x0020, 0x000E, b"UI", b"1.2.840.10008.9.7.1")
+            .add_element(0x0008, 0x0018, b"UI", b"1.2.840.10008.9.7.1.1")
+            .add_element(0x0008, 0x0060, b"CS", b"CT")
+            .build();
+        let mut data = file.clone();
+        data.extend_from_slice(&body);
+
+        // Element 0x00100010 precedes the delimiter run, so a walk that dies
+        // on the tenth delimiter would never reach this assertion.
+        let meta = DicomRsParser
+            .extract_metadata(&data)
+            .expect("the delimiter run is traversed, not recursed");
+        assert_eq!(meta.patient_id, "PAT-1");
     }
 }

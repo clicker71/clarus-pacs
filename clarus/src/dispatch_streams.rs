@@ -51,6 +51,14 @@ const DICOM_CT: &[u8] = b"application/dicom";
 /// pins it against `ts_uid::EXPLICIT_VR_LE` - the constant stays the single
 /// source of truth, and a drifted copy fails the build's tests instead of
 /// shipping a media type that names a different syntax than the bytes.
+/// The Explicit VR Little Endian media type, kept as a test fixture only.
+///
+/// The single-instance body no longer answers with a fixed syntax - it is
+/// whatever `maybe_transcode` returned - so nothing in the server uses this
+/// value. What it still does is pin the SPELLING of the media type against
+/// `ts_uid::EXPLICIT_VR_LE`: [`dicom_media_type`] builds that string at run
+/// time from the manifest's UID, and the test below keeps the format honest.
+#[cfg(test)]
 const DICOM_EVRLE_CT: &str = "application/dicom; transfer-syntax=1.2.840.10008.1.2.1";
 /// SSE content type.
 const SSE_CT: &[u8] = b"text/event-stream";
@@ -558,7 +566,7 @@ fn serve_single_object(
             Ok(b) => b,
             Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
         };
-        let out = match crate::handlers::wado_pure::maybe_transcode(
+        let (out, out_ts) = match crate::handlers::wado_pure::maybe_transcode(
             bytes,
             &oref.transfer_syntax,
             Some(clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE),
@@ -566,7 +574,7 @@ fn serve_single_object(
             &ctx.state.transcode_pool,
             ctx.state.config.transcode.max_megapixels,
         ) {
-            Ok(b) => b,
+            Ok(v) => v,
             // A conversion that produced nothing is not an answer: an empty
             // 200 would tell the client it retrieved the instance. The error
             // that got here already names the reason.
@@ -582,24 +590,75 @@ fn serve_single_object(
         }
         let range_header = ctx.head.range.and_then(|v| std::str::from_utf8(v).ok());
         let total = out.len() as u64;
-        return serve_instance_buffer(ctx, out, range_header, total);
+        return serve_instance_buffer(ctx, out, &out_ts, range_header, total);
     }
 
     let file = match resolve_file(ctx.state, &oref.sha256, oref.storage_tier) {
         Ok(f) => f,
         Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
     };
+    // N2: the length comes from the file actually opened, not from the
+    // manifest. `oref.file_size` is a manifest record, and this file itself
+    // documents it as stale after a canonicalization rewrite - so a Range, a
+    // Content-Length or a sendfile span computed from it could describe bytes
+    // that are no longer there. One stat on the handle already in hand is the
+    // only authoritative answer.
+    let real_size = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+    };
+    // The stored bytes are served unchanged, so the media type names the
+    // syntax they are actually in (PS3.18 8.7.3.1). Answering with a bare
+    // `application/dicom` left a client to decode the file meta itself, and a
+    // viewer that maps the media type on its own (cornerstone reads the part
+    // Content-Type first) fell back to Implicit VR and decoded compressed
+    // pixels as raw bytes.
+    let media_type = dicom_media_type(&oref.transfer_syntax);
+    // RFC 9110 14.2: a Range on a streamed object is answered with 206 and
+    // only the requested span. The whole-file head declared 200 and the whole
+    // length, so a client asking for a slice received the full object under a
+    // status that promised exactly the object.
+    let range_header = ctx.head.range.and_then(|v| std::str::from_utf8(v).ok());
+    let (status, reason, span) =
+        match crate::handlers::wado_range::parse_range_header_str(range_header, real_size) {
+            crate::handlers::wado_range::RangeResult::Partial(range) => {
+                (206u16, "Partial Content", range)
+            }
+            crate::handlers::wado_range::RangeResult::NotSatisfiable => {
+                return wado_err_response(ctx, WadoError::RangeNotSatisfiable);
+            }
+            // `InvalidIgnored` is the RFC 9110 14.2 "unsatisfiable syntax is
+            // ignored" case: the full representation is the legal answer.
+            _ => (
+                200u16,
+                "OK",
+                crate::handlers::wado_range::ByteRange {
+                    start: 0,
+                    end: real_size.saturating_sub(1),
+                },
+            ),
+        };
+    let content_len = if real_size == 0 { 0 } else { span.len() };
+    let mut extra: Vec<(&[u8], Vec<u8>)> = Vec::with_capacity(2);
+    extra.push((b"Accept-Ranges", b"bytes".to_vec()));
+    if status == 206 {
+        extra.push((
+            b"Content-Range",
+            crate::handlers::wado_range::content_range_header(span, real_size).into_bytes(),
+        ));
+    }
+    let extra_refs: Vec<(&[u8], &[u8])> = extra.iter().map(|(k, v)| (*k, v.as_slice())).collect();
     // A7: build the head into the reusable per-connection header buffer and
     // take it for the sendfile call (the conn.rs `send_file` take/re-assign
     // dance). No fresh Vec per request; the wire bytes are identical.
     clarus_core::http::response::build_head(
         &mut ctx.conn.header,
-        200,
-        "OK",
-        Some(DICOM_CT),
-        Some(oref.file_size),
+        status,
+        reason,
+        Some(media_type.as_bytes()),
+        Some(content_len),
         ctx.keep_alive == KeepAlive::On,
-        &[],
+        &extra_refs,
     );
     let head = std::mem::take(&mut ctx.conn.header);
     let res = if ctx.conn.suppress_body() {
@@ -608,11 +667,12 @@ fn serve_single_object(
         ctx.conn.stream().write_all(&head)
     } else {
         ctx.conn.write_all_configured(&head).and_then(|_| {
-            clarus_core::http::response::sendfile_response(
+            clarus_core::http::response::sendfile_response_at(
                 ctx.conn.stream(),
                 &[],
                 &file,
-                oref.file_size,
+                span.start,
+                content_len,
             )?;
             // sendfile_response writes straight to the raw stream and bypasses
             // Conn::response_bytes, so a serve_single_* instance download was
@@ -620,12 +680,25 @@ fn serve_single_object(
             // part loop fixed for streamed parts. A whole-instance GET is the
             // largest body this server sends; leaving it out made `bytes=` the
             // header size for exactly the requests that matter most.
-            ctx.conn.add_response_bytes(oref.file_size);
+            ctx.conn.add_response_bytes(content_len);
             Ok(())
         })
     };
     ctx.conn.header = head;
     res
+}
+
+/// The WADO-RS media type for a stored instance, with its transfer syntax.
+///
+/// PS3.18 8.7.3.1 lists the `transfer-syntax` parameter as optional for
+/// `application/dicom`; adding it is what lets a client pick its decoder
+/// without parsing the file meta, and a compressed instance is otherwise
+/// indistinguishable from an uncompressed one at the header layer.
+///
+/// The value comes from the manifest, not from a constant, because it must
+/// describe the bytes being sent.
+fn dicom_media_type(transfer_syntax_uid: &str) -> String {
+    format!("application/dicom; transfer-syntax={transfer_syntax_uid}")
 }
 
 /// Serve an already-transcoded single-instance buffer, applying an RFC 7233
@@ -640,24 +713,25 @@ fn serve_single_object(
 fn serve_instance_buffer(
     ctx: &mut RequestContext<'_>,
     out: Vec<u8>,
+    out_ts: &str,
     range_header: Option<&str>,
     total: u64,
 ) -> io::Result<()> {
     use crate::handlers::wado_range::{RangeResult, content_range_header, parse_range_header_str};
+    // The body is the OUTPUT of `maybe_transcode`, which may be the stored
+    // bytes (any syntax), a re-encoded Explicit VR dataset, a transcoded one,
+    // or the ORIGINAL bytes after a transient decoder failure. The parameter
+    // has to state which, so it is passed in rather than assumed: a hard-coded
+    // Explicit VR LE label was wrong on three of those four paths, and a client
+    // that picks its decoder from the header decoded the wrong thing.
+    let content_type = dicom_media_type(out_ts);
     match parse_range_header_str(range_header, total) {
         RangeResult::FullFile | RangeResult::InvalidIgnored => {
-            let resp = crate::handlers::wado_pure::WadoResp {
-                status: 200,
-                // The body here is the OUTPUT of `maybe_transcode`, which
-                // answers an Implicit VR source with Explicit VR LE (PS3.18
-                // 8.7.3 forbids serving Implicit VR over Web Services). The
-                // parameter states what the bytes are, so a client does not
-                // have to guess it from the file meta alone.
-                content_type: DICOM_EVRLE_CT,
-                headers: vec![("Accept-Ranges", "bytes".to_string())],
-                body: out,
-            };
-            write_wado_resp(ctx, &resp)
+            // Written directly rather than through `WadoResp`: that struct
+            // carries `content_type: &'static str`, and the media type here is
+            // built at run time from the syntax the body is actually in.
+            let mut headers: Vec<(&str, String)> = vec![("Accept-Ranges", "bytes".to_string())];
+            write_buffer_response(ctx, 200, &content_type, &mut headers, out)
         }
         RangeResult::Partial(range) => {
             // RFC 9110 14.1.2: the Content-Range end is INCLUSIVE, a Rust
@@ -671,16 +745,44 @@ fn serve_instance_buffer(
             let body = out[start..end].to_vec();
             let mut headers = vec![("Accept-Ranges", "bytes".to_string())];
             headers.push(("Content-Range", content_range_header(range, total)));
-            let resp = crate::handlers::wado_pure::WadoResp {
-                status: 206,
-                content_type: DICOM_EVRLE_CT,
-                headers,
-                body,
-            };
-            write_wado_resp(ctx, &resp)
+            write_buffer_response(ctx, 206, &content_type, &mut headers, body)
         }
         RangeResult::NotSatisfiable => wado_err_response(ctx, WadoError::RangeNotSatisfiable),
     }
+}
+
+/// Write a buffered WADO-RS response whose media type is decided at run time.
+///
+/// The counterpart of [`write_wado_resp`] for the one case that cannot go
+/// through [`crate::handlers::wado_pure::WadoResp`]: its `content_type` is
+/// `&'static str`, and the single-instance body may come back in any syntax
+/// the request asked for.
+fn write_buffer_response(
+    ctx: &mut RequestContext<'_>,
+    status: u16,
+    content_type: &str,
+    headers: &mut Vec<(&'static str, String)>,
+    body: Vec<u8>,
+) -> io::Result<()> {
+    let ka = ctx.keep_alive == KeepAlive::On;
+    let mut extra: Vec<(&[u8], &[u8])> = Vec::with_capacity(headers.len());
+    for (k, v) in headers.iter() {
+        extra.push((k.as_bytes(), v.as_bytes()));
+    }
+    clarus_core::http::response::build_head(
+        &mut ctx.conn.header,
+        status,
+        reason_phrase(status),
+        Some(content_type.as_bytes()),
+        Some(body.len() as u64),
+        ka,
+        &extra,
+    );
+    ctx.conn.write_all_configured(&ctx.conn.header.clone())?;
+    ctx.conn.header.clear();
+    ctx.conn.write_all_configured(&body)?;
+    ctx.conn.add_response_bytes(body.len() as u64);
+    Ok(())
 }
 
 /// `GET /dicomweb/studies/{s}/series/{se}/instances/{i}` - single instance.
@@ -761,7 +863,7 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             Ok(b) => b,
             Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
         };
-        let out = match crate::handlers::wado_pure::maybe_transcode(
+        let (out, out_ts) = match crate::handlers::wado_pure::maybe_transcode(
             bytes,
             &oref.transfer_syntax,
             Some(&ts),
@@ -770,12 +872,12 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             ctx.state.config.transcode.max_megapixels,
         ) {
             // NotAcceptable -> 406; Busy -> 503; PayloadTooLarge -> 413.
-            Ok(b) => b,
+            Ok(v) => v,
             Err(e) => return wado_err_response(ctx, e),
         };
         let range_header = ctx.head.range.and_then(|v| std::str::from_utf8(v).ok());
         let total = out.len() as u64;
-        return serve_instance_buffer(ctx, out, range_header, total);
+        return serve_instance_buffer(ctx, out, &out_ts, range_header, total);
     }
 
     // DICOMweb viewers (Weasis, OHIF) request `multipart/related` even for a
@@ -810,7 +912,7 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             Ok(b) => b,
             Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
         };
-        let out = match crate::handlers::wado_pure::maybe_transcode(
+        let (out, out_ts) = match crate::handlers::wado_pure::maybe_transcode(
             bytes,
             &oref.transfer_syntax,
             Some(clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE),
@@ -818,7 +920,7 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             &ctx.state.transcode_pool,
             ctx.state.config.transcode.max_megapixels,
         ) {
-            Ok(b) => b,
+            Ok(v) => v,
             Err(e) => return wado_err_response(ctx, e),
         };
         if out.is_empty() {
@@ -834,8 +936,8 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         // closing boundary: the same framing the streaming path writes, with
         // the converted bytes in the middle where the file used to be.
         let ct = format!("multipart/related; type=\"application/dicom\"; boundary=\"{boundary}\"");
-        let mut head =
-            format!("\r\n--{boundary}\r\nContent-Type: {DICOM_EVRLE_CT}\r\n\r\n").into_bytes();
+        let part_ct = dicom_media_type(&out_ts);
+        let mut head = format!("\r\n--{boundary}\r\nContent-Type: {part_ct}\r\n\r\n").into_bytes();
         let body_len = head.len() as u64 + out.len() as u64 + close_len(boundary);
         clarus_core::http::response::build_head(
             &mut ctx.conn.header,
@@ -866,9 +968,14 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     // WHOLE instance in RAM plus the part framing. Here the instance body is
     // streamed from the CAS file with `sendfile_response` (the :349 mechanism),
     // so a multi-GB instance costs O(1) server memory. Content-Length is
-    // computed from the file size (from the manifest) + the fixed framing.
+    // computed from the REAL file size (N2: the manifest record can be stale
+    // after a canonicalization rewrite) + the fixed framing.
     let file = match resolve_file(ctx.state, &oref.sha256, oref.storage_tier) {
         Ok(f) => f,
+        Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+    };
+    let real_size = match file.metadata() {
+        Ok(m) => m.len(),
         Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
     };
     let boundary = single_part_boundary();
@@ -879,7 +986,7 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         oref.transfer_syntax
     );
     let close = format!("\r\n--{boundary}--\r\n");
-    let body_len = open.len() as u64 + oref.file_size + close.len() as u64;
+    let body_len = open.len() as u64 + real_size + close.len() as u64;
     let ct = format!("multipart/related; type=\"application/dicom\"; boundary=\"{boundary}\"");
     let ka = ctx.keep_alive == KeepAlive::On;
     // The response head is built into the reusable per-connection buffer; the
@@ -901,13 +1008,8 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         // file bytes and the closing boundary do not.
         ctx.conn.stream().write_all(&head)
     } else {
-        clarus_core::http::response::sendfile_response(
-            ctx.conn.stream(),
-            &head,
-            &file,
-            oref.file_size,
-        )
-        .and_then(|_| ctx.conn.write_all_configured(close.as_bytes()))
+        clarus_core::http::response::sendfile_response(ctx.conn.stream(), &head, &file, real_size)
+            .and_then(|_| ctx.conn.write_all_configured(close.as_bytes()))
     };
     ctx.conn.header = head;
     res
@@ -1082,7 +1184,7 @@ fn serve_multipart_chunked(
                         continue;
                     }
                 };
-                let out = match crate::handlers::wado_pure::maybe_transcode(
+                let (out, out_ts) = match crate::handlers::wado_pure::maybe_transcode(
                     bytes,
                     &plan.source_ts,
                     Some(ts),
@@ -1090,7 +1192,7 @@ fn serve_multipart_chunked(
                     &ctx.state.transcode_pool,
                     ctx.state.config.transcode.max_megapixels,
                 ) {
-                    Ok(b) => b,
+                    Ok(v) => v,
                     // 2608 option (b): inside a chunked multipart stream a 503
                     // mid-body is impossible, so a saturated pool SKIPS the
                     // part (same graceful skip as a transcode failure) and
@@ -1106,6 +1208,13 @@ fn serve_multipart_chunked(
                         continue;
                     }
                 };
+                // The part header must name the syntax of THESE bytes: a
+                // transient decode failure serves the original bytes, so the
+                // requested target would be a lie about the part body.
+                let ct_line = format!(
+                    "Content-Type: {}; transfer-syntax={out_ts}\r\n",
+                    String::from_utf8_lossy(DICOM_CT)
+                );
                 let headers = format!(
                     "{boundary_header}{ct_line}{cl_line}Content-Length: {}\r\n\r\n",
                     out.len()
@@ -1784,6 +1893,27 @@ fn instance_metadata_json_at(
 /// (8.3.5.1.3/8.3.5.2) is resolved by [`thumbnail_request`], which also
 /// enforces the Accept negotiation both the media type table (10.4.4) and the
 /// viewport rules require.
+/// Refuse an instance whose stored size exceeds `[storage] max_instance_size_mb`.
+///
+/// Every thumbnail renderer reads the WHOLE instance into memory before
+/// scaling it down, so the instance size is the real allocation and the limit
+/// is the one STOW already accepted. The instance path had this check and the
+/// series and study paths did not, which is the same class one endpoint over:
+/// a multi-GB slide was pulled in whole to produce a 128-pixel preview.
+fn guard_instance_size(ctx: &RequestContext<'_>, file_size: u64) -> Result<(), WadoError> {
+    let max_instance = ctx
+        .state
+        .config
+        .max_instance_size_mb
+        .saturating_mul(1024 * 1024);
+    if file_size > max_instance {
+        return Err(WadoError::PayloadTooLargeStatic(
+            "instance exceeds [storage] max_instance_size_mb; cannot render a thumbnail",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn h_wado_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     let target = match thumbnail_request(ctx) {
         Ok(t) => t,
@@ -1805,18 +1935,8 @@ pub(crate) fn h_wado_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     // instance size is the real allocation. Refusing here keeps a multi-GB
     // slide from being pulled in to produce a 128-pixel preview; the limit is
     // the same one STOW accepted, so nothing served can exceed it.
-    let max_instance = ctx
-        .state
-        .config
-        .max_instance_size_mb
-        .saturating_mul(1024 * 1024);
-    if oref.file_size > max_instance {
-        return wado_err_response(
-            ctx,
-            WadoError::PayloadTooLargeStatic(
-                "instance exceeds [storage] max_instance_size_mb; cannot render a thumbnail",
-            ),
-        );
+    if let Err(e) = guard_instance_size(ctx, oref.file_size) {
+        return wado_err_response(ctx, e);
     }
     let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
         Ok(b) => b,
@@ -2254,6 +2374,12 @@ pub(crate) fn h_wado_series_thumbnail(ctx: &mut RequestContext<'_>) -> io::Resul
         Err(e) => return wado_err_response(ctx, e),
     };
     let first = &plans[0];
+    // Same guard as the instance path: the representative instance is read
+    // whole to render the preview, so an oversized one is refused before the
+    // read rather than after it.
+    if let Err(e) = guard_instance_size(ctx, first.file_size) {
+        return wado_err_response(ctx, e);
+    }
     let bytes = match read_cas_bytes(ctx.state, &first.sha256, first.storage_tier) {
         Ok(b) => b,
         Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(first.sha256.clone())),
@@ -2289,6 +2415,10 @@ pub(crate) fn h_wado_study_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result
             Err(e) => return wado_err_response(ctx, e),
         };
     let first = &plans[0];
+    // Same guard as the instance path (see `guard_instance_size`).
+    if let Err(e) = guard_instance_size(ctx, first.file_size) {
+        return wado_err_response(ctx, e);
+    }
     let bytes = match read_cas_bytes(ctx.state, &first.sha256, first.storage_tier) {
         Ok(b) => b,
         Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(first.sha256.clone())),
@@ -2453,14 +2583,13 @@ fn transcode_one_frame(
     // Released when this scope ends, including on an early return or a panic
     // inside the decoder - a leaked permit would saturate the pool for good.
     let _permit = TranscodePermit::new(&ctx.state.transcode_pool);
-    let out = crate::handlers::wado_pure::transcode_frame_to_evrle(
+    crate::handlers::wado_pure::transcode_frame_to_evrle(
         fragment,
         stored_ts,
         &pixel_module,
         &ctx.state.codec_registry,
         ctx.state.config.transcode.max_megapixels,
-    );
-    out
+    )
 }
 
 pub(crate) fn h_wado_frame(ctx: &mut RequestContext<'_>) -> io::Result<()> {
@@ -2945,6 +3074,10 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
                 accum.record(&ingest.outcome, ref_sop, fail_sop);
                 if ingest.coerced {
                     accum.warned = accum.warned.saturating_add(1);
+                    // The XML serializer reads the structured mirror, so the
+                    // Warn Reason must be set there too or the two formats
+                    // would describe different answers.
+                    accum.mark_last_referenced_coerced();
                 }
                 emit_update_event(ev_user, ev_ip, ev_via, &ingest);
             }
@@ -2981,8 +3114,29 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
                 );
             }
         }
-        // P1 group commit: one manifest write per study for this request.
-        crate::handlers::stow_pure::commit_manifests(ctx.state, &batch);
+        // P1 group commit: one manifest write per study for this request. An
+        // instance whose study manifest could not be written is not
+        // retrievable, so it is reported as failed (reason 272) instead of
+        // counted as stored.
+        let mut manifest_failed = crate::handlers::stow_pure::commit_manifests(ctx.state, &batch);
+        manifest_failed.extend(batch.take_manifest_failed());
+        for sop_instance_uid in &manifest_failed {
+            let reason = "Failed to write the study manifest for this instance".to_string();
+            let failed = InstanceOutcome::Failed {
+                sop_class_uid: None,
+                sop_instance_uid: Some(sop_instance_uid.clone()),
+                reason: reason.clone(),
+            };
+            accum.record(
+                &failed,
+                None,
+                Some(build_failed_sop_entry(
+                    None,
+                    Some(sop_instance_uid.as_str()),
+                    &reason,
+                )),
+            );
+        }
         // P2 durability: sync the written manifests before the 200/202 leaves.
         crate::handlers::stow_pure::sync_batch_manifests(ctx.state, &batch);
         // IOCM rate denominator: instances this request actually added. Exact
@@ -3005,8 +3159,10 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
         // F1: the studies are durable at this point, so the CAD workitems may
         // be created. Fire-and-forget - a failure is counted, never echoed.
         crate::handlers::cad_workitem::after_durable_stow(ctx.state, &batch);
+        let wants_xml =
+            accept_media_type_present_ci(ctx.accept().unwrap_or(""), "application/dicom+xml");
         let (status, ct, resp_body, warning) =
-            crate::handlers::stow_response::build_stow_response(&accum);
+            crate::handlers::stow_response::build_stow_response(&accum, wants_xml);
         let user = std::str::from_utf8(ctx.user).ok();
         // Access journal: the 110104 line carries the accepted count.
         ctx.stow_accepted = accum.accepted as u64;
@@ -3288,6 +3444,10 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
                 // a client that does not parse the body ever sees.
                 if ingest.coerced {
                     accum.warned = accum.warned.saturating_add(1);
+                    // The XML serializer reads the structured mirror, so the
+                    // Warn Reason must be set there too or the two formats
+                    // would describe different answers.
+                    accum.mark_last_referenced_coerced();
                 }
                 emit_update_event(ev_user, ev_ip, ev_via, &ingest);
                 dicom_parts += 1;
@@ -3368,8 +3528,31 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
     }
 
     // P1 group commit: one manifest write per study for this request (the
-    // accepted instances accumulated across all parts).
-    crate::handlers::stow_pure::commit_manifests(ctx.state, &batch);
+    // accepted instances accumulated across all parts). An instance whose
+    // study manifest could not be written is not retrievable, so it moves from
+    // the accepted count into FailedSOPSequence (reason 272).
+    let manifest_failed = {
+        let mut all = crate::handlers::stow_pure::commit_manifests(ctx.state, &batch);
+        all.extend(batch.take_manifest_failed());
+        all
+    };
+    for sop_instance_uid in &manifest_failed {
+        let reason = "Failed to write the study manifest for this instance".to_string();
+        let failed = InstanceOutcome::Failed {
+            sop_class_uid: None,
+            sop_instance_uid: Some(sop_instance_uid.clone()),
+            reason: reason.clone(),
+        };
+        accum.record(
+            &failed,
+            None,
+            Some(build_failed_sop_entry(
+                None,
+                Some(sop_instance_uid.as_str()),
+                &reason,
+            )),
+        );
+    }
     // P2 durability: sync the written manifests before the 200/202 leaves.
     crate::handlers::stow_pure::sync_batch_manifests(ctx.state, &batch);
     // IOCM rate denominator: instances this request actually added (see the
@@ -3387,8 +3570,10 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
     // F1: the studies are durable at this point, so the CAD workitems may
     // be created. Fire-and-forget - a failure is counted, never echoed.
     crate::handlers::cad_workitem::after_durable_stow(ctx.state, &batch);
+    let wants_xml =
+        accept_media_type_present_ci(ctx.accept().unwrap_or(""), "application/dicom+xml");
     let (status, ct, resp_body, warning) =
-        crate::handlers::stow_response::build_stow_response(&accum);
+        crate::handlers::stow_response::build_stow_response(&accum, wants_xml);
     let user = std::str::from_utf8(ctx.user).ok();
     // Access journal: the 110104 line carries the accepted count.
     ctx.stow_accepted = accum.accepted as u64;

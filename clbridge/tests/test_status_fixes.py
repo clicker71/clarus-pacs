@@ -3,8 +3,8 @@
 
 """0709 honest C-MOVE final statuses - regression (D1).
 
-D1a: zero slices delivered -> C-MOVE-RSP Failure 0xC000 with (0000,0902)
-     Error Comment, not 0xB000 "Sub-operations Complete" (a lie at zero).
+D1a: zero slices delivered -> C-MOVE-RSP Failure 0xC000, not 0xB000
+     "Sub-operations Complete" (a lie at zero).
 D1b: Failed/Cancel/Warning carry the (0008,0058) Failed SOP Instance UID
      List (PS3.4 C.4.2.1.4.2).
 D1c: an empty accepted-context map no longer leaves 0xC001 only in the log;
@@ -122,7 +122,9 @@ def _drain_final(gen):
 
 def test_zero_delivered_failure_is_c000_with_error_comment(move_jobs, monkeypatch):
     """D1a: a job that finished failed with ZERO slices delivered yields
-    Failure 0xC000 with an (0000,0902) Error Comment, never 0xB000."""
+    Failure 0xC000, never 0xB000. The Identifier must NOT carry (0000,0902):
+    Error Comment is a command-set element (PS3.7 Table 9.1-1), not a
+    data-set element, so the honest reason is logged, not encoded."""
     gen = _start_generator(move_jobs, monkeypatch)
     job = move_jobs.pick_pending_job(timeout=0)
     jid = job["id"]
@@ -132,7 +134,9 @@ def test_zero_delivered_failure_is_c000_with_error_comment(move_jobs, monkeypatc
     status, identifier = _drain_final(gen)
     assert status == 0xC000, hex(status)
     assert identifier is not None
-    assert (0x0000, 0x0902) in identifier, "C000 Error Comment (0000,0902) expected"
+    assert (0x0000, 0x0902) not in identifier, (
+        "Error Comment is a command-set element, not a data-set element"
+    )
 
 
 def test_partial_failure_b000_with_failed_sop_uid_list(move_jobs, monkeypatch):

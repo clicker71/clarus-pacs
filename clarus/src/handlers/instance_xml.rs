@@ -626,9 +626,11 @@ pub fn json_metadata_to_xml(json_bytes: &[u8]) -> Result<Vec<u8>, XmlError> {
 /// document path reads - which is why this function takes `tag` explicitly.
 ///
 /// # Errors
-/// Returns `Err` on malformed JSON. The bytes are serialized by this server's
-/// own [`crate::handlers::json_common::write_json_val`], so a parse failure
-/// cannot occur for a stored subtree that was written by this process.
+/// Returns `Err` on malformed JSON. A parse failure IS possible even for a
+/// stored subtree written by this process: this parser has no depth cap,
+/// while the request-body parser (`json_common`) refuses at `MAX_JSON_DEPTH`,
+/// so a stored subtree the server accepted can still fail here. Callers must
+/// therefore fall back to their typed projection instead of assuming success.
 pub fn json_info_to_xml_element(
     tag: &str,
     keyword: &str,

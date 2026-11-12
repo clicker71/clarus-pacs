@@ -86,8 +86,14 @@ pub fn intersect_study_uids<'a>(
             {
                 return;
             }
-            for c in cursors.iter_mut() {
-                *c += 1;
+            // Advance PAST every occurrence of `target`, not just one: a list
+            // carrying the same UID twice would otherwise re-emit it on the
+            // next round, and the intersection would list a study once per
+            // duplicate instead of once.
+            for i in 0..lists.len() {
+                while cursors[i] < lists[i].len() && lists[i][cursors[i]].as_str() == target {
+                    cursors[i] += 1;
+                }
             }
         } else {
             // Consume the minimum elements so the merge makes progress.

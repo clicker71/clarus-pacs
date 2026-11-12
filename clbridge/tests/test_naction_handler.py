@@ -7,8 +7,8 @@ shutdown, parse errors, and WADO verify flow.
 B1 (2408_writer_b1_naction_0000): a correctly-parsed request is ALWAYS
 acknowledged 0x0000 (J.3.2.1.4) - success / partial / total-fail differ ONLY
 by the Success / Failed SOP sequences. Protocol refusals use the standard
-codes from the verdict (0x0122 no-such-action, 0x0110/0x0213
-processing-failure), never the implementation-range 0xC2xx.
+codes from the verdict (0x0123 No Such Action, 0x0110 processing-failure),
+never the implementation-range 0xC2xx.
 """
 
 import tempfile
@@ -52,7 +52,7 @@ class TestHandleNActionValidation:
         assert rsp is None
 
     def test_rejects_invalid_action_type(self, mock_shutdown_not_set, sop_index):
-        """action_type != 1 -> 0x0122 (no-such-action, verdict set)."""
+        """action_type != 1 -> 0x0123 (No Such Action, verdict set)."""
         event = make_fake_naction_event(action_type=2)
         status, rsp = handle_n_action(
             event,
@@ -60,7 +60,7 @@ class TestHandleNActionValidation:
             False,
             sop_index,
         )
-        assert status == 0x0122
+        assert status == 0x0123
 
     def test_rejects_missing_transaction_uid(self, mock_shutdown_not_set, sop_index):
         """Missing TransactionUID -> parse error -> 0x0110 (processing failure)."""
@@ -72,6 +72,20 @@ class TestHandleNActionValidation:
             sop_index,
         )
         assert status == 0x0110
+
+    def test_unexpected_parse_exception_returns_0110(
+        self, mock_shutdown_not_set, sop_index
+    ):
+        """A non-ValueError parse failure is a permanent 0x0110 Processing
+        Failure, never 0x0213 (Resource Limitation invites a retry loop)."""
+        event = make_fake_naction_event(tx_uid="1.2.3.4.5", sop_list=[])
+        with patch(
+            "clean_code.handlers.naction._parse_n_action_rq",
+            side_effect=RuntimeError("boom"),
+        ):
+            status, rsp = handle_n_action(event, URL, False, sop_index)
+        assert status == 0x0110
+        assert rsp is None
 
     def test_action_type_none_accepted(self, mock_shutdown_not_set, sop_index):
         """action_type=None (not set) should be treated as valid (default)."""
@@ -97,6 +111,20 @@ class TestHandleNActionWadoVerify:
     always status-only, and nothing here probes WADO at all.
     """
 
+    @staticmethod
+    def _tracker():
+        """A tracker is REQUIRED for a request that names SOPs (R5): without
+        one no N-EVENT-REPORT can ever be pushed, so the request is refused."""
+        from clean_code.commit_tracker import CommitTracker
+
+        return CommitTracker(verify=lambda c, u: True, report=lambda *a, **k: None)
+
+    @staticmethod
+    def _resolve_scp(ae, addr):
+        """PS3.8: the report destination comes from the peer config, never
+        from the association's ephemeral source port."""
+        return ("10.0.0.5", 11112)
+
     def test_sop_not_in_index_returns_status_only_rsp(
         self, mock_shutdown_not_set, sop_index
     ):
@@ -111,6 +139,8 @@ class TestHandleNActionWadoVerify:
                 URL,
                 False,
                 sop_index,
+                commit_tracker=self._tracker(),
+                resolve_scp=self._resolve_scp,
             )
         assert status == 0x0000
         assert rsp is None, "the RSP carries no per-SOP sequences (J.3.2)"
@@ -134,6 +164,8 @@ class TestHandleNActionWadoVerify:
                 URL,
                 False,
                 sop_index,
+                commit_tracker=self._tracker(),
+                resolve_scp=self._resolve_scp,
             )
         assert status == 0x0000
         assert rsp is None, "status-only RSP: the verdict comes later"
@@ -156,6 +188,8 @@ class TestHandleNActionWadoVerify:
                 URL,
                 False,
                 sop_index,
+                commit_tracker=self._tracker(),
+                resolve_scp=self._resolve_scp,
             )
         assert status == 0x0000
         assert rsp is None
@@ -181,6 +215,8 @@ class TestHandleNActionWadoVerify:
                 URL,
                 False,
                 sop_index,
+                commit_tracker=self._tracker(),
+                resolve_scp=self._resolve_scp,
             )
         assert status == 0x0000
         assert rsp is None, (
@@ -246,8 +282,16 @@ class TestNActionRegistersInCommitTracker:
         # Batch is registered in the tracker for the async report.
         assert tracker.pending_count() == 1
 
-    def test_no_registration_without_tracker(self, mock_shutdown_not_set, sop_index):
-        """No tracker -> no registration, and still a status-only RSP."""
+    def test_no_tracker_refuses_a_request_that_names_sops(
+        self, mock_shutdown_not_set, sop_index
+    ):
+        """R5: without a tracker nothing registers and no N-EVENT-REPORT can
+        ever be pushed (PS3.4 J.3.3.1 - the report IS the result).
+
+        Acknowledging 0x0000 for that silently dropped the commitment and left
+        the Transaction UID hanging at the modality, so the request is refused
+        with 0x0110 Processing Failure.
+        """
         sop_good = "1.2.3.4.5.6.13"
         sop_index.insert_sop(sop_good, "1.2.3", "1.2.3.4")
         event = self._event_with_requestor(
@@ -261,8 +305,23 @@ class TestNActionRegistersInCommitTracker:
             False,
             sop_index,
         )
+        assert status == 0x0110, "no tracker -> the request cannot be honoured"
+        assert rsp is None, "a refusal carries no dataset"
+
+    def test_no_tracker_still_accepts_an_empty_request(
+        self, mock_shutdown_not_set, sop_index
+    ):
+        """With no SOPs there is nothing to report on, so nothing is lost by
+        acknowledging: the SCP only confirms it received the primitive."""
+        event = self._event_with_requestor(sop_list=[])
+        status, rsp = handle_n_action(
+            event,
+            URL,
+            False,
+            sop_index,
+        )
         assert status == 0x0000
-        assert rsp is None, "the RSP is status-only whether or not a tracker exists"
+        assert rsp is None, "the RSP is status-only"
 
     def test_registers_using_resolved_address_when_provided(
         self, mock_shutdown_not_set, sop_index

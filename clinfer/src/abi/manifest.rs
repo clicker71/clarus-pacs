@@ -122,8 +122,12 @@ pub struct Manifest {
     ///
     /// Always rendered, as `{}` when there are none: a script reads
     /// `manifest["parameters"]` unconditionally, so an absent object would
-    /// turn "the requester stated nothing" into a lookup failure. The key is
-    /// additive - `protocol.version` stays 1.
+    /// turn "the requester stated nothing" into a lookup failure.
+    ///
+    /// One entry per (0074,1210) Content Item, in sequence order. Several
+    /// items may share a Concept Name - the standard lets a requester state
+    /// a multi-valued selection that way - so the writer coalesces them into
+    /// one JSON array per name (see [`Manifest::to_json`]).
     pub parameters: Vec<ManifestParameter>,
     pub frames: Vec<FrameEntry>,
 }
@@ -192,7 +196,12 @@ impl Manifest {
     pub fn to_json(&self) -> String {
         let mut out = String::with_capacity(256 + self.frames.len() * 160);
         out.push_str("{\n");
-        out.push_str("  \"protocol\": {\"name\": \"clinfer-abi\", \"version\": 1},\n");
+        // Version 2 because the SHAPE of `parameters` changed: every value is
+        // an array, where version 1 published a bare scalar under a key that
+        // a repeated Concept Name collided on. A reader that knows only
+        // version 1 must see the bump rather than silently reading the first
+        // element of an unfamiliar array.
+        out.push_str("  \"protocol\": {\"name\": \"clinfer-abi\", \"version\": 2},\n");
         out.push_str("  \"clinfer_version\": ");
         write_json_string(&mut out, &self.clinfer_version);
         out.push_str(",\n");
@@ -216,18 +225,7 @@ impl Manifest {
 
         let _ = writeln!(out, "  \"profile_version\": {},", self.profile_version);
 
-        out.push_str("  \"parameters\": {");
-        for (at, parameter) in self.parameters.iter().enumerate() {
-            out.push_str(if at > 0 { ",\n    " } else { "\n    " });
-            write_json_string(&mut out, &parameter.name);
-            out.push_str(": ");
-            write_param_value(&mut out, &parameter.value);
-        }
-        if self.parameters.is_empty() {
-            out.push_str("},\n");
-        } else {
-            out.push_str("\n  },\n");
-        }
+        self.write_parameters(&mut out);
 
         out.push_str("  \"frames\": [\n");
         for (at, frame) in self.frames.iter().enumerate() {
@@ -255,9 +253,9 @@ impl Manifest {
             // The geometry keys are written ONLY when the instance declared
             // a value: an absent attribute is a fact about the source, and
             // writing a default here would present an invented geometry as
-            // a declared one. `protocol.version` stays 1 because the
-            // document is additive - readers are Python scripts doing
-            // json.loads, and a key they do not know is a key they ignore.
+            // a declared one. They do not move `protocol.version`: a reader
+            // is a Python script doing json.loads, and a key it does not
+            // know is a key it ignores.
             if let Some([row, column]) = frame.pixel_spacing
                 && row.is_finite()
                 && column.is_finite()
@@ -303,6 +301,57 @@ impl Manifest {
         out
     }
 
+    /// Write the `parameters` object: one JSON array per Concept Name.
+    ///
+    /// Every value is an array, a single-valued parameter included, and the
+    /// elements keep the order the (0074,1210) items had.
+    ///
+    /// The array is not a convenience: JSON object keys are unique, and
+    /// PS3.3 C.30.2 (Scheduled Processing Parameters Sequence) carries its
+    /// parameters as a SEQUENCE of Content Items, where two items may share
+    /// one Concept Name and differ in value - a multi-valued selection such
+    /// as three organs. Rendering each item as its own key produced a
+    /// document with duplicate keys, and every reader keeps only the last
+    /// one: three selected organs silently became one. Coalescing by name is
+    /// therefore the only shape that loses nothing, and a scalar under an
+    /// array-only contract would need a second reader path in every script.
+    ///
+    /// A repeated name keeps the position of its FIRST item, which is where
+    /// a reader that knows nothing of multiplicity already looks.
+    fn write_parameters(&self, out: &mut String) {
+        out.push_str("  \"parameters\": {");
+        let mut names: Vec<&str> = Vec::new();
+        for parameter in &self.parameters {
+            if names.contains(&parameter.name.as_str()) {
+                continue;
+            }
+            out.push_str(if names.is_empty() {
+                "\n    "
+            } else {
+                ",\n    "
+            });
+            write_json_string(out, &parameter.name);
+            out.push_str(": [");
+            let values = self.parameters.iter().filter(|p| p.name == parameter.name);
+            for (at, same) in values.enumerate() {
+                if at > 0 {
+                    out.push_str(", ");
+                }
+                write_param_value(out, &same.value);
+            }
+            out.push(']');
+            // The name of THIS item, not the first one: pushing the wrong
+            // reference would make the guard above miss every later repeat
+            // and write the same key again.
+            names.push(parameter.name.as_str());
+        }
+        if names.is_empty() {
+            out.push_str("},\n");
+        } else {
+            out.push_str("\n  },\n");
+        }
+    }
+
     /// Where one frame's bytes live, given the workdir.
     #[must_use]
     pub fn frame_path(workdir: &Path, file: &str) -> PathBuf {
@@ -341,6 +390,10 @@ fn write_json_string(out: &mut String, value: &str) {
 /// `"scheme:value"` - one token that names a code without inventing an object
 /// shape no script was written against - and DATETIME a JSON string, which is
 /// the form the requester wrote.
+///
+/// The element is written INTO an array: the kind of each element still
+/// distinguishes a code from a number, so a multi-valued selection keeps both
+/// its values and their types.
 ///
 /// The number is rendered only when finite: the reader that fills
 /// `parameters` refuses a non-finite DS, so an infinite one cannot reach here,
@@ -648,7 +701,9 @@ mod tests {
         let parsed = crate::json::parse(text.as_bytes()).expect("parses");
         let protocol = parsed.get("protocol").expect("protocol");
         assert_eq!(text_of(protocol, "name").as_deref(), Some("clinfer-abi"));
-        assert_eq!(protocol.get("version").and_then(|v| v.as_u64()), Some(1));
+        // Version 2 is the parameter shape (arrays, one key per Concept
+        // Name); a reader that only knows version 1 has to see the bump.
+        assert_eq!(protocol.get("version").and_then(|v| v.as_u64()), Some(2));
     }
 
     #[test]
@@ -771,51 +826,70 @@ mod tests {
         );
     }
 
-    /// A manifest with parameters renders them as a JSON object, and the
-    /// three value types keep their JSON kind: TEXT a string, NUMERIC a bare
+    /// One parameter of the statement under test.
+    fn parameter(name: &str, value: crate::dicomweb::ParamValue) -> ManifestParameter {
+        ManifestParameter {
+            name: name.to_string(),
+            value,
+        }
+    }
+
+    /// The strings of a parameter's array, in document order.
+    fn strings_of(parent: &crate::json::Json, key: &str) -> Vec<String> {
+        parent
+            .get(key)
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("{key} must be an array"))
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .unwrap_or_else(|| panic!("{key} holds strings"))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Every element of the `parameters` object is an array, and each one
+    /// keeps the JSON kind of its Value Type: TEXT a string, NUMERIC a bare
     /// number, CODE the `scheme:value` string.
     #[test]
-    fn the_parameters_object_renders_every_value_type() {
+    fn the_parameters_object_renders_every_value_type_as_an_array() {
         let mut manifest = manifest();
         manifest.parameters = vec![
-            ManifestParameter {
-                name: "ALGORITHM".to_string(),
-                value: crate::dicomweb::ParamValue::Text("clahe".to_string()),
-            },
-            ManifestParameter {
-                name: "CLIP_LIMIT".to_string(),
-                value: crate::dicomweb::ParamValue::Numeric(2.5),
-            },
-            ManifestParameter {
-                name: "BODY_SITE".to_string(),
-                value: crate::dicomweb::ParamValue::Code {
+            parameter(
+                "ALGORITHM",
+                crate::dicomweb::ParamValue::Text("clahe".to_string()),
+            ),
+            parameter("CLIP_LIMIT", crate::dicomweb::ParamValue::Numeric(2.5)),
+            parameter(
+                "BODY_SITE",
+                crate::dicomweb::ParamValue::Code {
                     scheme: "SRT".to_string(),
                     value: "T-D0050".to_string(),
                 },
-            },
-            ManifestParameter {
-                name: "SLICE_TIME".to_string(),
-                value: crate::dicomweb::ParamValue::DateTime("20261109101530.123+0300".to_string()),
-            },
+            ),
+            parameter(
+                "SLICE_TIME",
+                crate::dicomweb::ParamValue::DateTime("20261109101530.123+0300".to_string()),
+            ),
         ];
         let parsed = crate::json::parse(manifest.to_json().as_bytes()).expect("valid JSON");
         let parameters = parsed.get("parameters").expect("parameters object");
 
-        assert_eq!(text_of(parameters, "ALGORITHM").as_deref(), Some("clahe"));
         assert_eq!(
-            parameters
-                .get("CLIP_LIMIT")
-                .and_then(crate::json::Json::as_f64),
-            Some(2.5),
+            strings_of(parameters, "ALGORITHM"),
+            vec!["clahe"],
+            "a single-valued TEXT parameter is an array of one"
+        );
+        assert_eq!(
+            numbers_of(parameters, "CLIP_LIMIT"),
+            vec![2.5],
             "a NUMERIC parameter is a JSON number, not a string"
         );
+        assert_eq!(strings_of(parameters, "BODY_SITE"), vec!["SRT:T-D0050"]);
         assert_eq!(
-            text_of(parameters, "BODY_SITE").as_deref(),
-            Some("SRT:T-D0050")
-        );
-        assert_eq!(
-            text_of(parameters, "SLICE_TIME").as_deref(),
-            Some("20261109101530.123+0300"),
+            strings_of(parameters, "SLICE_TIME"),
+            vec!["20261109101530.123+0300"],
             "a DATETIME parameter is the string the requester wrote"
         );
 
@@ -827,6 +901,79 @@ mod tests {
         let frames = text.find("\"frames\"").expect("frames");
         assert!(profile < parameters_at, "parameters follow profile_version");
         assert!(parameters_at < frames, "frames follow parameters");
+    }
+
+    /// Three (0074,1210) Content Items that share one Concept Name arrive as
+    /// ONE key holding three values, in sequence order.
+    ///
+    /// This is the shape the standard allows and the previous writer
+    /// destroyed: it emitted three objects with the same key, and a reader
+    /// keeps only the last, so a selected set of three organs reached the
+    /// model as one. Coalescing by name is what makes the document able to
+    /// carry the selection at all - JSON object keys are unique (RFC 8259 4).
+    #[test]
+    fn content_items_sharing_a_concept_name_become_one_multi_value_array() {
+        let mut manifest = manifest();
+        manifest.parameters = vec![
+            parameter(
+                "Selected Organ Class",
+                crate::dicomweb::ParamValue::Code {
+                    scheme: "SRT".to_string(),
+                    value: "T-D0050".to_string(),
+                },
+            ),
+            parameter(
+                "Selected Organ Class",
+                crate::dicomweb::ParamValue::Code {
+                    scheme: "SRT".to_string(),
+                    value: "T-D0075".to_string(),
+                },
+            ),
+            parameter(
+                "Selected Organ Class",
+                crate::dicomweb::ParamValue::Code {
+                    scheme: "SRT".to_string(),
+                    value: "T-D0090".to_string(),
+                },
+            ),
+        ];
+        let text = manifest.to_json();
+        let parsed = crate::json::parse(text.as_bytes()).expect("valid JSON");
+        let parameters = parsed.get("parameters").expect("parameters object");
+
+        assert_eq!(
+            strings_of(parameters, "Selected Organ Class"),
+            vec!["SRT:T-D0050", "SRT:T-D0075", "SRT:T-D0090"],
+            "all three selected organs survive, in the requester's order"
+        );
+        assert_eq!(
+            text.matches("\"Selected Organ Class\"").count(),
+            1,
+            "one key per Concept Name: {text}"
+        );
+    }
+
+    /// A repeated name does not disturb the names around it: the object
+    /// keeps one key per Concept Name, in the order the names FIRST appear,
+    /// and a value repeated across different names stays with its own.
+    #[test]
+    fn a_repeated_name_keeps_its_first_position_and_the_others_follow() {
+        let mut manifest = manifest();
+        manifest.parameters = vec![
+            parameter("A", crate::dicomweb::ParamValue::Numeric(1.0)),
+            parameter("B", crate::dicomweb::ParamValue::Numeric(2.0)),
+            parameter("A", crate::dicomweb::ParamValue::Numeric(3.0)),
+        ];
+        let parsed = crate::json::parse(manifest.to_json().as_bytes()).expect("valid JSON");
+        let parameters = parsed.get("parameters").expect("parameters object");
+
+        assert_eq!(numbers_of(parameters, "A"), vec![1.0, 3.0]);
+        assert_eq!(numbers_of(parameters, "B"), vec![2.0]);
+
+        let text = manifest.to_json();
+        let a = text.find("\"A\"").expect("A");
+        let b = text.find("\"B\"").expect("B");
+        assert!(a < b, "A keeps the position of its first item: {text}");
     }
 
     /// A manifest with no parameters still carries the key, as `{}`: a script
@@ -856,13 +1003,13 @@ mod tests {
     #[test]
     fn an_integral_numeric_parameter_keeps_its_fraction() {
         let mut manifest = manifest();
-        manifest.parameters = vec![ManifestParameter {
-            name: "CLIP_LIMIT".to_string(),
-            value: crate::dicomweb::ParamValue::Numeric(2.0),
-        }];
+        manifest.parameters = vec![parameter(
+            "CLIP_LIMIT",
+            crate::dicomweb::ParamValue::Numeric(2.0),
+        )];
         let text = manifest.to_json();
         assert!(
-            text.contains("\"CLIP_LIMIT\": 2.0"),
+            text.contains("\"CLIP_LIMIT\": [2.0]"),
             "an integral float keeps its fraction: {text}"
         );
 
@@ -871,7 +1018,7 @@ mod tests {
         manifest.parameters[0].value = crate::dicomweb::ParamValue::Numeric(2.5);
         let text = manifest.to_json();
         assert!(
-            text.contains("\"CLIP_LIMIT\": 2.5"),
+            text.contains("\"CLIP_LIMIT\": [2.5]"),
             "2.5 stays 2.5: {text}"
         );
     }

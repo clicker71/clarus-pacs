@@ -35,7 +35,12 @@ fn sweep_once(state: &AppState) -> usize {
         state.config.commitment.result_retention_days,
         now_secs(),
     ) {
-        Ok(removed) => removed.len(),
+        Ok((removed, failed)) => {
+            if failed > 0 {
+                crate::clog_warn!("commitment retention: {failed} result(s) could not be deleted");
+            }
+            removed.len()
+        }
         Err(e) => {
             // A sweep failure must not take the server down; the next pass
             // retries, and the log says why nothing was removed.

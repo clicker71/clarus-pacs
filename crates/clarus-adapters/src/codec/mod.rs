@@ -743,18 +743,21 @@ fn first_us_of(data: &[u8], target: (u16, u16)) -> Option<u16> {
             u16::from_le_bytes([s[0], s[1]])
         }
     };
-    let mut pos = if data.len() >= 132 && &data[128..132] == b"DICM" {
-        132
-    } else {
-        0
-    };
+    // PS3.10 7.1: the File Meta group is Explicit VR LITTLE ENDIAN whatever
+    // the dataset syntax is, and it is not part of the dataset. Walking it
+    // with the dataset grammar read its short-form lengths in the wrong byte
+    // order (Big Endian source) or as a 4-byte length (Implicit VR source),
+    // and in the latter case the walk never left the meta group at all.
+    let mut pos = dataset_start(data);
     while pos + 8 <= data.len() {
         let g = u16_at(&data[pos..pos + 2]);
         let e = u16_at(&data[pos + 2..pos + 4]);
         let (len, value_start) = if implicit {
-            let l =
-                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
-            (l as usize, pos + 8)
+            // PS3.5 7.1: the value length follows the dataset byte order too.
+            // Only the TAG order was honoured here, so a Big Endian source had
+            // its 4-byte length read as little endian and the walk jumped to a
+            // meaningless offset.
+            (read_u32_grammar(data, pos + 4, be) as usize, pos + 8)
         } else {
             let vr = std::str::from_utf8(&data[pos + 4..pos + 6]).unwrap_or("");
             let ext = matches!(
@@ -776,18 +779,11 @@ fn first_us_of(data: &[u8], target: (u16, u16)) -> Option<u16> {
                 if pos + 12 > data.len() {
                     break;
                 }
-                let l = u32::from_le_bytes([
-                    data[pos + 8],
-                    data[pos + 9],
-                    data[pos + 10],
-                    data[pos + 11],
-                ]);
-                (l as usize, pos + 12)
+                // The short-form lengths follow the dataset's byte order as
+                // well (PS3.5 7.1) - only the VR letters are order-free.
+                (read_u32_grammar(data, pos + 8, be) as usize, pos + 12)
             } else {
-                (
-                    u16::from_le_bytes([data[pos + 6], data[pos + 7]]) as usize,
-                    pos + 8,
-                )
+                (read_u16_grammar(data, pos + 6, be) as usize, pos + 8)
             }
         };
         if (g, e) == target {
@@ -797,9 +793,18 @@ fn first_us_of(data: &[u8], target: (u16, u16)) -> Option<u16> {
             return None;
         }
         if len == 0xFFFF_FFFF {
-            // An undefined-length sequence is not a skip distance; the
-            // attributes that matter here are top-level, so stop.
-            break;
+            // PS3.5 7.5: an undefined-length element is followed by an item
+            // stream that ends at the Sequence Delimitation Item. Stopping
+            // here answered `None` for every attribute after such a sequence,
+            // so a file with e.g. a Referenced Image Sequence before
+            // PixelRepresentation lost its signedness and every value was
+            // reinterpreted as unsigned. Step over the stream instead.
+            let mut at = value_start;
+            if !skip_undefined_sequence(data, &mut at, implicit, be) {
+                break;
+            }
+            pos = at;
+            continue;
         }
         match value_start.checked_add(len) {
             Some(next) => pos = next + (len % 2),
@@ -807,6 +812,179 @@ fn first_us_of(data: &[u8], target: (u16, u16)) -> Option<u16> {
         }
     }
     None
+}
+
+/// Step `pos` past an undefined-length element's item stream.
+///
+/// `pos` is expected to point at the first item tag. Returns false when the
+/// stream is truncated or the delimiter is missing, which the caller treats as
+/// "no more attributes" - the same conservative answer as reaching EOF.
+fn skip_undefined_sequence(data: &[u8], pos: &mut usize, implicit: bool, be: bool) -> bool {
+    let mut depth: u32 = 0;
+    loop {
+        if *pos + 8 > data.len() {
+            return false;
+        }
+        let g = read_u16_grammar(data, *pos, be);
+        let e = read_u16_grammar(data, *pos + 2, be);
+        *pos += 4;
+        match (g, e) {
+            (0xFFFE, 0xE000) => {
+                let item_len = read_u32_grammar(data, *pos, be) as usize;
+                *pos += 4;
+                if item_len == 0xFFFF_FFFF {
+                    depth += 1;
+                } else if *pos + item_len > data.len() {
+                    return false;
+                } else {
+                    *pos += item_len;
+                }
+            }
+            (0xFFFE, 0xE00D) => {
+                *pos += 4;
+                depth = depth.saturating_sub(1);
+            }
+            (0xFFFE, 0xE0DD) => {
+                *pos += 4;
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            _ => {
+                // A plain element inside an item: its own length, in the
+                // dataset's grammar, tells where it ends.
+                if implicit {
+                    if *pos + 4 > data.len() {
+                        return false;
+                    }
+                    let l = read_u32_grammar(data, *pos, be) as usize;
+                    *pos += 4;
+                    if l == 0xFFFF_FFFF {
+                        depth += 1;
+                    } else if *pos + l > data.len() {
+                        return false;
+                    } else {
+                        *pos += l + (l % 2);
+                    }
+                } else {
+                    if *pos + 2 > data.len() {
+                        return false;
+                    }
+                    let vr = std::str::from_utf8(&data[*pos..*pos + 2]).unwrap_or("");
+                    *pos += 2;
+                    let ext = matches!(
+                        vr,
+                        "OB" | "OD"
+                            | "OF"
+                            | "OL"
+                            | "OV"
+                            | "OW"
+                            | "SQ"
+                            | "SV"
+                            | "UC"
+                            | "UN"
+                            | "UR"
+                            | "UT"
+                            | "UV"
+                    );
+                    let l = if ext {
+                        if *pos + 6 > data.len() {
+                            return false;
+                        }
+                        let l = read_u32_grammar(data, *pos + 2, be) as usize;
+                        *pos += 6;
+                        l
+                    } else {
+                        if *pos + 2 > data.len() {
+                            return false;
+                        }
+                        let l = read_u16_grammar(data, *pos, be) as usize;
+                        *pos += 2;
+                        l
+                    };
+                    if l == 0xFFFF_FFFF {
+                        depth += 1;
+                    } else if *pos + l > data.len() {
+                        return false;
+                    } else {
+                        *pos += l + (l % 2);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn read_u16_grammar(data: &[u8], at: usize, be: bool) -> u16 {
+    let pair = [data[at], data[at + 1]];
+    if be {
+        u16::from_be_bytes(pair)
+    } else {
+        u16::from_le_bytes(pair)
+    }
+}
+
+#[inline]
+fn read_u32_grammar(data: &[u8], at: usize, be: bool) -> u32 {
+    let quad = [data[at], data[at + 1], data[at + 2], data[at + 3]];
+    if be {
+        u32::from_be_bytes(quad)
+    } else {
+        u32::from_le_bytes(quad)
+    }
+}
+
+/// Byte offset of the first dataset element.
+///
+/// PS3.10 7.1: 128-byte preamble + "DICM", then group 0002 (File Meta
+/// Information, Explicit VR LE, each element listed at 4-byte granularity).
+/// A file without the prefix is treated as a bare dataset from offset 0.
+fn dataset_start(data: &[u8]) -> usize {
+    if data.len() < 132 || &data[128..132] != b"DICM" {
+        return 0;
+    }
+    let mut pos = 132;
+    while pos + 8 <= data.len() {
+        let g = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        if g != 0x0002 {
+            break;
+        }
+        let vr = std::str::from_utf8(&data[pos + 4..pos + 6]).unwrap_or("");
+        let extended = matches!(
+            vr,
+            "OB" | "OD"
+                | "OF"
+                | "OL"
+                | "OV"
+                | "OW"
+                | "SQ"
+                | "SV"
+                | "UC"
+                | "UN"
+                | "UR"
+                | "UT"
+                | "UV"
+        );
+        let (len, value_start) = if extended {
+            if pos + 12 > data.len() {
+                return pos;
+            }
+            (
+                u32::from_le_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]])
+                    as usize,
+                pos + 12,
+            )
+        } else {
+            (
+                u16::from_le_bytes([data[pos + 6], data[pos + 7]]) as usize,
+                pos + 8,
+            )
+        };
+        pos = value_start.saturating_add(len + (len % 2));
+    }
+    pos
 }
 
 /// `(is_implicit_vr, is_big_endian)` for a Part 10 file.
@@ -909,6 +1087,122 @@ mod tests {
         // Compressed codecs (RLE, JPEG-LS, etc.) - only with transcode feature.
         #[cfg(feature = "transcode")]
         assert!(registry.supports(ts_uid::RLE_LOSSLESS));
+    }
+
+    /// Append one Explicit VR LE element with a `US` value.
+    fn push_us(buf: &mut Vec<u8>, tag: (u16, u16), value: u16) {
+        buf.extend_from_slice(&tag.0.to_le_bytes());
+        buf.extend_from_slice(&tag.1.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// A Part 10 header with the Explicit VR LE transfer syntax.
+    fn evrle_header() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0u8; 128]);
+        d.extend_from_slice(b"DICM");
+        let ts = ts_uid::EXPLICIT_VR_LE.as_bytes();
+        d.extend_from_slice(&0x0002u16.to_le_bytes());
+        d.extend_from_slice(&0x0010u16.to_le_bytes());
+        d.extend_from_slice(b"UI");
+        d.extend_from_slice(&(ts.len() as u16).to_le_bytes());
+        d.extend_from_slice(ts);
+        // PS3.5 7.1: an odd-length UI value carries a NUL pad byte OUTSIDE the
+        // declared length. The transfer syntax UID is 19 characters, so
+        // without it every following element is off by one byte.
+        if !ts.len().is_multiple_of(2) {
+            d.push(0);
+        }
+        d
+    }
+
+    /// A top-level undefined-length sequence with one item, then `tail`.
+    ///
+    /// PS3.5 7.5: the item stream is delimited by (FFFE,E00D) per item and
+    /// (FFFE,E0DD) for the sequence itself.
+    fn push_undefined_sq(buf: &mut Vec<u8>, tag: (u16, u16), tail: &[u8]) {
+        buf.extend_from_slice(&tag.0.to_le_bytes());
+        buf.extend_from_slice(&tag.1.to_le_bytes());
+        buf.extend_from_slice(b"SQ");
+        buf.extend_from_slice(&[0u8, 0u8]);
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Item, undefined length, one NESTED undefined-length sequence inside
+        // it, then the item delimiter.
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf.extend_from_slice(&0x0008u16.to_le_bytes());
+        buf.extend_from_slice(&0x1140u16.to_le_bytes());
+        buf.extend_from_slice(b"SQ");
+        buf.extend_from_slice(&[0u8, 0u8]);
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x0D, 0xE0]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(tail);
+        buf.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    /// An undefined-length sequence must not end the walk.
+    ///
+    /// PS3.5 7.5 puts attributes after a sequence all the time. Stopping at
+    /// the first (FFFE,E0DD) - which belongs to the sequence - made every
+    /// later attribute invisible, so a signed image whose
+    /// PixelRepresentation followed a Referenced Image Sequence was encoded as
+    /// unsigned and every value shifted.
+    #[test]
+    fn an_undefined_sequence_does_not_hide_the_attributes_after_it() {
+        let mut d = evrle_header();
+        push_undefined_sq(&mut d, (0x0008, 0x1115), &[]);
+        push_us(&mut d, TAG_PIXEL_REPRESENTATION, 1);
+        push_us(&mut d, TAG_BITS_STORED, 12);
+
+        assert_eq!(
+            pixel_representation_of(&d),
+            1,
+            "the attribute after the sequence is read"
+        );
+        assert_eq!(bits_stored_of(&d), Some(12));
+    }
+
+    /// The nested sequence's delimiter must not be taken for the outer one.
+    ///
+    /// The inner (FFFE,E0DD) closes a sequence INSIDE an item; counting it as
+    /// the end of the outer element left the cursor in the middle of the item
+    /// stream and the next read started from a value byte.
+    #[test]
+    fn a_nested_sequence_delimiter_does_not_close_the_outer_one() {
+        let mut d = evrle_header();
+        push_us(&mut d, TAG_BITS_STORED, 8);
+        push_undefined_sq(&mut d, (0x0008, 0x1115), &[]);
+        push_us(&mut d, TAG_PIXEL_REPRESENTATION, 1);
+
+        assert_eq!(bits_stored_of(&d), Some(8));
+        assert_eq!(
+            pixel_representation_of(&d),
+            1,
+            "the nested delimiter is consumed, not mistaken for the outer end"
+        );
+    }
+
+    /// A truncated sequence stops the walk instead of guessing.
+    #[test]
+    fn a_truncated_undefined_sequence_yields_no_value() {
+        let mut d = evrle_header();
+        d.extend_from_slice(&0x0008u16.to_le_bytes());
+        d.extend_from_slice(&0x1115u16.to_le_bytes());
+        d.extend_from_slice(b"SQ");
+        d.extend_from_slice(&[0u8, 0u8]);
+        d.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // An item claiming 0x100 bytes with nothing behind it.
+        d.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        d.extend_from_slice(&0x100u32.to_le_bytes());
+        d.extend_from_slice(&[0u8; 4]);
+
+        assert_eq!(pixel_representation_of(&d), 0, "no value is invented");
     }
 
     #[cfg(feature = "transcode")]

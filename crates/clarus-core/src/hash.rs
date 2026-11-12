@@ -88,11 +88,35 @@ impl<W: std::io::Write> CasWrite<W> {
     }
 
     /// Write `buf` to the inner writer and fold the SAME bytes into the hash.
-    /// A failed inner write is returned WITHOUT hashing the bytes (they never
-    /// reached the destination).
+    ///
+    /// Hashing follows what actually reached the destination, not what the
+    /// caller intended to send. `Write::write_all` may write a prefix and then
+    /// fail; returning the error without folding that prefix in left the digest
+    /// describing fewer bytes than the file on disk held, so a recovered writer
+    /// could store a CAS address that does not name its own contents. The
+    /// chunks are therefore hashed one successful write at a time.
+    ///
+    /// A caller that sees `Err` must treat the wrapper as unusable: the digest
+    /// is not finished and the destination is a partial body.
     pub fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.inner.write_all(buf)?;
-        self.hasher.update(buf);
+        let mut rest = buf;
+        while !rest.is_empty() {
+            match self.inner.write(rest) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "writing to the CAS sink returned 0 bytes",
+                    ));
+                }
+                Ok(n) => {
+                    // Only the bytes the destination accepted are hashed.
+                    self.hasher.update(&rest[..n]);
+                    rest = &rest[n..];
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 
@@ -106,6 +130,85 @@ impl<W: std::io::Write> CasWrite<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer that accepts a prefix of the buffer and then fails, the way a
+    /// full disk or a short device write does.
+    struct PartialThenFail {
+        accept: usize,
+        written: Vec<u8>,
+        failed: bool,
+    }
+
+    impl std::io::Write for PartialThenFail {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.failed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "no space left on device",
+                ));
+            }
+            let n = self.accept.min(buf.len());
+            self.written.extend_from_slice(&buf[..n]);
+            self.failed = n < buf.len();
+            if self.failed && n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "no space left on device",
+                ));
+            }
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// C4: the digest must describe the bytes that reached the destination.
+    ///
+    /// `write_all` can accept a prefix and then fail. Returning the error
+    /// without folding that prefix in left the digest shorter than the file,
+    /// so a recovered writer could publish a CAS address that names bytes the
+    /// object does not contain.
+    #[test]
+    fn a_partially_written_buffer_hashes_exactly_what_reached_the_sink() {
+        let sink = PartialThenFail {
+            accept: 5,
+            written: Vec::new(),
+            failed: false,
+        };
+        let mut w = CasWrite::new(sink);
+        let body = b"0123456789";
+        let err = w.write_all(body).expect_err("the sink runs out of space");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+
+        let (digest, sink) = w.finish();
+        assert_eq!(&sink.written, b"01234", "a 5-byte prefix landed");
+
+        // The digest over the ACCEPTED prefix, not over the whole buffer.
+        let expected = cas_hash_one(b"01234");
+        assert_eq!(
+            hex(&digest),
+            hex(&expected),
+            "the digest must cover exactly the bytes on disk"
+        );
+        let wrong = cas_hash_one(body);
+        assert_ne!(
+            hex(&digest),
+            hex(&wrong),
+            "hashing the whole buffer would name bytes the object lacks"
+        );
+    }
+
+    /// The happy path is unchanged: one write, one digest over everything.
+    #[test]
+    fn a_complete_write_hashes_the_whole_buffer() {
+        let mut w = CasWrite::new(Vec::new());
+        w.write_all(b"hello").expect("write");
+        let (digest, sink) = w.finish();
+        assert_eq!(sink, b"hello");
+        assert_eq!(hex(&digest), hex(&cas_hash_one(b"hello")));
+    }
 
     fn hex(digest: &[u8; 32]) -> String {
         let mut s = String::with_capacity(64);

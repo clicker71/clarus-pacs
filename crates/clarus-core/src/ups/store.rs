@@ -136,6 +136,17 @@ pub struct StoreFilter<'a> {
     /// Procedure ID - a standard matching key (PS3.4 Table CC.2.5-3, R).
     pub requested_procedure_id: Option<&'a str>,
     pub patient_id: Option<&'a str>,
+    /// (0040,0405) Scheduled Procedure Step Start DateTime - a REQUIRED
+    /// matching key (PS3.4 Table CC.2.5-3, "Single Value or Range").
+    ///
+    /// A `-`-separated value is a RANGE across the stored DT, which is what the
+    /// standard's matchType states; a single value is an exact match.
+    pub sps_start_datetime: Option<&'a str>,
+    /// (0074,1200) Scheduled Procedure Step Priority - a REQUIRED matching key
+    /// (Single Value).
+    pub sps_priority: Option<&'a str>,
+    /// (0010,0010) Patient's Name - a REQUIRED matching key.
+    pub patient_name: Option<&'a str>,
     /// (0008,0060) Modality - vendor extended, matched case-insensitively
     /// (a modality is a DICOM CS value, so its case is not significant).
     pub modality: Option<&'a str>,
@@ -245,7 +256,15 @@ impl WorkItemStore {
     }
 
     /// Delete a workitem by UID. Returns `true` when a file was removed.
+    ///
+    /// Takes the same striped lock as [`insert`] and [`cas_update`]: a delete
+    /// racing an insert of the SAME uid could otherwise remove the file the
+    /// insert just committed, or the insert could re-create it under the
+    /// delete's `remove_file`, and the store would hand out an "absent" and a
+    /// "present" answer for one workitem in the same instant.
     pub fn delete(&self, uid: &str) -> Result<bool, StoreError> {
+        let stripe = uid_lock(uid);
+        let _guard = stripe.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.path_for(uid);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
@@ -410,6 +429,43 @@ fn matches_filter(rec: &WorkItemRecord, f: &StoreFilter<'_>) -> bool {
         && rec.patient_id.as_deref() != Some(v)
     {
         return false;
+    }
+    // (0040,0010) Patient's Name: literal comparison, the same convention the
+    // sibling LO/SH keys use here.
+    //
+    // One deliberate difference: the caller has already stripped surrounding
+    // whitespace from `v`, and the comparison ignores it on BOTH sides. A PN
+    // arriving through a URL is routinely padded, and a padding difference is
+    // not a different patient.
+    if let Some(v) = f.patient_name
+        && rec.patient_name.as_deref().map(str::trim) != Some(v.trim())
+    {
+        return false;
+    }
+    if let Some(v) = f.sps_priority
+        && rec.sps_priority.as_deref() != Some(v)
+    {
+        return false;
+    }
+    // (0040,0405) ScheduledProcedureStepStartDateTime: "Single Value or Range"
+    // per Table CC.2.5-3. An empty value matches everything (the zero-length
+    // key convention); `<lo>-<hi>` is an inclusive range; anything else is one
+    // instant compared exactly. DT values sort lexically in DICOM's fixed
+    // `YYYYMMDDHHMMSS.FFFFFF` layout, so string comparison IS time comparison.
+    if let Some(v) = f.sps_start_datetime
+        && !v.is_empty()
+    {
+        let Some(stored) = rec.sps_start_datetime.as_deref() else {
+            // A workitem with no start datetime does not match a datetime query.
+            return false;
+        };
+        let matched = match v.split_once('-') {
+            Some((lo, hi)) => (lo.is_empty() || stored >= lo) && (hi.is_empty() || stored <= hi),
+            None => stored == v,
+        };
+        if !matched {
+            return false;
+        }
     }
     if let Some(v) = f.requested_procedure_id
         && rec.requested_procedure_id.as_deref() != Some(v)

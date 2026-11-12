@@ -205,7 +205,10 @@ pub fn emit(e: &AccessEvent) {
                     .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
             {
-                crate::clog_warn!("access audit dropped N events (ring full; bounded loss)");
+                crate::clog_warn!(
+                    dropped = crate::metrics::ACCESS_AUDIT_DROPPED.load(Ordering::Relaxed),
+                    "access audit dropped events (ring full; bounded loss)"
+                );
             }
         }
         Err(TrySendError::Disconnected(_)) => {}

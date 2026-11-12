@@ -25,7 +25,9 @@ class AssocInfo:
     def __init__(self, ae_title: str, address: str):
         self.ae_title = ae_title
         self.address = address
-        # studies: dict[study_uid -> {'patient_id': str, 'modality': str, 'count': int}]
+        # studies: dict[study_uid -> {'modality': str, 'count': int}]
+        # No PatientID here: the summary this feeds only prints modality and
+        # counts, so a raw identifier would be PHI held in memory for nothing.
         self.studies: dict[str, dict] = {}
         self.instance_count = 0
 
@@ -107,9 +109,7 @@ def register_assoc_released(assoc_id: int) -> None:
     )
 
 
-def record_cstore(
-    assoc_id: int, study_uid: str, patient_id: str, modality: str
-) -> bool:
+def record_cstore(assoc_id: int, study_uid: str, modality: str) -> bool:
     """Record a C-STORE instance in the association tracker.
 
     Returns True if this is the FIRST instance for this study_uid
@@ -127,7 +127,6 @@ def record_cstore(
 
         if study_uid not in info.studies:
             info.studies[study_uid] = {
-                "patient_id": patient_id or "?",
                 "modality": modality or "??",
                 "count": 1,
             }

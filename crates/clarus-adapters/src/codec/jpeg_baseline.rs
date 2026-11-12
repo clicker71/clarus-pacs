@@ -20,8 +20,8 @@
 
 use super::{CodecError, DecodedPixels, DicomCodec, DicomMeta, ts_uid};
 use super::{
-    TAG_BITS_ALLOCATED, TAG_COLUMNS, TAG_PHOTOMETRIC_INTERPRETATION, TAG_PIXEL_DATA,
-    TAG_PIXEL_REPRESENTATION, TAG_ROWS, TAG_SAMPLES_PER_PIXEL,
+    TAG_BITS_ALLOCATED, TAG_BITS_STORED, TAG_COLUMNS, TAG_PHOTOMETRIC_INTERPRETATION,
+    TAG_PIXEL_DATA, TAG_PIXEL_REPRESENTATION, TAG_ROWS, TAG_SAMPLES_PER_PIXEL,
 };
 
 /// Codec for JPEG Baseline (1.2.840.10008.1.2.4.50).
@@ -196,8 +196,14 @@ fn parse_jpeg_meta(data: &[u8]) -> Result<DicomMeta, CodecError> {
         .map(|v| v as u8)
         .unwrap_or(1);
     let bits_allocated: u8 = find_tag_u16(data, TAG_BITS_ALLOCATED).unwrap_or(8) as u8;
-    let bits_stored: u8 = find_tag_u16(data, TAG_BITS_ALLOCATED)
+    // PS3.5 8.1.1: BitsStored (0028,0101) is the count of bits that actually
+    // carry signal and shall never exceed BitsAllocated (0028,0100). Reading
+    // BitsAllocated here declared a 12-bit-in-16 CT as 16-bit, so the
+    // re-encoded output carried BitsStored=16 / HighBit=15 and a viewer showed
+    // the four uninitialised low bits as signal.
+    let bits_stored: u8 = find_tag_u16(data, TAG_BITS_STORED)
         .map(|v| v as u8)
+        .filter(|v| *v > 0 && *v <= bits_allocated)
         .unwrap_or(bits_allocated);
     let photometric_interpretation = find_tag_str(data, TAG_PHOTOMETRIC_INTERPRETATION)
         .unwrap_or_else(|| "MONOCHROME2".to_string());
@@ -777,6 +783,42 @@ mod tests {
             JpegBaselineCodec.transfer_syntax_uid(),
             ts_uid::JPEG_BASELINE
         );
+    }
+
+    /// R-01: BitsStored (0028,0101) is what the codec reports, not
+    /// BitsAllocated (0028,0100). PS3.5 8.1.1 forbids BitsStored from
+    /// exceeding BitsAllocated, so a larger value is clamped, not believed.
+    #[test]
+    fn the_codec_reports_bits_stored_not_bits_allocated() {
+        let dicom = build_meta_only(16, 12);
+        let meta = parse_jpeg_meta(&dicom).expect("metadata");
+        assert_eq!(meta.bits_allocated, 16);
+        assert_eq!(meta.bits_stored, 12, "BitsStored decides");
+
+        let dicom = build_meta_only(8, 20);
+        let meta = parse_jpeg_meta(&dicom).expect("metadata");
+        assert_eq!(meta.bits_stored, 8, "clamped to BitsAllocated");
+    }
+
+    /// A Part 10 file with only the geometry the metadata reader needs.
+    fn build_meta_only(bits_allocated: u16, bits_stored: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 128]);
+        out.extend_from_slice(b"DICM");
+        push_us(&mut out, TAG_ROWS, 2);
+        push_us(&mut out, TAG_COLUMNS, 2);
+        push_us(&mut out, TAG_SAMPLES_PER_PIXEL, 1);
+        push_us(&mut out, TAG_BITS_ALLOCATED, bits_allocated);
+        push_us(&mut out, TAG_BITS_STORED, bits_stored);
+        out
+    }
+
+    fn push_us(out: &mut Vec<u8>, tag: (u16, u16), value: u16) {
+        out.extend_from_slice(&tag.0.to_le_bytes());
+        out.extend_from_slice(&tag.1.to_le_bytes());
+        out.extend_from_slice(b"US");
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
     }
 
     #[test]

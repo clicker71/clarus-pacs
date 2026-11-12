@@ -44,8 +44,36 @@ use crate::handlers::admin::pure::{CORRUPTED_HASH_LIST_CAP, CasAuditState};
 /// The state is injected: production passes the process-global
 /// `pure::AUDIT_STATE` (a single walker writes it), while tests pass a local
 /// `RwLock` so parallel tests can never race on a shared global.
-pub fn run_cas_audit(cas_root: PathBuf, manifest_dir: PathBuf, state: &RwLock<CasAuditState>) {
-    let referenced = crate::erase_worker::collect_referenced(&manifest_dir).unwrap_or_default();
+pub fn run_cas_audit(
+    cas_root: PathBuf,
+    manifest_dir: PathBuf,
+    temp_dir: PathBuf,
+    state: &RwLock<CasAuditState>,
+) {
+    // A skipped pass must NEVER fall back to an empty reference set: every blob
+    // would then be counted unreferenced, which is one edit away from the data
+    // loss batch 9 fixed. An unreadable manifest directory aborts the pass; a
+    // directory that does not exist yet holds no studies, so it is an empty
+    // set rather than a failed scan.
+    let referenced = match crate::erase_worker::collect_referenced(&manifest_dir) {
+        Ok(set) => set,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => {
+            crate::clog_warn!(
+                manifest_dir = %manifest_dir.display(),
+                error = %e,
+                "CAS audit: reference scan failed, pass skipped"
+            );
+            // Leaving the status at "running" is what W9 did by accident: the
+            // next audit request sees "running" and answers 409, so ONE failed
+            // scan disabled the endpoint until the process restarted. The
+            // status must reach a terminal state on every exit path; "error:"
+            // is the same prefix the unreadable-root branch below uses, so the
+            // request handler recognises both as finished.
+            set_status(state, format!("error: reference scan failed: {e}"));
+            return;
+        }
+    };
     let started = Instant::now();
     let mut checked: u64 = 0;
     let mut errors: u64 = 0;
@@ -67,9 +95,22 @@ pub fn run_cas_audit(cas_root: PathBuf, manifest_dir: PathBuf, state: &RwLock<Ca
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // The CAS staging directory holds files being written right now.
+            // Counting them made every in-flight upload look like an orphan,
+            // which is the opposite of what the number is for. The path comes
+            // from the store's own accessor rather than a hard-coded name.
+            if path == temp_dir {
+                continue;
+            }
             if path.is_dir() {
                 dirs.push(path);
             } else if path.is_file() {
+                // Only stored instances are candidates. A sidecar, a part
+                // file or a lock in the tree is not an instance, and counting
+                // it as unreferenced reported a phantom orphan.
+                if path.extension().and_then(|e| e.to_str()) != Some("dcm") {
+                    continue;
+                }
                 // 2808 P1: report-only unreferenced counter (no deletion).
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
                     && !referenced.contains(stem)
@@ -237,6 +278,52 @@ mod tests {
         path
     }
 
+    /// A failed reference scan must leave a TERMINAL status, never "running".
+    ///
+    /// The audit request claims the state by writing `"running"` and answers
+    /// 409 to every later request while that exact string is there. The
+    /// scan-failure branch returned after only logging, so one unreadable
+    /// manifest directory disabled the audit endpoint until restart - the very
+    /// bug W9 was meant to remove, reappearing on the error path.
+    #[test]
+    fn a_failed_reference_scan_is_a_terminal_status_not_running() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A FILE where the manifest DIRECTORY must be makes the scan fail with
+        // something other than NotFound, so the abort branch runs.
+        let manifest_dir = tmp.path().join("manifests");
+        std::fs::write(&manifest_dir, b"not a directory").expect("blocker");
+
+        let state = RwLock::new(CasAuditState {
+            status: "running".to_string(),
+            files_checked: 0,
+            files_total: 0,
+            errors: 0,
+            unreferenced: 0,
+            corrupted: 0,
+            unreadable: 0,
+            corrupted_hashes: Vec::new(),
+            started_at: None,
+            eta_seconds: None,
+        });
+        run_cas_audit(
+            tmp.path().join("cas"),
+            manifest_dir,
+            tmp.path().join("_tmp"),
+            &state,
+        );
+
+        let st = state.read().expect("state");
+        assert_ne!(
+            st.status, "running",
+            "a failed pass must not stay `running` (every later audit would 409)"
+        );
+        assert!(
+            st.status.starts_with("error:"),
+            "the failure must be reported as an error status: {}",
+            st.status
+        );
+    }
+
     #[test]
     fn walker_running_to_done_with_valid_and_corrupt() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -265,6 +352,7 @@ mod tests {
         run_cas_audit(
             tmp.path().to_path_buf(),
             tmp.path().join("manifests"),
+            tmp.path().join("_tmp"),
             &state,
         );
 
@@ -315,6 +403,7 @@ mod tests {
         run_cas_audit(
             tmp.path().to_path_buf(),
             tmp.path().join("manifests"),
+            tmp.path().join("_tmp"),
             &state,
         );
         let st = state.read().expect("lock");

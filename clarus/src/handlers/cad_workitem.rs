@@ -307,6 +307,13 @@ pub fn build_record_for_entry(
         created_at: None,
         updated_at: None,
         step_label: Some(CAD_STEP_LABEL.to_string()),
+        // (0074,1202) is Type 2/1 and the SCP fills it when the creator gives
+        // none; the CAD path names its step, so the same value groups the
+        // worklist.
+        worklist_label: Some(CAD_STEP_LABEL.to_string()),
+        // (0020,000D) at dataset root: this path DOES know the study the
+        // outputs belong to - it is the study the catalog entry came from.
+        output_study_uid: Some(study_instance_uid.to_string()),
         input_readiness: Some(input_readiness.to_string()),
         // Filled by the caller, which is the only side with a clock.
         sps_start_datetime: None,
@@ -336,6 +343,11 @@ pub fn build_record_for_entry(
         // lives inside a sequence this path never writes.
         scheduled_processing_parameters: None,
         reason_for_requested_procedure: None,
+        // No full Input Information Sequence nor performed-procedure sequence
+        // is stored here: the minted workitem carries only the typed study UID
+        // projection and no performer report, so both opaque fields are None.
+        input_information: None,
+        performed_procedure_information: None,
     }
 }
 
@@ -585,6 +597,7 @@ fn create_one(
     }
 
     let stamp = super::ups_pure::now_stamp();
+    let dt_stamp = super::ups_pure::now_dt();
     let mut record = build_record_for_entry(
         study_instance_uid,
         patient_id,
@@ -592,10 +605,11 @@ fn create_one(
         super::readiness::READINESS_INCOMPLETE,
         entry,
     );
-    // (0040,4005) Scheduled Procedure Step Start DateTime is VR DT, so it
-    // takes the date and time joined with a `T` delimiter rather than the
-    // DA/TM pair the station attributes use. The step is offered now.
-    record.sps_start_datetime = Some(stamp.replacen(' ', "T", 1));
+    // (0040,4005) Scheduled Procedure Step Start DateTime is VR DT, whose form
+    // is `YYYYMMDDHHMMSS` with no separators (PS3.5 6.2). Joining the store's
+    // human-readable stamp with a `T` produced ISO 8601, which is a different
+    // syntax and is not a legal DT. The step is offered now.
+    record.sps_start_datetime = Some(dt_stamp);
     record.created_at = Some(stamp.clone());
     record.updated_at = Some(stamp);
 

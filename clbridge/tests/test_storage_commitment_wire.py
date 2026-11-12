@@ -51,8 +51,17 @@ class RecordingScp:
 
     def __init__(self):
         self.ae = AE(ae_title="TEST_SCP")
+        # PS3.7 D.3.3.4: the requestor proposes its own roles in an SCP/SCU
+        # Role Selection item, and the ACCEPTOR must answer with the same role
+        # values or the proposal is declined and the default roles apply. The
+        # bridge needs the requestor to hold SCP so it can receive this
+        # N-EVENT-REPORT, so the peer here grants both roles - a peer that
+        # answers `False` (the default) is exercised separately.
         self.ae.add_supported_context(
-            StorageCommitmentPushModel, [ImplicitVRLittleEndian]
+            StorageCommitmentPushModel,
+            [ImplicitVRLittleEndian],
+            scu_role=True,
+            scp_role=True,
         )
         self.actions = []
         self.events = []
@@ -86,7 +95,10 @@ class RecordingScp:
         info = event.event_information
         self.events.append(
             {
-                "event_type": getattr(info, "EventTypeID", None),
+                # EventTypeID (0000,1002) is a command-set element (PS3.7
+                # Table 9.1-1): it travels in the primitive as event.event_type,
+                # NOT inside the Event Information data set.
+                "event_type": event.event_type,
                 "tx_uid": str(getattr(info, "TransactionUID", "") or ""),
                 "sops": [
                     (str(i.ReferencedSOPClassUID), str(i.ReferencedSOPInstanceUID))

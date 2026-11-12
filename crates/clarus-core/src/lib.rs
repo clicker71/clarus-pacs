@@ -51,6 +51,7 @@ pub mod recovery;
 pub mod shutdown;
 pub mod stow;
 pub mod time;
+pub mod uid;
 pub mod ups;
 pub mod workflow;
 

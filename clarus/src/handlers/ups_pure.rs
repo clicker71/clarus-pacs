@@ -185,6 +185,26 @@ pub(crate) fn now_stamp() -> String {
     format!("{year:04}-{month:02}-{day:02} {hh:02}:{mm:02}:{ss:02}")
 }
 
+/// A `YYYYMMDDHHMMSS` UTC timestamp for a DICOM **DT** value.
+///
+/// PS3.5 6.2 Table 6.2-1: DT is `YYYYMMDDHHMMSS` with no separators (the
+/// fractional-second and offset parts are optional). The store's own
+/// `created_at`/`updated_at` use the human-readable `YYYY-MM-DD HH:MM:SS`
+/// form from [`now_stamp`], and writing that into an attribute plus a `T` for
+/// the space produced `2026-11-10T...`, which is ISO 8601 and not DT.
+pub(crate) fn now_dt() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (year, month, day) = civil_from_days(days as i64);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    format!("{year:04}{month:02}{day:02}{hh:02}{mm:02}{ss:02}")
+}
+
 /// Convert a proleptic-Gregorian day count (days since 1970-01-01) to
 /// `(year, month, day)` - the civil-from-days algorithm shared by POSIX.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -220,6 +240,8 @@ fn workitem_to_record(wi: &WorkItem) -> clarus_core::ups::WorkItemRecord {
         created_at: wi.created_at.clone(),
         updated_at: wi.updated_at.clone(),
         step_label: wi.step_label.clone(),
+        worklist_label: wi.worklist_label.clone(),
+        output_study_uid: wi.output_study_uid.clone(),
         input_readiness: wi.input_readiness.clone(),
         sps_start_datetime: wi.sps_start_datetime.clone(),
         input_study_uid: wi.input_study_uid.clone(),
@@ -238,6 +260,7 @@ fn workitem_to_record(wi: &WorkItem) -> clarus_core::ups::WorkItemRecord {
                 .iter()
                 .map(|out| clarus_core::ups::OutputReference {
                     sop_class_uid: out.sop_class_uid.clone(),
+                    study_instance_uid: out.study_instance_uid.clone(),
                     series_instance_uid: out.series_instance_uid.clone(),
                     sop_instance_uid: out.sop_instance_uid.clone(),
                 })
@@ -262,6 +285,8 @@ fn workitem_to_record(wi: &WorkItem) -> clarus_core::ups::WorkItemRecord {
         performed_end_datetime: wi.performed_end_datetime.clone(),
         scheduled_processing_parameters: wi.scheduled_processing_parameters.clone(),
         reason_for_requested_procedure: wi.reason_for_requested_procedure.clone(),
+        input_information: wi.input_information.clone(),
+        performed_procedure_information: wi.performed_procedure_information.clone(),
     }
 }
 
@@ -288,6 +313,8 @@ fn record_to_workitem(rec: &clarus_core::ups::WorkItemRecord) -> WorkItem {
         created_at: rec.created_at.clone(),
         updated_at: rec.updated_at.clone(),
         step_label: rec.step_label.clone(),
+        worklist_label: rec.worklist_label.clone(),
+        output_study_uid: rec.output_study_uid.clone(),
         input_readiness: rec.input_readiness.clone(),
         sps_start_datetime: rec.sps_start_datetime.clone(),
         input_study_uid: rec.input_study_uid.clone(),
@@ -307,6 +334,7 @@ fn record_to_workitem(rec: &clarus_core::ups::WorkItemRecord) -> WorkItem {
                 .iter()
                 .map(|out| OutputReference {
                     sop_class_uid: out.sop_class_uid.clone(),
+                    study_instance_uid: out.study_instance_uid.clone(),
                     series_instance_uid: out.series_instance_uid.clone(),
                     sop_instance_uid: out.sop_instance_uid.clone(),
                 })
@@ -332,6 +360,8 @@ fn record_to_workitem(rec: &clarus_core::ups::WorkItemRecord) -> WorkItem {
         performed_end_datetime: rec.performed_end_datetime.clone(),
         scheduled_processing_parameters: rec.scheduled_processing_parameters.clone(),
         reason_for_requested_procedure: rec.reason_for_requested_procedure.clone(),
+        input_information: rec.input_information.clone(),
+        performed_procedure_information: rec.performed_procedure_information.clone(),
     }
 }
 
@@ -423,12 +453,16 @@ pub fn ups_create(
     let (step_label, input_readiness, sps_start_datetime, sps_priority) =
         match required_create_tags(body_obj) {
             Ok(v) => v,
-            Err(missing) => {
+            Err(CreateTagsError::Missing(missing)) => {
                 return Err(UpsErr {
                     status: 400,
                     body: err_msg_json("Bad Request", &format!("Missing required tag: {missing}")),
                 });
             }
+            // A bad VALUE is not a missing tag: the message names the attribute
+            // and what was wrong with it, so the client fixes the value it sent
+            // instead of adding a second copy of a tag it already has.
+            Err(CreateTagsError::Invalid(e)) => return Err(e),
         };
 
     // The state is SCHEDULED, always. Table CC.1.1-2 row 1: the instance is
@@ -460,6 +494,19 @@ pub fn ups_create(
     // Both are read BEFORE the record is built: either can refuse the request,
     // and a workitem must not be stored on a body the server rejected.
     let scheduled_processing_parameters = extract_scheduled_processing_parameters(body_obj)?;
+    // The full (0040,4021) subtree, stored losslessly beside the typed study
+    // UID projection, so nested references survive the create round trip.
+    let input_information = extract_input_information(body_obj)?;
+
+    // (0074,1202) Worklist Label - PS3.4 Table CC.2.5-3 types it 2/1 and says
+    // "the SCP shall fill in the Worklist Label" when the SCU supplies none, so
+    // the attribute is always present and a retrieval always states it. The SCP
+    // default is the Procedure Step Label: it is the one value the creator
+    // always gave, and a worklist grouped by the step label is what a
+    // performer's worklist shows anyway.
+    let worklist_label = extract_tag(body_obj, "00741202")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| step_label.clone());
 
     let workitem = WorkItem {
         id: None,
@@ -497,6 +544,12 @@ pub fn ups_create(
         created_at: None,
         updated_at: None,
         step_label: Some(step_label),
+        worklist_label: Some(worklist_label),
+        // (0020,000D) at DATASET ROOT - the study assigned to the output
+        // instances. A different fact from `input_study_uid` (which the
+        // Referenced Request Sequence carries as Type 1 nested), so it is read
+        // from the ROOT only, never from the sequence item.
+        output_study_uid: extract_tag(body_obj, "0020000D").filter(|v| !v.is_empty()),
         input_readiness: Some(input_readiness),
         sps_start_datetime: Some(sps_start_datetime),
         input_study_uid,
@@ -525,6 +578,10 @@ pub fn ups_create(
         // attribute of the Referenced Request Sequence.
         scheduled_processing_parameters,
         reason_for_requested_procedure: extract_first_item_tag(body_obj, "0040A370", "00401002"),
+        // The full input sequence, stored opaquely; the performed report is
+        // UPDATE-time only, so the workitem is born without one.
+        input_information,
+        performed_procedure_information: None,
     };
 
     // Insert via the CBOR store (fresh timestamps, no Transaction UID).
@@ -714,7 +771,11 @@ pub fn ups_update(
     // The CAS precondition is what is on disk right now, before the write.
     let cas_tuid = existing.transaction_uid.clone();
 
+    // Two different formats, deliberately: `updated_at` is the CBOR store's own
+    // human-readable field, while (0040,4052) is a DICOM DT and must carry the
+    // DT spelling (PS3.5 6.2: `YYYYMMDDHHMMSS`, no separators).
     let stamp = now_stamp();
+    let dt_stamp = now_dt();
 
     // A state change touches the state and the two attributes the standard
     // assigns to the transition; the rest of the record is carried over
@@ -738,7 +799,7 @@ pub fn ups_update(
             existing.reason_for_cancellation
         },
         cancellation_datetime: if cancellation_now {
-            Some(stamp.clone())
+            Some(dt_stamp.clone())
         } else {
             existing.cancellation_datetime
         },
@@ -797,11 +858,12 @@ pub fn ups_update(
 ///
 /// # Behavior (CC.2.2.3)
 ///
-/// - SCHEDULED: the SCP changes the state to CANCELED, meeting the Final State
-///   requirements (Reason for Cancellation when the payload gives one, and the
-///   Procedure Step Cancellation DateTime). Answered `202 Accepted` - the
-///   request was accepted for processing, which is what 11.8's success status
-///   means; the state change is the SCP's own act, not an echo of the request.
+/// - SCHEDULED: the SCP changes the state to IN PROGRESS and then to CANCELED,
+///   meeting the Final State requirements on the second hop (Reason for
+///   Cancellation when the payload gives one, and the Procedure Step
+///   Cancellation DateTime). Answered `202 Accepted` - the request was accepted
+///   for processing, which is what 11.8's success status means; the state
+///   change is the SCP's own act, not an echo of the request.
 /// - COMPLETED or CANCELED: a terminal workitem cannot be canceled, so `409`.
 ///   A repeated cancel on CANCELED is the same refusal: the state is terminal,
 ///   and 11.8 explicitly lists "Workitem in the COMPLETED state" as a conflict.
@@ -852,6 +914,24 @@ pub fn ups_request_cancel(
 
     // The state decides everything, and it is read BEFORE the payload is even
     // parsed: a terminal workitem is a conflict whatever the request says.
+    //
+    // IN PROGRESS needs one more distinction. A workitem CLAIMED by a performer
+    // carries a Transaction UID (a claim always issues one, PS3.4 CC.2.6.2), and
+    // this server is the Task Manager rather than that performer, so it cannot
+    // complete the cancel on the performer's behalf - that stays a 409.
+    //
+    // A workitem IN PROGRESS with NO Transaction UID can only have been put
+    // there by our own first hop below, which reports IN PROGRESS and then
+    // CANCELED (CC.2.2.3 / Table CC.1.1-2). If the second hop failed or the
+    // process died between them, that item is stranded: no API path could ever
+    // move it to a terminal state, because the claim guard refuses it forever.
+    // There is no performing SCU to inform, so the 409 is wrong for exactly this
+    // state and the cancel is completed here instead.
+    let unclaimed_in_progress = existing.transaction_uid.is_none()
+        && matches!(
+            existing.workflow_state.as_str(),
+            "SCHEDULED" | "IN PROGRESS"
+        );
     match existing.workflow_state.as_str() {
         "SCHEDULED" => {}
         "COMPLETED" | "CANCELED" => {
@@ -866,6 +946,7 @@ pub fn ups_request_cancel(
                 ),
             });
         }
+        "IN PROGRESS" if existing.transaction_uid.is_none() => {}
         "IN PROGRESS" => {
             return Err(UpsErr {
                 status: 409,
@@ -897,44 +978,120 @@ pub fn ups_request_cancel(
         extract_tag(body_obj, "00741238")
     };
 
+    // `updated_at` is the CBOR store's own human-readable field; (0040,4052)
+    // is a DICOM DT and takes `YYYYMMDDHHMMSS` (PS3.5 6.2).
     let stamp = now_stamp();
-    let previous_state = existing.workflow_state.clone();
-    let updated = WorkItem {
-        workflow_state: "CANCELED".to_string(),
-        reason_for_cancellation: reason.or(existing.reason_for_cancellation),
-        // (0040,4052) is a Final State requirement (CC.2.2.3): the moment the
-        // cancellation happened is part of the state, not of the request.
-        cancellation_datetime: Some(stamp.clone()),
-        updated_at: None,
-        ..existing
+    let dt_stamp = now_dt();
+
+    // CC.2.2.3: "If the Procedure Step State (0074,1000) of the UPS instance is
+    // still SCHEDULED, the SCP shall change the Procedure Step State ... FIRST
+    // TO IN PROGRESS and THEN TO CANCELED". Table CC.1.1-2 row "N-ACTION to
+    // Request Cancel" lists two state reports for the SCHEDULED column, so a
+    // subscriber MUST observe the intermediate state. One write straight to
+    // CANCELED is an illegal transition that no client sees the end of.
+    //
+    // Hop 1. The lock is deliberately NOT taken: a workitem cancelled from
+    // SCHEDULED was never claimed, so it has no Locking UID and CC.2.6.3 does
+    // not apply. `..existing` keeps `transaction_uid: None` - the standard asks
+    // for a state change here, not a claim.
+    //
+    // A workitem ALREADY stranded IN PROGRESS (our own earlier hop 1) takes no
+    // hop 1 at all: it is already there, and re-reporting it would tell
+    // subscribers about a transition that did not happen. It goes straight to
+    // the CANCELED write below.
+    let in_progress = if unclaimed_in_progress && existing.workflow_state == "IN PROGRESS" {
+        existing.clone()
+    } else {
+        WorkItem {
+            workflow_state: "IN PROGRESS".to_string(),
+            updated_at: None,
+            ..existing
+        }
     };
-
-    let mut record = workitem_to_record(&updated);
-    record.updated_at = Some(stamp);
-
+    let mut record = workitem_to_record(&in_progress);
+    record.updated_at = Some(stamp.clone());
     // NO transaction-UID precondition: a SCHEDULED workitem has no lock (only
     // the claim issues one), so `None` is the honest expectation. The store's
     // CAS still refuses a concurrent write on the UID itself.
+    //
+    // A stranded IN PROGRESS item skips hop 1 entirely, so the write below is
+    // its only write and it needs no second CAS.
+    let skipped_hop1 = unclaimed_in_progress && existing.workflow_state == "IN PROGRESS";
+    let hop1 = if skipped_hop1 {
+        Ok(())
+    } else {
+        store.cas_update(&record, None)
+    };
+    match hop1 {
+        Ok(()) => {
+            // Report what the store now holds, not a repeated literal: the two
+            // must not be able to drift apart.
+            //
+            // ONLY when hop 1 actually wrote. A stranded item was already
+            // IN PROGRESS, so announcing "SCHEDULED -> IN PROGRESS" would
+            // describe a transition that did not happen - the same rule the
+            // skip above follows. Its single event is the hop-2 one below,
+            // `IN PROGRESS -> CANCELED`.
+            if !skipped_hop1 {
+                sink.notify_state_change(
+                    workitem_uid,
+                    "SCHEDULED",
+                    &record.workflow_state,
+                    super::ups::event_bus::FilterRouting::from_record(&record),
+                );
+            }
+        }
+        Err(clarus_core::ups::StoreError::CasConflict(_)) => {
+            return Err(cancel_cas_conflict());
+        }
+        Err(e) => return Err(store_err(e)),
+    }
+    // The state hop 1 actually persisted, so hop 2's `previous` is what an
+    // observer last saw rather than an assumption.
+    let prev_state = record.workflow_state.clone();
+
+    // Hop 2, built FROM the record hop 1 wrote so that nothing the store
+    // normalised on the way in is lost. (0040,4052) is set here and only here:
+    // CC.2.5-3 makes it an obligation of the CANCELED transition ("If changing
+    // the UPS State to CANCELED and this Attribute has no value, the SCP shall
+    // fill it with the current datetime"), so the IN PROGRESS hop must not
+    // carry it.
+    let canceled = WorkItem {
+        workflow_state: "CANCELED".to_string(),
+        reason_for_cancellation: reason.or_else(|| in_progress.reason_for_cancellation.clone()),
+        cancellation_datetime: Some(dt_stamp),
+        updated_at: None,
+        ..in_progress.clone()
+    };
+
+    let mut record = workitem_to_record(&canceled);
+    record.updated_at = Some(stamp);
+
     match store.cas_update(&record, None) {
         Ok(()) => {
             sink.notify_state_change(
                 workitem_uid,
-                &previous_state,
-                &updated.workflow_state,
+                &prev_state,
+                &record.workflow_state,
                 super::ups::event_bus::FilterRouting::from_record(&record),
             );
             // 11.8's success status, with the updated workitem as the body so
             // a requester sees what it asked for.
-            render_workitem_response(202, &updated, accept)
+            render_workitem_response(202, &canceled, accept)
         }
-        Err(clarus_core::ups::StoreError::CasConflict(_)) => Err(UpsErr {
-            status: 409,
-            body: err_msg_json(
-                "Conflict",
-                "Workitem changed while the cancel request was being processed",
-            ),
-        }),
+        Err(clarus_core::ups::StoreError::CasConflict(_)) => Err(cancel_cas_conflict()),
         Err(e) => Err(store_err(e)),
+    }
+}
+
+/// The 409 both cancel writes answer when the store rejects the CAS.
+fn cancel_cas_conflict() -> UpsErr {
+    UpsErr {
+        status: 409,
+        body: err_msg_json(
+            "Conflict",
+            "Workitem changed while the cancel request was being processed",
+        ),
     }
 }
 
@@ -1043,39 +1200,57 @@ pub fn ups_update_attributes(
     // request is a contradiction, and answering 200 on a guess would let a
     // caller believe a lock it did not present.
     let body_transaction_uid = extract_tag(body_obj, "00081195");
-    let request_transaction_uid = match (body_transaction_uid.as_deref(), transaction_uid_query) {
+    let supplied_transaction_uid = match (body_transaction_uid.as_deref(), transaction_uid_query) {
         (Some(body), Some(query)) if body != query => {
             return Err(bad_request(&format!(
                 "Transaction UID present in both the payload ('{body}') and the query \
                  ('{query}') with different values"
             )));
         }
-        (Some(body), _) => body,
-        (None, Some(query)) => query,
-        (None, None) => {
-            return Err(bad_request(
-                "Missing required Transaction UID (0008,1195): send it as a payload \
-                 attribute or the TransactionUid query parameter",
-            ));
-        }
+        (Some(body), _) => Some(body),
+        (None, Some(query)) => Some(query),
+        (None, None) => None,
     };
 
-    // The stored UID is what the caller must present. An unclaimed workitem
-    // has none, and 11.6 cannot install one: only the SCHEDULED -> IN
-    // PROGRESS transition issues the lock (11.6.3.2 makes that an N-SET
-    // failure for a workitem with no Transaction UID), so an update of an
-    // unclaimed workitem is refused rather than performed unlocked.
-    match existing.transaction_uid.as_deref() {
-        Some(stored) if stored == request_transaction_uid => {}
-        Some(stored) => {
-            return Err(bad_request(&format!(
-                "Transaction UID mismatch: expected '{stored}', got '{request_transaction_uid}'"
-            )));
-        }
-        None => {
+    // PS3.4 CC.2.6.2 requires the Transaction UID from an IN PROGRESS workitem
+    // only: the lock exists from the moment the workitem is claimed, and an
+    // SCHEDULED workitem has none yet. Demanding it there made every attribute
+    // edit of a queued workitem impossible - a requester could not even set a
+    // label before a performer picked the step up. PS3.18 11.6.1.2 is what
+    // the Query Parameter form serves; the N-SET Attribute form is CC.2.6.2's
+    // own carriage and follows the same condition.
+    let in_progress = existing.workflow_state == "IN PROGRESS";
+    let request_transaction_uid = match (supplied_transaction_uid, in_progress) {
+        (Some(uid), _) => uid,
+        (None, true) => {
             return Err(bad_request(
-                "Workitem has no Transaction UID: it must be claimed before it can be updated",
+                "Missing required Transaction UID (0008,1195): an IN PROGRESS workitem \
+                 is locked by the claim, so the update has to present it",
             ));
+        }
+        // A SCHEDULED workitem carries no value to compare against, so the
+        // update proceeds unlocked. `cas_update` is called with `None` below,
+        // which holds the same stripe lock as every other write.
+        (None, false) => "",
+    };
+
+    // The stored UID is what the caller must present once the workitem is
+    // claimed. An SCHEDULED workitem has none to compare against and keeps its
+    // unlocked update path; an IN PROGRESS one compared above and reaches here
+    // with a value that matched.
+    if in_progress {
+        match existing.transaction_uid.as_deref() {
+            Some(stored) if stored == request_transaction_uid => {}
+            Some(stored) => {
+                return Err(bad_request(&format!(
+                    "Transaction UID mismatch: expected '{stored}', got '{request_transaction_uid}'"
+                )));
+            }
+            None => {
+                return Err(bad_request(
+                    "Workitem is IN PROGRESS but carries no Transaction UID",
+                ));
+            }
         }
     }
 
@@ -1147,6 +1322,19 @@ pub fn ups_update_attributes(
     }
     if let Some(priority) = body_obj.obj_get("00741200") {
         updated.sps_priority = Some(extract_required_priority(priority, "00741200")?);
+    }
+
+    // (0040,4041) Input Readiness State is 1/1 in Table CC.2.5-3, so an SCU
+    // MAY set it at N-SET. Without this an INCOMPLETE workitem was unusable:
+    // create stores INCOMPLETE (legal), the claim path then refuses every
+    // IN PROGRESS transition while the record says INCOMPLETE, and no other
+    // route could change it - so a requester following CC.2.4 (create
+    // INCOMPLETE, set READY once the inputs are stored) was permanently
+    // blocked. The value set is enumerated, so an unrecognized state is
+    // refused rather than stored: a readiness no performer recognizes is not
+    // a readiness.
+    if let Some(readiness) = body_obj.obj_get("00404041") {
+        updated.input_readiness = Some(extract_required_readiness(readiness, "00404041")?);
     }
 
     // (0040,4018) Scheduled Workitem Code Sequence: Table CC.2.5-3 types it
@@ -1225,6 +1413,17 @@ pub fn ups_update_attributes(
         if let Some(end) = item.obj_get("00404051") {
             updated.performed_end_datetime = Some(extract_required_dt(end, "00404051")?);
         }
+
+        // Merge the incoming item into the opaque (0074,1216) element at the
+        // CHILD level: a partial update (e.g. only the end datetime) must not
+        // erase children a previous update stored. The base is the stored
+        // element, or the materialized typed projection for a legacy record,
+        // so the transition to lossless keeps the old children.
+        updated.performed_procedure_information = Some(merge_performed_information(
+            existing.performed_procedure_information.as_deref(),
+            &existing,
+            item,
+        )?);
     }
 
     // The state is carried over untouched, and nothing is published: this is
@@ -1233,7 +1432,7 @@ pub fn ups_update_attributes(
     let mut record = workitem_to_record(&updated);
     record.updated_at = Some(stamp);
 
-    match store.cas_update(&record, Some(request_transaction_uid)) {
+    match store.cas_update(&record, in_progress.then_some(request_transaction_uid)) {
         Ok(()) => render_workitem_response(200, &updated, accept),
         Err(clarus_core::ups::StoreError::CasConflict(_)) => Err(UpsErr {
             status: 409,
@@ -1309,15 +1508,42 @@ fn extract_required_dt(
 /// Exactly the AIW-I 4.84.4.1.2.1 performer report: what was produced, and
 /// the two codes describing who produced it, plus the three attributes a
 /// requester may still tune while the step runs - the label, the priority,
-/// and the performing system's parameter list (PS3.4 Table CC.2.5-3 types
-/// all three 3/2 at N-SET, so a requester that changes its mind has a
-/// standard way to say so) - and (0040,4018) Scheduled Workitem Code
-/// Sequence, which Table CC.2.5-3 types 3/1 at N-SET: the SCP SHALL handle
-/// its update. Anything else in a payload is refused (see
+/// and the performing system's parameter list.
+///
+/// Table CC.2.5-3 types them differently at N-SET, and the merge set follows
+/// the table rather than a single blanket row: (0074,1204) Procedure Step
+/// Label and (0074,1200) Scheduled Procedure Step Priority are **3/1** -
+/// updatable, and the SCP SHALL handle the update - while (0074,1210)
+/// Scheduled Processing Parameters Sequence is **3/2**, updatable but not
+/// required. (0040,4018) Scheduled Workitem Code Sequence is also 3/1: the SCP
+/// SHALL handle its update. Anything else in a payload is refused (see
 /// [`ups_update_attributes`]).
 const UPDATE_MERGE_SET: &[&str] = &[
-    "00741216", "00741204", "00741200", "00741210", "0040A370", "00404018",
+    "00741216", "00741204", "00741200", "00741210", "0040A370", "00404018", "00404041",
 ];
+
+/// Read (0040,4041) Input Readiness State from an Update payload.
+///
+/// PS3.4 CC.2.2 gives exactly three values: READY, INCOMPLETE and
+/// UNAVAILABLE. Anything else is refused rather than stored - the claim path
+/// matches on INCOMPLETE by name, so a typo would otherwise park the workitem
+/// in a state nothing recognizes.
+fn extract_required_readiness(
+    value: &crate::handlers::json_common::JsonVal,
+    tag: &str,
+) -> Result<String, UpsErr> {
+    let text = value
+        .obj_get("Value")
+        .and_then(|v| v.first_of_array())
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match text {
+        "READY" | "INCOMPLETE" | "UNAVAILABLE" => Ok(text.to_string()),
+        other => Err(bad_request(&format!(
+            "({tag}) has value '{other}'; the standard allows READY, INCOMPLETE or UNAVAILABLE"
+        ))),
+    }
+}
 
 /// Read (0074,1204) Procedure Step Label from an Update payload.
 ///
@@ -1413,9 +1639,12 @@ fn extract_referenced_request_for_update(
 /// (0074,1216) the caller passes the item's own (0040,4033) and not the whole
 /// payload, so the reader never has to know which level it was called from.
 ///
-/// Each item is a (0008,1150)/(0008,1155) pair. An item with no instance UID
-/// names nothing and is refused rather than stored, because a reference a
-/// consumer cannot resolve is worse than no reference at all.
+/// Each item is a (0008,1150)/(0008,1155) pair, either FLAT on the item or
+/// NESTED as the items of (0008,1199) Referenced SOP Sequence (the Referenced
+/// Instances and Access Macro, PS3.3 Table 10-3b). The nested form is what a
+/// conformant full-macro input carries, and reading only the flat form used
+/// to yield an empty instance UID -> 400. An item with no instance UID in
+/// either form names nothing and is refused rather than stored.
 fn extract_output_information(
     sequence: &crate::handlers::json_common::JsonVal,
 ) -> Result<Vec<OutputReference>, UpsErr> {
@@ -1426,43 +1655,211 @@ fn extract_output_information(
 
     let mut outputs = Vec::with_capacity(items.len());
     for item in items {
-        let instance = item
-            .obj_get("00081155")
+        // (0020,000E) Series Instance UID and (0020,000D) Study Instance UID
+        // are 1C in the Referenced Instances and Access Macro (PS3.3 Table
+        // 10-3b) and live on the ITEM level in both forms, so they are read
+        // here once and inherited by every nested pair.
+        let series = reference_scalar(item, "0020000E");
+        let study = reference_scalar(item, "0020000D");
+        if let Some(inner_items) = item
+            .obj_get("00081199")
             .and_then(|v| v.obj_get("Value"))
-            .and_then(|v| v.first_of_array())
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if instance.is_empty() {
-            return Err(bad_request(
-                "(0040,4033) item has no (0008,1155) Referenced SOP Instance UID",
-            ));
+            .and_then(|v| v.as_array())
+        {
+            // Nested form: (0008,1199) Referenced SOP Sequence, one
+            // (0008,1150)/(0008,1155) pair per item.
+            for inner in inner_items {
+                outputs.push(read_output_reference(inner, &study, &series)?);
+            }
+        } else {
+            // Flat form: the pair sits directly on the item.
+            outputs.push(read_output_reference(item, &study, &series)?);
         }
-        let class = item
-            .obj_get("00081150")
-            .and_then(|v| v.obj_get("Value"))
-            .and_then(|v| v.first_of_array())
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // (0020,000E) Series Instance UID is 1C in the Referenced Instances and
-        // Access Macro (PS3.3 Table 10-3b), so a performer may name it and a
-        // consumer needs it to build a retrieve URL. Absent or empty leaves it
-        // empty rather than refusing the item.
-        let series = item
-            .obj_get("0020000E")
-            .and_then(|v| v.obj_get("Value"))
-            .and_then(|v| v.first_of_array())
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        outputs.push(OutputReference {
-            sop_class_uid: class,
-            series_instance_uid: series,
-            sop_instance_uid: instance,
-        });
     }
     Ok(outputs)
+}
+
+/// The first string value of `tag` inside a reference item, empty when absent.
+fn reference_scalar(item: &crate::handlers::json_common::JsonVal, tag: &str) -> String {
+    item.obj_get(tag)
+        .and_then(|v| v.obj_get("Value"))
+        .and_then(|v| v.first_of_array())
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Build one [`OutputReference`] from a (0008,1150)/(0008,1155) pair plus the
+/// study and series the referencing item named. An empty instance UID names
+/// nothing and is refused.
+fn read_output_reference(
+    item: &crate::handlers::json_common::JsonVal,
+    study: &str,
+    series: &str,
+) -> Result<OutputReference, UpsErr> {
+    let instance = reference_scalar(item, "00081155");
+    if instance.is_empty() {
+        return Err(bad_request(
+            "(0040,4033) item has no (0008,1155) Referenced SOP Instance UID",
+        ));
+    }
+    let class = reference_scalar(item, "00081150");
+    Ok(OutputReference {
+        sop_class_uid: class,
+        study_instance_uid: study.to_string(),
+        series_instance_uid: series.to_string(),
+        sop_instance_uid: instance,
+    })
+}
+
+/// A DICOM JSON scalar element `{"Value":[v],"vr":"VR"}` (Value before vr, the
+/// canonical key order this writer emits everywhere).
+fn scalar_element(vr: &str, value: &str) -> JsonVal {
+    JsonVal::Obj(vec![
+        (
+            "Value".to_string(),
+            JsonVal::Arr(vec![JsonVal::Str(value.to_string())]),
+        ),
+        ("vr".to_string(), JsonVal::Str(vr.to_string())),
+    ])
+}
+
+/// A `CodeSequenceMacro` child as a DICOM JSON sequence element, in the shape
+/// the JSON renderer emits ((0008,0100)/(0008,0102)/(0008,0104) inside one
+/// item).
+fn code_sequence_element(code: &WorkItemCode) -> JsonVal {
+    let item = JsonVal::Obj(vec![
+        ("00080100".to_string(), scalar_element("SH", &code.value)),
+        ("00080102".to_string(), scalar_element("SH", &code.scheme)),
+        ("00080104".to_string(), scalar_element("LO", &code.meaning)),
+    ]);
+    JsonVal::Obj(vec![
+        ("Value".to_string(), JsonVal::Arr(vec![item])),
+        ("vr".to_string(), JsonVal::Str("SQ".to_string())),
+    ])
+}
+
+/// (0040,4033) Output Information Sequence as a DICOM JSON sequence element,
+/// one item per reference in the same shape `emit_output_information` emits.
+fn output_sequence_element(outputs: &[OutputReference]) -> JsonVal {
+    let items: Vec<JsonVal> = outputs
+        .iter()
+        .map(|output| {
+            let mut pairs = vec![
+                (
+                    "00081150".to_string(),
+                    scalar_element("UI", &output.sop_class_uid),
+                ),
+                (
+                    "00081155".to_string(),
+                    scalar_element("UI", &output.sop_instance_uid),
+                ),
+            ];
+            // Omitted when the performer named no series, mirroring the render.
+            if !output.series_instance_uid.is_empty() {
+                pairs.push((
+                    "0020000E".to_string(),
+                    scalar_element("UI", &output.series_instance_uid),
+                ));
+            }
+            JsonVal::Obj(pairs)
+        })
+        .collect();
+    JsonVal::Obj(vec![
+        ("Value".to_string(), JsonVal::Arr(items)),
+        ("vr".to_string(), JsonVal::Str("SQ".to_string())),
+    ])
+}
+
+/// Materialize the typed performed-procedure projection into the (0074,1216)
+/// ITEM object (children in ascending tag order, no outer wrapper).
+///
+/// This is the legacy projection in parsed form: it is the base a partial
+/// N-SET merges against when the record predates the opaque field and holds
+/// only the typed children.
+fn materialize_performed_item(wi: &WorkItem) -> JsonVal {
+    let mut children: Vec<(String, JsonVal)> = Vec::new();
+    if let Some(code) = wi
+        .performed_workitem_code
+        .as_ref()
+        .filter(|c| !c.value.is_empty())
+    {
+        children.push(("00404019".to_string(), code_sequence_element(code)));
+    }
+    if let Some(code) = wi
+        .performed_station_name_code
+        .as_ref()
+        .filter(|c| !c.value.is_empty())
+    {
+        children.push(("00404028".to_string(), code_sequence_element(code)));
+    }
+    if let Some(outputs) = wi.output_information.as_deref() {
+        children.push(("00404033".to_string(), output_sequence_element(outputs)));
+    }
+    if let Some(start) = wi.performed_start_datetime.as_deref() {
+        children.push(("00404050".to_string(), scalar_element("DT", start)));
+    }
+    if let Some(end) = wi.performed_end_datetime.as_deref() {
+        children.push(("00404051".to_string(), scalar_element("DT", end)));
+    }
+    JsonVal::Obj(children)
+}
+
+/// Merge an incoming (0074,1216) item into the stored opaque element.
+///
+/// A partial N-SET names only the children it changes (e.g. only (0040,4051)
+/// end datetime). The opaque element must therefore merge at the CHILD level:
+/// incoming children replace, absent children come from the stored item - a
+/// wholesale replace would erase a start time or output list stored by an
+/// earlier update. When the record predates the opaque field, the base is
+/// materialized from the typed projection first, so the transition to lossless
+/// does not drop the legacy children.
+///
+/// A stored element that fails to parse is a stored-corruption case, not a
+/// client shape, so it answers 500 (never `expect` on user data).
+fn merge_performed_information(
+    stored: Option<&str>,
+    legacy: &WorkItem,
+    incoming: &JsonVal,
+) -> Result<String, UpsErr> {
+    let mut base_item = match stored {
+        Some(stored) => {
+            let parsed = parse_json(stored.as_bytes())
+                .ok_or_else(|| internal_err("stored (0074,1216) is not valid JSON"))?;
+            match parsed
+                .obj_get("Value")
+                .and_then(|v| v.as_array())
+                .and_then(|items| items.first())
+            {
+                Some(item) => item.clone(),
+                // An empty Value array is a legal stored shape ("a performance
+                // was reported and it states nothing" is not one this server
+                // writes, but tolerate it by falling back to the typed base).
+                None => materialize_performed_item(legacy),
+            }
+        }
+        None => materialize_performed_item(legacy),
+    };
+
+    // Incoming children replace, absent children are kept: upsert into the
+    // base item's key list, preserving the base's document order for keys the
+    // incoming item does not name.
+    if let (JsonVal::Obj(base_pairs), JsonVal::Obj(in_pairs)) = (&mut base_item, incoming) {
+        for (key, value) in in_pairs {
+            match base_pairs.iter_mut().find(|(existing, _)| existing == key) {
+                Some(slot) => slot.1 = value.clone(),
+                None => base_pairs.push((key.clone(), value.clone())),
+            }
+        }
+    }
+
+    let element = JsonVal::Obj(vec![
+        ("Value".to_string(), JsonVal::Arr(vec![base_item])),
+        ("vr".to_string(), JsonVal::Str("SQ".to_string())),
+    ]);
+    let mut out = Vec::with_capacity(128);
+    crate::handlers::json_common::write_json_val(&mut out, &element);
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Read a one-item `CodeSequenceMacro` attribute: value, scheme, meaning.
@@ -1518,24 +1915,48 @@ fn bad_request(message: &str) -> UpsErr {
     }
 }
 
+/// Why a create body was refused.
+enum CreateTagsError {
+    /// A Type 1 attribute is absent. The payload is its DICOM name.
+    Missing(&'static str),
+    /// An attribute is present but its value is not one the table allows.
+    Invalid(UpsErr),
+}
+
 /// The type-1 attributes of PS3.4 Table CC.2.5-3 at N-CREATE, in the order
 /// the standard lists them so the message names the first that is missing.
 ///
-/// Returns the four values on success, or the human-readable name of the
-/// missing attribute.
+/// Returns the four values on success.
 fn required_create_tags(
     body: &crate::handlers::json_common::JsonVal,
-) -> Result<(String, String, String, String), &'static str> {
-    let priority = extract_tag(body, "00741200");
+) -> Result<(String, String, String, String), CreateTagsError> {
+    // Presence is not enough for the priority: N-SET validates the value set
+    // (see `extract_required_priority`), so a create that stored `URGENT` would
+    // accept a workitem that the same value could never update. The value goes
+    // through the same check here, and a rejection is reported as INVALID
+    // rather than as missing - telling a client its tag is absent when it sent
+    // a bad value sends it looking in the wrong place.
+    let priority = match body.obj_get("00741200") {
+        Some(v) => {
+            Some(extract_required_priority(v, "00741200").map_err(CreateTagsError::Invalid)?)
+        }
+        None => None,
+    };
     let label = extract_tag(body, "00741204");
     let start = extract_tag(body, "00404005");
     let readiness = extract_tag(body, "00404041");
 
     match (priority, label, start, readiness) {
-        (None, ..) => Err("(0074,1200) Scheduled Procedure Step Priority"),
-        (_, None, ..) => Err("(0074,1204) Procedure Step Label"),
-        (_, _, None, _) => Err("(0040,4005) Scheduled Procedure Step Start DateTime"),
-        (_, _, _, None) => Err("(0040,4041) Input Readiness State"),
+        (None, ..) => Err(CreateTagsError::Missing(
+            "(0074,1200) Scheduled Procedure Step Priority",
+        )),
+        (_, None, ..) => Err(CreateTagsError::Missing("(0074,1204) Procedure Step Label")),
+        (_, _, None, _) => Err(CreateTagsError::Missing(
+            "(0040,4005) Scheduled Procedure Step Start DateTime",
+        )),
+        (_, _, _, None) => Err(CreateTagsError::Missing(
+            "(0040,4041) Input Readiness State",
+        )),
         (Some(priority), Some(label), Some(start), Some(readiness)) => {
             Ok((label, readiness, start, priority))
         }
@@ -1762,6 +2183,49 @@ fn extract_scheduled_processing_parameters(
     Ok(Some(String::from_utf8_lossy(&out).into_owned()))
 }
 
+/// Read (0040,4021) Input Information Sequence into its stored form.
+///
+/// The item may carry the full Referenced Instances and Access Macro
+/// (PS3.3 Table 10-3b): (0008,1150)/(0008,1155), a nested (0008,1199)
+/// Referenced SOP Sequence, and (0020,000D)/(0020,000E). The typed projection
+/// flattens that to one Study UID, so the full element is ALSO serialized
+/// verbatim and handed back unchanged - the requester can then verify the
+/// unchanged inputs it sent. Same store-as-is discipline as (0074,1210):
+/// only the outer wrapper is re-emitted in this server's own shape.
+///
+/// An absent element is `None`. A present one without a `Value` array is
+/// refused rather than stored as a shape no reader could use.
+fn extract_input_information(
+    body: &crate::handlers::json_common::JsonVal,
+) -> Result<Option<String>, UpsErr> {
+    let Some(entry) = body.obj_get("00404021") else {
+        return Ok(None);
+    };
+    let Some(value) = entry.obj_get("Value") else {
+        return Err(UpsErr {
+            status: 400,
+            body: err_msg_json(
+                "Bad Request",
+                "Input Information Sequence (0040,4021) has no Value array",
+            ),
+        });
+    };
+    if !matches!(value, crate::handlers::json_common::JsonVal::Arr(_)) {
+        return Err(UpsErr {
+            status: 400,
+            body: err_msg_json(
+                "Bad Request",
+                "Input Information Sequence (0040,4021) Value must be an array",
+            ),
+        });
+    }
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(br#"{"Value":"#);
+    crate::handlers::json_common::write_json_val(&mut out, value);
+    out.extend_from_slice(br#","vr":"SQ"}"#);
+    Ok(Some(String::from_utf8_lossy(&out).into_owned()))
+}
+
 // -- Delete (R-03) -------------------------------------------------------
 /// `DELETE /dicomweb/workitems/{uid}` - UPS Delete.
 ///
@@ -1886,6 +2350,18 @@ pub fn ups_search(
         scheduled_workitem_code_value: query.scheduled_workitem_code_value.as_deref(),
         requested_procedure_id: query.requested_procedure_id.as_deref(),
         patient_id: query.patient_id.as_deref(),
+        // (0010,0010) Patient's Name. Surrounding whitespace is not part of the
+        // fact - a PN arriving through a URL is routinely padded - so the store
+        // compares it trimmed on both sides.
+        patient_name: query.patient_name.as_deref(),
+        // (0074,1200) and (0040,0405): REQUIRED matching keys of Table
+        // CC.2.5-3 with no filter before this. The start datetime accepts the
+        // standard's range form (matchType "Single Value or Range").
+        sps_priority: query.sps_priority.as_deref().filter(|s| !s.is_empty()),
+        sps_start_datetime: query
+            .sps_start_datetime
+            .as_deref()
+            .filter(|s| !s.is_empty()),
         // An empty parameter is the same statement as an absent one: match
         // all, which is the DICOMweb convention for a zero-length key.
         modality: query.modality.as_deref().filter(|m| !m.is_empty()),
@@ -2092,6 +2568,33 @@ fn query_from_body(obj: &JsonVal) -> Result<UpsQuery, UpsErr> {
     if let Some(v) = extract_tag(obj, "00741000") {
         query.workflow_state = Some(v);
     }
+    // Every key this function reads is listed below. A key outside the list is
+    // neither applied nor refused by the reads above, so the search answers
+    // with a WIDER set than the body asked for - the silent-filter-loss class
+    // that the comments on the individual keys describe. A body asking for a
+    // filter that does not exist cannot be honoured, and answering unfiltered
+    // hides that fact from the client, so it is refused by name.
+    //
+    // `00080050` stays allowed at the root for the reason given above: some
+    // clients flatten the accession out of (0040,0370), and it IS applied.
+    let known: [&str; 10] = [
+        "0020000D", "0040A370", "00080050", "00741204", "00404025", "00404018", "00100020",
+        "00080060", "00741000",
+        // The Sequence Wrapper key of the DICOM JSON dataset itself.
+        "vr",
+    ];
+    let unknown: Vec<String> = obj
+        .keys()
+        .into_iter()
+        .filter(|k| !known.iter().any(|n| n.eq_ignore_ascii_case(k)))
+        .map(str::to_string)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(bad_request(&format!(
+            "unsupported search keys in body: {}",
+            unknown.join(", ")
+        )));
+    }
     Ok(query)
 }
 
@@ -2136,6 +2639,74 @@ mod tests {
     use super::*;
     use crate::handlers::ups::event_bus::FilterRouting;
     use std::sync::{Arc, Mutex};
+
+    // -- N-CREATE priority validation ----------------------------------
+
+    /// A create refuses a priority value the table does not allow.
+    ///
+    /// Update already validated the value set; create checked presence only,
+    /// so `URGENT` was stored on create and 400 on update - a workitem that
+    /// exists in a state its own update path rejects.
+    #[test]
+    fn a_create_body_with_an_invalid_priority_is_refused() {
+        let body = br#"{"00741200":{"vr":"CS","Value":["URGENT"]},
+                 "00741204":{"vr":"LO","Value":["LBL"]},
+                 "00404005":{"vr":"DT","Value":["20261110120000"]},
+                 "00404041":{"vr":"CS","Value":["READY"]}}"#;
+        let parsed = parse_json(body).expect("valid json");
+        let obj = single_dataset(&parsed).expect("one data set");
+        match required_create_tags(obj) {
+            Err(CreateTagsError::Invalid(e)) => {
+                assert_eq!(e.status, 400, "a bad value is a bad request");
+            }
+            Ok(_) => panic!("URGENT must be refused, not accepted"),
+            Err(CreateTagsError::Missing(m)) => {
+                panic!("a bad value must not be reported as a missing tag: {m}")
+            }
+        }
+
+        // The allowed values still pass.
+        let body = br#"{"00741200":{"vr":"CS","Value":["HIGH"]},
+                 "00741204":{"vr":"LO","Value":["LBL"]},
+                 "00404005":{"vr":"DT","Value":["20261110120000"]},
+                 "00404041":{"vr":"CS","Value":["READY"]}}"#;
+        let parsed = parse_json(body).expect("valid json");
+        let obj = single_dataset(&parsed).expect("one data set");
+        assert!(required_create_tags(obj).is_ok(), "HIGH is allowed");
+    }
+
+    /// An unknown key in a body search is refused by name.
+    ///
+    /// The reads are a fixed list; a key outside it was neither applied nor
+    /// refused, so the search answered a WIDER set than the body asked for and
+    /// the client could not tell.
+    #[test]
+    fn a_body_search_with_an_unknown_key_is_refused() {
+        let body = br#"{"0020000D":{"vr":"UI","Value":["1.2.3"]},
+                 "00500010":{"vr":"SQ","Value":[]}}"#;
+        let parsed = parse_json(body).expect("valid json");
+        let obj = single_dataset(&parsed).expect("one data set");
+        let err = match query_from_body(obj) {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown key must be refused"),
+        };
+        assert_eq!(err.status, 400);
+        let text = String::from_utf8_lossy(&err.body);
+        assert!(
+            text.contains("00500010"),
+            "the message names the key: {text}"
+        );
+
+        // Only known keys: still works.
+        let body = br#"{"0020000D":{"vr":"UI","Value":["1.2.3"]}}"#;
+        let parsed = parse_json(body).expect("valid json");
+        let obj = single_dataset(&parsed).expect("one data set");
+        let q = match query_from_body(obj) {
+            Ok(q) => q,
+            Err(e) => panic!("a known key must be applied, got status {}", e.status),
+        };
+        assert_eq!(q.study_uid.as_deref(), Some("1.2.3"));
+    }
 
     /// m19: the station and accession filters must be READ, not silently lost.
     ///
@@ -2332,5 +2903,179 @@ mod tests {
         assert!(!is_valid_uid(""));
         assert!(!is_valid_uid("1.2.abc"));
         assert!(!is_valid_uid("12a34"));
+    }
+
+    /// A workitem with every attribute absent except identity, so the
+    /// performed-procedure helpers can set the fields they test without a
+    /// 30-line literal each.
+    fn performed_workitem() -> WorkItem {
+        WorkItem {
+            id: None,
+            workitem_uid: "1.2.3".to_string(),
+            workflow_state: "CANCELED".to_string(),
+            station_aet: None,
+            station_name: None,
+            procedure_step_start_date: None,
+            procedure_step_start_time: None,
+            patient_name: None,
+            patient_id: None,
+            accession_number: None,
+            requesting_physician: None,
+            modality: None,
+            sps_priority: None,
+            transaction_uid: None,
+            created_at: None,
+            updated_at: None,
+            step_label: None,
+            worklist_label: None,
+            output_study_uid: None,
+            input_readiness: None,
+            sps_start_datetime: None,
+            input_study_uid: None,
+            input_information: None,
+            reason_for_cancellation: None,
+            cancellation_datetime: None,
+            patient_id_issuer: None,
+            scheduled_workitem_code: None,
+            output_information: None,
+            performed_workitem_code: None,
+            performed_station_name_code: None,
+            requested_procedure_id: None,
+            performed_start_datetime: None,
+            performed_end_datetime: None,
+            scheduled_processing_parameters: None,
+            performed_procedure_information: None,
+            reason_for_requested_procedure: None,
+        }
+    }
+
+    /// Unwrap a `Result<T, UpsErr>` without demanding `Debug` on `UpsErr`.
+    fn ok<T>(result: Result<T, UpsErr>, what: &str) -> T {
+        match result {
+            Ok(v) => v,
+            Err(e) => panic!("{what}: status {}", e.status),
+        }
+    }
+
+    /// F3: both the flat (0008,1150)/(0008,1155) form and the nested
+    /// (0008,1199) Referenced SOP Sequence form yield the same reference, and
+    /// the series UID is read from the item level in both.
+    #[test]
+    fn output_information_reads_the_nested_referenced_sop_sequence() {
+        let flat = parse_json(
+            br#"{"Value":[{"00081150":{"vr":"UI","Value":["1.2.840.10008.5.1.4.1.1.2"]},"00081155":{"vr":"UI","Value":["1.2.3.4.5"]},"0020000E":{"vr":"UI","Value":["1.2.3.4"]}}],"vr":"SQ"}"#,
+        )
+        .expect("valid json");
+        let nested = parse_json(
+            br#"{"Value":[{"0020000D":{"vr":"UI","Value":["1.2.3"]},"0020000E":{"vr":"UI","Value":["1.2.3.4"]},"00081199":{"vr":"SQ","Value":[{"00081150":{"vr":"UI","Value":["1.2.840.10008.5.1.4.1.1.2"]},"00081155":{"vr":"UI","Value":["1.2.3.4.5"]}}]}}],"vr":"SQ"}"#,
+        )
+        .expect("valid json");
+        let expected = OutputReference {
+            sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
+            study_instance_uid: String::new(),
+            series_instance_uid: "1.2.3.4".to_string(),
+            sop_instance_uid: "1.2.3.4.5".to_string(),
+        };
+        assert_eq!(
+            ok(extract_output_information(&flat), "flat"),
+            vec![expected.clone()],
+            "the flat form still reads"
+        );
+        // The nested form additionally names the STUDY at item level; the
+        // macro types it 1C, so it is inherited by the inner pair exactly as
+        // the series is.
+        let expected_with_study = OutputReference {
+            study_instance_uid: "1.2.3".to_string(),
+            ..expected.clone()
+        };
+        assert_eq!(
+            ok(extract_output_information(&nested), "nested"),
+            vec![expected_with_study],
+            "the nested (0008,1199) form reads the same reference plus the study"
+        );
+    }
+
+    /// F3: an item with no instance UID in either form is refused with 400.
+    #[test]
+    fn output_information_without_an_instance_uid_is_refused_in_either_form() {
+        let nested = parse_json(
+            br#"{"Value":[{"00081199":{"vr":"SQ","Value":[{"00081150":{"vr":"UI","Value":["1.2.840.10008.5.1.4.1.1.2"]}}]}}],"vr":"SQ"}"#,
+        )
+        .expect("valid json");
+        let err = match extract_output_information(&nested) {
+            Ok(_) => panic!("an item without an instance UID must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, 400);
+
+        let flat = parse_json(
+            br#"{"Value":[{"00081150":{"vr":"UI","Value":["1.2.840.10008.5.1.4.1.1.2"]}}],"vr":"SQ"}"#,
+        )
+        .expect("valid json");
+        let err = match extract_output_information(&flat) {
+            Ok(_) => panic!("an item without an instance UID must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, 400);
+    }
+
+    /// F5: a partial N-SET (only the end datetime) over a legacy record whose
+    /// start and outputs are only in the typed projection must keep both and
+    /// add the incoming child.
+    #[test]
+    fn a_partial_performed_update_merges_against_the_typed_projection() {
+        let mut legacy = performed_workitem();
+        legacy.performed_start_datetime = Some("20261109T100000".to_string());
+        legacy.output_information = Some(vec![OutputReference {
+            sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
+            study_instance_uid: "1.2.3".to_string(),
+            series_instance_uid: "1.2.3.4".to_string(),
+            sop_instance_uid: "1.2.3.4.5".to_string(),
+        }]);
+        let incoming = parse_json(br#"{"00404051":{"vr":"DT","Value":["20261109T101500"]}}"#)
+            .expect("valid json");
+        let merged = ok(
+            merge_performed_information(None, &legacy, &incoming),
+            "merge",
+        );
+        assert!(merged.contains("00404050"), "start survives: {merged}");
+        assert!(merged.contains("20261109T100000"), "{merged}");
+        assert!(merged.contains("00404033"), "outputs survive: {merged}");
+        assert!(merged.contains("00404051"), "the end is added: {merged}");
+        assert!(merged.contains("20261109T101500"), "{merged}");
+    }
+
+    /// F5: over a record that already stores the opaque element, a partial
+    /// update replaces the incoming child and keeps the stored siblings.
+    #[test]
+    fn a_partial_performed_update_preserves_stored_siblings() {
+        let stored = r#"{"Value":[{"00404050":{"vr":"DT","Value":["20261109T100000"]},"00404051":{"vr":"DT","Value":["20261109T101000"]}}],"vr":"SQ"}"#;
+        let incoming = parse_json(br#"{"00404051":{"vr":"DT","Value":["20261109T101500"]}}"#)
+            .expect("valid json");
+        let legacy = performed_workitem();
+        let merged = ok(
+            merge_performed_information(Some(stored), &legacy, &incoming),
+            "merge",
+        );
+        assert!(merged.contains("20261109T100000"), "start kept: {merged}");
+        assert!(merged.contains("20261109T101500"), "end replaced: {merged}");
+        assert!(
+            !merged.contains("20261109T101000"),
+            "the old end is gone: {merged}"
+        );
+    }
+
+    /// F5: a stored element that does not parse is stored corruption, not a
+    /// client shape - it answers 500 rather than panicking on user data.
+    #[test]
+    fn a_corrupted_stored_performed_element_answers_500() {
+        let incoming = parse_json(br#"{"00404051":{"vr":"DT","Value":["20261109T101500"]}}"#)
+            .expect("valid json");
+        let legacy = performed_workitem();
+        let err = match merge_performed_information(Some("{not json"), &legacy, &incoming) {
+            Ok(_) => panic!("a corrupt stored element must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, 500);
     }
 }

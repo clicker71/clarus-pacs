@@ -6,7 +6,7 @@
 import logging
 from urllib.parse import urlsplit
 
-VERSION = "0.3.0-beta"
+VERSION = "0.3.1-beta"
 
 
 class ConfParser:
@@ -46,7 +46,14 @@ class ConfParser:
         v = self.get(section, key)
         if v is None or v == "":
             return default
-        return int(v)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            # A bare "invalid literal for int()" leaves the operator to guess
+            # which of a hundred keys broke the start-up. Name it.
+            raise ValueError(
+                f"[{section}] {key}: expected an integer, got {v!r}"
+            ) from None
 
     def get_float(self, section, key, default=None):
         """Get a config value as float, with explicit range validation."""
@@ -110,6 +117,29 @@ def validate_clarus_url(cfg):
         raise ValueError(
             f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
             "has no host (expected scheme://host[:port]/dicomweb)"
+        )
+
+    # `urlsplit` accepts any text after ':' as the netloc, so `host:abc` and
+    # `host:99999` pass the checks above and only fail when the first request
+    # tries to connect. `parts.port` raises ValueError for a non-numeric port
+    # and for one outside 0-65535, which is exactly the configuration error to
+    # report here. A URL with NO port yields None and stays valid: the scheme
+    # default (80/443) is implied by the HTTP client, and every caller here
+    # passes the URL straight to it.
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError(
+            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            "has an invalid port (expected a number between 1 and 65535)"
+        ) from None
+    # `urlsplit` returns 0 for ':0' without raising. Port 0 means "pick any
+    # free port" for a BIND, which is meaningless for a CLIENT endpoint, so
+    # accepting it started the bridge with a URL it can never reach.
+    if port == 0:
+        raise ValueError(
+            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            "has port 0 (expected a number between 1 and 65535)"
         )
 
     # Trailing slash is stripped (not an error).

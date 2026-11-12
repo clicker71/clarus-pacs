@@ -75,6 +75,47 @@ def test_sanitize_dataset_without_audit_needs_no_system():
     assert (0x0400, 0x0561) not in ds
 
 
+def test_the_deferred_tuple_records_the_empty_string():
+    """The .mods sidecar tuple must carry what the attribute ACTUALLY held -
+    the empty string - so the audit entry the worker writes later states the
+    real old value. "(empty)" is a LOG placeholder, never audit data."""
+    ds = _empty_patient()
+    mods = sanitize_dataset(ds, write_audit=False)
+    olds = {tag: old for tag, old, _new in mods}
+    assert olds[(0x0010, 0x0020)] == "", (
+        "PatientID old value must be the empty string, not '(empty)': "
+        f"{olds[(0x0010, 0x0020)]!r}"
+    )
+    assert olds[(0x0010, 0x0010)] == "", (
+        "PatientName old value must be the empty string: "
+        f"{olds[(0x0010, 0x0010)]!r}"
+    )
+
+
+def test_sync_and_deferred_paths_record_the_same_old_value():
+    """The synchronous audit entry and the deferred tuple must agree on what
+    the attribute held before the fix."""
+    # Deferred path: the tuple travels to the worker via the .mods sidecar.
+    ds = _empty_patient()
+    deferred_olds = [old for _tag, old, _new in sanitize_dataset(ds, write_audit=False)]
+
+    # Synchronous path: the entry is written immediately.
+    ds_sync = _empty_patient()
+    sanitize_dataset(ds_sync, write_audit=True, modifying_system="TEST_BRIDGE")
+    sync_olds = []
+    for item in ds_sync.OriginalAttributesSequence:
+        mod_item = item.ModifiedAttributesSequence[0]
+        for tag in ((0x0010, 0x0020), (0x0010, 0x0010)):
+            if tag in mod_item:
+                sync_olds.append(str(mod_item[tag].value))
+
+    assert deferred_olds == ["", ""], deferred_olds
+    assert deferred_olds == sync_olds, (
+        f"the two paths must record the same old value: deferred={deferred_olds} "
+        f"sync={sync_olds}"
+    )
+
+
 @pytest.mark.parametrize("value", ["CLBRIDGE", "TEST_BRIDGE", "A" * 16])
 def test_system_value_is_written_verbatim(value):
     ds = Dataset()

@@ -238,6 +238,15 @@ impl StudyScanner {
     fn candidate_study_uids(&self, filter: &QueryFilter) -> Result<Vec<String>, StudySearchError> {
         // Direct UID: exactly one candidate.
         if let Some(uid) = filter.study_instance_uid.as_deref() {
+            // The UID becomes a path component below. A query controls this
+            // value, so the same rule that guards every other "is this a UID"
+            // question must apply here too: the public validator refuses empty
+            // values, separators, dot-escapes and non-conforming digit runs
+            // (PS3.5 9.1), and a second, weaker copy of that rule would let a
+            // value through that every writer path rejects.
+            if crate::uid::validate_path_uid(uid).is_err() {
+                return Ok(Vec::new());
+            }
             // Only candidate if the manifest actually exists.
             let path = self.manifests_dir.join(format!("{uid}.manifest"));
             if path.is_file() {
@@ -585,6 +594,60 @@ mod tests {
         assert_eq!(res.len(), 2);
     }
 
+    /// A StudyInstanceUID a query controls must not become a path escape.
+    ///
+    /// PS3.5 9.1: a UID is digits and dots only, so `/`, `\` and `..` never
+    /// occur in one. A value that carries them is malformed input, not a study;
+    /// joining it into the manifest path would read a file outside the
+    /// directory the scanner owns.
+    #[test]
+    fn a_uid_that_is_a_path_escape_answers_no_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        // A study OUTSIDE the manifests dir, reachable only by escaping.
+        let outside = dir.path().join("1.2.99.manifest");
+        write_manifest(
+            &outside,
+            &Manifest {
+                sys: SysHeader {
+                    version: 1,
+                    storage_tier: 1,
+                    total_pixel_bytes: 0,
+                    arrived_at: 0,
+                },
+                study: StudyQido {
+                    attrs: vec![(0x0020_000D, AttrValue::Text("1.2.99".into()))],
+                    ..Default::default()
+                },
+                series: vec![],
+            },
+        )
+        .expect("outside manifest");
+
+        let scanner = StudyScanner::new(manifests.clone(), dir.path().join("idx"));
+        for uid in ["../1.2.99", "..\\1.2.99", "..", ".", ""] {
+            let f = QueryFilter {
+                study_instance_uid: Some(uid.to_string()),
+                ..Default::default()
+            };
+            let (res, _) = scanner.search(&f).expect("search");
+            assert!(
+                res.is_empty(),
+                "a malformed UID {uid:?} must not resolve anything"
+            );
+        }
+
+        // A well-formed UID still resolves.
+        seed_manifest(&manifests, "1.2.1", "alice", 20260101);
+        let f = QueryFilter {
+            study_instance_uid: Some("1.2.1".into()),
+            ..Default::default()
+        };
+        let (res, _) = scanner.search(&f).expect("search");
+        assert_eq!(res.len(), 1);
+    }
+
     /// `Modality=CT,MR` must union the buckets, not look up one path.
     ///
     /// PS3.18 makes Modality multi-valued. Building the bucket path from the raw
@@ -665,6 +728,64 @@ mod tests {
         let (res, _) = scanner.search(&f).expect("search");
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].study_uid, "1.2.9");
+    }
+
+    /// A StudyInstanceUID the scanner accepts must be one the public UID
+    /// validator accepts too: two code paths disagreeing about what a study
+    /// UID is means a QIDO answer can name a "study" that every writer path
+    /// would refuse.
+    ///
+    /// The fixture is deliberately a file that DOES exist under
+    /// `manifests/` (`1..2.manifest`) so the test cannot pass just because
+    /// nothing was found: the rejection has to come from the validator.
+    #[test]
+    fn a_uid_the_validator_rejects_answers_no_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        // A literal `1..2.manifest` on disk: the ad-hoc guard (no `/`, no
+        // `..` as the WHOLE value) used to let this one through.
+        let bogus = manifests.join("1..2.manifest");
+        write_manifest(
+            &bogus,
+            &Manifest {
+                sys: SysHeader {
+                    version: 1,
+                    storage_tier: 1,
+                    total_pixel_bytes: 0,
+                    arrived_at: 0,
+                },
+                study: StudyQido {
+                    attrs: vec![(0x0020_000D, AttrValue::Text("1..2".into()))],
+                    ..Default::default()
+                },
+                series: vec![],
+            },
+        )
+        .expect("bogus manifest");
+
+        let scanner = StudyScanner::new(manifests.clone(), dir.path().join("idx"));
+        for uid in ["1..2", "study-a", "1.02"] {
+            let f = QueryFilter {
+                study_instance_uid: Some(uid.to_string()),
+                ..Default::default()
+            };
+            let (res, _) = scanner.search(&f).expect("search");
+            assert!(
+                res.is_empty(),
+                "the validator rejects {uid:?}, the scanner must agree"
+            );
+        }
+
+        // Non-vacuity half: a well-formed UID that exists resolves.
+        seed_manifest(&manifests, "1.2.5", "dave", 20260404);
+        let f = QueryFilter {
+            study_instance_uid: Some("1.2.5".into()),
+            ..Default::default()
+        };
+        let (res, _) = scanner.search(&f).expect("search");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].study_uid, "1.2.5");
     }
 
     #[test]

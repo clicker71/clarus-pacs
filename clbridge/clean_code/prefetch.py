@@ -38,11 +38,17 @@ class PartPrefetcher:
         pref.stop()
     """
 
-    def __init__(self, source, max_parts=DEFAULT_PREFETCH_PARTS):
+    def __init__(self, source, max_parts=DEFAULT_PREFETCH_PARTS, on_stop=None):
         self._q = queue.Queue(maxsize=max_parts)
         self._source = source
         self._error = None
         self._stop = threading.Event()
+        # Called ONCE by `stop()` BEFORE the join. The reader may be blocked
+        # inside the source (an `iter_content` on a slow or half-open HTTP
+        # response), where no queue drain can reach it; closing the response
+        # makes that read return, so the join does not sit out its whole
+        # timeout on every early exit.
+        self._on_stop = on_stop
         self._thread = threading.Thread(
             target=self._fill, name="cmove-prefetch", daemon=True
         )
@@ -120,8 +126,18 @@ class PartPrefetcher:
         and the reader then parks the part it was holding, so a pass that
         finished before that wake-up would miss it and leave its spill file
         behind. The second pass after the join catches exactly that item.
+
+        `on_stop` runs BEFORE the join: the drain only frees a reader blocked
+        in `put`, while a reader blocked inside the source (iterating a slow
+        or half-open response) is only reachable by closing what it reads.
+        Without the callback every early exit waited out the whole 5 s join.
         """
         self._stop.set()
+        if self._on_stop is not None:
+            try:
+                self._on_stop()
+            except Exception:
+                pass
         self._drain()
         if self._thread.is_alive():
             self._thread.join(timeout=5.0)

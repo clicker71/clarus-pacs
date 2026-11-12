@@ -1137,9 +1137,23 @@ const PATIENT_IE_KEYS_PLUS_STUDY_UID: [&str; 5] = [
     "StudyInstanceUID",
 ];
 
-/// Series IE search keys. Legal on the Study's-Instances scoped resource and
-/// on the global All-Instances resource. `Modality` is a REAL filter there
-/// (see `btree_study_instances`); the rest are accepted-and-ignored.
+/// Series IE search keys that the instance-level routes actually APPLY.
+///
+/// PS3.18 10.6.1.2.1 marks the whole Series IE legal on the Study's-Instances
+/// resource, but legality is not the same as being honoured: the former
+/// accepted-and-ignored list answered a `Modality=CT` instance query with every
+/// modality in the study, which is a wider answer than the ask.
+///
+/// `Modality` is a real filter in `btree_study_instances`; the rest below are
+/// refused with 400 rather than silently dropped (see
+/// [`SERIES_IE_KEYS_REFUSED`]).
+/// Series IE search keys, applied by the instance-level routes.
+///
+/// PS3.18 10.6.1.2.1 marks the whole Series IE legal on the Study's-Instances
+/// resource, and `btree_study_instances` APPLIES all of them through the same
+/// `SeriesFilter` the series routes use. The former list was
+/// accepted-and-ignored, which answered a filtered instance query with the
+/// study's every instance - a wider answer than the ask.
 const SERIES_IE_KEYS: [&str; 15] = [
     "SeriesInstanceUID",
     "SeriesNumber",
@@ -1159,8 +1173,9 @@ const SERIES_IE_KEYS: [&str; 15] = [
 ];
 
 /// Study IE + Series IE search keys. Both groups are Legal on the global
-/// All-Instances resource. `Modality` is a REAL filter there; the rest are
-/// accepted-and-ignored.
+/// All-Instances resource and both are APPLIED there: the Study IE keys narrow
+/// the manifest scan and the Series IE keys narrow the series the instance
+/// walk descends into.
 const ALL_STUDY_SERIES_KEYS: [&str; 32] = [
     "PatientName",
     "PatientID",
@@ -1727,15 +1742,13 @@ fn btree_study_instances(
     };
     let offset = query.offset.unwrap_or(0) as usize;
     let take_n = limit.map(|l| l as usize).unwrap_or(usize::MAX);
-    // Modality is a Series IE key that PS3.18 10.6.1.2.1 makes LEGAL and this
-    // route applies as a REAL filter: a series whose modality does not match
-    // is skipped entirely. It reuses the series-level matcher (comma list,
-    // exact, trimmed) so the semantics match the series resources. With no
-    // Modality key the filter matches every series (no behavior change).
-    let series_filter = clarus_core::query::SeriesFilter {
-        modality: query.Modality.clone(),
-        ..Default::default()
-    };
+    // Every Series IE key PS3.18 10.6.1.2.1 makes LEGAL here is APPLIED, not
+    // accepted-and-ignored: a series whose attributes do not match contributes
+    // no instances. Ignoring them answered a filtered instance query with the
+    // study's every instance, which the client cannot distinguish from "no
+    // matches". The same `SeriesFilter` the series routes use is built here, so
+    // the semantics of one key cannot differ between the two surfaces.
+    let series_filter = series_filter_from(query, state);
     // Collect (instance, study_uid, series_uid) triples across all series, in
     // the flattened series-then-instance order. `total` counts every match
     // before pagination, so the Warning can state what is left; `seen` counts
@@ -1923,10 +1936,15 @@ pub fn qido_study_instances(
 ) -> Result<QidoResp, QidoError> {
     let content_type = negotiate(accept);
 
-    // This scoped resource is the study's instances - DICOM
-    // 10.6.1.2.1 marks Series IE search keys LEGAL here. They are accepted and
-    // ignored (the study scope is fixed by the path; NO filtering, no 400).
-    // Study/Patient IE keys stay foreign (they would re-scope a wrong study).
+    // This scoped resource is the study's instances - PS3.18 10.6.1.2.1 marks
+    // the whole Series IE LEGAL here, and every key in `SERIES_IE_KEYS` is
+    // APPLIED: `btree_study_instances` runs them through the same
+    // `SeriesFilter` the series routes use, so a non-matching series
+    // contributes no instances. A key that is legal but silently dropped would
+    // answer `SeriesDescription=X` with every series - wider than the ask, and
+    // invisible to the client.
+    // Study/Patient IE keys stay foreign here (they would re-scope a study the
+    // path already fixed).
     let query = parse_and_validate_with(query_str, QidoLevel::Instance, &SERIES_IE_KEYS)?;
 
     validate_uid(study_uid)?;
@@ -2301,8 +2319,9 @@ pub fn qido_instances_global(
     let content_type = negotiate(accept);
 
     // Global "All Instances" - DICOM 10.6.1.2.1 marks Study IE
-    // AND Series IE search keys LEGAL here. Accepted and ignored (no filter,
-    // no 400). Only truly foreign keys here are none beyond those groups.
+    // AND Series IE search keys LEGAL here, and BOTH are applied: the Study IE
+    // keys gate the manifest scan through the study `QueryFilter` below, and
+    // the Series IE keys gate the series the instance walk descends into.
     let query = parse_and_validate_with(query_str, QidoLevel::Instance, &ALL_STUDY_SERIES_KEYS)?;
     let limit = resolve_limit(&query, &state.config.query);
 
@@ -2349,12 +2368,24 @@ pub fn qido_instances_global(
     // Modality is a Series IE key made LEGAL on this relational resource by
     // PS3.18 10.6.1.2.1, and applied here as a REAL filter (a non-matching
     // series contributes no instances). Reuses the series-level matcher.
-    let series_filter = clarus_core::query::SeriesFilter {
-        modality: query.Modality.clone(),
-        ..Default::default()
-    };
+    // The full Series IE filter is applied here too (see the scoped route):
+    // PS3.18 10.6.1.2.1 makes those keys legal on this relational resource and
+    // a non-matching series contributes no instances.
+    let series_filter = series_filter_from(&query, state);
     let mut out: Vec<clarus_core::query::GlobalInstance<'_>> = Vec::new();
-    clarus_core::query::search_all_instances(&manifests, &filter, &series_filter, &mut out, expose);
+    // P1: the Study IE keys this route ACCEPTS are applied here, not dropped.
+    // `qido_to_btree_filter` turns them into the same study-level matcher the
+    // study route uses, so `?PatientID=P1` narrows the scan instead of
+    // returning every patient's instances.
+    let study_filter = qido_to_btree_filter(&query, limit, &state.config.query);
+    clarus_core::query::search_all_instances(
+        &manifests,
+        &filter,
+        &series_filter,
+        Some(&study_filter),
+        &mut out,
+        expose,
+    );
 
     let offset = query.offset.unwrap_or(0) as usize;
     let take_n = limit.map(|l| l as usize).unwrap_or(usize::MAX);
@@ -2971,12 +3002,8 @@ mod tests {
 
         // Legal on the relational instance resources via the allowlists.
         assert!(
-            parse_and_validate_with(
-                Some("Modality=CT&SeriesNumber=7"),
-                QidoLevel::Instance,
-                &SERIES_IE_KEYS
-            )
-            .is_ok(),
+            parse_and_validate_with(Some("Modality=CT"), QidoLevel::Instance, &SERIES_IE_KEYS)
+                .is_ok(),
             "scoped study-instances must accept Modality"
         );
         assert!(
@@ -2987,6 +3014,19 @@ mod tests {
             )
             .is_ok(),
             "global instances must accept Modality"
+        );
+
+        // Legal on the relational instance resources via the allowlists, and
+        // APPLIED there (see `btree_study_instances` / `qido_instances_global`):
+        // accepting a filter and ignoring it answered a wider set than asked.
+        assert!(
+            parse_and_validate_with(
+                Some("Modality=CT&SeriesNumber=7"),
+                QidoLevel::Instance,
+                &SERIES_IE_KEYS
+            )
+            .is_ok(),
+            "scoped study-instances must accept the Series IE keys it applies"
         );
 
         // Strict (no allowlist) - the hierarchical route's policy: 400.

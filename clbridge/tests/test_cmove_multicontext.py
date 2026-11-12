@@ -26,8 +26,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from clean_code.handlers.cmove import (
     _associate_for_move,
-    _preflight_study_ts_by_class,
     _trim_optional_ts,
+)
+from clean_code.handlers.cmove import (
+    _preflight_study_ts_by_class as _preflight_raw,
 )
 from clean_code.protocol import canonical_ts_sort_key
 from pydicom.uid import (
@@ -36,6 +38,18 @@ from pydicom.uid import (
     JPEGLosslessSV1,
 )
 from pynetdicom import AE, evt
+
+
+def _preflight_study_ts_by_class(*args, **kwargs):
+    """The class map alone.
+
+    Batch 8 made the walk return `(map, partial)` so the caller can tell a
+    COMPLETE pre-flight from one that missed series. Every test here asks
+    only what the walk LEARNED, so the completeness flag is unpacked away in
+    one place.
+    """
+    value, _partial = _preflight_raw(*args, **kwargs)
+    return value
 
 EVRLE = ExplicitVRLittleEndian
 IVRLE = ImplicitVRLittleEndian
@@ -103,6 +117,21 @@ def _free_port():
     p = s.getsockname()[1]
     s.close()
     return p
+
+
+def _sop_uid_of(part):
+    """Read (0008,0018) SOPInstanceUID out of the raw DICOM bytes.
+
+    The QIDO instance list the stub serves has to name the instances the parts
+    actually carry, so the fixture derives it from the bytes instead of
+    hard-coding a UID list that drifts from the parts.
+    """
+    import io
+
+    from pydicom import dcmread
+
+    ds = dcmread(io.BytesIO(part), stop_before_pixels=True, force=True)
+    return str(getattr(ds, "SOPInstanceUID", "") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -179,9 +208,177 @@ class _FakeResp:
             raise RuntimeError("HTTP 500")
 
 
+def _inst_list(sop_uids):
+    """QIDO instance-list rows: one per instance, carrying (0008,0018)."""
+    return [{"00080018": {"vr": "UI", "Value": [u]}} for u in sop_uids]
+
+
+def _probe_router(get_calls, meta_rows):
+    """requests.get side effect for the PROBE shape.
+
+    `/instances` is served by `_qido_request`; `/instances/{sop}/metadata` is
+    the probe, and every call to it must address one instance.
+    """
+
+    def _fake_get(url, **kwargs):
+        get_calls.append(url)
+        if "/instances/" in url and url.endswith("/metadata"):
+            return _FakeResp(meta_rows)
+        raise AssertionError(f"unexpected metadata GET {url}")
+
+    return _fake_get
+
+
+def test_preflight_probes_one_instance_per_series(monkeypatch):
+    """One metadata request per series, not one per instance and not the
+    series-level resource: the series-level answer renders every instance and
+    is what made the pre-flight lose its budget."""
+    import clean_code.handlers.cmove as cm
+
+    cm._preflight_cache.clear()
+    series_rows = [
+        {"0020000E": {"vr": "UI", "Value": [SERIES]}},
+        {"0020000E": {"vr": "UI", "Value": [SERIES + "2"]}},
+    ]
+    calls = {"get": [], "qido": []}
+
+    def _fake_qido(url, *a, **k):
+        calls["qido"].append(url)
+        if url.endswith("/series"):
+            return list(series_rows)
+        # instance list: 5 instances per series
+        return _inst_list([f"{SOP_CT}.{i}" for i in range(5)])
+
+    monkeypatch.setattr(cm, "_qido_request", _fake_qido)
+    monkeypatch.setattr(
+        cm.requests, "get", _probe_router(calls["get"], meta_rows=_class_ts_row())
+    )
+    out = _preflight_study_ts_by_class(STUDY, "http://127.0.0.1/dicomweb")
+
+    assert len(calls["get"]) == 2, (
+        "exactly one metadata request per series (2 series, 5 instances "
+        f"each), got {len(calls['get'])}"
+    )
+    for url in calls["get"]:
+        assert url.endswith("/metadata"), url
+        assert "/instances/" in url, (
+            "the probe must address ONE instance; the series-level resource "
+            f"renders every instance: {url}"
+        )
+    assert out == {CT: {TS_470}}
+
+
+def _class_ts_row(ts=TS_470):
+    return [
+        {
+            "00080016": {"vr": "UI", "Value": [CT]},
+            "00020010": {"vr": "UI", "Value": [ts]},
+        }
+    ]
+
+
+def test_preflight_probe_reads_class_and_transfer_syntax(monkeypatch):
+    """The probed instance's (0008,0016) / (0002,0010) become the map."""
+    import clean_code.handlers.cmove as cm
+
+    cm._preflight_cache.clear()
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            [{"0020000E": {"vr": "UI", "Value": [SERIES]}}]
+            if url.endswith("/series")
+            else _inst_list([SOP_CT])
+        ),
+    )
+    gets = []
+    monkeypatch.setattr(
+        cm.requests,
+        "get",
+        _probe_router(gets, meta_rows=_class_ts_row(TS_470)),
+    )
+    out = _preflight_study_ts_by_class(STUDY, "http://127.0.0.1/dicomweb")
+    assert out == {CT: {TS_470}}
+
+
+def test_preflight_does_not_abandon_on_one_series_failure(monkeypatch):
+    """One slow/failing series must not discard the series already probed.
+
+    The old code returned None from the per-series except-block, so a single
+    failure threw away every stored-TS pair the study had (and the caller fell
+    back to the registry-wide proposal)."""
+    import clean_code.handlers.cmove as cm
+
+    cm._preflight_cache.clear()
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            [
+                {"0020000E": {"vr": "UI", "Value": [SERIES]}},
+                {"0020000E": {"vr": "UI", "Value": [SERIES + "2"]}},
+            ]
+            if url.endswith("/series")
+            else _inst_list([SOP_CT])
+        ),
+    )
+    gets = []
+    # Both series probe the SAME SOP UID here, so series 2 is exactly the
+    # "first probe succeeded, second failed" shape the defect hit.
+    state = {"n": 0}
+    ok = _class_ts_row()
+
+    def _fake_get(url, **kwargs):
+        gets.append(url)
+        state["n"] += 1
+        if state["n"] > 1:
+            raise RuntimeError("series 2 probe timed out")
+        return _FakeResp(ok)
+
+    monkeypatch.setattr(cm.requests, "get", _fake_get)
+    out = _preflight_study_ts_by_class(STUDY, "http://127.0.0.1/dicomweb")
+
+    assert len(gets) == 2, f"both series were probed: {gets}"
+    assert out is not None, "a single series failure must not abandon the study"
+    assert out == {CT: {TS_470}}, out
+
+
+def test_preflight_series_probe_is_bounded(monkeypatch):
+    """A sick series must not consume the whole budget: the probe returns
+    quickly with whatever was learned instead of hanging."""
+    import clean_code.handlers.cmove as cm
+
+    cm._preflight_cache.clear()
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            [
+                {"0020000E": {"vr": "UI", "Value": [SERIES]}},
+                {"0020000E": {"vr": "UI", "Value": [SERIES + "2"]}},
+            ]
+            if url.endswith("/series")
+            else _inst_list([SOP_CT])
+        ),
+    )
+
+    def _slow_get(url, **kwargs):
+        time.sleep(3.0)  # would blow a 4 s budget twice over
+        return _FakeResp(_class_ts_row())
+
+    monkeypatch.setattr(cm.requests, "get", _slow_get)
+    started = time.monotonic()
+    out = _preflight_study_ts_by_class(STUDY, "http://127.0.0.1/dicomweb")
+    elapsed = time.monotonic() - started
+    assert elapsed < 10.0, f"the probe hung for {elapsed:.1f}s"
+    # Either the probes answered late or the budget cut them - both are a
+    # clean answer; what must NOT happen is an exception or a hang.
+    assert out is None or isinstance(out, dict), out
+
+
 def test_preflight_metadata_path_map(monkeypatch):
-    """R1 happy path: QIDO series + per-series metadata (00020010) yields
-    dict[sop_class -> set[ts]]."""
+    """R1 happy path: QIDO series + QIDO instance list + the ONE instance's
+    metadata (00020010) yields dict[sop_class -> set[ts]]."""
     import clean_code.handlers.cmove as cm
 
     cm._preflight_cache.clear()
@@ -196,9 +393,16 @@ def test_preflight_metadata_path_map(monkeypatch):
             "00020010": {"vr": "UI", "Value": [EVRLE]},
         },
     ]
-    monkeypatch.setattr(cm, "_qido_request", lambda *a, **k: series_rows)
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            series_rows if url.endswith("/series") else _inst_list([SOP_CT])
+        ),
+    )
 
     def _fake_get(url, **kwargs):
+        assert "/instances/" in url, f"the probe must be instance-level: {url}"
         return _FakeResp(meta_rows)
 
     monkeypatch.setattr(cm.requests, "get", _fake_get)
@@ -222,7 +426,13 @@ def test_preflight_metadata_multipart_related(monkeypatch):
             "00020010": {"vr": "UI", "Value": [TS_470]},
         },
     ]
-    monkeypatch.setattr(cm, "_qido_request", lambda *a, **k: series_rows)
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            series_rows if url.endswith("/series") else _inst_list([SOP_CT])
+        ),
+    )
     boundary = "18d3aa_9b7c"
     payload = (
         f"--{boundary}\r\n"
@@ -268,7 +478,13 @@ def test_preflight_metadata_multipart_object_per_part(monkeypatch):
 
     cm._preflight_cache.clear()
     series_rows = [{"0020000E": {"vr": "UI", "Value": [SERIES]}}]
-    monkeypatch.setattr(cm, "_qido_request", lambda *a, **k: series_rows)
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            series_rows if url.endswith("/series") else _inst_list([SOP_CT])
+        ),
+    )
 
     boundary = "18d3b30b89f0452a"
     inst_a = {
@@ -316,13 +532,20 @@ def test_preflight_metadata_multipart_object_per_part(monkeypatch):
 
 
 def test_preflight_metadata_404_returns_none(monkeypatch):
-    """R1 failure: metadata 404 -> the whole pre-flight returns None (the
-    caller then degrades to the default proposal - never fails the job)."""
+    """R1 failure: the probe 404s -> the study yields NO stored-TS info (an
+    empty map, not an exception) and the caller degrades to the default
+    proposal - never fails the job."""
     import clean_code.handlers.cmove as cm
 
     cm._preflight_cache.clear()
     series_rows = [{"0020000E": {"vr": "UI", "Value": [SERIES]}}]
-    monkeypatch.setattr(cm, "_qido_request", lambda *a, **k: series_rows)
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            series_rows if url.endswith("/series") else _inst_list([SOP_CT])
+        ),
+    )
 
     def _fake_get(url, **kwargs):
         raise RuntimeError("404")
@@ -331,7 +554,7 @@ def test_preflight_metadata_404_returns_none(monkeypatch):
     out = _preflight_study_ts_by_class(
         STUDY, "http://127.0.0.1/dicomweb", http_timeout=0.2
     )
-    assert out is None
+    assert out == {}, "a failed probe leaves nothing known, and must not raise"
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +592,35 @@ class _Clarus(BaseHTTPRequestHandler):
             self._send(200, "application/dicom+json", body)
             return
         sup = f"/dicomweb/studies/{STUDY}/series/{SERIES}"
+        # QIDO instance list for the series (pre-flight step 2, and the source
+        # `_study_sop_uids` reads). It must name every instance the parts
+        # carry: the (0008,0058) tail is computed as this list minus what was
+        # delivered, so a stub that lists one SOP hides every other.
+        if self.path == f"{sup}/instances":
+            listed = []
+            for part in self.parts:
+                try:
+                    sop = _sop_uid_of(part)
+                except Exception:
+                    continue
+                if sop and sop not in listed:
+                    listed.append(sop)
+            body = json.dumps(
+                [
+                    {
+                        "00080018": {"vr": "UI", "Value": [sop]},
+                        "00200013": {"vr": "IS", "Value": [i + 1]},
+                    }
+                    for i, sop in enumerate(listed)
+                ]
+            ).encode()
+            self._send(200, "application/dicom+json", body)
+            return
+        # The probe: ONE instance's metadata (pre-flight step 3)
+        if self.path == f"{sup}/instances/{SOP_CT}/metadata":
+            body = json.dumps(self.metadata).encode()
+            self._send(200, "application/dicom+json", body)
+            return
         if self.path == f"{sup}/metadata":
             body = json.dumps(self.metadata).encode()
             self._send(200, "application/dicom+json", body)
@@ -485,6 +737,14 @@ def _run(job_id, scp, httpd, parts, part_ts, caps, instances):
     _Clarus.parts = list(parts)
     _Clarus.part_ts = list(part_ts)
     _Clarus.instances.update(instances)
+    # Both study-level caches are module state: a stale entry from an earlier
+    # test made the NEXT test read the previous fixture's SOP list, so the
+    # (0008,0058) tail was computed against the wrong study. Reset them with
+    # the HTTP stub they belong to.
+    import clean_code.handlers.cmove as _cm
+
+    _cm._preflight_cache.clear()
+    _cm._study_sop_uids_cache.clear()
     from clean_code.handlers.cmove import _execute_cmove_job
 
     jobs = _Jobs()
@@ -693,7 +953,13 @@ def test_preflight_cache_hit_skips_http(monkeypatch):
         }
     ]
     calls = {"get": 0}
-    monkeypatch.setattr(cm, "_qido_request", lambda *a, **k: series_rows)
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            series_rows if url.endswith("/series") else _inst_list([SOP_CT])
+        ),
+    )
 
     def _fake_get(url, **kwargs):
         calls["get"] += 1
@@ -719,7 +985,13 @@ def test_preflight_cache_expiry_refetches(monkeypatch):
         }
     ]
     calls = {"get": 0}
-    monkeypatch.setattr(cm, "_qido_request", lambda *a, **k: series_rows)
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            series_rows if url.endswith("/series") else _inst_list([SOP_CT])
+        ),
+    )
 
     def _fake_get(url, **kwargs):
         calls["get"] += 1
@@ -735,19 +1007,26 @@ def test_preflight_cache_expiry_refetches(monkeypatch):
 
 
 def test_preflight_failure_not_cached(monkeypatch):
+    """A failed probe caches NOTHING: the next C-MOVE retries it."""
     import clean_code.handlers.cmove as cm
 
     cm._preflight_cache.clear()
     series_rows = [{"0020000E": {"vr": "UI", "Value": [SERIES]}}]
     calls = {"get": 0}
-    monkeypatch.setattr(cm, "_qido_request", lambda *a, **k: series_rows)
+    monkeypatch.setattr(
+        cm,
+        "_qido_request",
+        lambda url, *a, **k: (
+            series_rows if url.endswith("/series") else _inst_list([SOP_CT])
+        ),
+    )
 
     def _fake_get(url, **kwargs):
         calls["get"] += 1
         raise RuntimeError("404")
 
     monkeypatch.setattr(cm.requests, "get", _fake_get)
-    assert _preflight_study_ts_by_class(STUDY, "http://x/dicomweb") is None
-    assert _preflight_study_ts_by_class(STUDY, "http://x/dicomweb") is None
+    assert _preflight_study_ts_by_class(STUDY, "http://x/dicomweb") == {}
+    assert _preflight_study_ts_by_class(STUDY, "http://x/dicomweb") == {}
     assert calls["get"] == 2
     assert cm._preflight_cache == {}

@@ -429,6 +429,14 @@ def test_the_knob_defaults_to_false_and_reads_bool_conventions():
 
 
 def _naction_event(sop_list):
+    """A stand-in for pynetdicom's N-ACTION request event.
+
+    The request payload is exposed as `action_information`, which is the real
+    event property for an N-ACTION's Action Information (PS3.7 9.3.2): the
+    generic `dataset` property belongs to C-STORE and reads the `DataSet`
+    parameter, which an N-ACTION-RQ does not carry. A fixture built on
+    `.dataset` therefore asserts a signal the wire never delivers.
+    """
     from pydicom import Dataset
 
     ds = Dataset()
@@ -441,12 +449,18 @@ def _naction_event(sop_list):
         ref.append(item)
     ds.ReferencedSOPSequence = ref
 
-    Req = type(
-        "Req", (), {"ae_title": "TEST_SCU", "address": "10.0.0.5", "port": 11112}
-    )
+    Req = type("Req", (), {"ae_title": "TEST_SCU", "address": "10.0.0.5", "port": 11112})
     Assoc = type("Assoc", (), {"requestor": Req()})
-    Event = type("Event", (), {"dataset": ds, "assoc": Assoc(), "action_type": 1})
-    return Event()
+
+    class _Event:
+        # No `dataset`: accessing it on a real N-ACTION event raises
+        # AttributeError, and the parser must fall back to the real property.
+        def __init__(self):
+            self.action_information = ds
+            self.assoc = Assoc()
+            self.action_type = 1
+
+    return _Event()
 
 
 def test_true_mode_answers_a_status_only_rsp_and_probes_nothing():

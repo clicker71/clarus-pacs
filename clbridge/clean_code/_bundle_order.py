@@ -18,10 +18,13 @@ def canonical_name(rel_path):
     return ".".join(parts)
 
 
-def find_imports(content):
+def find_imports(content, path=None):
     """Extract set of clean_code module names imported from content.
 
     Returns names WITHOUT 'clean_code.' prefix (matching canonical_name output).
+
+    `path` is the file the content came from; it is named in the error below
+    so an operator does not have to grep the tree to find the offending module.
 
     Parsed with `ast` rather than a regular expression, because the text is a
     Python program and not a string to scan: a commented-out import is not an
@@ -43,15 +46,21 @@ def find_imports(content):
                 if alias.name == "clean_code" or alias.name.startswith("clean_code."):
                     imports.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
-            # `from . import x` has no module level; relative imports inside
-            # clean_code are its own package, so they are prefix-free and
-            # resolved by the caller like any other name.
-            base = node.module or ""
-            if node.level == 0 and not (
-                base == "clean_code" or base.startswith("clean_code.")
-            ):
-                continue
             if node.level:
+                # `from . import x` names a module of THIS package, and the
+                # bundle needs the dependency edge to order it. Dropping it
+                # silently would leave the edge out of the topological sort,
+                # and the single-file bundle then fails at run time on a
+                # module that concatenation happened to place later. Refusing
+                # here names the offending module instead.
+                raise ValueError(
+                    f"{path or '<unknown>'}: relative import cannot be "
+                    f"ordered by the bundler: from {'.' * node.level}"
+                    f"{node.module or ''} import "
+                    f"{', '.join(alias.name for alias in node.names)}"
+                )
+            base = node.module or ""
+            if not (base == "clean_code" or base.startswith("clean_code.")):
                 continue
             imports.add(base)
             for alias in node.names:
@@ -106,7 +115,9 @@ def compute_order(base_dir):
         full = os.path.join(base_dir, rel)
         with open(full, "r", encoding="utf-8-sig") as fh:
             content = fh.read()
-        deps[name] = resolve_imports(find_imports(content), set(modules.keys()))
+        deps[name] = resolve_imports(
+            find_imports(content, path=rel), set(modules.keys())
+        )
         deps[name].discard(name)  # No self-dependency
 
     # Topological sort (Kahn's algorithm)

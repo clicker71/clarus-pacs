@@ -231,6 +231,43 @@ pub fn extract_transfer_syntax_from_accept_str(accept: Option<&str>) -> Option<S
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `transfer-syntax` value ends at the next `;`, because the parameters
+    /// are split on it. A trailing `q=` therefore cannot leak into the UID.
+    #[test]
+    fn a_quality_parameter_does_not_leak_into_the_transfer_syntax() {
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; type=\"application/dicom\"; \
+                 transfer-syntax=1.2.840.10008.1.2.4.80; q=0.9"
+            )),
+            Some("1.2.840.10008.1.2.4.80".to_string())
+        );
+        // Parameter first, no `q=`.
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; transfer-syntax=1.2.840.10008.1.2.4.80"
+            )),
+            Some("1.2.840.10008.1.2.4.80".to_string())
+        );
+        // Quoted value, spaced parameters.
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related ; type=application/dicom ; transfer-syntax=\"1.2.840.10008.1.2.1\""
+            )),
+            Some("1.2.840.10008.1.2.1".to_string())
+        );
+        assert_eq!(extract_transfer_syntax_from_accept_str(None), None);
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some("multipart/related")),
+            None
+        );
+    }
+}
+
 /// Legacy WADO-URI query parameters per PS3.18 Section 9.
 ///
 /// Thin wrapper over `wado_instance` - validates parameters and delegates

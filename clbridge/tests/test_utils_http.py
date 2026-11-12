@@ -511,17 +511,26 @@ class TestQidoEmptyAnswers:
             assert _qido_request(URL, {}) == []
         resp.json.assert_not_called()
 
-    def test_a_200_with_an_empty_body_is_an_empty_result(self):
-        from clean_code.http_helpers import _qido_request
+    def test_a_200_with_an_empty_body_is_a_failure(self):
+        """PS3.18 10.6.1: a successful QIDO-RS answer is a JSON array. An
+        empty 200 body is a server that answered without an answer - a proxy
+        or a broken endpoint - and is as unreadable as an HTML page. Returning
+        [] made it identical to "matched nothing"."""
+        from clean_code.http_helpers import QidoMalformedBodyError, _qido_request
 
         resp = self._response(200, b"")
         resp.json = MagicMock(side_effect=ValueError("200 with no body"))
         with patch("clean_code.http_helpers._http_retry", return_value=resp):
-            assert _qido_request(URL, {}) == []
+            with pytest.raises(QidoMalformedBodyError):
+                _qido_request(URL, {})
+        # The body was never parsed: emptiness alone is the failure signal.
         resp.json.assert_not_called()
 
-    def test_a_non_json_body_warns_and_returns_empty(self, caplog):
-        from clean_code.http_helpers import _qido_request
+    def test_a_non_json_body_is_a_failure_not_an_empty_result(self):
+        """PS3.18 10.6.1: a successful QIDO-RS answer is a JSON array. A 200
+        carrying HTML is a proxy/error page. Returning [] made it identical to
+        "matched nothing", so a caller counted a real answer as zero."""
+        from clean_code.http_helpers import QidoMalformedBodyError, _qido_request
 
         resp = MagicMock()
         resp.status_code = 200
@@ -529,9 +538,20 @@ class TestQidoEmptyAnswers:
         resp.raise_for_status = MagicMock()
         resp.json = MagicMock(side_effect=ValueError("not json"))
         with patch("clean_code.http_helpers._http_retry", return_value=resp):
-            with caplog.at_level("WARNING"):
-                assert _qido_request(URL, {}) == []
-        assert any("not JSON" in r.message for r in caplog.records)
+            with pytest.raises(QidoMalformedBodyError):
+                _qido_request(URL, {})
+
+    def test_a_non_array_json_body_is_also_a_failure(self):
+        from clean_code.http_helpers import QidoMalformedBodyError, _qido_request
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.content = b'{"message": "upstream timeout"}'
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"message": "upstream timeout"})
+        with patch("clean_code.http_helpers._http_retry", return_value=resp):
+            with pytest.raises(QidoMalformedBodyError):
+                _qido_request(URL, {})
 
     def test_the_body_is_parsed_once(self):
         """Two calls to json() would read the body twice and, on a stream,

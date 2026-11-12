@@ -294,10 +294,11 @@ class TestCMoveSelfLoopGuards:
 
     def test_poll_timeout_finishes_jobs_as_failed(self, move_jobs):
         """Injected 0s poll timeout: unfinished job delivered NOTHING ->
-        final 0xC000 (Failure) with an (0000,0902) Error Comment, because
-        "Sub-operations Complete" (0xB000) would be a lie at zero completed
-        slices (PS3.4 Table C.4-2). The status must be the terminal yield,
-        not a bare sub-operation count."""
+        final 0xC000 (Failure), because "Sub-operations Complete" (0xB000)
+        would be a lie at zero completed slices (PS3.4 Table C.4-2). The
+        status must be the terminal yield, not a bare sub-operation count.
+        The Identifier must NOT carry (0000,0902): Error Comment is a
+        command-set element (PS3.7 Table 9.1-1), not a data-set element."""
         move_jobs.register_peer("DEST_AE", "127.0.0.1", 11112)
         event = make_fake_move_event(
             study_uid="1.2.3",
@@ -319,23 +320,23 @@ class TestCMoveSelfLoopGuards:
         status, identifier = results[-1]
         assert status == 0xC000, f"zero-delivered job -> Failure, got {hex(status)}"
         assert identifier is not None
-        assert (
-            0x0000,
-            0x0902,
-        ) in identifier, "C000 must carry (0000,0902) Error Comment"
+        assert (0x0000, 0x0902) not in identifier, (
+            "Error Comment is a command-set element, not a data-set element"
+        )
         assert move_jobs.pick_pending_job(timeout=0) is None
         _, _, st = move_jobs.get_job_progress(1)
         assert st == "failed"
 
 
 class TestCMoveRspPolicy:
-    """0909 RSP policy (e): the held dialog yields exactly the RSP int + final.
+    """1112 RSP policy: the held dialog yields a truthful count + final.
 
     handle_c_move now polls the DB until every job is terminal and then
     branches:
     - all succeeded -> yield 0 (int): pynetdicom emits the final 0000, no
       store_assoc;
-    - failures -> yield 0, then 0xB000/0xC000 + (0008,0058);
+    - failures -> yield max(1, expected_total), then 0xB000/0xC000 +
+      (0008,0058) - a bare 0 would send 0x0000 Success and stop reading;
     - cancelled -> yield 1, then 0xFE00 + (0008,0058).
     No QIDO HTTP is issued in the reactor (the instance-count lookup and its
     QIDO latency left the DIMSE reactor).
@@ -409,9 +410,10 @@ class TestCMoveRspPolicy:
         assert list(gen) == [0]
         assert calls == [], f"reactor issued HTTP: {calls}"
 
-    def test_failure_partial_yields_one_then_warning_0008_0058(self, move_jobs):
-        """Job finished failed with completed>0 -> yield 0, then 0xB000 with
-        (0008,0058) Failed SOP Instance UID List (PS3.4 C.4.2.1.4.2)."""
+    def test_failure_partial_yields_expected_total_then_warning_0008_0058(self, move_jobs):
+        """Job finished failed with completed<total -> yield the expected
+        total (keeps the dialog open), then 0xB000 with (0008,0058) Failed
+        SOP Instance UID List (PS3.4 C.4.2.1.4.2)."""
         event, _ = self._start(move_jobs)
         gen = handle_c_move(
             event,
@@ -426,18 +428,21 @@ class TestCMoveRspPolicy:
         move_jobs.finish_job(1, success=False)
         pulled = list(gen)
         assert len(pulled) == 2
-        assert pulled[0] == 0, (
-            "a terminal result advertises zero sub-operations in flight, so "
-            "pynetdicom does not associate with the move destination again"
+        assert pulled[0] == 3, (
+            "a partial failure advertises the expected total so pynetdicom "
+            "keeps the dialog open and reads the 0xB000 (a bare 0 would send "
+            "0x0000 Success and stop reading)"
         )
         status, identifier = pulled[1]
         assert status == 0xB000, hex(status)
         assert identifier is not None and (0x0008, 0x0058) in identifier
 
     def test_failure_zero_yields_one_then_c000_0008_0058(self, move_jobs):
-        """Job finished failed with zero completed -> yield 0, then 0xC000
-        (Failure, not a lying "sub-operations complete" Warning), carrying
-        the (0000,0902) Error Comment."""
+        """Job finished failed with zero completed -> yield 1 (the dialog
+        must stay open), then 0xC000 (Failure, not a lying "sub-operations
+        complete" Warning). The Identifier must NOT carry (0000,0902) Error
+        Comment - it is a command-set element (PS3.7 Table 9.1-1), not a
+        data-set element."""
         event, _ = self._start(move_jobs)
         gen = handle_c_move(
             event,
@@ -450,11 +455,16 @@ class TestCMoveRspPolicy:
         move_jobs.finish_job(1, success=False)
         pulled = list(gen)
         assert len(pulled) == 2
-        assert pulled[0] == 0
+        assert pulled[0] == 1, (
+            "zero delivered must still advertise a non-zero count (a bare 0 "
+            "would send 0x0000 Success and drop the 0xC000)"
+        )
         status, identifier = pulled[1]
         assert status == 0xC000, hex(status)
         assert identifier is not None
-        assert (0x0000, 0x0902) in identifier, "C000 must carry (0000,0902)"
+        assert (0x0000, 0x0902) not in identifier, (
+            "Error Comment is a command-set element, not a data-set element"
+        )
 
     def test_cancel_yields_one_then_fe00_0008_0058(self, move_jobs):
         """Cancel pending: yield 1, then 0xFE00 Cancel with (0008,0058), and

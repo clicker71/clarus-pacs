@@ -11,13 +11,12 @@
 //!
 //! Every libc / WinAPI / memmap2 call in the crate is gathered here so the
 //! `unsafe` surface is auditable in one file: `time.rs` (localtime),
-//! `http/conn.rs` (setsockopt), `http/response.rs` (sendfile/TransmitFile),
-//! `idx/preload.rs` and `manifest/read.rs` (mmap).
+//! `http/response.rs` (sendfile/TransmitFile), `idx/preload.rs` and
+//! `manifest/read.rs` (mmap). Socket timeouts go through std
+//! (`TcpStream::set_read_timeout` / `set_write_timeout`), so they need no
+//! boundary here.
 
 #![allow(unsafe_code)]
-
-#[cfg(unix)]
-use std::time::Duration;
 
 /// Fill a `libc::tm` from the OS local-time conversion for an epoch offset.
 ///
@@ -45,51 +44,6 @@ pub fn localtime_civil(epoch_secs: libc::time_t) -> Option<libc::tm> {
     if rc != 0 { None } else { Some(tm) }
 }
 
-/// Set SO_RCVTIMEO / SO_SNDTIMEO on a socket (the Unix half of
-/// `conn::set_timeouts`; Windows uses the std `TcpStream` setters).
-#[cfg(unix)]
-pub fn set_socket_timeouts(
-    stream: &std::net::TcpStream,
-    recv: Duration,
-    send: Duration,
-) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let rv = to_timeval(recv);
-    let sv = to_timeval(send);
-    // SAFETY: the option pointers are derived from references to stack
-    // `timeval`s (`&rv as *const _ as *const c_void`) valid for the duration
-    // of each call; `fd` is a live descriptor from `AsRawFd`; the level /
-    // option / length constants are the POSIX definitions for SO_RCVTIMEO
-    // and SO_SNDTIMEO. Failures are ignored by the caller's contract
-    // (best-effort timeouts).
-    unsafe {
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &rv as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDTIMEO,
-            &sv as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn to_timeval(d: Duration) -> libc::timeval {
-    libc::timeval {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_usec: d.subsec_micros() as libc::suseconds_t,
-    }
-}
-
 /// One `sendfile` call: returns the kernel result (`>= 0` = bytes sent,
 /// `< 0` = errno). The caller owns the loop, fallback and error mapping.
 ///
@@ -98,6 +52,15 @@ fn to_timeval(d: Duration) -> libc::timeval {
 /// `(fd, sock, off, len, *hdtr, *sbytes)` and does not accept a descriptor
 /// pair, so this declaration does not even link there. macOS/BSD take the
 /// generic copy path instead of failing to build.
+///
+/// # Why this stays instead of `std::io::copy`
+///
+/// `io::copy` looks like a drop-in replacement, and on Linux it really does
+/// dispatch to the kernel - but it tries `copy_file_range` FIRST, and that call
+/// is tuned for file->file. Measured on ext4 through a real socket pair:
+/// `io::copy` 380 MiB/s against 2694 MiB/s for this direct `sendfile` loop.
+/// The capability list says `io::copy` can do more; the clock says it does it
+/// 7x slower, so the explicit call is what ships.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn sendfile_once(
     out_fd: std::os::unix::io::RawFd,
@@ -163,13 +126,82 @@ pub fn transmit_file(socket: usize, file: usize, len: u32) -> i32 {
 
 /// Map a read-only file into memory (memmap2).
 ///
-/// The caller must open `file` read-only and guarantee no concurrent writer
-/// mutates or truncates the underlying file while the mapping lives
-/// (manifests are written temp+rename; rolled-over idx files are immutable).
-pub fn map_readonly(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
-    // SAFETY: memmap2 duplicates the handle so the returned `Mmap` is
-    // self-contained; the UB preconditions (read-only map, no concurrent
-    // writes, no file shrink below the mapped range) are guaranteed by the
-    // caller's contract above. The mapping is dropped before `file`.
+/// # Safety
+///
+/// The caller must guarantee that nothing mutates or truncates the underlying
+/// file for as long as the returned mapping lives. Two concrete ways that
+/// guarantee is broken, both of which memmap2 documents as undefined
+/// behaviour:
+///
+/// - an in-place writer (anything other than temp-file + rename) touching the
+///   mapped range, and
+/// - the file being truncated or replaced while the mapping is still readable.
+///
+/// Keeping the `File` open for the mapping's lifetime is NOT sufficient by
+/// itself on every platform, which is why this stays `unsafe` and the
+/// obligation is spelled out at each call site rather than hidden behind a
+/// safe signature.
+pub unsafe fn map_readonly(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+    // SAFETY: the caller upholds the immutability contract documented above;
+    // this block only forwards that obligation to memmap2. The mapping is
+    // dropped before `file`.
     unsafe { memmap2::Mmap::map(file) }
+}
+
+/// Map a file and hold it open for as long as the mapping is readable.
+///
+/// Safe counterpart to [`map_readonly`]: the `File` travels with the mapping,
+/// so the descriptor cannot be closed (and the name reused) while bytes are
+/// still mapped. The remaining obligation - that no in-place writer mutates or
+/// truncates the file - is the one the callers below meet by construction, and
+/// it is documented per call site.
+pub struct MappedFile {
+    mmap: memmap2::Mmap,
+    /// Kept solely to pin the descriptor for the mapping's lifetime.
+    _file: std::fs::File,
+}
+
+impl MappedFile {
+    /// Map an already-open read-only handle.
+    ///
+    /// Safe by construction for the file classes this crate maps. The
+    /// immutability obligation is NOT delegated to the caller: every file
+    /// mapped here is published by temp-file + rename and is never written in
+    /// place afterwards -
+    ///
+    /// - manifests: `stow/manifest.rs` writes `<study>.manifest.tmp` then
+    ///   renames, so a reader either sees the previous inode or the new one;
+    /// - rolled-over idx days: the writer only ever appends to today's file, and
+    ///   a day is sealed before it is preloaded.
+    ///
+    /// The handle is kept alive for the mapping's lifetime, so the descriptor
+    /// cannot be closed and the name reused underneath us.
+    pub fn from_file(file: std::fs::File) -> std::io::Result<Self> {
+        // SAFETY: see the file-class argument above. memmap2's documented UB
+        // conditions are a concurrent in-place writer and a truncation below
+        // the mapped range; neither can happen for a published manifest or a
+        // sealed index day.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }?;
+        Ok(Self { mmap, _file: file })
+    }
+
+    /// Open `path` read-only and map it, keeping the handle pinned.
+    ///
+    /// Same file-class argument as [`MappedFile::from_file`].
+    pub fn open_readonly(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Self::from_file(file)
+    }
+
+    /// The mapped bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap
+    }
+}
+
+impl std::ops::Deref for MappedFile {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.mmap
+    }
 }

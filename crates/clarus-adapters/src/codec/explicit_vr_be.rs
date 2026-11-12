@@ -20,8 +20,9 @@
 
 use super::{CodecError, DecodedPixels, DicomCodec, DicomMeta, ts_uid};
 use super::{
-    TAG_BITS_ALLOCATED, TAG_BITS_STORED, TAG_COLUMNS, TAG_PHOTOMETRIC_INTERPRETATION,
-    TAG_PIXEL_DATA, TAG_PLANAR_CONFIGURATION, TAG_ROWS, TAG_SAMPLES_PER_PIXEL,
+    TAG_BITS_ALLOCATED, TAG_BITS_STORED, TAG_COLUMNS, TAG_NUMBER_OF_FRAMES,
+    TAG_PHOTOMETRIC_INTERPRETATION, TAG_PIXEL_DATA, TAG_PLANAR_CONFIGURATION, TAG_ROWS,
+    TAG_SAMPLES_PER_PIXEL,
 };
 use crate::dicom_rs::DicomRsParser;
 
@@ -104,20 +105,39 @@ impl DicomCodec for BigEndianCodec {
             .map_err(|e| CodecError::DecodeFailed(e.to_string()))?
             .ok_or_else(|| CodecError::DecodeFailed("PixelData (7FE0,0010) not found".into()))?;
 
+        // NumberOfFrames (0028,0008) IS, default 1. Multi-frame sources hold
+        // all frames concatenated in PixelData, and the per-frame planes of a
+        // colour-by-plane source are contiguous within each frame - so the
+        // planar conversion needs the frame count, exactly as the Explicit VR
+        // LE codec does.
+        let frames: u32 = parser
+            .extract_tag_value(dicom_bytes, TAG_NUMBER_OF_FRAMES)
+            .map_err(|e| CodecError::DecodeFailed(e.to_string()))?
+            .map(|v| {
+                String::from_utf8_lossy(&v)
+                    .trim()
+                    .trim_end_matches('\0')
+                    .parse::<u32>()
+                    .unwrap_or(1)
+            })
+            .unwrap_or(1)
+            .max(1);
+
         let expected_size = rows as usize
             * columns as usize
             * samples_per_pixel as usize
-            * (bits_allocated as usize >> 3);
-
+            * (bits_allocated as usize >> 3)
+            * frames as usize;
         if pixel_data.len() != expected_size {
             return Err(CodecError::DecodeFailed(format!(
-                "PixelData size mismatch: got {} bytes, expected {} ({}x{}x{}x{})",
+                "PixelData size mismatch: got {} bytes, expected {} ({}x{}x{}x{}x{} frames)",
                 pixel_data.len(),
                 expected_size,
                 rows,
                 columns,
                 samples_per_pixel,
                 bits_allocated >> 3,
+                frames,
             )));
         }
 
@@ -129,8 +149,19 @@ impl DicomCodec for BigEndianCodec {
         // For 8-bit: bytes are identical (OB is byte-order independent).
 
         // -- Planar conversion -------------------------------------
+        // The codec's convention is planar (RRR...GGG...BBB... per frame), so
+        // an interleaved source is reordered and a colour-by-plane source is
+        // already in that shape. Comparing against `1` matters: `!= 1` is the
+        // interleaved case, and treating a planar source as interleaved
+        // shuffles the three channels into each other.
         let planar = if samples_per_pixel == 3 && planar_configuration != 1 {
-            interleaved_to_planar(&pixels, rows as usize, columns as usize)
+            interleaved_to_planar_frames(
+                &pixels,
+                rows as usize,
+                columns as usize,
+                frames as usize,
+                (bits_allocated as usize) >> 3,
+            )
         } else {
             pixels
         };
@@ -145,11 +176,17 @@ impl DicomCodec for BigEndianCodec {
         })
     }
 
-    fn encode(&self, pixels: &DecodedPixels, _meta: &DicomMeta) -> Result<Vec<u8>, CodecError> {
+    fn encode(&self, pixels: &DecodedPixels, meta: &DicomMeta) -> Result<Vec<u8>, CodecError> {
         // Explicit VR BE = uncompressed, but pixel data stored Big Endian.
         // Convert back from planar to interleaved if needed, then byte-swap LE -> BE.
         let mut data = if pixels.samples_per_pixel == 3 {
-            planar_to_interleaved(&pixels.data, pixels.rows as usize, pixels.columns as usize)
+            planar_to_interleaved_frames(
+                &pixels.data,
+                pixels.rows as usize,
+                pixels.columns as usize,
+                meta.frames.max(1) as usize,
+                (pixels.bits_allocated as usize) >> 3,
+            )
         } else {
             pixels.data.clone()
         };
@@ -181,34 +218,63 @@ fn swap_bytes_16(data: &mut [u8]) {
 // Pixel layout conversion helpers (same as explicit_vr_le.rs)
 // ===========================================================================
 
-/// Convert interleaved RGB pixel data to planar (RRR...GGG...BBB...).
-fn interleaved_to_planar(data: &[u8], rows: usize, cols: usize) -> Vec<u8> {
-    let pixel_count = rows * cols;
-    let mut planar = vec![0u8; pixel_count * 3];
-
-    let (r_plane, rest) = planar.split_at_mut(pixel_count);
-    let (g_plane, b_plane) = rest.split_at_mut(pixel_count);
-
-    for i in 0..pixel_count {
-        r_plane[i] = data[i * 3];
-        g_plane[i] = data[i * 3 + 1];
-        b_plane[i] = data[i * 3 + 2];
+/// Convert interleaved RGB pixel data to planar (RRR...GGG...BBB...), one
+/// frame at a time.
+///
+/// Multi-frame PixelData concatenates whole frames, so the planes of each
+/// frame are contiguous per frame: converting the buffer as one frame would
+/// have moved the second frame's samples into the first frame's planes.
+fn interleaved_to_planar_frames(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    frames: usize,
+    bps: usize,
+) -> Vec<u8> {
+    let frame_pixels = rows * cols;
+    let plane_bytes = frame_pixels * bps;
+    let frame_bytes = plane_bytes * 3;
+    let mut planar = vec![0u8; data.len()];
+    for f in 0..frames {
+        let src = &data[f * frame_bytes..(f + 1) * frame_bytes];
+        let dst = &mut planar[f * frame_bytes..(f + 1) * frame_bytes];
+        let (r_plane, rest) = dst.split_at_mut(plane_bytes);
+        let (g_plane, b_plane) = rest.split_at_mut(plane_bytes);
+        for px in 0..frame_pixels {
+            let s = px * 3 * bps;
+            r_plane[px * bps..(px + 1) * bps].copy_from_slice(&src[s..s + bps]);
+            g_plane[px * bps..(px + 1) * bps].copy_from_slice(&src[s + bps..s + 2 * bps]);
+            b_plane[px * bps..(px + 1) * bps].copy_from_slice(&src[s + 2 * bps..s + 3 * bps]);
+        }
     }
-
     planar
 }
 
-/// Convert planar pixel data (RRR...GGG...BBB...) to interleaved RGB.
-fn planar_to_interleaved(data: &[u8], rows: usize, cols: usize) -> Vec<u8> {
-    let pixel_count = rows * cols;
-    let mut interleaved = vec![0u8; pixel_count * 3];
-
-    for i in 0..pixel_count {
-        interleaved[i * 3] = data[i];
-        interleaved[i * 3 + 1] = data[pixel_count + i];
-        interleaved[i * 3 + 2] = data[2 * pixel_count + i];
+/// Convert planar pixel data (RRR...GGG...BBB...) back to interleaved RGB,
+/// one frame at a time.
+fn planar_to_interleaved_frames(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    frames: usize,
+    bps: usize,
+) -> Vec<u8> {
+    let frame_pixels = rows * cols;
+    let plane_bytes = frame_pixels * bps;
+    let frame_bytes = plane_bytes * 3;
+    let mut interleaved = vec![0u8; data.len()];
+    for f in 0..frames {
+        let src = &data[f * frame_bytes..(f + 1) * frame_bytes];
+        let dst = &mut interleaved[f * frame_bytes..(f + 1) * frame_bytes];
+        for px in 0..frame_pixels {
+            let d = px * 3 * bps;
+            let r = px * bps;
+            dst[d..d + bps].copy_from_slice(&src[r..r + bps]);
+            dst[d + bps..d + 2 * bps].copy_from_slice(&src[plane_bytes + r..plane_bytes + r + bps]);
+            dst[d + 2 * bps..d + 3 * bps]
+                .copy_from_slice(&src[2 * plane_bytes + r..2 * plane_bytes + r + bps]);
+        }
     }
-
     interleaved
 }
 
@@ -397,5 +463,57 @@ mod tests {
         let mut swapped_twice = back_to_le;
         swap_bytes_16(&mut swapped_twice);
         assert_eq!(swapped_twice, le_data);
+    }
+
+    /// The planar conversion is per FRAME, checked where it can actually be
+    /// observed: a 2-pixel-wide frame makes a single-frame conversion produce
+    /// a different order than the per-frame one.
+    ///
+    /// The planar conversion is per FRAME, in the frame-major layout the
+    /// Explicit VR LE codec already produces: all three planes of frame 0,
+    /// then all three of frame 1.
+    ///
+    /// Frame 0 = (1,2,3) (4,5,6); frame 1 = (7,8,9) (10,11,12).
+    /// Expected: 1,4 | 2,5 | 3,6 | 7,10 | 8,11 | 9,12.
+    /// A buffer-wide conversion would emit 1,4,7,10 | 2,5,8,11 | 3,6,9,12 -
+    /// the second frame's red plane lands in the first frame's green plane.
+    #[test]
+    fn a_multi_frame_conversion_keeps_frames_apart() {
+        let interleaved: Vec<u8> = (1..=12).collect();
+
+        let planar = interleaved_to_planar_frames(&interleaved, 1, 2, 2, 1);
+        assert_eq!(
+            planar,
+            vec![1u8, 4, 2, 5, 3, 6, 7, 10, 8, 11, 9, 12],
+            "each frame keeps its own three planes"
+        );
+        assert_eq!(
+            planar_to_interleaved_frames(&planar, 1, 2, 2, 1),
+            interleaved,
+            "the conversion is reversible"
+        );
+    }
+
+    /// A 16-bit colour instance interleaves 16-bit samples, so the plane
+    /// stride is TWO bytes per pixel - not one.
+    ///
+    /// Handled sample-wise, the first byte of a sample stays with its own
+    /// channel; handled byte-wise, the high and low halves of neighbouring
+    /// samples swap channels, which reads as a colour fringe on every edge.
+    #[test]
+    fn a_sixteen_bit_colour_instance_keeps_samples_whole() {
+        // Two pixels: R=(1,2) G=(3,4) B=(5,6), then R=(7,8) G=(9,10) B=(11,12).
+        let interleaved: Vec<u8> = (1..=12).collect();
+        let planar = interleaved_to_planar_frames(&interleaved, 1, 2, 1, 2);
+        assert_eq!(
+            planar,
+            vec![1u8, 2, 7, 8, 3, 4, 9, 10, 5, 6, 11, 12],
+            "each plane holds whole 2-byte samples"
+        );
+        assert_eq!(
+            planar_to_interleaved_frames(&planar, 1, 2, 1, 2),
+            interleaved,
+            "the conversion is reversible"
+        );
     }
 }

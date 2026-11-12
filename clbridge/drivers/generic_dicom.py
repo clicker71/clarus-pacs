@@ -20,21 +20,79 @@ from pydicom.uid import generate_uid
 from pynetdicom import AE
 from pynetdicom.sop_class import (
     BasicColorImageBox,
+    BasicColorPrintManagementMeta,
     BasicFilmBox,
     BasicFilmSession,
     BasicGrayscaleImageBox,
+    BasicGrayscalePrintManagementMeta,
     Printer,
 )
 
 from .base import AbstractPrintDriver, PrintResult
 
-# DIMSE Print status codes (PS3.4 §H.4.1)
+# DIMSE Print status codes (PS3.4 H.4.1)
 STATUS_SUCCESS = 0x0000
 STATUS_FILM_SESSION_ERROR = 0xB600
 STATUS_FILM_BOX_ERROR = 0xB601
 STATUS_IMAGE_BOX_ERROR = 0xB602
 STATUS_PRINT_FAILURE = 0xB603
 STATUS_GENERIC_ERROR = 0xC200
+
+# PS3.7 Annex C: 0xB000-0xBFFF is the WARNING class - the primitive
+# COMPLETED and produced a result, so a warning is not a reason to abandon
+# the job. 0xB600/B601/B602/B603 are the print-specific WARNING values that
+# PS3.4 H.4.1 qualifies as "the film session/film box/image box was created
+# but ..."; treating them as failures aborted a job the printer had accepted.
+#
+# The generic Warning values are PS3.7 Table C.1-1: 0x0107 "Attribute List
+# Error" and 0x0116 "Attribute Value Out of Range". Both mean the SCP PROCESSED
+# the operation and is telling us about an attribute, which PS3.4 H.4.1 keeps
+# out of the Failure class; only 0xAxxx/0xCxxx mean it did not complete.
+_WARNING_MIN = 0xB000
+_WARNING_MAX = 0xBFFF
+_WARNING_CODES = frozenset({0x0107, 0x0116})
+
+# PS3.4 H.4.2.2.4: 0xB603 is "Film Box SOP Instance hierarchy does not
+# contain Image Box SOP instances" - the printer has NOTHING to put on the
+# film. It is a WARNING in the sense that the primitive completed, but the
+# film is blank, so counting it as printed reports a film that does not exist.
+STATUS_EMPTY_PAGE = 0xB603
+
+
+def _is_success_or_warning(status_code):
+    """True when a print status means the operation completed.
+
+    PS3.7 Annex C: Success is 0x0000 and the warnings above are non-fatal.
+    Only the FAILURE classes (0xAxxx/0xCxxx) mean the operation did not
+    complete.
+    """
+    if status_code == STATUS_SUCCESS:
+        return True
+    if _WARNING_MIN <= status_code <= _WARNING_MAX:
+        return True
+    return status_code in _WARNING_CODES
+
+
+# PS3.4 H.4.1.2: the Film Session N-CREATE attribute set. ImageDisplayFormat,
+# FilmOrientation, FilmSizeID and the density/trim attributes are Film BOX
+# attributes (H.4.1.2.2) and must not appear in the Film Session request.
+#
+# SpecificCharacterSet (0008,0005) IS a Film Session attribute (PS3.4
+# Table H.4-1): it declares the encoding of the character-set-dependent values
+# in the request (FilmSessionLabel, OwnerID). Dropping it made a Cyrillic
+# label a missing-attribute failure on a strict SCP, or silently re-encoded.
+# MemoryAllocation (2000,0060) is a Film SESSION attribute, not a Film Box one
+# - H.4.1.2.2 lists it among the Film Session parameters the SCU supplies.
+_FILM_SESSION_ATTRIBUTES = (
+    "NumberOfCopies",
+    "PrintPriority",
+    "MediumType",
+    "FilmDestination",
+    "FilmSessionLabel",
+    "OwnerID",
+    "SpecificCharacterSet",
+    "MemoryAllocation",
+)
 
 
 class GenericDicomPrintDriver(AbstractPrintDriver):
@@ -54,28 +112,52 @@ class GenericDicomPrintDriver(AbstractPrintDriver):
         printer_host: str,
         printer_port: int,
         calling_aet: str,
+        called_aet: str | None = None,
     ) -> PrintResult:
         """Execute a DICOM Print job.
 
         See AbstractPrintDriver.print() for full documentation.
+
+        `calling_aet` is the SCU's OWN AE Title (who we are); `called_aet` is
+        the printer's AE Title (who we address). PS3.8 9.3.2.1 makes them two
+        separate fields of the A-ASSOCIATE-RQ, and addressing a printer by our
+        own title only works when a peer happens to accept anything - a
+        configured SCP rejects it as "called AE title not recognised".
         """
         job_id = str(uuid.uuid4())[:8]
         film_boxes_printed = 0
         failed_images = []
         printer_message = None
+        submitted_images = 0
 
         # Determine Image Box SOP Class from first image
         image_box_sop_class = self._image_box_sop_class(images)
 
+        # D8: negotiate the Print Management META SOP Class (PS3.4 H.3/H.4).
+        # The meta class is the abstract syntax a conforming printer is
+        # registered for; it implies the Film Session, Film Box, Image Box and
+        # Printer contexts, and the N-* primitives are then sent with the
+        # meta_uid so the SCP can resolve them to the requested instance.
+        meta_sop_class = (
+            BasicColorPrintManagementMeta
+            if image_box_sop_class == BasicColorImageBox
+            else BasicGrayscalePrintManagementMeta
+        )
+
         ae = AE(ae_title=calling_aet)
+        ae.add_requested_context(meta_sop_class)
         ae.add_requested_context(BasicFilmSession)
         ae.add_requested_context(BasicFilmBox)
         ae.add_requested_context(image_box_sop_class)
         ae.add_requested_context(Printer)
 
-        # 1. Association
+        # 1. Association. D1: the CALLED AE is the printer's, never our own.
         try:
-            assoc = ae.associate(printer_host, printer_port, ae_title=calling_aet)
+            assoc = ae.associate(
+                printer_host,
+                printer_port,
+                ae_title=(called_aet or calling_aet),
+            )
             if not assoc.is_established:
                 logging.warning(
                     "[C-PRINT] Association to %s:%d failed",
@@ -99,25 +181,29 @@ class GenericDicomPrintDriver(AbstractPrintDriver):
 
         film_session_uid = None
         film_box_uid = None
-        image_box_uids = []
 
         try:
             # 2. N-CREATE Film Session
             film_session_uid = generate_uid()
             fs_ds = Dataset()
-            # Copy all attributes from the supplied film_session
-            for elem in film_session:
-                if elem.keyword and elem.keyword not in (
-                    "SOPClassUID",
-                    "SOPInstanceUID",
-                ):
-                    setattr(fs_ds, elem.keyword, elem.value)
+            # D7: PS3.4 H.4.1 defines the Film Session N-CREATE attribute set
+            # as NumberOfCopies, PrintPriority, MediumType, FilmDestination,
+            # FilmSessionLabel, OwnerID and (optionally) the privatization
+            # attributes. Film Box attributes (ImageDisplayFormat,
+            # FilmOrientation, FilmSizeID, ...) belong to the FILM BOX request;
+            # copying the whole supplied dataset here sent elements the
+            # Film Session IOD does not define, which a strict SCP rejects.
+            for attr in _FILM_SESSION_ATTRIBUTES:
+                if hasattr(film_session, attr):
+                    setattr(fs_ds, attr, getattr(film_session, attr))
             fs_ds.SOPClassUID = BasicFilmSession
             fs_ds.SOPInstanceUID = film_session_uid
 
-            status, fs_response = assoc.send_n_create(fs_ds, BasicFilmSession)
+            status, fs_response = assoc.send_n_create(
+                fs_ds, BasicFilmSession, film_session_uid, meta_uid=meta_sop_class
+            )
             status_code = self._status_code(status)
-            if status_code != STATUS_SUCCESS:
+            if not _is_success_or_warning(status_code):
                 logging.warning(
                     "[C-PRINT] N-CREATE Film Session failed: status=0x%04X", status_code
                 )
@@ -171,9 +257,11 @@ class GenericDicomPrintDriver(AbstractPrintDriver):
                 if hasattr(film_session, attr):
                     setattr(fb_ds, attr, getattr(film_session, attr))
 
-            status, fb_response = assoc.send_n_create(fb_ds, BasicFilmBox)
+            status, fb_response = assoc.send_n_create(
+                fb_ds, BasicFilmBox, film_box_uid, meta_uid=meta_sop_class
+            )
             status_code = self._status_code(status)
-            if status_code != STATUS_SUCCESS:
+            if not _is_success_or_warning(status_code):
                 logging.warning(
                     "[C-PRINT] N-CREATE Film Box failed: status=0x%04X", status_code
                 )
@@ -189,20 +277,67 @@ class GenericDicomPrintDriver(AbstractPrintDriver):
 
             logging.debug("[C-PRINT] Film Box created: %s", film_box_uid)
 
+            # D3: the Image Box instances belong to the PRINTER. PS3.4 H.4.1.2.3
+            # has the Film Box SCP create them and return their identities in
+            # the ReferencedImageBoxSequence of the N-CREATE-RSP; the SCU then
+            # addresses THOSE instance UIDs in the N-SET. Generating local
+            # UIDs made every N-SET reference an instance the SCP does not
+            # have, so a conforming printer rejected the whole film.
+            printer_image_box_uids = self._image_box_uids_from_response(fb_response)
+            if not printer_image_box_uids:
+                logging.error(
+                    "[C-PRINT] Film Box N-CREATE returned no "
+                    "ReferencedImageBoxSequence - cannot address the Image Boxes"
+                )
+                self._safe_n_delete(assoc, BasicFilmSession, film_session_uid)
+                assoc.release()
+                return PrintResult(
+                    job_id=job_id,
+                    status=STATUS_FILM_BOX_ERROR,
+                    film_boxes_printed=0,
+                    printer_message=(
+                        "Film Box N-CREATE returned no ReferencedImageBoxSequence"
+                    ),
+                )
+
+            # PS3.4 H.4.1.2.3: the ReferencedImageBoxSequence IS the film's
+            # capacity - the SCP created exactly that many cells. Images beyond
+            # it cannot be placed, so the film would be printed incomplete while
+            # the caller was told a film went out. Refuse BEFORE the N-ACTION:
+            # once the SCP has printed, the missing cells are unrecoverable.
+            if len(images) > len(printer_image_box_uids):
+                logging.error(
+                    "[C-PRINT] %d image(s) for a %d-cell film - not printing "
+                    "an incomplete film",
+                    len(images),
+                    len(printer_image_box_uids),
+                )
+                self._safe_n_delete(assoc, BasicFilmSession, film_session_uid)
+                assoc.release()
+                return PrintResult(
+                    job_id=job_id,
+                    status=STATUS_IMAGE_BOX_ERROR,
+                    film_boxes_printed=0,
+                    failed_images=[
+                        (idx, "No image box position on this film")
+                        for idx in range(len(printer_image_box_uids), len(images))
+                    ],
+                    printer_message=(
+                        f"{len(images)} image(s) for a "
+                        f"{len(printer_image_box_uids)}-position film - "
+                        "film not printed"
+                    ),
+                )
+
             # 4. N-SET Image Box × N
             for idx, image_bytes in enumerate(images):
-                image_box_uid = generate_uid()
-                image_box_uids.append(image_box_uid)
-
+                # D4: ImageBoxPosition (2020,0010) is a REQUIRED attribute of
+                # the Basic Image Box N-SET (PS3.4 H.4.1.2.4): it tells the SCP
+                # which cell of the film this image occupies. Omitting it is a
+                # missing-attribute failure, not a default.
                 ib_ds = Dataset()
                 ib_ds.SOPClassUID = image_box_sop_class
-                ib_ds.SOPInstanceUID = image_box_uid
-
-                # ReferencedFilmBoxSequence
-                ref_fb_item = Dataset()
-                ref_fb_item.ReferencedSOPClassUID = BasicFilmBox
-                ref_fb_item.ReferencedSOPInstanceUID = film_box_uid
-                ib_ds.ReferencedFilmBoxSequence = [ref_fb_item]
+                ib_ds.ImageBoxPosition = idx + 1
 
                 # Image pixel data in appropriate sequence
                 try:
@@ -217,11 +352,15 @@ class GenericDicomPrintDriver(AbstractPrintDriver):
                 else:
                     ib_ds.BasicGrayscaleImageSequence = [img_ds]
 
+                # The film defines the cell count and the excess was refused
+                # before the print action, so every image here has a cell.
+                image_box_uid = printer_image_box_uids[idx]
+
                 status, ib_response = assoc.send_n_set(
-                    ib_ds, image_box_sop_class, image_box_uid
+                    ib_ds, image_box_sop_class, image_box_uid, meta_uid=meta_sop_class
                 )
                 status_code = self._status_code(status)
-                if status_code != STATUS_SUCCESS:
+                if not _is_success_or_warning(status_code):
                     logging.warning(
                         "[C-PRINT] N-SET Image Box %d failed: status=0x%04X",
                         idx,
@@ -229,64 +368,116 @@ class GenericDicomPrintDriver(AbstractPrintDriver):
                     )
                     failed_images.append((idx, f"N-SET error: 0x{status_code:04X}"))
                 else:
+                    # D2: only an ACCEPTED image counts as submitted.
+                    submitted_images += 1
+                    if status_code != STATUS_SUCCESS:
+                        logging.warning(
+                            "[C-PRINT] N-SET Image Box %d warning 0x%04X - "
+                            "accepted with the SCP's note",
+                            idx,
+                            status_code,
+                        )
                     logging.debug("[C-PRINT] Image Box %d set: %s", idx, image_box_uid)
 
             # 5. N-ACTION Print
-            if image_box_uids:
-                na_ds = Dataset()
-                # ReferencedFilmBoxSequence
-                ref_fb_item = Dataset()
-                ref_fb_item.ReferencedSOPClassUID = BasicFilmBox
-                ref_fb_item.ReferencedSOPInstanceUID = film_box_uid
-                na_ds.ReferencedFilmBoxSequence = [ref_fb_item]
-
-                # Also include PrintManagementStatusSequence if in film_session
-                if hasattr(film_session, "PrintManagementStatusSequence"):
-                    na_ds.PrintManagementStatusSequence = (
-                        film_session.PrintManagementStatusSequence
-                    )
-
-                status, na_response = assoc.send_n_action(
-                    na_ds,
-                    action_type=1,
-                    class_uid=BasicFilmSession,
-                    instance_uid=film_session_uid,
+            #
+            # D2: a film with NO accepted image is not printed. N-ACTION on an
+            # unpopulated Film Box tells the SCP to produce a blank film (and
+            # some SCPs print it), while reporting film_boxes_printed=1 told
+            # the caller a film went out when every image had failed.
+            if submitted_images == 0:
+                logging.error(
+                    "[C-PRINT] No image was accepted on the film - not printing"
                 )
-                status_code = self._status_code(status)
-                if status_code != STATUS_SUCCESS:
-                    logging.warning(
-                        "[C-PRINT] N-ACTION Print failed: status=0x%04X", status_code
-                    )
-                    # Extract printer message from response if available
-                    if na_response:
-                        printer_message = self._extract_status_info(na_response)
-                    assoc.release()
-                    return PrintResult(
-                        job_id=job_id,
-                        status=STATUS_PRINT_FAILURE,
-                        film_boxes_printed=0,
-                        failed_images=failed_images,
-                        printer_message=printer_message
-                        or f"N-ACTION Print failed: 0x{status_code:04X}",
-                    )
+                self._safe_n_delete(assoc, BasicFilmSession, film_session_uid)
+                assoc.release()
+                return PrintResult(
+                    job_id=job_id,
+                    status=STATUS_IMAGE_BOX_ERROR,
+                    film_boxes_printed=0,
+                    failed_images=failed_images,
+                    printer_message=(
+                        "No image accepted by the printer - film not printed"
+                    ),
+                )
 
-                # Extract printer status info from N-ACTION response
+            na_ds = Dataset()
+
+            # D5: the Print action is sent to the FILM BOX (PS3.4 H.4.1.2.3 -
+            # the Basic Film Box SOP Instance is what the Print N-ACTION
+            # addresses); the Film Session N-ACTION is an optional
+            # session-level operation most SCPs do not implement, and the
+            # ReferencedFilmBoxSequence is not an attribute of the request.
+            # Sending it to the Film Session asked the SCP to print a session
+            # the request did not identify.
+            status, na_response = assoc.send_n_action(
+                na_ds,
+                action_type=1,
+                class_uid=BasicFilmBox,
+                instance_uid=film_box_uid,
+                meta_uid=meta_sop_class,
+            )
+            status_code = self._status_code(status)
+            if not _is_success_or_warning(status_code):
+                logging.warning(
+                    "[C-PRINT] N-ACTION Print failed: status=0x%04X", status_code
+                )
+                # Extract printer message from response if available
                 if na_response:
                     printer_message = self._extract_status_info(na_response)
-
-                logging.info(
-                    "[C-PRINT] Print job %s: N-ACTION succeeded, %d images",
-                    job_id,
-                    len(image_box_uids),
+                assoc.release()
+                return PrintResult(
+                    job_id=job_id,
+                    status=STATUS_PRINT_FAILURE,
+                    film_boxes_printed=0,
+                    failed_images=failed_images,
+                    printer_message=printer_message
+                    or f"N-ACTION Print failed: 0x{status_code:04X}",
+                )
+            if status_code != STATUS_SUCCESS:
+                logging.warning(
+                    "[C-PRINT] N-ACTION Print returned warning 0x%04X - the "
+                    "film was accepted; check the printer",
+                    status_code,
+                )
+            # PS3.4 H.4.2.2.4: 0xB603 says the Film Box holds no Image Box the
+            # printer could put on film. The primitive COMPLETED, so the warning
+            # class above lets it through, but no sheet came out - counting it
+            # as printed hid a blank print from the caller.
+            if status_code == STATUS_EMPTY_PAGE:
+                logging.error(
+                    "[C-PRINT] Printer reported an EMPTY PAGE (0x%04X) - no "
+                    "image reached the film",
+                    status_code,
+                )
+                if na_response:
+                    printer_message = self._extract_status_info(na_response)
+                return PrintResult(
+                    job_id=job_id,
+                    status=STATUS_EMPTY_PAGE,
+                    film_boxes_printed=0,
+                    failed_images=failed_images,
+                    printer_message=printer_message
+                    or "Empty page: the printer found no Image Box to print",
                 )
 
-            # Count successfully printed film boxes
-            film_boxes_printed = 1 if image_box_uids else 0
+            # Extract printer status info from N-ACTION response
+            if na_response:
+                printer_message = self._extract_status_info(na_response)
+
+            logging.info(
+                "[C-PRINT] Print job %s: N-ACTION succeeded, %d/%d images",
+                job_id,
+                submitted_images,
+                len(images),
+            )
+
+            # Count successfully printed film boxes: the film is printed when
+            # the Print action completed, which reaching here means it did.
+            film_boxes_printed = 1
 
             # Determine final status
-            if failed_images and len(failed_images) == len(images):
-                final_status = STATUS_IMAGE_BOX_ERROR
-            elif failed_images:
+            if failed_images:
                 final_status = STATUS_SUCCESS  # partial success = success with warnings
             else:
                 final_status = STATUS_SUCCESS
@@ -321,6 +512,29 @@ class GenericDicomPrintDriver(AbstractPrintDriver):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _image_box_uids_from_response(fb_response) -> list[str]:
+        """The Image Box instance UIDs the PRINTER created for this film.
+
+        PS3.4 H.4.1.2.3: the Film Box N-CREATE-RSP carries a
+        ReferencedImageBoxSequence, one item per available film position, and
+        each item's Referenced SOP Instance UID is the instance the SCU must
+        address in the following N-SET. These are the SCP's instances, not
+        ours, so they cannot be generated locally.
+        """
+        if fb_response is None:
+            return []
+        uids = []
+        try:
+            seq = getattr(fb_response, "ReferencedImageBoxSequence", None)
+            for item in seq or []:
+                uid = str(getattr(item, "ReferencedSOPInstanceUID", "") or "")
+                if uid:
+                    uids.append(uid)
+        except Exception as e:
+            logging.debug("[C-PRINT] Could not read ReferencedImageBoxSequence: %s", e)
+        return uids
 
     def _image_box_sop_class(self, images: list[bytes]) -> str:
         """Determine Image Box SOP Class from first image's channels.

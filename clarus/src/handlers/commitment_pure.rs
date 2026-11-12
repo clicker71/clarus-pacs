@@ -213,6 +213,18 @@ fn wrap_multipart(boundary: &str, part_type: &str, body: &[u8]) -> Vec<u8> {
 }
 
 fn finish(kind: AcceptKind, transaction_uid: &str, json: Vec<u8>, rel: u64) -> CommitmentResp {
+    // The XML rendering can refuse a body (PS3.19 conversion has no answer for
+    // some shapes). Answering 200 with `application/dicom+xml` and zero bytes
+    // tells the client the response IS an empty document, which is a lie about
+    // a successful request; the same conversion in `dispatch.rs:1615` answers
+    // 500, and one of the two had to change.
+    let render_xml = |json: &[u8]| match super::instance_xml::json_metadata_to_xml(json) {
+        Ok(xml) => Some(xml),
+        Err(e) => {
+            crate::clog_warn!(error = %e, "commitment: DICOM XML rendering failed");
+            None
+        }
+    };
     match kind {
         AcceptKind::Json => CommitmentResp {
             status: 200,
@@ -221,7 +233,9 @@ fn finish(kind: AcceptKind, transaction_uid: &str, json: Vec<u8>, rel: u64) -> C
             body: json,
         },
         AcceptKind::Xml => {
-            let xml = super::instance_xml::json_metadata_to_xml(&json).unwrap_or_default();
+            let Some(xml) = render_xml(&json) else {
+                return internal_error();
+            };
             CommitmentResp {
                 status: 200,
                 content_type: "application/dicom+xml".to_string(),
@@ -232,10 +246,10 @@ fn finish(kind: AcceptKind, transaction_uid: &str, json: Vec<u8>, rel: u64) -> C
         AcceptKind::MultipartJson | AcceptKind::MultipartXml => {
             let xml = matches!(kind, AcceptKind::MultipartXml);
             let (inner_type, part) = if xml {
-                (
-                    "application/dicom+xml",
-                    super::instance_xml::json_metadata_to_xml(&json).unwrap_or_default(),
-                )
+                let Some(rendered) = render_xml(&json) else {
+                    return internal_error();
+                };
+                ("application/dicom+xml", rendered)
             } else {
                 ("application/dicom+json", json)
             };
@@ -250,6 +264,20 @@ fn finish(kind: AcceptKind, transaction_uid: &str, json: Vec<u8>, rel: u64) -> C
                 body,
             }
         }
+    }
+}
+
+/// The 500 the XML conversion failure answers, shaped like every other
+/// Storage Commitment error body so the client has one error format to read.
+fn internal_error() -> CommitmentResp {
+    let mut json = Vec::from(&b"{\"error\":"[..]);
+    push_json_str(&mut json, "Internal Server Error");
+    json.push(b'}');
+    CommitmentResp {
+        status: 500,
+        content_type: "application/dicom+json; charset=utf-8".to_string(),
+        headers: Vec::new(),
+        body: json,
     }
 }
 
@@ -1383,5 +1411,46 @@ mod tests {
         assert!(ts.ends_with('Z'), "timestamp: {ts}");
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[10..11], "T");
+    }
+
+    /// A body the XML writer refuses must not be answered as an empty 200.
+    ///
+    /// `application/dicom+xml` with zero bytes says "the document is empty",
+    /// and an empty document is a well-formed answer to a well-formed request -
+    /// so the client had no way to learn the render failed. The body used here
+    /// is truncated JSON, which the PS3.19 converter parses before rendering.
+    #[test]
+    fn an_unrenderable_body_answers_500_rather_than_an_empty_200() {
+        let truncated = b"[{\"00080016\":{\"Value\":[".to_vec();
+        for kind in [
+            AcceptKind::Xml,
+            AcceptKind::MultipartXml,
+            AcceptKind::MultipartJson,
+        ] {
+            let multipart_json = matches!(kind, AcceptKind::MultipartJson);
+            let is_xml = matches!(kind, AcceptKind::Xml);
+            let resp = finish(kind, "2.25.7", truncated.clone(), 0);
+            if multipart_json {
+                // The JSON part is never parsed, so it is returned verbatim
+                // inside the multipart envelope.
+                assert_eq!(resp.status, 200, "the JSON bytes need no XML pass");
+                assert!(
+                    resp.body
+                        .windows(truncated.len())
+                        .any(|w| w == truncated.as_slice())
+                );
+                continue;
+            }
+            assert_eq!(resp.status, 500, "the XML branch must not claim success");
+            assert_eq!(resp.content_type, "application/dicom+json; charset=utf-8");
+            assert!(
+                resp.body.windows(7).any(|w| w == b"\"error\""),
+                "the failure is named in the body (xml={is_xml})"
+            );
+        }
+        // The happy path still renders, so the refusal is about the body.
+        let ok = finish(AcceptKind::Xml, "2.25.7", b"[]".to_vec(), 0);
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.content_type, "application/dicom+xml");
     }
 }

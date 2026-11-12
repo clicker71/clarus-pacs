@@ -411,17 +411,23 @@ pub fn decode_client_frame(buf: &[u8]) -> Result<(Frame, usize), FrameError> {
     }
 
     let mut offset = 2usize;
-    let len = match b1 & 0x7F {
+    // The length stays 64-bit until AFTER the cap check. RFC 6455 5.2 gives the
+    // extended form 64 bits, and `v as usize` on a 32-bit target keeps only the
+    // low half: a length whose low 32 bits happened to be small would pass a cap
+    // its real value fails, and the frame would then be read as that truncated
+    // size. Comparing in `u64` with the cap widened makes both sides the same
+    // width on every target.
+    let len_u64: u64 = match b1 & 0x7F {
         126 => {
             if buf.len() < offset + 2 {
                 return Err(FrameError::Incomplete);
             }
-            let v = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+            let v = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
             offset += 2;
             if v < 126 {
                 return Err(FrameError::BadLength); // non-minimal encoding
             }
-            v
+            u64::from(v)
         }
         127 => {
             if buf.len() < offset + 8 {
@@ -439,14 +445,16 @@ pub fn decode_client_frame(buf: &[u8]) -> Result<(Frame, usize), FrameError> {
             if v <= u16::MAX as u64 {
                 return Err(FrameError::BadLength); // non-minimal encoding
             }
-            v as usize
+            v
         }
-        n => n as usize,
+        n => u64::from(n),
     };
 
-    if len > MAX_CLIENT_FRAME {
+    if len_u64 > MAX_CLIENT_FRAME as u64 {
         return Err(FrameError::TooLarge);
     }
+    // Safe now: the value is at most MAX_CLIENT_FRAME, which is a usize.
+    let len = len_u64 as usize;
 
     if buf.len() < offset + 4 {
         return Err(FrameError::Incomplete);
@@ -693,6 +701,40 @@ mod tests {
         let (frame, used) = decode_client_frame(&raw).expect("decodes");
         assert_eq!(used, raw.len());
         assert_eq!(frame.payload.len(), 65_536);
+    }
+
+    /// The cap is applied to the 64-bit length, before any `usize` cast.
+    ///
+    /// A 32-bit target keeps only the low half of `v as usize`, so a declared
+    /// length of `2^32 + 8` became `8` - under the cap - and the frame would
+    /// then be read as eight bytes. The value is refused here on every target,
+    /// which is what makes the check independent of the pointer width.
+    #[test]
+    fn a_length_above_the_cap_is_refused_before_any_narrowing() {
+        let mask = [5, 6, 7, 8];
+        // Hand-built: FIN + binary, mask bit, 64-bit length form.
+        let mut raw = vec![0x82u8, 0x80 | 127];
+        raw.extend_from_slice(&(MAX_CLIENT_FRAME as u64 + 1).to_be_bytes());
+        raw.extend_from_slice(&mask);
+        assert_eq!(decode_client_frame(&raw), Err(FrameError::TooLarge));
+
+        // The truncation case: the low 32 bits are tiny, the real value is
+        // enormous. A `as usize` before the cap would have accepted this on a
+        // 32-bit target.
+        let mut raw = vec![0x82u8, 0x80 | 127];
+        raw.extend_from_slice(&(1u64 << 32).saturating_add(8).to_be_bytes());
+        raw.extend_from_slice(&mask);
+        assert_eq!(
+            decode_client_frame(&raw),
+            Err(FrameError::TooLarge),
+            "a 64-bit length must be judged at its own width"
+        );
+
+        // And the largest value the 64-bit form may carry is still refused.
+        let mut raw = vec![0x82u8, 0x80 | 127];
+        raw.extend_from_slice(&u64::MAX.to_be_bytes());
+        raw.extend_from_slice(&mask);
+        assert_eq!(decode_client_frame(&raw), Err(FrameError::BadLength));
     }
 
     #[test]

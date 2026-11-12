@@ -212,11 +212,15 @@ pub fn parse_headers<'a>(
         count += 1;
         pos = line_end + 2;
     }
-    // Exactly `MAX_HEADERS` seen but no blank line yet -> too many.
-    if find_line_end(&headers[pos..]).is_some() {
-        return Err(ParseError::TooManyHeaders);
+    // The loop stops with `MAX_HEADERS` parsed. The next line decides: a blank
+    // line is the END of a valid `MAX_HEADERS`-header request, anything else is
+    // a 65th header. Treating the blank line as a header made an EXACTLY
+    // `MAX_HEADERS` request fail with TooManyHeaders - the off-by-one.
+    match find_line_end(&headers[pos..]) {
+        Some(e) if headers[pos..pos + e].is_empty() => Ok(pos + e + 2),
+        Some(_) => Err(ParseError::TooManyHeaders),
+        None => Err(ParseError::Incomplete),
     }
-    Err(ParseError::Incomplete)
 }
 
 /// Framing headers already seen, as a bitfield.
@@ -574,6 +578,31 @@ mod tests {
         assert_eq!(
             parse_headers(&mut h, hdr),
             Err(ParseError::BadContentLength)
+        );
+    }
+
+    #[test]
+    fn exactly_max_headers_is_accepted_one_more_is_rejected() {
+        // The old loop rejected an EXACTLY MAX_HEADERS request: after the 64th
+        // header it re-checked the NEXT line (the blank terminator) and
+        // misread it as a 65th header. Exactly 64 must pass; 65 must fail.
+        let mut hdr = String::new();
+        for i in 0..MAX_HEADERS {
+            hdr.push_str(&format!("X-H{i}: v\r\n"));
+        }
+        hdr.push_str("\r\n");
+        let mut h = RequestHead::borrow_empty();
+        parse_headers(&mut h, hdr.as_bytes()).expect("exactly MAX_HEADERS is valid");
+
+        let mut hdr = String::new();
+        for i in 0..=MAX_HEADERS {
+            hdr.push_str(&format!("X-H{i}: v\r\n"));
+        }
+        hdr.push_str("\r\n");
+        let mut h = RequestHead::borrow_empty();
+        assert_eq!(
+            parse_headers(&mut h, hdr.as_bytes()),
+            Err(ParseError::TooManyHeaders)
         );
     }
 }

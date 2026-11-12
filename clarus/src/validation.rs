@@ -117,6 +117,35 @@ pub struct OriginalAttributeItem {
     pub reason: &'static str,
 }
 
+/// Build the DICOM header elements that FR-001 generated for an instance.
+///
+/// A coerced store fills an empty PatientID/PatientName in the MANIFEST, but
+/// the stored blob kept no such element - so QIDO found the instance and
+/// WADO-RS `/metadata` (which reads the blob) did not. These are the SAME
+/// values written as ordinary Explicit VR LE elements, in ascending tag order
+/// so the dataset stays walkable:
+///
+///     (0010,0010) PN PatientName
+///     (0010,0020) LO PatientID
+///
+/// Callers must place the result BEFORE (7FE0,0010) PixelData: a header
+/// attribute appended to the tail of a file is never read, because the
+/// metadata walk stops at the pixel data.
+///
+/// Empty values are skipped - a coercion that generated nothing writes nothing,
+/// and an empty PN/LO element would claim a value where there is none.
+#[must_use]
+pub fn build_coerced_patient_elements(patient_name: &str, patient_id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(patient_name.len() + patient_id.len() + 16);
+    if !patient_name.is_empty() {
+        write_element(&mut out, 0x0010, 0x0010, "PN", patient_name.as_bytes());
+    }
+    if !patient_id.is_empty() {
+        write_element(&mut out, 0x0010, 0x0020, "LO", patient_id.as_bytes());
+    }
+    out
+}
+
 /// Build DICOM (0400,0561) OriginalAttributesSequence binary.
 ///
 /// Structure (DICOM PS3.3 Table C.12.1.1.9-1):
@@ -372,5 +401,50 @@ mod tests {
         write_element(&mut buf, 0xFFFE, 0xE000, "SQ", &[1, 2, 3]);
         assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 3);
         assert_eq!(&buf[8..], &[1, 2, 3]);
+    }
+
+    // -- FR-001b: the generated patient elements -------------------------
+
+    /// The two generated elements are written as ordinary Explicit VR LE
+    /// attributes a reader can walk, in ascending tag order.
+    #[test]
+    fn the_coerced_patient_elements_are_walkable() {
+        let buf = build_coerced_patient_elements("Anonymous^Patient", "AUTOPAT_1234");
+        let walked = walk(&buf);
+        assert_eq!(walked.len(), 2, "PN then LO, nothing else");
+        assert_eq!(walked[0].0, (0x0010, 0x0010), "PatientName first");
+        assert_eq!(&walked[0].1, b"PN");
+        assert_eq!(walked[1].0, (0x0010, 0x0020), "PatientID second");
+        assert_eq!(&walked[1].1, b"LO");
+        // The values are what the manifest holds, and every length is even
+        // (PS3.5 7.1.1: the pad byte is part of the value). "Anonymous^Patient"
+        // is 17 bytes, so it is padded to 18.
+        assert_eq!(walked[0].2, 18, "17-byte PN padded to an even length");
+        assert_eq!(&buf[8..26], b"Anonymous^Patient ");
+        assert!(walked[0].2.is_multiple_of(2), "PN padded to even");
+        assert!(walked[1].2.is_multiple_of(2), "LO padded to even");
+    }
+
+    /// An odd-length value is padded with SPACE, and the length field states
+    /// the PADDED size - a reader that trusts it must land on the next tag.
+    #[test]
+    fn an_odd_patient_name_is_space_padded() {
+        // 5 bytes -> 6 with the pad.
+        let buf = build_coerced_patient_elements("A^B^C", "P1");
+        let walked = walk(&buf);
+        assert_eq!(walked[0].2, 6, "padded length");
+        assert_eq!(&buf[8..14], b"A^B^C ", "trailing SPACE, not NUL");
+    }
+
+    /// Nothing generated means nothing written: an empty value must not become
+    /// an empty element, which would claim a value where there is none.
+    #[test]
+    fn empty_values_produce_no_elements() {
+        assert!(build_coerced_patient_elements("", "").is_empty());
+        // Only one of the two coerced: only that element is written.
+        let only_id = build_coerced_patient_elements("", "AUTOPAT_X");
+        let walked = walk(&only_id);
+        assert_eq!(walked.len(), 1);
+        assert_eq!(walked[0].0, (0x0010, 0x0020));
     }
 }

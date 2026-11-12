@@ -622,6 +622,12 @@ pub struct WorkflowConfig {
     /// Default 200. A client `limit` above this is CLAMPED, and so is a
     /// default-derived one: this is the bound that stops one request from
     /// pulling a whole site's worklist in one answer.
+    ///
+    /// `0` is REFUSED at load rather than read as "unlimited". Unlimited is the
+    /// obvious temptation, but it would make the ceiling a no-op exactly where
+    /// it matters, and `limit.min(0)` would then answer every client limit with
+    /// zero results. The unbounded mode lives in `mwl_default_limit = 0`
+    /// instead, which the search resolves back to this ceiling.
     pub mwl_max_responses: u64,
     /// The `[btree] root` this config was loaded with, used to derive the
     /// default directory. Empty in a hand-built config, which then falls back
@@ -1408,10 +1414,40 @@ impl ConfParser {
     /// bounded numeric key must NOT use this: an unparseable value becomes
     /// indistinguishable from an absent one, so a range check placed after it
     /// can never fire and `abc` silently turns into the default.
+    ///
+    /// Boolean keys should use [`parse_bool`] instead, for the same reason.
     pub fn get_or<T: FromStr>(&self, section: &str, key: &str, default: T) -> T {
         self.get(section, key)
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
+    }
+}
+
+/// Read a boolean key, failing loudly on anything that is not `true`/`false`.
+///
+/// `get_or::<bool>` accepted only the exact lowercase words, so `True`, `TRUE`,
+/// `yes` or `1` fell through to the default. That is a silent WRONG ANSWER, not
+/// a tidy fallback, when the default is the permissive side of a security dial:
+/// `[server] require_proxy_identity = True` turned the requirement OFF while
+/// the operator read it as on. The same shape as `parse_bounded_u64`: absent ->
+/// `default`, present but unrecognised -> error naming section and key.
+///
+/// Case is folded because `True`/`FALSE` are natural in a hand-written config
+/// and carry no ambiguity. Everything else - including `1`/`0`, `yes`/`no`,
+/// `on`/`off` and the empty string - is refused rather than guessed at: a
+/// spelling this parser does not know is a spelling the operator should fix.
+pub fn parse_bool(p: &ConfParser, section: &str, key: &str, default: bool) -> Result<bool, String> {
+    let Some(raw) = p.get(section, key) else {
+        return Ok(default);
+    };
+    if raw.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if raw.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(format!(
+            "clarus.conf [{section}] {key}: '{raw}' is not a boolean (accepted: true, false)"
+        ))
     }
 }
 
@@ -2078,8 +2114,8 @@ impl Config {
                 }
                 v
             },
-            require_proxy_identity: p.get_or("server", "require_proxy_identity", false),
-            anyclass_enable: p.get_or("server", "anyclass_enable", false),
+            require_proxy_identity: parse_bool(&p, "server", "require_proxy_identity", false)?,
+            anyclass_enable: parse_bool(&p, "server", "anyclass_enable", false)?,
             // Administrative surface networks. Absent = empty = local machine
             // only. A typo in one entry fails startup rather than silently
             // widening or narrowing access.
@@ -2142,8 +2178,9 @@ impl Config {
             // -- [query] default QIDO limit -------------------------
             query: {
                 let default_limit: u64 = p.get_or("query", "default_limit", 250u64);
-                let case_sensitive_pn: bool = p.get_or("query", "case_sensitive_pn", true);
-                let fuzzymatch_override: bool = p.get_or("query", "fuzzymatch_override", false);
+                let case_sensitive_pn: bool = parse_bool(&p, "query", "case_sensitive_pn", true)?;
+                let fuzzymatch_override: bool =
+                    parse_bool(&p, "query", "fuzzymatch_override", false)?;
                 QueryConfig {
                     default_limit,
                     case_sensitive_pn,
@@ -2154,7 +2191,7 @@ impl Config {
             // -- [ups] UPS-RS search default limit + Task Producer (12.09) --
             ups: {
                 let default_limit: u64 = p.get_or("ups", "default_limit", 100u64);
-                let task_producer: bool = p.get_or("ups", "task_producer", false);
+                let task_producer: bool = parse_bool(&p, "ups", "task_producer", false)?;
                 // Validated, not clamped: a typo must not silently buy a
                 // different retry budget than the operator wrote. Parsed
                 // explicitly rather than through `get_or`, because `get_or`
@@ -2485,7 +2522,7 @@ impl Config {
             // typo must not silently buy a different bound than the operator
             // wrote, and `parse_bounded_u64` names the accepted range.
             workflow: {
-                let enabled: bool = p.get_or("workflow", "enabled", false);
+                let enabled: bool = parse_bool(&p, "workflow", "enabled", false)?;
                 // An explicit dir resolves against the config file's parent,
                 // exactly as `[btree] root` does; absent or empty leaves the
                 // default derivation to `resolved_dir`.
@@ -2589,17 +2626,20 @@ impl Config {
                         }
                     }
                 },
-                access_prune_dry_run: p.get_or("audit", "access_prune_dry_run", false),
+                access_prune_dry_run: parse_bool(&p, "audit", "access_prune_dry_run", false)?,
             },
 
             log_level: {
                 let raw = p.get_or("logging", "log_level", "info".to_string());
                 LogLevel::parse(&raw)?
             },
-            log_dir: p.get_or("logging", "log_dir", "./logs".to_string()),
+            log_dir: resolve(
+                base_dir,
+                &p.get_or("logging", "log_dir", "./logs".to_string()),
+            ),
             #[cfg(feature = "s3")]
             s3,
-            jpeg2000_enabled: p.get_or("features", "jpeg2000", false),
+            jpeg2000_enabled: parse_bool(&p, "features", "jpeg2000", false)?,
         };
 
         // Warn if [s3] section is present but s3 feature is not compiled in.
@@ -4882,6 +4922,67 @@ port = 8024
         )
         .expect("write conf");
         Config::from_file(&conf)
+    }
+
+    /// A boolean key must never fall back to its default on a spelling it does
+    /// not know.
+    ///
+    /// `get_or::<bool>` accepted only exact `true`/`false`, so every other
+    /// spelling became the default. For `require_proxy_identity` the default is
+    /// the PERMISSIVE side, so `True` - which any operator would read as "on" -
+    /// silently disabled the requirement. That is the worst kind of config bug:
+    /// the file says one thing and the server does another, with no error.
+    #[test]
+    fn test_config_boolean_keys_refuse_unknown_spellings() {
+        // Accepted spellings fold case; `True` means TRUE, not the default.
+        for (text, want) in [
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("false", false),
+            ("FALSE", false),
+        ] {
+            let c = load_workflow(&format!("[server]\nrequire_proxy_identity = {text}"))
+                .unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(
+                c.require_proxy_identity, want,
+                "'{text}' must parse as {want}"
+            );
+        }
+
+        // `True` on a key whose default is false proves the value was READ,
+        // not defaulted: the default would also be false for a broken parse.
+        let c = load_workflow("[workflow]\nenabled = True").expect("parse");
+        assert!(c.workflow.enabled, "'True' must enable the surface");
+
+        // Anything else is refused, naming the section and the key.
+        for bad in ["yes", "1", "on", "t", "", "truthy"] {
+            let err = load_workflow(&format!("[workflow]\nenabled = {bad}"))
+                .err()
+                .unwrap_or_else(|| panic!("'{bad}' must be refused"));
+            assert!(
+                err.contains("[workflow]") && err.contains("enabled"),
+                "'{bad}' must be named in the error: {err}"
+            );
+            assert!(err.contains("boolean"), "'{bad}': {err}");
+        }
+
+        // The same guard applies to every boolean key, not just one section.
+        for (body, key) in [
+            ("[server]\nanyclass_enable = yes", "anyclass_enable"),
+            ("[query]\ncase_sensitive_pn = maybe", "case_sensitive_pn"),
+            ("[ups]\ntask_producer = 1", "task_producer"),
+            (
+                "[audit]\naccess_prune_dry_run = off",
+                "access_prune_dry_run",
+            ),
+            ("[features]\njpeg2000 = on", "jpeg2000"),
+        ] {
+            let err = load_workflow(body)
+                .err()
+                .unwrap_or_else(|| panic!("'{key}' must be refused"));
+            assert!(err.contains(key), "'{key}' must be named: {err}");
+        }
     }
 
     /// An absent `[workflow]` section yields the shipped defaults: the surface

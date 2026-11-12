@@ -140,6 +140,45 @@ class TestJsonToDataset:
         # Only SpecificCharacterSet (0008,0005) is always added
         assert len(list(ds)) == 1
 
+    def test_charset_stays_utf8_when_study_json_has_iso_ir_100(self):
+        """INC-004 class: a study row carrying its own charset must not
+        overwrite the forced UTF-8, or a Cyrillic value becomes unencodable.
+
+        The series map already omits 0008,0005 for this reason; the study map
+        mapped it, so the server's Latin-1 declaration replaced the forced
+        UTF-8 and pydicom then wrote '?' replacement characters on the wire.
+        """
+        import io
+
+        from pydicom import dcmwrite
+        from pydicom.dataset import FileMetaDataset
+        from pydicom.uid import ExplicitVRLittleEndian
+
+        study_json = {
+            "00080005": {"vr": "CS", "Value": ["ISO_IR 100"]},
+            "00100010": {"vr": "PN", "Value": [{"Alphabetic": "Петров^Иван"}]},
+            "0020000D": {"vr": "UI", "Value": ["1.2.3"]},
+        }
+        ds = _json_to_dataset(study_json, {"PatientName"})
+
+        assert str(ds.SpecificCharacterSet) == "ISO_IR 192"
+        assert "00080005" not in QIDO_KEY_TO_TAG, (
+            "mapping 0008,0005 lets the server charset overwrite the forced UTF-8"
+        )
+        assert "?" not in str(ds.PatientName)
+
+        # The declaration is only useful if the value ENCODES: with the wrong
+        # charset pydicom warns "using replacement characters" and writes '?'.
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        ds.file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.2"
+        ds.file_meta.MediaStorageSOPInstanceUID = "1.2.3.4.5"
+        buf = io.BytesIO()
+        dcmwrite(buf, ds, enforce_file_format=True)
+        assert "Петров^Иван".encode("utf-8") in buf.getvalue(), (
+            "the Cyrillic name was not encoded as UTF-8 on the wire"
+        )
+
 
 class TestJsonToDatasetSeries:
     """Tests for _json_to_dataset_series() - series rows + study identity."""
@@ -183,7 +222,6 @@ class TestJsonToDatasetSeries:
         ds = _json_to_dataset_series(series_json, set(), None)
         assert str(ds.SpecificCharacterSet) == "ISO_IR 192"
         assert "00080005" not in QIDO_SERIES_KEY_TO_TAG
-
     def test_no_study_json_no_identity(self):
         series_json = {"0020000E": {"Value": ["2.25.5555666677778888"]}}
         ds = _json_to_dataset_series(series_json, set(), None)

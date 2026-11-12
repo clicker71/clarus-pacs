@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
-"""Clarus Bridge v0.3.0-beta - DIMSE to DICOMweb bridge.
+"""Clarus Bridge v0.3.1-beta - DIMSE to DICOMweb bridge.
 
 C-STORE to STOW-RS, C-FIND to QIDO-RS,  MWL to UPS-RS, N-ACTION to Storage
 Commitment, C-MOVE to WADO-RS streaming plus C-STORE forwarding.
@@ -26,7 +26,7 @@ CLI:
 import logging
 from urllib.parse import urlsplit
 
-VERSION = "0.3.0-beta"
+VERSION = "0.3.1-beta"
 
 class ConfParser:
     """Parses clbridge.conf (nginx-style: [section], key = value, # comment)."""
@@ -65,7 +65,14 @@ class ConfParser:
         v = self.get(section, key)
         if v is None or v == "":
             return default
-        return int(v)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            # A bare "invalid literal for int()" leaves the operator to guess
+            # which of a hundred keys broke the start-up. Name it.
+            raise ValueError(
+                f"[{section}] {key}: expected an integer, got {v!r}"
+            ) from None
 
     def get_float(self, section, key, default=None):
         """Get a config value as float, with explicit range validation."""
@@ -128,6 +135,29 @@ def validate_clarus_url(cfg):
         raise ValueError(
             f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
             "has no host (expected scheme://host[:port]/dicomweb)"
+        )
+
+    # `urlsplit` accepts any text after ':' as the netloc, so `host:abc` and
+    # `host:99999` pass the checks above and only fail when the first request
+    # tries to connect. `parts.port` raises ValueError for a non-numeric port
+    # and for one outside 0-65535, which is exactly the configuration error to
+    # report here. A URL with NO port yields None and stays valid: the scheme
+    # default (80/443) is implied by the HTTP client, and every caller here
+    # passes the URL straight to it.
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError(
+            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            "has an invalid port (expected a number between 1 and 65535)"
+        ) from None
+    # `urlsplit` returns 0 for ':0' without raising. Port 0 means "pick any
+    # free port" for a BIND, which is meaningless for a CLIENT endpoint, so
+    # accepting it started the bridge with a URL it can never reach.
+    if port == 0:
+        raise ValueError(
+            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            "has port 0 (expected a number between 1 and 65535)"
         )
 
     # Trailing slash is stripped (not an error).
@@ -764,8 +794,15 @@ STUDY_ROOT_UID = "1.2.840.10008.5.1.4.1.2.2.1"
 MWL_UID = "1.2.840.10008.5.1.4.31"
 
 # QIDO JSON key -> (DICOM tag group, element, VR, keyword)
+#
+# DELIBERATE omission: 0008,0005 SpecificCharacterSet. _json_map_to_dataset
+# forces ISO_IR 192 (UTF-8) on the dataset BEFORE this map is applied, so that
+# Cyrillic PatientName / StudyDescription survives (INC-004). A server study
+# row that carries its own charset would REPLACE that value - the row is the
+# server's opinion of the bytes it stored, not of the bytes this bridge emits -
+# and a Latin-1 declaration makes a Cyrillic value unencodable on the wire.
+# The series map below omits the same key for the same reason.
 QIDO_KEY_TO_TAG = {
-    "00080005": (0x0008, 0x0005, "CS", "SpecificCharacterSet"),
     "00080020": (0x0008, 0x0020, "DA", "StudyDate"),
     "00080030": (0x0008, 0x0030, "TM", "StudyTime"),
     "00080050": (0x0008, 0x0050, "SH", "AccessionNumber"),
@@ -1067,7 +1104,43 @@ MWL_TO_UPS_PARAM = {
     "PatientID": "00100020",
     "StudyInstanceUID": "0020000D",
     "ProcedureStepState": "00741000",
+    "ScheduledProcedureStepStartDate": "00404005",
 }
+
+def _mwl_date_to_ups_datetime(value):
+    """Map a (0040,0002) DA match value onto the (0040,4005) DT grammar.
+
+    MWL matches a DATE; UPS stores a DATETIME. The server compares the query
+    value against the stored DT with string semantics inside an inclusive
+    range (`<lo>-<hi>`), so:
+      - `YYYYMMDD`        -> `YYYYMMDD000000-YYYYMMDD235959` (the whole day)
+      - `YYYYMMDD-YYYYMMDD` -> `YYYYMMDD000000-YYYYMMDD235959`
+      - a DT-shaped value is passed through untouched (some senders fill the
+        DA key with the full instant).
+    An unusable value is returned unchanged: a filter that cannot be built is
+    not a reason to widen the search silently, and the server answers the
+    unchanged form as it always has.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    def _day(part):
+        part = part.strip()
+        return part if len(part) == 8 and part.isdigit() else None
+
+    if "-" in text:
+        low, _, high = text.partition("-")
+        lo, hi = _day(low), _day(high)
+        # Open-ended ranges keep their open end (the server treats an empty
+        # bound as unbounded).
+        if lo is None and hi is None:
+            return text
+        return f"{lo or ''}000000-{hi or ''}235959" if (lo or hi) else text
+    day = _day(text)
+    if day is None:
+        return text
+    return f"{day}000000-{day}235959"
 
 def _build_mwl_params(ds):
     """Build UPS-RS workitems query params from a C-FIND MWL request Dataset.
@@ -1104,6 +1177,8 @@ def _build_mwl_params(ds):
         else:
             val = str(elem.value).strip()
         if val:
+            if keyword == "ScheduledProcedureStepStartDate":
+                val = _mwl_date_to_ups_datetime(val)
             params[param] = val
     return params
 
@@ -1114,32 +1189,51 @@ def _safe_add_new(ds, group, elem, vr, val):
     except ValueError:
         ds[(group, elem)] = DataElement((group, elem), vr, val)
 
-def _json_add_vr(ds, group, elem, vr, raw_first):
+def _json_add_vr(ds, group, elem, vr, raw_value):
     """Add one DICOMweb JSON value to `ds` under the element's VR (CMP-005).
 
     The single place a JSON value becomes a pydicom element, shared by the
     QIDO and MWL converters so the two cannot drift on VR handling. Returns
     True when the element was added.
+
+    `raw_value` is the whole DICOMweb `Value` array (already checked non-empty
+    by the caller). CS, UI and SH are value-multiplicity VRs (PS3.5 Table
+    6.2-1): ModalitiesInStudy (0008,0061) legitimately carries several CS
+    values, and taking `Value[0]` reported one modality for a study performed
+    on three. Rendering the array with `str()` would be no better - the SCU
+    would read "['CT', 'MR']" as a single value.
+
+    A JSON `null` inside `Value` is an ABSENT value, not the text "None":
+    `["CT", null]` stringified the null into five characters that then
+    travelled to the SCU as a modality. Nulls are dropped before conversion;
+    an array of nothing but nulls carries no value at all and is not added.
     """
     try:
-        if vr == "PN":
-            # Person Name: prefer the Alphabetic component.
-            if isinstance(raw_first, dict):
-                val = raw_first.get("Alphabetic", "")
-            else:
-                val = str(raw_first)
-        elif vr == "IS":
-            val = int(raw_first)
-        elif vr == "TM":
-            # Time: normalize the display "HH:MM:SS" form to the canonical
-            # DICOM "HHMMSS.FFFFFF" (PS3.5 6.2). pydicom logs
-            # "Invalid value for VR TM: '11:25:01'" when a colon form is
-            # constructed (field noise on every C-FIND); stripping the
-            # colons keeps the attribute valid and warning-free.
-            val = str(raw_first).replace(":", "")
+        items = [v for v in raw_value if v is not None]
+        if not items:
+            return False
+        if vr in ("CS", "UI", "SH") and len(items) > 1:
+            val = [str(item) for item in items]
         else:
-            # CS, UI, LO, SH, DA - plain string. CS may arrive as a list.
-            val = str(raw_first)
+            raw_first = items[0]
+            if vr == "PN":
+                # Person Name: prefer the Alphabetic component.
+                if isinstance(raw_first, dict):
+                    val = raw_first.get("Alphabetic", "")
+                else:
+                    val = str(raw_first)
+            elif vr == "IS":
+                val = int(raw_first)
+            elif vr == "TM":
+                # Time: normalize the display "HH:MM:SS" form to the canonical
+                # DICOM "HHMMSS.FFFFFF" (PS3.5 6.2). pydicom logs
+                # "Invalid value for VR TM: '11:25:01'" when a colon form is
+                # constructed (field noise on every C-FIND); stripping the
+                # colons keeps the attribute valid and warning-free.
+                val = str(raw_first).replace(":", "")
+            else:
+                # LO, DA - plain string.
+                val = str(raw_first)
     except (TypeError, ValueError, IndexError):
         return False
     _safe_add_new(ds, group, elem, vr, val)
@@ -1177,7 +1271,7 @@ def _json_map_to_dataset(json_obj, keymap):
             # zero-length attribute; we deliberately do not do that (keeps
             # the rows minimal and is tolerated by all viewers).
             continue
-        _json_add_vr(ds, group, elem, vr, raw_value[0])
+        _json_add_vr(ds, group, elem, vr, raw_value)
     return ds
 
 def _json_to_dataset(json_obj, request_keywords):
@@ -1189,12 +1283,18 @@ def _json_first_value(json_obj, key):
 
     PN values arrive as {"Alphabetic": ...} objects; everything else as
     plain strings/numbers.
+
+    A JSON null (or an empty list) means the attribute carries NO value, and
+    returns None rather than the string "None": `str(None)` is a plausible
+    looking token that then travels as a UID.
     """
     attr = json_obj.get(key) or {}
     values = attr.get("Value") or []
     if not values:
         return ""
     first = values[0]
+    if first is None:
+        return None
     if isinstance(first, dict):
         return str(first.get("Alphabetic", ""))
     return str(first)
@@ -1248,18 +1348,22 @@ def _json_to_dataset_series(json_obj, request_keywords, study_json=None):
     return ds
 
 def _mwl_tail(value):
-    """Last MWL_SPS_ID_LEN characters of an identifier, or '' when too short.
+    """An identifier that fits MWL_SPS_ID_LEN characters, or '' when absent.
 
     Both identifiers below live in VR SH (16 characters). A UPS workitem UID is
     `2.25.<decimal u128>` (up to 43 characters), so it cannot be carried
-    verbatim; the tail is used instead. This is a DERIVATION into an
+    verbatim and its tail is used instead. This is a DERIVATION into an
     identifier's own scoped namespace, not a truncation of a value the modality
     must round-trip: a modality only needs a stable handle to couple MPPS to
     the step, and SPS ID is scoped by the Requested Procedure (PS3.3 C.4.10).
+
+    A value that ALREADY fits is returned unchanged. Returning '' for it made
+    a short workitem UID yield no (0040,0009) at all - a Type 1 MWL key - even
+    though the only reason to shorten anything is the VR's 16 characters.
     """
     text = str(value or "").strip()
-    if len(text) < MWL_SPS_ID_LEN:
-        return ""
+    if len(text) <= MWL_SPS_ID_LEN:
+        return text
     return text[-MWL_SPS_ID_LEN:]
 
 def _mwl_sps_id(workitem_uid):
@@ -1349,7 +1453,7 @@ def _json_to_dataset_mwl(json_obj, request_keywords):
                 # attribute with no value is absent from the row (documented
                 # deviation, PS3.4 C.4.1.1.3.2 note 2 would allow zero-length).
                 continue
-            _json_add_vr(target, group, elem, vr, raw_value[0])
+            _json_add_vr(target, group, elem, vr, raw_value)
 
     # Identifier level: the two Return keys, then the request-gated Optional
     # ones. The study and the accession live in the Referenced Request
@@ -1367,6 +1471,17 @@ def _json_to_dataset_mwl(json_obj, request_keywords):
         # dropped StudyInstanceUID while leaving the RP ID derived from it.
         if flat_key == "0020000D":
             value = _json_workitem_study_uid(json_obj)
+        elif flat_key == "00080050":
+            # AccessionNumber (0008,0050) is Type 2: a present-but-EMPTY flat
+            # tag is the valid "not recorded" marker, not a value. The
+            # accession's standard carriage is (0040,A370) Referenced Request
+            # Sequence (PS3.4 Table CC.2.5-3), so it is resolved FIRST, with
+            # the bare tag only as a fallback. The old guard skipped the
+            # resolution on the bare tag's mere presence, so an empty flat tag
+            # shadowed a sequence value and fill() dropped the attribute.
+            value = _json_seq_first_value(
+                json_obj, seq_key, item_key
+            ) or _json_first_value(json_obj, flat_key)
         else:
             if flat_key in optional_source:
                 continue
@@ -1431,15 +1546,20 @@ def _parse_n_action_rq(event):
     Returns (transaction_uid, [(sop_class_uid, sop_instance_uid), ...]).
     Raises ValueError if TransactionUID (0008,1195) is missing.
     """
-    # pynetdicom N-ACTION-RQ: dataset is in .dataset or fallback to .action_information
+    # An N-ACTION-RQ carries its payload as the Action Information parameter
+    # (PS3.7 9.3.2), which is `event.action_information`. `event.dataset` reads
+    # the C-STORE Data Set parameter instead and RAISES for an N-ACTION, so it
+    # is only a fallback for test doubles that populate it.
+    ds = None
     try:
-        ds = event.dataset
+        ds = event.action_information
     except AttributeError:
-        ds = (
-            event.action_information
-            if hasattr(event, "action_information")
-            else Dataset()
-        )
+        pass
+    if ds is None:
+        try:
+            ds = event.dataset
+        except AttributeError:
+            ds = Dataset()
     tx_uid = getattr(ds, "TransactionUID", None)
     if not tx_uid or str(tx_uid).strip() == "":
         raise ValueError("N-ACTION-RQ: missing TransactionUID (0008,1195)")
@@ -1492,7 +1612,7 @@ def _build_n_action_rsp(tx_uid, verified_sops, failed_sops):
 
 """Clarus Bridge  -  SOP Class and Printer registries.
 
-YAML-driven SOP class acceptance. 11 built-in fallback classes.
+YAML-driven SOP class acceptance. 13 built-in fallback classes.
 Printer registry for C-PRINT (P22c).
 """
 
@@ -1526,9 +1646,17 @@ def _parse_simple_yaml(path):
                 # Top-level section: "sop_classes:" or "printers:"
                 current_section = stripped[:-1].strip()
                 result[current_section] = {}
-            elif indent == 2 and stripped.endswith(":"):
-                # UID/name key: "  1.2.840...:"
-                current_uid = stripped[:-1].strip().strip("\"'")
+            elif indent == 2:
+                # UID/name key: "  1.2.840...:". An inline comment after the
+                # colon ("  1.2.840...:  # MR") is documentation, not part of
+                # the key: strip it BEFORE the `endswith(":")` test, otherwise
+                # the line ends on the comment, the header is skipped and the
+                # NEXT `accept:` line lands on the PREVIOUS UID - re-enabling
+                # a class the operator switched off.
+                header = stripped.split("#", 1)[0].rstrip()
+                if not header.endswith(":"):
+                    continue
+                current_uid = header[:-1].strip().strip("\"'")
                 current_entry = {}
                 if current_section:
                     result[current_section][current_uid] = current_entry
@@ -1564,27 +1692,92 @@ def _load_sop_registry(yaml_path="sop_classes.yaml"):
     try:
         data = _parse_simple_yaml(yaml_path)
         registry = data.get("sop_classes", {}) if data else {}
-        if registry:
-            logging.info(
-                "[SOP-REG] Loaded %d SOP classes from %s", len(registry), yaml_path
-            )
-            return registry
     except FileNotFoundError:
         logging.info("[SOP-REG] Using built-in SOP defaults (no custom %s)", yaml_path)
+        return _BUILTIN_SOP_CLASSES()
     except Exception as e:
         logging.info(
             "[SOP-REG] Using built-in SOP defaults: %s parse error - %s", yaml_path, e
         )
+        return _BUILTIN_SOP_CLASSES()
 
+    if registry:
+        # A file that parses but yields an entry without `accept` means the
+        # parser desynchronised for THAT entry. Accepting it as-is silently
+        # turns an unreadable class into an accepted one, so the entry is
+        # dropped and reported. Replacing the WHOLE registry with the built-ins
+        # (the old behaviour) threw away every correct line as well - an
+        # operator's `accept: false` was replaced by a built-in `accept: true`,
+        # so a class they switched off came back on.
+        broken = sorted(uid for uid, entry in registry.items() if "accept" not in entry)
+        if broken:
+            logging.error(
+                "[SOP-REG] %s: %d SOP class entr%s without `accept` (%s) - "
+                "those entries are ignored, the rest of the file is used",
+                yaml_path,
+                len(broken),
+                "y" if len(broken) == 1 else "ies",
+                ", ".join(broken[:3]) + (", ..." if len(broken) > 3 else ""),
+            )
+            for uid in broken:
+                registry.pop(uid, None)
+        # `accept` must be a real boolean. `_parse_simple_yaml` already turns
+        # the two literals into bools, so anything else got here as a STRING
+        # (`accept: yes`, `accept: 1`, `accept: on`) and `bool("no")` is True.
+        # Coercing it would accept a class the operator wrote as refused, which
+        # is the same silent-wrong-answer failure as a missing key, so such an
+        # entry is dropped rather than corrected - never the whole file.
+        mistyped = sorted(
+            uid for uid, entry in registry.items() if not isinstance(entry["accept"], bool)
+        )
+        if mistyped:
+            for uid in mistyped:
+                logging.error(
+                    "[SOP-REG] %s: SOP class %s has non-boolean accept=%r - "
+                    "expected true or false; entry ignored",
+                    yaml_path,
+                    uid,
+                    registry[uid]["accept"],
+                )
+            logging.error(
+                "[SOP-REG] %d SOP class entr%s with a non-boolean `accept` - "
+                "ignored; the other %d entr%s of the file are still used",
+                len(mistyped),
+                "y" if len(mistyped) == 1 else "ies",
+                len(registry) - len(mistyped),
+                "y" if len(registry) - len(mistyped) == 1 else "ies",
+            )
+            for uid in mistyped:
+                registry.pop(uid, None)
+        if not registry:
+            logging.error(
+                "[SOP-REG] %s yielded no usable SOP class - using built-in defaults",
+                yaml_path,
+            )
+            return _BUILTIN_SOP_CLASSES()
+        logging.info(
+            "[SOP-REG] Loaded %d SOP classes from %s", len(registry), yaml_path
+        )
+        return registry
+
+    logging.info(
+        "[SOP-REG] %s parsed to zero SOP classes - using built-in defaults", yaml_path
+    )
     return _BUILTIN_SOP_CLASSES()
 
 def _BUILTIN_SOP_CLASSES():
-    """Return 11 built-in SOP classes  -  always available, no dependencies (CMP-006).
+    """Return 13 built-in SOP classes  -  always available, no dependencies (CMP-006).
 
-    Includes 3 legacy Retired classes still in active use on pre-2006 equipment:
-    - MG For Processing (Retired): replaced by 1.2.840.10008.5.1.4.1.1.1.2.1
-    - US Multi-frame (Retired): replaced by 1.2.840.10008.5.1.4.1.1.6.1
-    - NM (Retired): replaced by 1.2.840.10008.5.1.4.1.1.20
+    Both the current and the Retired UID are listed for the two classes whose
+    UID was re-issued, because the fallback runs precisely when no
+    sop_classes.yaml exists and the installed base is unknown: a cine loop
+    arrives as 1.2.840.10008.5.1.4.1.1.3.1 on current equipment and as
+    1.2.840.10008.5.1.4.1.1.3 on pre-2006 equipment.
+
+    Retired classes kept for pre-2006 equipment still in active use:
+    - MG For Processing (Retired): 1.2.840.10008.5.1.4.1.1.1.2.1
+    - US Multi-frame (Retired): 1.2.840.10008.5.1.4.1.1.3, superseded by ...3.1
+    - NM (Retired): 1.2.840.10008.5.1.4.1.1.5, superseded by ...20
     """
     return {
         "1.2.840.10008.1.1": {"name": "Verification", "accept": True},
@@ -1621,6 +1814,15 @@ def _BUILTIN_SOP_CLASSES():
         },
         "1.2.840.10008.5.1.4.1.1.5": {
             "name": "Nuclear Medicine Image Storage (Retired)",
+            "accept": True,
+        },
+        # Current UIDs of the same two classes (PS3.6 Table A-1).
+        "1.2.840.10008.5.1.4.1.1.3.1": {
+            "name": "Ultrasound Multi-frame Image Storage",
+            "accept": True,
+        },
+        "1.2.840.10008.5.1.4.1.1.20": {
+            "name": "Nuclear Medicine Image Storage",
             "accept": True,
         },
     }
@@ -1667,111 +1869,6 @@ def _load_printer_registry(yaml_path="printers.yaml"):
         logging.info("[PRINT-REG] Printers config parse error - %s: %s", yaml_path, e)
 
     return {}
-
-# ---------------------------------------------------------------------------
-# Bridge: sop_index
-# ---------------------------------------------------------------------------
-
-"""SOP Instance UID index  -  filesystem-backed key-value store.
-
-nginx-way: one JSON file per SOP UID. Directory = index.
-No SQLite. No locks. No busy_timeout.
-"""
-
-import json
-import logging
-import os
-import time
-
-class SopIndexManager:
-    """Filesystem-backed index: SOPInstanceUID -> (StudyInstanceUID, SeriesInstanceUID).
-
-    Layout:
-        sop_index/{sop_uid}.json -> {"study_uid": "...", "series_uid": "...",
-                                     "ts": ..., "is_verified": false}
-
-    Populated at C-STORE time after successful STOW-RS (HTTP 200/201/202).
-    Looked up at N-ACTION time to verify Storage Commitment.
-    """
-
-    def __init__(self, index_dir):
-        """index_dir: path to sop_index directory (created if absent)."""
-        self._dir = index_dir
-        os.makedirs(self._dir, exist_ok=True)
-
-    def _path(self, sop_uid):
-        safe = sop_uid.replace("\x00", "_").replace("/", "_").replace("\\", "_")
-        return os.path.join(self._dir, f"{safe}.json")
-
-    def insert_sop(self, sop_uid, study_uid, series_uid):
-        """Insert or replace a SOP entry. Idempotent."""
-        data = {
-            "study_uid": study_uid,
-            "series_uid": series_uid,
-            "ts": int(time.time()),
-            "is_verified": False,
-        }
-        path = self._path(sop_uid)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-            f.flush()
-        os.replace(tmp, path)
-
-    def lookup_sop(self, sop_uid):
-        """Look up a SOP UID. Returns dict or None."""
-        path = self._path(sop_uid)
-        if not os.path.isfile(path):
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logging.warning("[SOP-INDEX] Corrupt %s: %s", path, e)
-            return None
-
-    def mark_verified(self, sop_uid):
-        """Mark a SOP as verified after successful N-ACTION check."""
-        entry = self.lookup_sop(sop_uid)
-        if entry is None:
-            return
-        entry["is_verified"] = True
-        path = self._path(sop_uid)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(entry, f)
-            f.flush()
-        os.replace(tmp, path)
-
-    def cleanup(self, max_age_seconds=86400):
-        """Remove entries older than max_age_seconds (default: 24h)."""
-        cutoff = time.time() - max_age_seconds
-        removed = 0
-        try:
-            for name in os.listdir(self._dir):
-                if not name.endswith(".json"):
-                    continue
-                path = os.path.join(self._dir, name)
-                try:
-                    if os.path.getmtime(path) < cutoff:
-                        os.unlink(path)
-                        removed += 1
-                except OSError:
-                    pass
-        except OSError:
-            pass
-        if removed > 0:
-            logging.info("[SOP-INDEX] Cleaned %d entries", removed)
-
-    def count(self):
-        """Return total number of entries."""
-        try:
-            return sum(1 for n in os.listdir(self._dir) if n.endswith(".json"))
-        except OSError:
-            return 0
-
-    def close(self):
-        """No-op on filesystem."""
 
 # ---------------------------------------------------------------------------
 # Bridge: streaming
@@ -2141,6 +2238,7 @@ and C-STORE dataset size measurement.
 import hashlib
 import hmac
 import io
+import ipaddress
 import logging
 import os
 import signal
@@ -2291,6 +2389,116 @@ def _measure_dataset_bytes(dataset, event=None):
 # ---------------------------------------------------------------------------
 # Bridge: PatientName masking - no PHI in logs.
 # ---------------------------------------------------------------------------
+def replace_with_retry(src, dst, attempts=50):
+    """Publish `src` over `dst` atomically, retrying a transient refusal.
+
+    `os.replace` is atomic but NOT free of contention on Windows: it is built
+    on ReplaceFile, which fails with a sharing violation (WinError 5/32) when
+    the destination is momentarily held open by another handle - a concurrent
+    writer, a reader mid-parse, or the OS itself. Measured on this code base:
+    8 threads publishing the same destination lost ~10% of the renames, and a
+    single thread in isolation never does.
+
+    Retrying is the whole fix: the window is a single syscall wide, so a short
+    escalating sleep converges almost immediately (measured: 265 failures
+    without a retry, zero with one, ~0.9 extra attempts per publish). The
+    attempt budget bounds the cost when the destination is genuinely locked
+    forever, and the last error is re-raised unchanged so callers keep their
+    existing error handling.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.001 * (attempt + 1))
+
+# Fixed-size lock striping. A dict keyed by SOP Instance UID (or by index-file
+# path) grows one entry per distinct key and nothing ever removes them, so a
+# 24/7 service leaks a lock object per instance received - monotonic RSS growth
+# with no upper bound. Stripes bound the registry at construction time.
+#
+# 256 stripes: two writers for the SAME key must still serialise, and they do
+# because equal keys hash to the same stripe. Distinct keys sharing a stripe
+# merely wait for each other, which costs concurrency but never correctness,
+# and 256 is far more than the handful of concurrent publishers this bridge
+# runs - the collision rate only matters if that count approaches the stripe
+# count.
+_STRIPE_COUNT = 256
+
+class LockStripes:
+    """A bounded replacement for a per-key dict of threading.Lock."""
+
+    __slots__ = ("_stripes",)
+
+    def __init__(self, count=_STRIPE_COUNT):
+        self._stripes = [threading.Lock() for _ in range(count)]
+
+    def for_key(self, key):
+        """Return the lock guarding `key`.
+
+        `hash()` is used rather than a digest because a single CPython process
+        keeps string hashes stable for its lifetime, and these keys never leave
+        the process. `zlib.crc32(key.encode())` would be the portable choice if
+        this ever had to agree across interpreters; it does not.
+        """
+        stripes = self._stripes
+        return stripes[hash(key) % len(stripes)]
+
+# ---------------------------------------------------------------------------
+# Peer address normalisation
+# ---------------------------------------------------------------------------
+def normalize_host(host):
+    """Canonical form of a peer address for EQUALITY comparison.
+
+    A `peers.conf` host may be `localhost`, an upper-case alias, a bracketed
+    IPv6 literal or this machine's FQDN, while a request's calling address is
+    the raw A-ASSOCIATE socket address (`127.0.0.1`, `::1`). String inequality
+    is not address inequality, so both sides go through this once before being
+    compared.
+
+    What it actually does, in order:
+      1. strips brackets and whitespace and lower-cases (a NAME is returned
+         lower-cased and otherwise untouched - no DNS lookup, no expansion);
+      2. the wildcard binds (`0.0.0.0`, `::`) and the literal `localhost`
+         become `127.0.0.1`;
+      3. anything the IPv4/IPv6 parser accepts is canonicalised by
+         `str(ip_address(...))`, and every address in the loopback BLOCK
+         (`127.0.0.0/8`, `::1`, and IPv4-mapped forms such as
+         `::ffff:127.0.0.1`) is collapsed to `127.0.0.1`.
+
+    It does NOT resolve names, does NOT expand a non-loopback alias to the
+    address the kernel would pick, and does NOT treat two different
+    non-loopback addresses as equal.
+    """
+    h = str(host or "").strip().lower().strip("[]")
+    if not h:
+        return ""
+    # Zero-compression-vs-explicit and IPv4-mapped forms are the same endpoint.
+    if h in ("0.0.0.0", "::"):
+        return "127.0.0.1"
+    if h == "localhost":
+        return "127.0.0.1"
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        return h
+    # An IPv4-mapped IPv6 address IS the IPv4 address: a dual-stack listener
+    # reports an IPv4 peer as `::ffff:10.0.0.5` while peers.conf says
+    # `10.0.0.5`, and comparing the two as written never matches. Unwrap
+    # first so the rest of the canonicalisation sees one address family.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    # The whole loopback block is one machine: `::1`, `[::1]` and `127.0.0.1`
+    # must compare equal or a peers.conf entry saying `localhost` disagrees
+    # with an A-ASSOCIATE from `::1`.
+    if addr.is_loopback:
+        return "127.0.0.1"
+    return str(addr)
+
 def mask_patient_name(name: str) -> str:
     """Mask PatientName for 152-FZ: Ivanov -> I....v, Smith -> S...h."""
     if not name:
@@ -2487,12 +2695,24 @@ def _load_or_create_key() -> bytes:
             os.close(fd)
         else:
             # Present but unusable: it cannot be trusted and `O_EXCL` would
-            # refuse to fix it, so it is replaced. The length is reported
-            # because a short key is a symptom worth seeing.
+            # refuse to fix it, so it is replaced.
+            #
+            # R11: re-read first. A SHORT file is also what a process sees
+            # while ANOTHER process is mid-publish, and replacing it there
+            # made two live processes hold DIFFERENT keys - the same PatientID
+            # then masked to different tokens, which breaks log correlation.
+            # `_read_key` retries with its own bounded pause, so a publication
+            # in flight gets to finish; ours is published only if the file is
+            # still unusable afterwards.
+            adopted = _read_key(path)
+            if len(adopted) >= _MASK_KEY_BYTES:
+                return adopted
+            # The length is reported because a short key is a symptom worth
+            # seeing; after the retries it really is truncated, not in flight.
             logging.warning(
                 "[MASK] key file %s is short (%d bytes); replacing it",
                 path,
-                len(existing),
+                len(adopted),
             )
         _publish_key(path, key)
     except OSError as exc:
@@ -2580,7 +2800,7 @@ def record_modification(
         Item:
           AttributeModificationDateTime (0400,0562)
           ModifyingSystem (0400,0563)
-          ModifyingOperator (0400,0566)  -  who made the change (Type 2)
+          SourceOfPreviousValues (0400,0564)  -  Type 2, may be empty
           ReasonForModification (0400,0565)
           ModifiedAttributesSequence (0400,0550)
             Item: the actual changed tag with its OLD value
@@ -2617,17 +2837,27 @@ def record_modification(
     attr_item.ReasonForTheAttributeModification = (
         reason  # (0400,0565) Type 1  -  CID 7050: COERCE
     )
-    # (0400,0566) ModifyingOperator  -  who (Type 2). Not in pydicom data dict
-    # (pydicom doesn't know this private-ish tag), so use add_new() to avoid
-    # "Camel case attribute" warnings.
-    attr_item.add_new((0x0400, 0x0566), "PN", modifying_operator or "DIMSE")
+    # (0400,0566) ModifyingOperator is NOT a standard attribute: the Attribute
+    # Modification macro's "who" is (0400,0562) DateTime, (0400,0563) Modifying
+    # System and (0400,0564) Source of Previous Values (PS3.3 C.12.1.1.9.1),
+    # and (0400,0566) is absent from the PS3.6 registry (verified against the
+    # installed pydicom 3.0.2 dictionary). Group 0400 is even, so it cannot
+    # carry a private element either (PS3.5 7.8.1). Writing it produced a tag
+    # no reader can resolve, so the operator travels in ModifyingSystem above.
 
     # -- ModifiedAttributesSequence (0400,0550)  -  WHAT was changed --
     # Type 1. Single Item containing the modified tag with its OLD value.
     # Preserve VR from original element, fallback to LO (Long String).
     vr = ds[tag].VR if tag in ds else "LO"
     mod_attr = Dataset()
-    mod_attr[tag] = DataElement(tag, vr, old_value or "")
+    # PS3.3 C.12.1.1.9.1: the item holds the PREVIOUS value. `old_value or ""`
+    # replaced every falsy previous value - 0, 0.0, False - with an empty
+    # string, so an audit entry for a changed numeric attribute recorded "no
+    # previous value" instead of the zero it really held. Only None (no value
+    # at all) becomes empty.
+    mod_attr[tag] = DataElement(
+        tag, vr, "" if old_value is None else old_value
+    )
     mod_seq = Sequence()
     mod_seq.append(mod_attr)
     attr_item.ModifiedAttributesSequence = mod_seq
@@ -2680,13 +2910,14 @@ def sanitize_dataset(
     # PatientID (0010,0020)  -  Type 2
     pid = ds.get((0x0010, 0x0020))
     if not pid or not pid.value:
-        # Two values with different jobs: the log tuple needs a readable
-        # placeholder, while the audit entry records what the attribute
-        # ACTUALLY held - the empty string for an absent or empty Type 2 field
-        # (PS3.3 C.2.2). Recording "(empty)" in the Modified Attributes
-        # Sequence would state a value the attribute never had.
+        # Two consumers with different jobs: the audit entry records what the
+        # attribute ACTUALLY held - the empty string for an absent or empty
+        # Type 2 field (PS3.3 C.2.2) - so the tuple carries `old`, never a
+        # placeholder. The "(empty)" substitution belongs to the LOG line in
+        # cstore.py, which needs a readable placeholder the audit must not
+        # record. Recording "(empty)" in the Modified Attributes Sequence
+        # would state a value the attribute never had.
         old = str(pid.value) if (pid and pid.value) else ""
-        logged = old or "(empty)"
         if fix_patient_id:
             if study_uid:
                 new_id = generate_patient_id_from_study(study_uid, id_prefix)
@@ -2697,7 +2928,7 @@ def sanitize_dataset(
                 record_modification(
                     ds, (0x0010, 0x0020), old, modifying_system=modifying_system
                 )
-            modifications.append(((0x0010, 0x0020), logged, new_id))
+            modifications.append(((0x0010, 0x0020), old, new_id))
         else:
             raise ValueError("PatientID is empty and fix_patient_id is disabled")
 
@@ -2705,7 +2936,6 @@ def sanitize_dataset(
     pname = ds.get((0x0010, 0x0010))
     if not pname or not pname.value:
         old = str(pname.value) if (pname and pname.value) else ""
-        logged = old or "(empty)"
         if fix_patient_name:
             if study_uid:
                 new_name = generate_patient_name_from_study(study_uid, name_prefix)
@@ -2716,7 +2946,7 @@ def sanitize_dataset(
                 record_modification(
                     ds, (0x0010, 0x0010), old, modifying_system=modifying_system
                 )
-            modifications.append(((0x0010, 0x0010), logged, new_name))
+            modifications.append(((0x0010, 0x0010), old, new_name))
         else:
             raise ValueError("PatientName is empty and fix_patient_name is disabled")
 
@@ -2733,653 +2963,6 @@ def sanitize_dataset(
 # Bridge: handlers
 # ---------------------------------------------------------------------------
 # Clarus Bridge  -  handlers subpackage (development only).
-
-# ---------------------------------------------------------------------------
-# Bridge: move_jobs
-# ---------------------------------------------------------------------------
-
-"""Clarus Bridge - C-MOVE job queue and SCP target registry (BR-007).
-
-MoveJobManager: SQLite-backed C-MOVE job queue with SCP target auto-registration.
-Thread-safe via SharedDb: one connection, one lock.
-Survives bridge restarts.
-
-Known limitations:
-- C-MOVE-CANCEL not supported. Client can close association;
-  Bridge finishes the current job (data won't be lost).
-- No duplicate SOP check before re-send after restart.
-- Double I/O: temp-file -> read -> send (streaming future).
-"""
-
-import ipaddress
-import logging
-import threading
-import time
-
-# ---------------------------------------------------------------------------
-# DB Migration helpers (subnet support, composite keys)
-# ---------------------------------------------------------------------------
-def _migrate_move_jobs(conn):
-    """Add target_host/target_port columns if missing (pre-existing DBs)."""
-    cols = {r[1] for r in conn.execute("PRAGMA table_info('move_jobs')").fetchall()}
-    if "target_host" not in cols:
-        conn.execute(
-            "ALTER TABLE move_jobs ADD COLUMN target_host TEXT NOT NULL DEFAULT ''"
-        )
-    if "target_port" not in cols:
-        conn.execute(
-            "ALTER TABLE move_jobs ADD COLUMN target_port INTEGER NOT NULL DEFAULT 0"
-        )
-    # (0008,0058) Failed SOP Instance UID List - newline-joined UIDs of
-    # the slices that failed transfer in this job (PS3.4 C.4.2.1.4.2). The
-    # C-MOVE reactor reads it to put the list on the final Failed/Cancel/
-    # Warning C-MOVE-RSP Identifier.
-    if "failed_sops" not in cols:
-        conn.execute(
-            "ALTER TABLE move_jobs ADD COLUMN failed_sops TEXT NOT NULL DEFAULT ''"
-        )
-    # Per-association expose flag: 1 when this job was requested over the
-    # Expose Rejected Instances AE. Carried on the job because the C-MOVE
-    # worker threads are long-lived and outlive the association that queued
-    # the work, so it cannot be read from the event when the job runs.
-    if "expose_rejected" not in cols:
-        conn.execute(
-            "ALTER TABLE move_jobs ADD COLUMN expose_rejected INTEGER NOT NULL DEFAULT 0"
-        )
-
-def _migrate_scp_targets(conn):
-    """Migrate scp_targets from single PK (ae_title) to composite (ae_title, host).
-
-    Preserves existing data. Idempotent  -  safe to run multiple times.
-    """
-    # Check if old schema (ae_title as sole PK) exists
-    cols = {r[1] for r in conn.execute("PRAGMA table_info('scp_targets')").fetchall()}
-    if not cols:
-        # Table doesn't exist yet  -  create with v2 schema
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS scp_targets ("
-            "  ae_title TEXT NOT NULL,"
-            "  host TEXT NOT NULL,"
-            "  port INTEGER NOT NULL DEFAULT 104,"
-            "  last_seen INTEGER NOT NULL,"
-            "  consecutive_failures INTEGER DEFAULT 0,"
-            "  PRIMARY KEY (ae_title, host)"
-            ")"
-        )
-        return
-
-    # Check if already migrated: composite PK present.
-    # SQLite PRAGMA table_info doesn't directly show composite PK.
-    # Check by trying to insert a duplicate (ae, host)  -  if UNIQUE constraint
-    # fails on (ae_title) alone, we're on old schema.
-    # Simpler: check if 'host' is part of PK by looking at the CREATE TABLE sql
-    create_sql = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='scp_targets'"
-    ).fetchone()
-    if create_sql and "PRIMARY KEY (ae_title, host)" in create_sql[0]:
-        return  # Already v2
-
-    # Migrate: create v2, copy data, drop v1, rename
-    conn.execute(
-        "CREATE TABLE scp_targets_v2 ("
-        "  ae_title TEXT NOT NULL,"
-        "  host TEXT NOT NULL,"
-        "  port INTEGER NOT NULL DEFAULT 104,"
-        "  last_seen INTEGER NOT NULL,"
-        "  consecutive_failures INTEGER DEFAULT 0,"
-        "  PRIMARY KEY (ae_title, host)"
-        ")"
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO scp_targets_v2"
-        " SELECT ae_title, host, port, last_seen, consecutive_failures"
-        " FROM scp_targets"
-    )
-    conn.execute("DROP TABLE scp_targets")
-    conn.execute("ALTER TABLE scp_targets_v2 RENAME TO scp_targets")
-
-# ---------------------------------------------------------------------------
-# Bridge: C-MOVE job queue and SCP target registry
-# ---------------------------------------------------------------------------
-class MoveJobManager:
-    """SQLite-backed C-MOVE job queue with SCP target auto-registration.
-
-    Thread-safe via SharedDb  -  "one connection, one lock".
-    Survives bridge restarts.
-
-    Known limitations:
-    - C-MOVE-CANCEL not supported. Client can close association;
-      Bridge finishes the current job (data won't be lost).
-    - No duplicate SOP check before re-send after restart.
-    - Double I/O: temp-file -> read -> send (streaming future).
-    """
-
-    def __init__(self, shared_db, max_workers=2, scp_remove_failures=3):
-        """shared_db: SharedDb instance (NOT raw sqlite3.Connection).
-
-        Uses SharedDb.locked() for ALL DB operations - no own lock.
-        One connection, one lock: a single serialized writer avoids both lock
-        ordering bugs and SQLite busy-handler tuning.
-
-        scp_remove_failures: consecutive-failure threshold for the auto-remove
-        of an auto-registered SCP peer (CM-006). Fixed constant 3 (fed from
-        `_SCP_FAILURES_BEFORE_REMOVE` in main.py); there is no config knob.
-        """
-        self._db = shared_db  # SharedDb, NOT sqlite3.Connection
-        self._cond = (
-            threading.Condition()
-        )  # notify workers (own cond, not on SharedDb lock)
-        self.max_workers = max_workers
-        self.scp_remove_failures = max(1, int(scp_remove_failures or 3))
-        self._cancel_callbacks = {}  # job_id -> callable
-        self._last_peers_reload = 0.0  # timestamp of last peers reload
-        self.lazyload_peers_interval = (
-            30  # seconds between peers.conf reloads (0 = every call)
-        )
-
-        with self._db.locked() as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS move_jobs ("
-                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                "  study_uid TEXT NOT NULL,"
-                "  move_dest_ae TEXT NOT NULL,"
-                "  target_host TEXT NOT NULL DEFAULT '',"
-                "  target_port INTEGER NOT NULL DEFAULT 0,"
-                "  status TEXT NOT NULL DEFAULT 'pending',"
-                "  total_instances INTEGER DEFAULT 0,"
-                "  completed_instances INTEGER DEFAULT 0,"
-                "  failed_instances INTEGER DEFAULT 0,"
-                "  error_message TEXT,"
-                "  failed_sops TEXT NOT NULL DEFAULT '',"
-                "  created_at INTEGER NOT NULL,"
-                "  updated_at INTEGER NOT NULL,"
-                "  attempts INTEGER DEFAULT 0,"
-                "  expose_rejected INTEGER NOT NULL DEFAULT 0"
-                ")"
-            )
-            # Migration: add target_host/target_port columns if missing (pre-existing DBs)
-            _migrate_move_jobs(conn)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_move_jobs_status ON move_jobs(status)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_move_jobs_created ON move_jobs(created_at)"
-            )
-            # scp_targets v2: composite primary key (ae_title, host) for subnet support
-            _migrate_scp_targets(conn)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_scp_targets_ae ON scp_targets(ae_title)"
-            )
-            conn.commit()
-
-    # --- move_jobs CRUD ---
-
-    def create_job(
-        self,
-        study_uid,
-        move_dest_ae,
-        target_host="",
-        target_port=0,
-        expose_rejected=False,
-    ):
-        """Create a new pending C-MOVE job. Returns job id.
-
-        target_host/target_port: resolved Move Destination address.
-        Stored so worker doesn't need to re-resolve (subnet support).
-        expose_rejected: the job was queued over the QA AE; the worker queries
-        the configured `[dicomweb] qa_url` endpoint instead of `clarus_url`.
-        Stored because the worker outlives the association.
-        """
-        now = int(time.time())
-        with self._db.locked() as conn:
-            cur = conn.execute(
-                "INSERT INTO move_jobs"
-                " (study_uid, move_dest_ae, target_host, target_port,"
-                "  status, created_at, updated_at, expose_rejected)"
-                " VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
-                (
-                    study_uid,
-                    move_dest_ae,
-                    target_host,
-                    target_port,
-                    now,
-                    now,
-                    1 if expose_rejected else 0,
-                ),
-            )
-            conn.commit()
-            with self._cond:
-                self._cond.notify()  # wake one waiting worker
-            return cur.lastrowid
-
-    def count_pending(self):
-        """Number of jobs in the 'pending' state (drain gauge).
-
-        Read-only and cheap (one indexed COUNT); never raises, so a metrics
-        scrape cannot be broken by a busy/locked database - returns 0 instead.
-        """
-        try:
-            with self._db.locked() as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM move_jobs WHERE status = 'pending'"
-                ).fetchone()
-            return int(row[0]) if row else 0
-        except Exception:
-            return 0
-
-    def pick_pending_job(self, timeout=5.0):
-        """Atomically pick one pending job.
-
-        Returns dict or None.
-        """
-        while True:
-            with self._db.locked() as conn:
-                rows = conn.execute(
-                    "SELECT id, study_uid, move_dest_ae, attempts,"
-                    " target_host, target_port"
-                    " FROM move_jobs WHERE status = 'pending'"
-                    " ORDER BY created_at ASC"
-                ).fetchall()
-
-            if len(rows) == 0:
-                with self._cond:
-                    notified = self._cond.wait(timeout=timeout)
-                if not notified:
-                    return None
-                continue
-
-            row = rows[0]
-            job_id = row[0]
-            now = int(time.time())
-            with self._db.locked() as conn:
-                row2 = conn.execute(
-                    "SELECT id, study_uid, move_dest_ae, attempts,"
-                    " target_host, target_port, expose_rejected"
-                    " FROM move_jobs WHERE status = 'pending' AND id = ?",
-                    (job_id,),
-                ).fetchone()
-                if not row2:
-                    continue  # Another worker claimed it
-
-                conn.execute(
-                    "UPDATE move_jobs SET status = 'in_progress',"
-                    " updated_at = ?, attempts = attempts + 1"
-                    " WHERE id = ?",
-                    (now, job_id),
-                )
-                conn.commit()
-                return {
-                    "id": job_id,
-                    "study_uid": row2[1],
-                    "move_dest_ae": row2[2],
-                    "attempts": row2[3],
-                    "target_host": row2[4],
-                    "target_port": row2[5],
-                    # The worker outlives the association that queued the job,
-                    # so which base URL to stream from has to come from the
-                    # row. Omitting it here silently sent every QA job to
-                    # clarus_url, i.e. the sequester was never lifted.
-                    "expose_rejected": int(row2[6] or 0),
-                }
-
-    def update_job_progress(self, job_id, completed, failed, total):
-        """Update job progress counters (CM-005)."""
-        now = int(time.time())
-        with self._db.locked() as conn:
-            conn.execute(
-                "UPDATE move_jobs SET completed_instances = ?,"
-                " failed_instances = ?, total_instances = ?,"
-                " updated_at = ? WHERE id = ?",
-                (completed, failed, total, now, job_id),
-            )
-            conn.commit()
-
-    def get_job_progress(self, job_id):
-        """Return (completed, total, status) for a job. Used by C-MOVE generator for 0xFF00 polling."""
-        with self._db.locked() as conn:
-            row = conn.execute(
-                "SELECT completed_instances, total_instances, status"
-                " FROM move_jobs WHERE id = ?",
-                (job_id,),
-            ).fetchone()
-            if row is None:
-                return (0, 0, "unknown")
-            return (row[0], row[1], row[2])
-
-    def set_job_failed_sops(self, job_id, uids):
-        """Record the (0008,0058) Failed SOP Instance UID List for a job.
-
-        newline-joined UIDs of the slices that were attempted but not
-        delivered. Read back by the C-MOVE generator so the final
-        Failed/Cancel/Warning C-MOVE-RSP Identifier carries the list
-        (PS3.4 C.4.2.1.4.2). Call once at job end.
-        """
-        text = "\n".join(u for u in (uids or []) if u)
-        now = int(time.time())
-        with self._db.locked() as conn:
-            conn.execute(
-                "UPDATE move_jobs SET failed_sops = ?, updated_at = ? WHERE id = ?",
-                (text, now, job_id),
-            )
-            conn.commit()
-
-    def get_job_failed_sops(self, job_id):
-        """Return the (0008,0058) Failed SOP Instance UID list for a job."""
-        with self._db.locked() as conn:
-            row = conn.execute(
-                "SELECT failed_sops FROM move_jobs WHERE id = ?",
-                (job_id,),
-            ).fetchone()
-        if not row or not row[0]:
-            return []
-        return [u for u in str(row[0]).split("\n") if u]
-
-    def finish_job(self, job_id, success=True, error_message=None):
-        """Mark job as success or failed. A terminal row is never rewritten.
-
-        Two wakers can finish the same job - the poll reactor on timeout and
-        the worker when it reaches the end of the instance list - and the last
-        writer would otherwise decide the outcome. A row that already says
-        `failed` must not turn into `success` (or the reverse), because the
-        viewer was already told the first verdict and the counter was already
-        incremented for it.
-
-        Returns True when THIS call moved the row to a terminal status, False
-        when another waker had already finished it. The caller must use that
-        answer before counting the outcome: a second waker that counts its own
-        call double-counts a job that only finished once.
-        """
-        status = "success" if success else "failed"
-        now = int(time.time())
-        with self._db.locked() as conn:
-            cur = conn.execute(
-                "UPDATE move_jobs SET status = ?, error_message = ?,"
-                " updated_at = ? WHERE id = ?"
-                " AND status NOT IN ('success', 'failed')",
-                (status, error_message or "", now, job_id),
-            )
-            conn.commit()
-            return cur.rowcount > 0
-
-    def reset_job_to_pending(self, job_id, reason=""):
-        """Reset an in_progress job back to pending (viewer busy, retry later)."""
-        now = int(time.time())
-        with self._db.locked() as conn:
-            conn.execute(
-                "UPDATE move_jobs SET status = 'pending', error_message = ?,"
-                " updated_at = ? WHERE id = ?",
-                (reason, now, job_id),
-            )
-            conn.commit()
-        with self._cond:
-            self._cond.notify()  # Wake a worker to process the reset job (after fail_timeout)
-
-    def recover_in_progress_jobs(self):
-        """On startup: reset all in_progress jobs to pending (CM-007)."""
-        now = int(time.time())
-        with self._db.locked() as conn:
-            cur = conn.execute(
-                "UPDATE move_jobs SET status = 'pending', updated_at = ?"
-                " WHERE status = 'in_progress'",
-                (now,),
-            )
-            conn.commit()
-            return cur.rowcount
-
-    def cleanup_old_jobs(self, max_age_seconds=86400):
-        """Remove success/failed jobs older than max_age_seconds (default 24h) (CM-008)."""
-        with self._db.locked() as conn:
-            cutoff = int(time.time()) - max_age_seconds
-            conn.execute(
-                "DELETE FROM move_jobs WHERE status IN ('success', 'failed')"
-                " AND updated_at < ?",
-                (cutoff,),
-            )
-            conn.commit()
-
-    # --- scp_targets CRUD ---
-
-    def register_peer(self, ae_title, host, port=104):
-        """Register or update a manually configured peer from peers.conf.
-
-        Composite key (ae_title, host)  -  supports multiple entries per AE
-        (exact IP + CIDR subnet, or multiple subnets).
-        Non-CIDR (exact IP) entries: only ONE per AE title  -  re-registration
-        with a different host replaces the old one. CIDR entries coexist.
-        """
-        now = int(time.time())
-        with self._db.locked() as conn:
-            # Non-CIDR host: delete any existing non-CIDR entry for this AE
-            # so re-registration with a different IP replaces the old one.
-            if "/" not in host:
-                conn.execute(
-                    "DELETE FROM scp_targets"
-                    " WHERE ae_title = ? AND host NOT LIKE '%/%'",
-                    (ae_title,),
-                )
-            conn.execute(
-                "INSERT OR REPLACE INTO scp_targets"
-                " (ae_title, host, port, last_seen, consecutive_failures)"
-                " VALUES (?, ?, ?, ?, 0)",
-                (ae_title, host, port, now),
-            )
-            conn.commit()
-        logging.info(
-            "[PEER] Registered %s at %s:%d",
-            ae_title,
-            host,
-            port,
-        )
-
-    # --- SCP peer lookup with subnet support --------------------
-
-    def lookup_scp(self, ae_title, client_ip=None):
-        """Look up SCP peer by AE Title, with optional IP subnet matching.
-
-        Args:
-            ae_title: Move Destination AE Title.
-            client_ip: IP address of the requesting SCU (for subnet matching).
-                If None, returns first exact-match (non-CIDR) entry.
-
-        Returns:
-            (host, port) tuple or None.
-
-        Subnet matching (CIDR):
-            peers.conf supports: WEASIS_AE  192.168.1.0/24  11113
-            When client_ip falls within the subnet, returns the CIDR host
-            (e.g. "192.168.1.0/24") and port. Caller uses the PORT for
-            association; the HOST is informational (routed via client_ip).
-        """
-        with self._db.locked() as conn:
-            rows = conn.execute(
-                "SELECT host, port FROM scp_targets WHERE ae_title = ?",
-                (ae_title,),
-            ).fetchall()
-
-        if not rows:
-            return None
-
-        if client_ip is None:
-            # No IP  -  return first exact (non-CIDR) match, else first entry
-            for host, port in rows:
-                if "/" not in host:
-                    return (host, port)
-            return (rows[0][0], rows[0][1])
-
-        # IP provided  -  match against subnets
-        try:
-            client = ipaddress.ip_address(client_ip)
-        except ValueError:
-            # Invalid IP string  -  fall back to exact match
-            for host, port in rows:
-                if "/" not in host:
-                    return (host, port)
-            return None
-
-        # Priority 1: exact IP match (non-CIDR)
-        for host, port in rows:
-            if "/" not in host and host == client_ip:
-                return (host, port)
-
-        # Priority 2: CIDR subnet match
-        for host, port in rows:
-            if "/" in host:
-                try:
-                    network = ipaddress.ip_network(host, strict=False)
-                    if client in network:
-                        return (host, port)
-                except ValueError:
-                    continue
-
-        return None
-
-    def reload_peers_from_file(self, peers_file):
-        """Reload peers from peers.conf into scp_targets table.
-
-        Respects lazyload_peers_interval. Composite key (ae_title, host)
-         -  multiple entries per AE (CIDR + exact) are preserved.
-        """
-        if self.lazyload_peers_interval > 0:
-            elapsed = time.time() - self._last_peers_reload
-            if elapsed < self.lazyload_peers_interval:
-                return 0
-
-        self._last_peers_reload = time.time()
-        new_count = 0
-        seen = set()
-        with self._db.locked() as conn:
-            for ae_title, host, port in parse_peers_conf(peers_file):
-                seen.add((ae_title, host))
-                row = conn.execute(
-                    "SELECT host, port FROM scp_targets"
-                    " WHERE ae_title = ? AND host = ?",
-                    (ae_title, host),
-                ).fetchone()
-                existing = (row[0], row[1]) if row else None
-                if existing is None or existing != (host, port):
-                    now = int(time.time())
-                    conn.execute(
-                        "INSERT OR REPLACE INTO scp_targets"
-                        " (ae_title, host, port, last_seen, consecutive_failures)"
-                        " VALUES (?, ?, ?, ?, 0)",
-                        (ae_title, host, port, now),
-                    )
-                    new_count += 1
-            # A peer removed from peers.conf is gone from the operator's view,
-            # so routing to the stale row was a destination the config no
-            # longer names. Deleting by (ae_title, host) keeps a peer that is
-            # still listed under a different port.
-            stale = [
-                (ae, host)
-                for ae, host in conn.execute("SELECT ae_title, host FROM scp_targets")
-                if (ae, host) not in seen
-            ]
-            for ae, host in stale:
-                conn.execute(
-                    "DELETE FROM scp_targets WHERE ae_title = ? AND host = ?",
-                    (ae, host),
-                )
-            if stale:
-                logging.info(
-                    "[PEER] Removed %d peer(s) no longer in %s",
-                    len(stale),
-                    peers_file,
-                )
-            conn.commit()
-        if new_count:
-            logging.info(
-                "[PEER] Reloaded %d new/updated peer(s) from %s", new_count, peers_file
-            )
-        return new_count
-
-    # --- scp failure tracking ---
-
-    def record_scp_failure(self, ae_title, host=None):
-        """Record a failure to reach SCP.
-
-        Auto-remove after 3 consecutive failures (CM-006).
-        If host is provided, only updates that specific entry (subnet-safe).
-        """
-        with self._db.locked() as conn:
-            if host:
-                conn.execute(
-                    "UPDATE scp_targets SET consecutive_failures ="
-                    " consecutive_failures + 1"
-                    " WHERE ae_title = ? AND host = ?",
-                    (ae_title, host),
-                )
-                row = conn.execute(
-                    "SELECT consecutive_failures FROM scp_targets"
-                    " WHERE ae_title = ? AND host = ?",
-                    (ae_title, host),
-                ).fetchone()
-                if row and row[0] >= self.scp_remove_failures:
-                    conn.execute(
-                        "DELETE FROM scp_targets" " WHERE ae_title = ? AND host = ?",
-                        (ae_title, host),
-                    )
-                    logging.warning(
-                        "[SCP] Removed %s@%s after %d consecutive failures",
-                        ae_title,
-                        host,
-                        self.scp_remove_failures,
-                    )
-            else:
-                # Backward compat: update all entries for this AE
-                conn.execute(
-                    "UPDATE scp_targets SET consecutive_failures ="
-                    " consecutive_failures + 1 WHERE ae_title = ?",
-                    (ae_title,),
-                )
-                # Check and auto-remove entries with >= N failures
-                conn.execute(
-                    "DELETE FROM scp_targets"
-                    " WHERE ae_title = ? AND consecutive_failures >= ?",
-                    (ae_title, self.scp_remove_failures),
-                )
-            conn.commit()
-
-    def record_scp_success(self, ae_title, host=None):
-        """Reset failure counter on successful connection (CM-006).
-        If host is provided, only resets that specific entry (subnet-safe).
-        """
-        with self._db.locked() as conn:
-            if host:
-                conn.execute(
-                    "UPDATE scp_targets SET consecutive_failures = 0"
-                    " WHERE ae_title = ? AND host = ?",
-                    (ae_title, host),
-                )
-            else:
-                conn.execute(
-                    "UPDATE scp_targets SET consecutive_failures = 0"
-                    " WHERE ae_title = ?",
-                    (ae_title,),
-                )
-            conn.commit()
-
-    def close(self):
-        """no-op  -  SharedDb owns the connection, closed in main()."""
-
-    # --- C-MOVE-CANCEL support ---
-
-    def set_job_cancel_callback(self, job_id, callback):
-        """Store cancel callback for a job (BR-012)."""
-        self._cancel_callbacks[job_id] = callback
-
-    def is_job_cancelled(self, job_id):
-        """Check if job was cancelled by SCU (BR-012)."""
-        cb = self._cancel_callbacks.get(job_id)
-        if cb:
-            try:
-                return cb()
-            except Exception:
-                return False
-        return False
-
-    def clear_job_callback(self, job_id):
-        """Remove cancel callback after job completes (BR-012)."""
-        self._cancel_callbacks.pop(job_id, None)
 
 # ---------------------------------------------------------------------------
 # Bridge: assoc_tracker
@@ -3407,7 +2990,9 @@ class AssocInfo:
     def __init__(self, ae_title: str, address: str):
         self.ae_title = ae_title
         self.address = address
-        # studies: dict[study_uid -> {'patient_id': str, 'modality': str, 'count': int}]
+        # studies: dict[study_uid -> {'modality': str, 'count': int}]
+        # No PatientID here: the summary this feeds only prints modality and
+        # counts, so a raw identifier would be PHI held in memory for nothing.
         self.studies: dict[str, dict] = {}
         self.instance_count = 0
 
@@ -3484,9 +3069,7 @@ def register_assoc_released(assoc_id: int) -> None:
         ", ".join(study_parts),
     )
 
-def record_cstore(
-    assoc_id: int, study_uid: str, patient_id: str, modality: str
-) -> bool:
+def record_cstore(assoc_id: int, study_uid: str, modality: str) -> bool:
     """Record a C-STORE instance in the association tracker.
 
     Returns True if this is the FIRST instance for this study_uid
@@ -3504,7 +3087,6 @@ def record_cstore(
 
         if study_uid not in info.studies:
             info.studies[study_uid] = {
-                "patient_id": patient_id or "?",
                 "modality": modality or "??",
                 "count": 1,
             }
@@ -3547,10 +3129,36 @@ import time
 DEFAULT_DEADLINE_SEC = 300.0
 DEFAULT_RESOLVE_INTERVAL = 5.0
 
+# Wall-clock budget for ONE batch's verification walk inside a single tick.
+# `verify()` may be a round trip to the origin, and the tracker has exactly one
+# worker: an unbounded walk over a large batch delayed every other peer past
+# its own deadline. 30 s is well inside the default 300 s batch deadline, so a
+# healthy origin never hits it, while a sick one costs at most this much before
+# the remaining SOPs are reported as unconfirmed.
+DEFAULT_VERIFY_BUDGET_SEC = 30.0
+
+# Delivery attempts per batch before the verdict is abandoned. One attempt is
+# not enough (the peer may be restarting) and an unbounded retry is a DoS: the
+# tracker's single worker ticks every `interval`, and each N-EVENT-REPORT burns
+# acse + network + dimse timeouts before it fails, so one dead peer starves
+# every other batch FOREVER. 5 attempts at the default 5 s interval covers
+# roughly half a minute of a restarting peer; PS3.4 J.3.3.1 makes the report
+# the result, so a batch that cannot be reported is abandoned loudly rather
+# than retried into the heat death of the universe.
+MAX_REPORT_ATTEMPTS = 5
+
 # Failure Reason (0008,1197) for an SOP never confirmed by the deadline:
 # 0110H Processing Failure (PS3.3 C.14.1.1). 0111H is not an enumerated
 # Failure Reason - it exists only as an N-CREATE status in PS3.7.
 REASON_UNCONFIRMED = 0x0110
+
+# R10: how long an ABANDONED row is kept for inspection before it is deleted.
+# An abandoned verdict has already cost MAX_REPORT_ATTEMPTS associations and
+# can never be delivered, so keeping it forever only grows the table and the
+# inspection list with every dead peer. A day is long enough to read the
+# ERROR line that came with it; `abandoned_at` is what the sweep measures
+# against, so the retention is independent of the job's own deadline.
+ABANDONED_RETENTION_SEC = 24 * 3600.0
 
 def _pair(item):
     """One `(sop_class, sop_uid)` tuple from a persisted JSON pair.
@@ -3562,18 +3170,47 @@ def _pair(item):
     sop_class, sop_uid = item
     return (sop_class, sop_uid)
 
+def _verdict_to_json(verdict):
+    """Serialise a frozen verdict for the row, or None.
+
+    Lists, not tuples: JSON has no tuple, and the shapes are rebuilt by
+    `_verdict_from_json`.
+    """
+    if verdict is None:
+        return None
+    ok, failed, event_type = verdict
+    return [[list(item) for item in ok], [list(item) for item in failed], event_type]
+
+def _verdict_from_json(raw):
+    """Rebuild a frozen verdict from its row form (None when unset/unreadable)."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        ok = [_pair(item) for item in data[0]]
+        # A failed entry is (class, uid, reason) - the reason is an int.
+        failed = [(item[0], item[1], item[2]) for item in data[1]]
+        return (ok, failed, int(data[2]))
+    except (ValueError, TypeError, IndexError, KeyError):
+        return None
+
 class CommitJob:
     """One N-ACTION Storage Commitment batch awaiting resolution."""
 
     __slots__ = (
+        "abandoned",
+        "abandoned_at",
         "calling_ae",
         "deadline",
+        "frozen_verdict",
         "host",
         "pending",
         "pending_persisted",
         "port",
+        "report_attempts",
         "sops",
         "tx_uid",
+        "verdict_persisted",
     )
 
     def __init__(self, tx_uid, calling_ae, host, port, sops, deadline):
@@ -3588,6 +3225,25 @@ class CommitJob:
         # live set so a freshly registered batch is not rewritten on the first
         # tick for no reason.
         self.pending_persisted = len(self.pending)
+        # N-EVENT-REPORT delivery attempts so far (see MAX_REPORT_ATTEMPTS).
+        self.report_attempts = 0
+        # CC3: the verdict decided on the FIRST delivery attempt, as
+        # `(ok, failed, event_type)`. Once set it is what every retry reports:
+        # the outcome may not change between attempts.
+        self.frozen_verdict = None
+        # Whether the row on disk actually carries `frozen_verdict`. A tuple
+        # cannot be "not None and unsaved", so the flag is what makes a FAILED
+        # verdict write retryable: without it the next tick skipped the write
+        # because the verdict was already set, and a restart rebuilt a
+        # different verdict from the old `pending` set.
+        self.verdict_persisted = False
+        # R8: set when the report budget is exhausted and the verdict can never
+        # leave this process. Persisted, because a reload that treats an
+        # abandoned row as active grants the dead peer another full round of
+        # delivery attempts at EVERY restart, on the single commit worker.
+        self.abandoned = False
+        # R10: when the row became abandoned (retention reference point).
+        self.abandoned_at = 0.0
 
 class CommitTracker:
     """Tracks commitment batches; resolves and reports them asynchronously.
@@ -3616,6 +3272,7 @@ class CommitTracker:
         shutdown=None,
         now=time.time,
         db=None,
+        verify_budget_sec=DEFAULT_VERIFY_BUDGET_SEC,
     ):
         self._verify = verify  # verify(sop_class, sop_uid) -> bool
         self._report = report  # report(...)
@@ -3624,7 +3281,17 @@ class CommitTracker:
         self._resolve_fn = resolve
         self._interval = interval
         self._deadline_sec = deadline_sec
+        # CC2: wall-clock budget for ONE job's verification walk in a tick.
+        # Each `_verify` can be a network round trip to the origin; without a
+        # budget a large batch held the single commit worker past every other
+        # peer's deadline.
+        self._verify_budget_sec = verify_budget_sec
         self._jobs = {}
+        # R10: abandoned batches, kept OUT of the working set. They are never
+        # ticked and never counted as pending - only inspected - so keeping
+        # them in `_jobs` made `pending_count()` grow for every dead peer.
+        # Bounded by `purge_abandoned`.
+        self._abandoned = {}
         self._lock = threading.Lock()
         self._stop = shutdown if shutdown is not None else threading.Event()
         self._now = now  # injectable clock for tests
@@ -3654,10 +3321,31 @@ class CommitTracker:
                 "  port INTEGER NOT NULL,"
                 "  sops TEXT NOT NULL,"  # JSON [[cls, uid], ...]
                 "  pending TEXT NOT NULL,"  # JSON [[cls, uid], ...]
-                "  deadline REAL NOT NULL"
+                "  deadline REAL NOT NULL,"
+                "  frozen TEXT,"  # JSON [ok, failed, event_type] or NULL
+                "  abandoned INTEGER NOT NULL DEFAULT 0,"
+                "  abandoned_at REAL NOT NULL DEFAULT 0"
                 ")"
             )
             conn.commit()
+        # A table created before these columns existed gains them in place.
+        # Without `frozen` a restart rebuilt a possibly different verdict and
+        # reported it as if it were the one already sent; without `abandoned`
+        # every reload treated a dead peer's parked batch as active and gave
+        # it five more delivery rounds on the single worker at every restart.
+        for column, ddl in (
+            ("frozen", "TEXT"),
+            ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
+            ("abandoned_at", "REAL NOT NULL DEFAULT 0"),
+        ):
+            try:
+                with self._db.locked() as conn:
+                    conn.execute(f"ALTER TABLE commit_jobs ADD COLUMN {column} {ddl}")
+                    conn.commit()
+            except Exception:
+                # The column already exists (the normal case after the first
+                # upgrade). Any other failure surfaces on the first read/write.
+                pass
 
     def _reload(self):
         """Restore the pending batches left by a previous process.
@@ -3670,12 +3358,25 @@ class CommitTracker:
         SCP already made.
         """
         restored = 0
+        abandoned = 0
         with self._db.locked() as conn:
             rows = conn.execute(
-                "SELECT tx_uid, calling_ae, host, port, sops, pending, deadline"
+                "SELECT tx_uid, calling_ae, host, port, sops, pending, deadline,"
+                " frozen, abandoned, abandoned_at"
                 " FROM commit_jobs"
             ).fetchall()
-        for tx_uid, calling_ae, host, port, sops, pending, deadline in rows:
+        for (
+            tx_uid,
+            calling_ae,
+            host,
+            port,
+            sops,
+            pending,
+            deadline,
+            frozen,
+            abandoned_flag,
+            abandoned_at,
+        ) in rows:
             try:
                 sop_pairs = [_pair(item) for item in json.loads(sops)]
                 pending_pairs = {_pair(item) for item in json.loads(pending)}
@@ -3689,6 +3390,24 @@ class CommitTracker:
                 )
                 job.pending = pending_pairs
                 job.pending_persisted = len(pending_pairs)
+                # R10: the verdict already decided travels with the row, so a
+                # restart re-sends the SAME result instead of computing a new
+                # one that may contradict what the SCM was told.
+                job.frozen_verdict = _verdict_from_json(frozen)
+                job.verdict_persisted = job.frozen_verdict is not None
+                if abandoned_flag:
+                    # R10: an abandoned row stays abandoned. Reloading it as
+                    # active would grant the dead peer another MAX_REPORT_ATTEMPTS
+                    # rounds on the single commit worker at every restart; it
+                    # would also be counted as pending forever.
+                    job.abandoned = True
+                    job.report_attempts = MAX_REPORT_ATTEMPTS
+                    # R10: the retention clock travels with the row; without
+                    # it a reloaded batch read as age 0 and was never purged.
+                    job.abandoned_at = float(abandoned_at or 0.0)
+                    self._abandoned[tx_uid] = job
+                    abandoned += 1
+                    continue
             except (ValueError, TypeError) as e:
                 # A row that cannot be read is not a reason to refuse the
                 # whole reload: the other batches are still deliverable, and
@@ -3707,6 +3426,63 @@ class CommitTracker:
                 "session; the modality is still waiting for their verdicts",
                 restored,
             )
+        if abandoned:
+            logging.error(
+                "[COMMIT] %d recovered batch(es) were already abandoned - their "
+                "verdicts can no longer be delivered and are kept for inspection",
+                abandoned,
+            )
+
+    def purge_abandoned(self, max_age_sec=ABANDONED_RETENTION_SEC, now=None):
+        """Delete abandoned rows older than `max_age_sec`; return the count.
+
+        R10: nothing removed an abandoned row, so the table and the inspection
+        list grew with every dead peer. The row's own deadline is NOT the
+        reference point - it may be days old when a long pause finally exhausts
+        the report budget - so the age is measured from `abandoned_at`, which
+        `_park_undelivered` stamps.
+        """
+        if self._db is None:
+            return 0
+        cutoff = (self._now() if now is None else now) - max_age_sec
+        removed = 0
+        with self._lock:
+            stale = [
+                tx
+                for tx, job in self._abandoned.items()
+                if getattr(job, "abandoned_at", 0.0) <= cutoff
+            ]
+        for tx in stale:
+            try:
+                with self._db.locked() as conn:
+                    cur = conn.execute(
+                        "DELETE FROM commit_jobs"
+                        " WHERE tx_uid = ? AND abandoned = 1",
+                        (tx,),
+                    )
+                    conn.commit()
+                    removed += cur.rowcount or 0
+                # Drop the in-memory entry only AFTER the row is gone. The
+                # old order deleted it first, so a failed DELETE left the row
+                # on disk with nobody to find it on the next sweep.
+                with self._lock:
+                    self._abandoned.pop(tx, None)
+            except Exception as e:
+                # A failed delete leaves the row AND the in-memory entry for
+                # the next sweep; it must not abort the retention pass for
+                # the other batches.
+                logging.error(
+                    "[COMMIT] tx=%s: abandoned row could not be purged (%s)",
+                    tx,
+                    e,
+                )
+        if removed:
+            logging.info(
+                "[COMMIT] purged %d abandoned batch(es) older than %.0fs",
+                removed,
+                max_age_sec,
+            )
+        return removed
 
     def _persist(self, job):
         if self._db is None:
@@ -3714,8 +3490,9 @@ class CommitTracker:
         with self._db.locked() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO commit_jobs"
-                " (tx_uid, calling_ae, host, port, sops, pending, deadline)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " (tx_uid, calling_ae, host, port, sops, pending, deadline,"
+                "  frozen, abandoned, abandoned_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job.tx_uid,
                     job.calling_ae,
@@ -3724,6 +3501,15 @@ class CommitTracker:
                     json.dumps([list(item) for item in job.sops]),
                     json.dumps(sorted(list(item) for item in job.pending)),
                     float(job.deadline),
+                    # R10: the verdict travels with the row. A restart after a
+                    # report was sent but its response was lost must re-send
+                    # the SAME result, not a freshly computed one that may
+                    # differ for the same transaction.
+                    json.dumps(_verdict_to_json(job.frozen_verdict))
+                    if job.frozen_verdict is not None
+                    else None,
+                    1 if job.abandoned else 0,
+                    float(getattr(job, "abandoned_at", 0.0)),
                 ),
             )
             conn.commit()
@@ -3736,14 +3522,93 @@ class CommitTracker:
             conn.commit()
 
     def register(self, tx_uid, calling_ae, host, port, sops):
-        """Register an N-ACTION batch for async resolution. Fire-and-forget."""
+        """Register an N-ACTION batch for async resolution. Fire-and-forget.
+
+        `_persist` can raise (disk full, locked or corrupt database). Persist
+        BEFORE the in-memory registration: a failed persist then leaves BOTH
+        the on-disk row and the in-memory `_jobs` entry from an EARLIER
+        registration for the same tx_uid untouched. The old order overwrote
+        `_jobs[tx_uid]` first, so a failed persist and the following rollback
+        `pop` removed the EARLIER job from the working set while its row
+        survived - `_tick` then never resolved that commitment until a
+        restart. Persisting first also means `_tick` can never observe a job
+        whose persist failed and push an N-EVENT-REPORT for a request the
+        caller is about to answer 0x0110. The caller's `except Exception`
+        turns the failure into a clean 0x0110.
+
+        `_forget()` is deliberately NOT used here: it runs a DELETE, and after
+        a failed INSERT there may be a row from an earlier registration for the
+        same tx_uid that must survive - deleting it would lose a commitment the
+        SCU was already told about.
+
+        CC1: the ROW and its in-memory owner move together. `_persist` runs
+        under the same lock that publishes the job, so a concurrent `_tick`
+        never sees the row of one registration paired with the object of
+        another, and a crash cannot leave a row whose owner nobody knows. The
+        lock is a plain `threading.Lock` held across an SQLite write - the
+        store has its own lock and no path takes the two in the other order.
+        """
         deadline = self._now() + self._deadline_sec
         job = CommitJob(tx_uid, calling_ae, host, port, sops, deadline)
         with self._lock:
+            # R6: a Transaction UID names ONE transaction (PS3.4 J.3.2). A
+            # second N-ACTION carrying it is a protocol error, not a retry: the
+            # SCU reused an identifier the SCP has already acknowledged, and
+            # accepting it would replace the first batch's row and in-memory
+            # job - the first N-EVENT-REPORT would never be sent, silently.
+            # The check and the registration are one locked step so two
+            # concurrent requests cannot both pass it.
+            if tx_uid in self._jobs:
+                raise ValueError(
+                    f"Transaction UID {tx_uid} is already active - the SCU "
+                    "must use a new UID for a new request"
+                )
+            self._persist(job)
             self._jobs[tx_uid] = job
-        self._persist(job)
 
     # ---- resolution ------------------------------------------------------
+
+    def _build_verdict(self, job):
+        """Decide the batch's verdict ONCE: `(ok, failed, event_type)`.
+
+        Called on the first delivery attempt and stored on the job, so every
+        retry reports the SAME outcome. Recomputing per attempt meant a SOP
+        confirmed (or a report that failed and was retried) between attempts
+        could change what the modality had already been told - and for the
+        success/failure split that is a contradiction, not a retry.
+        """
+        ok = []
+        failed = []
+        for sop_class, sop_uid in job.sops:
+            if (sop_class, sop_uid) in job.pending:
+                failed.append((sop_class, sop_uid, REASON_UNCONFIRMED))
+            else:
+                ok.append((sop_class, sop_uid))
+        event_type = 1 if not failed else 2  # success / complete-with-failures
+        return (ok, failed, event_type)
+
+    def _park_undelivered(self, job):
+        """Keep an undelivered verdict durable (CC4).
+
+        The job leaves the working set so it stops blocking the single commit
+        worker, but its ROW is kept: it is the record that these SOPs were
+        never confirmed and that no N-EVENT-REPORT ever reached the modality.
+        Deleting it erased the only trace of the outcome.
+
+        R10: `abandoned_at` is stamped here, because this is the instant the
+        row becomes eligible for retention - the job's own deadline may be days
+        older than the moment the report budget finally ran out.
+        """
+        job.abandoned_at = self._now()
+        try:
+            self._persist(job)
+        except Exception as e:
+            logging.error(
+                "[COMMIT] tx=%s: undelivered verdict could not be recorded "
+                "(%s) - the row may be stale",
+                job.tx_uid,
+                e,
+            )
 
     def _resolve(self, job):
         """Send one N-EVENT-REPORT for the batch.
@@ -3766,25 +3631,11 @@ class CommitTracker:
                 logging.error("[COMMIT] resolve for tx=%s failed: %s", job.tx_uid, e)
                 return False
 
-        ok = []
-        failed = []
-        for sop_class, sop_uid in job.sops:
-            if (sop_class, sop_uid) in job.pending:
-                failed.append((sop_class, sop_uid, REASON_UNCONFIRMED))
-            else:
-                ok.append((sop_class, sop_uid))
-        event_type = 1 if not failed else 2  # success / complete-with-failures
-        # The verdict counters belong here, not in the handler: this is where
-        # a SOP actually acquires a verdict. The handler answers 0x0000
-        # without checking anything (PS3.4 J.3.2), so counting there would
-        # report a verdict the bridge had no evidence for at that instant.
-        try:
-            if ok:
-                naction_total.labels(verdict="success").inc(len(ok))
-            if failed:
-                naction_total.labels(verdict="failed").inc(len(failed))
-        except Exception:
-            pass
+        # CC3: report the FROZEN verdict when there is one.
+        if job.frozen_verdict is not None:
+            ok, failed, event_type = job.frozen_verdict
+        else:
+            ok, failed, event_type = self._build_verdict(job)
         try:
             delivered = self._report(
                 job.host, job.port, job.calling_ae, job.tx_uid, event_type, ok, failed
@@ -3792,14 +3643,52 @@ class CommitTracker:
         except Exception as e:
             logging.error("[COMMIT] report for tx=%s failed: %s", job.tx_uid, e)
             return False
-        return delivered is not False
+        if delivered is False:
+            return False
+        # The verdict counters belong here, not in the handler: this is where
+        # a SOP actually acquires a verdict. The handler answers 0x0000
+        # without checking anything (PS3.4 J.3.2), so counting there would
+        # report a verdict the bridge had no evidence for at that instant.
+        # Counting BEFORE the report made an undelivered verdict bump the
+        # counters on every retry of the same batch, so the metric described
+        # attempts rather than outcomes.
+        try:
+            if ok:
+                naction_total.labels(verdict="success").inc(len(ok))
+            if failed:
+                naction_total.labels(verdict="failed").inc(len(failed))
+        except Exception:
+            pass
+        return True
 
     def _tick(self):
         with self._lock:
             jobs = list(self._jobs.values())
         now = self._now()
         for job in jobs:
-            for sop_item in list(job.pending):
+            # Verification is bounded: each `_verify` may be a network round
+            # trip to the origin, and an unbounded walk over a large batch held
+            # the single commit worker past the job's own deadline - delaying
+            # every other peer's verdict. The deadline is the job's, because
+            # that is the instant its answer stops improving: past it the
+            # remaining SOPs are reported as unconfirmed regardless.
+            #
+            # A FROZEN verdict is never re-examined: the outcome was decided
+            # (and, once persisted, is on disk), so the remaining ticks only
+            # retry the REPORT. Walking `pending` anyway burned up to
+            # `verify_budget_sec` of origin round trips per tick on the single
+            # commit worker, for an answer nothing may use any more.
+            verify_deadline = min(job.deadline, self._now() + self._verify_budget_sec)
+            to_verify = [] if job.frozen_verdict is not None else list(job.pending)
+            for sop_item in to_verify:
+                if self._now() >= verify_deadline:
+                    logging.info(
+                        "[COMMIT] tx=%s: verification budget reached (%d left "
+                        "unverified) - resolving with what is known",
+                        job.tx_uid,
+                        len(job.pending),
+                    )
+                    break
                 sop_class, sop_uid = sop_item
                 try:
                     if self._verify(sop_class, sop_uid):
@@ -3807,23 +3696,129 @@ class CommitTracker:
                 except Exception as e:
                     logging.warning("[COMMIT] verify %s error: %s", sop_uid, e)
             if not job.pending or now >= job.deadline:
+                # CC3: the verdict is FROZEN on the first attempt. The report
+                # must describe the batch as it stood when the outcome was
+                # decided: recomputing it per attempt let a later successful
+                # verify (or a late confirmation) change what had already been
+                # reported, so the retry could contradict the first try.
+                if job.frozen_verdict is None:
+                    job.frozen_verdict = self._build_verdict(job)
+                # R10: the verdict is durable BEFORE the first report goes
+                # out. Memory-only, a crash after the N-EVENT-REPORT left the
+                # response lost and the restart rebuilt a verdict from a later
+                # `pending` set - so the SAME transaction could be reported
+                # twice with different outcomes.
+                #
+                # The write is keyed on `verdict_persisted`, not on the verdict
+                # being absent, and it runs on EVERY attempt until it lands: a
+                # single failed write left the verdict in memory, so a guard on
+                # `frozen_verdict is None` skipped every later attempt and the
+                # row kept arguing from the OLD `pending` set at every restart.
+                # With a database the operator asked for durability, so a
+                # failed persist WITHHOLDS the report: sending first and
+                # crashing before `_forget` left a restart to rebuild a
+                # DIFFERENT verdict from a later `pending` set - the same
+                # transaction reported twice with different outcomes (PS3.4
+                # J.3.3.1: the report IS the result). The job stays in the
+                # working set so the next tick retries the persist.
+                if self._db is not None and not job.verdict_persisted:
+                    try:
+                        self._persist(job)
+                        job.verdict_persisted = True
+                        job.pending_persisted = len(job.pending)
+                    except Exception as e:
+                        logging.critical(
+                            "[COMMIT] tx=%s: frozen verdict still not persisted "
+                            "(%s) - report withheld until it is",
+                            job.tx_uid,
+                            e,
+                        )
+                        continue
                 # Retire the job only once its verdict was actually delivered:
                 # dropping it after a failed N-EVENT-REPORT lost the outcome
                 # the modality was waiting for.
                 if self._resolve(job):
+                    # R7/R9: the ownership test, the in-memory removal and the
+                    # row delete are ONE locked transition. Releasing the lock
+                    # between them let a `register` for the same tx_uid persist
+                    # a NEW row that this `_forget` then deleted - the new job
+                    # survived in memory but its row did not, so a restart lost
+                    # a commitment the SCU had just been told to expect.
                     with self._lock:
-                        self._jobs.pop(job.tx_uid, None)
-                    # Drop the row only after the verdict left the process:
-                    # a row deleted before the report would lose the batch on
-                    # a crash between the two, which is the failure this
-                    # persistence exists to prevent.
-                    self._forget(job.tx_uid)
+                        still_ours = self._jobs.get(job.tx_uid) is job
+                        if still_ours:
+                            del self._jobs[job.tx_uid]
+                            # A failed delete must NOT escape: the verdict is
+                            # already delivered, and aborting the tick leaves
+                            # the row behind, so the next restart reloads the
+                            # batch and sends a SECOND report for a verdict
+                            # the modality already received.
+                            try:
+                                self._forget(job.tx_uid)
+                            except Exception as e:
+                                logging.error(
+                                    "[COMMIT] tx=%s: verdict delivered but the "
+                                    "row could not be deleted (%s) - a restart "
+                                    "may re-send it once",
+                                    job.tx_uid,
+                                    e,
+                                )
+                    if not still_ours:
+                        # Re-registered while the report was in flight: the
+                        # NEW job and its row belong to the new request.
+                        # Retiring them here would lose a commitment the SCU
+                        # was just told to expect.
+                        logging.info(
+                            "[COMMIT] tx=%s was re-registered during resolution "
+                            "- keeping the new job",
+                            job.tx_uid,
+                        )
+                        continue
                 else:
-                    logging.warning(
-                        "[COMMIT] tx=%s kept for another attempt: the verdict "
-                        "was not delivered",
-                        job.tx_uid,
-                    )
+                    job.report_attempts += 1
+                    if job.report_attempts >= MAX_REPORT_ATTEMPTS:
+                        # The modality will never hear this verdict: retire
+                        # the batch and say so at ERROR level. Keeping it
+                        # would re-block the single commit worker on every
+                        # tick, delaying every other peer's verdict.
+                        logging.error(
+                            "[COMMIT] tx=%s: giving up after %d failed "
+                            "N-EVENT-REPORT attempts - the verdict was never "
+                            "delivered",
+                            job.tx_uid,
+                            job.report_attempts,
+                        )
+                        # CC4: an UNDELIVERED verdict is the record of what
+                        # happened, not a transient state. The job leaves the
+                        # working set (it would otherwise re-block this single
+                        # worker on every tick) but its ROW STAYS, so the
+                        # outcome survives a restart and can be re-reported or
+                        # inspected. Deleting it would erase the only trace
+                        # that these SOPs were never confirmed.
+                        #
+                        # Ownership test, in-memory removal and the ABANDONED
+                        # row are ONE locked transition, the same rule `_forget`
+                        # follows below. Writing the row after releasing the
+                        # lock let a `register` of the same Transaction UID land
+                        # in between, and the parked row then overwrote the NEW
+                        # request's acknowledged commitment.
+                        with self._lock:
+                            still_ours = self._jobs.get(job.tx_uid) is job
+                            if still_ours:
+                                job.abandoned = True
+                                del self._jobs[job.tx_uid]
+                                self._park_undelivered(job)
+                                self._abandoned[job.tx_uid] = job
+                        if not still_ours:
+                            # Re-registered while the verdict was being
+                            # abandoned: the NEW job and its row belong to the
+                            # new request.
+                            logging.info(
+                                "[COMMIT] tx=%s was re-registered during "
+                                "abandonment - keeping the new job",
+                                job.tx_uid,
+                            )
+                            continue
             elif self._db is not None:
                 # Confirmations shrink `job.pending` and that set is what a
                 # restart reads back. Rewriting the row on EVERY tick would put
@@ -3831,9 +3826,43 @@ class CommitTracker:
                 # for the full deadline; the row is written when the set
                 # actually shrank, which is the only state change here that a
                 # restart can observe.
+                #
+                # The write only belongs to a job that STILL OWNS its row. A
+                # re-registration for the same tx_uid replaces `_jobs[tx_uid]`
+                # with a fresh CommitJob and its own row; this tick is then
+                # holding a snapshot of the OLD object, and writing it would
+                # REPLACE the new job's row with stale SOPs and an old
+                # deadline. Drawing on one's own row is exactly what "tie the
+                # write to the job object" means here.
                 if len(job.pending) != job.pending_persisted:
-                    job.pending_persisted = len(job.pending)
-                    self._persist(job)
+                    with self._lock:
+                        still_ours = self._jobs.get(job.tx_uid) is job
+                    if still_ours:
+                        # CM1: advance the watermark only once the write has
+                        # SUCCEEDED. Setting it first meant a failed persist
+                        # was never retried - the batch then looked persisted
+                        # for the rest of its life, so a restart brought back
+                        # the OLD pending set and re-verified (or re-reported)
+                        # SOPs that had already been confirmed.
+                        #
+                        # One batch's store failure must not abort this tick:
+                        # the remaining batches would wait an extra interval
+                        # for a reason that has nothing to do with them.
+                        try:
+                            self._persist(job)
+                            job.pending_persisted = len(job.pending)
+                        except Exception as e:
+                            logging.error(
+                                "[COMMIT] tx=%s: pending state not persisted (%s)",
+                                job.tx_uid,
+                                e,
+                            )
+                    else:
+                        logging.debug(
+                            "[COMMIT] tx=%s: re-registered - stale pending "
+                            "state not written back",
+                            job.tx_uid,
+                        )
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -3849,6 +3878,11 @@ class CommitTracker:
     def pending_count(self):
         with self._lock:
             return len(self._jobs)
+
+    def abandoned_count(self):
+        """Undelivered batches kept for inspection (R10). Never ticked."""
+        with self._lock:
+            return len(self._abandoned)
 
     def close(self):
         self._stop.set()
@@ -4006,6 +4040,13 @@ def _http_retry(request_func, max_retries=3, delay=2.0):
 # ---------------------------------------------------------------------------
 # Bridge: QIDO-RS with retry
 # ---------------------------------------------------------------------------
+class QidoMalformedBodyError(ValueError):
+    """A 2xx QIDO-RS answer whose body is not a DICOM JSON array.
+
+    Separate from an empty result: `[]` means the query ran and matched
+    nothing, whereas this means the answer could not be read at all.
+    """
+
 def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     """QIDO-RS GET with retry wrapper. Auth by nginx.
 
@@ -4042,19 +4083,32 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     # callers only catch httpx errors - a no-match search would surface as a
     # tooling failure instead of an empty result set. The same applies to an
     # intermediary that answers 200 with an empty or non-JSON body.
-    if resp.status_code == 204 or not resp.content:
+    # PS3.18 10.6.1: 204 is the explicit "nothing to return" answer and stays
+    # an empty result. A 200 with no body is NOT that: the server claimed to
+    # answer a query and delivered nothing readable, which is the same failure
+    # class as an HTML error page and must not read as "matched nothing".
+    if resp.status_code == 204:
         return []
+    if not resp.content:
+        raise QidoMalformedBodyError(f"{url} answered 200 with an empty body")
     try:
         body = resp.json()
     except ValueError:
-        logging.warning(
-            "[QIDO] %s answered 200 with a body that is not JSON "
-            "(%d bytes); treating it as no matches",
-            url,
-            len(resp.content),
+        # PS3.18 10.6.1: a successful QIDO-RS response is a JSON array. A 200
+        # carrying HTML/plain text is a proxy or an error page, not an empty
+        # answer - and returning `[]` made it indistinguishable from "the
+        # study has no matches", so a caller that counted on a real result got
+        # a silent, confidently wrong zero. Signal it as a failure instead.
+        raise QidoMalformedBodyError(
+            f"{url} answered 200 with a body that is not JSON ({len(resp.content)} bytes)"
         )
-        return []
-    return body if isinstance(body, list) else []
+    if not isinstance(body, list):
+        # A DICOM JSON object where the array belongs is the same class of
+        # breakage: it states nothing about matches.
+        raise QidoMalformedBodyError(
+            f"{url} answered 200 with a JSON {type(body).__name__}, expected an array"
+        )
+    return body
 
 # ---------------------------------------------------------------------------
 # Bridge: WADO-RS metadata lookup with retry
@@ -4370,40 +4424,102 @@ def _http_status_to_dimse(http_status):
 # ---------------------------------------------------------------------------
 # Bridge: STOW-RS response parser  -  detect per-SOP failures
 # ---------------------------------------------------------------------------
+class StowBodyNotJsonObject(ValueError):
+    """A STOW-RS response body parsed to something that is not a JSON object.
+
+    PS3.18 10.5.2 makes the STOW response a DICOM JSON OBJECT (an array or a
+    bare scalar is not one). Rejecting it here turns what used to be an
+    AttributeError escaping the handler into a structured 4xx the caller can
+    act on.
+    """
+
+def _stow_body_dict(response_text):
+    """Parse a STOW-RS body and return the JSON object it must contain.
+
+    Returns None when the body is empty or not JSON at all (the caller treats
+    that as "no failure report"). Raises `StowBodyNotJsonObject` when the body
+    IS JSON but is not an object - a list or a scalar - because silently
+    returning [] there reported a malformed answer as a clean one.
+    """
+    try:
+        body = json.loads(response_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(body, dict):
+        raise StowBodyNotJsonObject(
+            f"STOW-RS body is {type(body).__name__}, not a JSON object"
+        )
+    return body
+
+def _stow_seq_value(tag, seq_item):
+    """The `Value` list of one DICOM JSON tag element, type-checked (PS3.18 J.2).
+
+    A tag element is an object with an optional `Value` array. Anything else -
+    a bare string, a list where the element should be, a `Value` that is not a
+    list - used to reach `.get`/`[0]` and raise AttributeError, which the wide
+    `except Exception` in the callers mapped to 0xC000: a PERMANENT refusal
+    for a body that is merely malformed. Corruption is transient, so it raises
+    `StowBodyNotJsonObject` and the caller answers 0xA700 (retryable) instead.
+    """
+    if not isinstance(seq_item, dict):
+        raise StowBodyNotJsonObject(
+            f"failed-SOP item({tag}) is {type(seq_item).__name__}, not an object"
+        )
+    values = seq_item.get("Value", [])
+    if values is None:
+        values = []
+    if not isinstance(values, list):
+        raise StowBodyNotJsonObject(
+            f"failed-SOP item({tag}) Value is {type(values).__name__}, not a list"
+        )
+    return values
+
 def _parse_stow_failures_all(response_text):
     """Parse STOW-RS JSON for ALL failed SOPs (0008,1198 Failed SOP Sequence).
 
     Server returns HTTP 202 even when individual SOPs in a batch fail.
     Returns a list of {"sop_uid": str, "reason": str}; empty when none failed.
+    Raises `StowBodyNotJsonObject` when the body is JSON but not an object, or
+    when a failed-SOP item does not follow the DICOM JSON shape.
     """
-    try:
-        body = json.loads(response_text)
-    except (json.JSONDecodeError, TypeError):
+    body = _stow_body_dict(response_text)
+    if body is None:
         return []
 
     failed_seq = body.get("00081198")
-    if not failed_seq:
+    if not isinstance(failed_seq, dict):
         return []
 
     items = failed_seq.get("Value", [])
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise StowBodyNotJsonObject(
+            f"00081198 Value is {type(items).__name__}, not a list"
+        )
     if not items:
         return []
 
     failures = []
+    seq_items = []
     for item in items:
+        if not isinstance(item, dict):
+            raise StowBodyNotJsonObject(
+                f"00081198 item is {type(item).__name__}, not an object"
+            )
+        seq_items.append(item)
+
+    for item in seq_items:
         # 00081197 = Failure Reason (US, numeric code)
-        failure_code_tag = item.get("00081197", {})
-        codes = failure_code_tag.get("Value", [])
+        codes = _stow_seq_value("00081197", item.get("00081197", {}))
         failure_code = codes[0] if codes else "?"
 
         # 00000902 = Error Comment (LO, human-readable)
-        error_comment_tag = item.get("00000902", {})
-        comments = error_comment_tag.get("Value", [])
+        comments = _stow_seq_value("00000902", item.get("00000902", {}))
         error_comment = comments[0] if comments else "Unknown reason"
 
         # 00081155 = Referenced SOP Instance UID (PS3.18 sec.10.5.2.1)
-        ref_sop_tag = item.get("00081155", {})
-        ref_sops = ref_sop_tag.get("Value", [])
+        ref_sops = _stow_seq_value("00081155", item.get("00081155", {}))
         ref_sop = ref_sops[0] if ref_sops else "?"
 
         failures.append(
@@ -4470,9 +4586,18 @@ def stow_single_instance(
     if raw_bytes is not None:
         dicom_bytes = raw_bytes
     else:
-        buf = io.BytesIO()
-        dcmwrite(buf, dataset, enforce_file_format=True)
-        dicom_bytes = buf.getvalue()
+        # R4: an instance that cannot be re-serialized (an invalid value for
+        # its VR) is a verdict about THIS instance, not a crash. Letting
+        # dcmwrite raise here escaped before the function returned its
+        # promised three-tuple, and the caller's broad handler then answered
+        # for the whole request.
+        try:
+            buf = io.BytesIO()
+            dcmwrite(buf, dataset, enforce_file_format=True)
+            dicom_bytes = buf.getvalue()
+        except Exception as e:
+            logging.error("[STOW-RS] could not serialize the instance: %s", e)
+            return (0xC000, None, f"Serialize error: {e}")
 
     boundary = f"BOUNDARY_{uuid.uuid4().hex[:16]}"
     body = (
@@ -4529,8 +4654,15 @@ def stow_single_instance(
         sop_uid = str(getattr(dataset, "SOPInstanceUID", "?"))
 
         if resp.status_code in (200, 201, 202):
-            # Bridge: parse STOW-RS JSON for per-SOP failures
-            rejection = _parse_stow_failures(resp.text, sop_uid)
+            # Bridge: parse STOW-RS JSON for per-SOP failures. A body that is
+            # not a DICOM JSON object is the server answering the wrong thing:
+            # report it as a rejected instance rather than letting the parse
+            # exception escape the C-STORE handler.
+            try:
+                rejection = _parse_stow_failures(resp.text, sop_uid)
+            except StowBodyNotJsonObject as e:
+                logging.error("[STOW-RS] malformed response body: %s", e)
+                return (0xA700, resp.status_code, str(e))
             if rejection:
                 logging.error(
                     "[STOW-RS] Server rejected SOP %s: %s - check clarus-server logs",
@@ -4561,6 +4693,15 @@ def stow_single_instance(
         logging.warning("-> STOW-RS: TOTAL TIMEOUT after %.0fs", total_timeout)
         stow_requests.labels(status="error").inc()
         return (0xA700, None, "Total timeout")
+    except httpx.TransportError as e:
+        # ReadError / WriteError / RemoteProtocolError: the TCP link broke
+        # mid-request. This is TRANSIENT (retryable), not a permanent verdict:
+        # answering 0xC000 told the modality the instance was refused and must
+        # never be re-sent, so a single blip lost data. 0xA700 (Out of
+        # Resources) is the retryable refusal.
+        logging.warning("-> STOW-RS: TRANSPORT ERROR (%s)", e)
+        stow_requests.labels(status="error").inc()
+        return (0xA700, None, str(e))
     except Exception as e:
         logging.warning("-> STOW-RS: ERROR (%s)", e)
         logging.debug("-> STOW-RS: Full traceback follows:", exc_info=True)
@@ -4596,12 +4737,29 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
     stow_url = f"{base}/studies"
 
     body = bytearray()
+    pre_failed = []
     for sop_uid, ds, raw_bytes in payloads:
         if raw_bytes is None:
-            _ensure_stow_ts(ds)
-            buf = io.BytesIO()
-            dcmwrite(buf, ds, enforce_file_format=True)
-            dicom_bytes = buf.getvalue()
+            # R4: re-serialization is per-SOP work and can raise on ONE bad
+            # instance (an invalid value for its VR). Outside this guard that
+            # exception escaped before the function returned the `(results,
+            # retry_after)` tuple it promises, so the whole batch had no
+            # outcome and the retry re-sent every other SOP with it. A failed
+            # part is reported as 0xC000 (this instance is unwritable) and the
+            # rest of the batch still goes.
+            try:
+                _ensure_stow_ts(ds)
+                buf = io.BytesIO()
+                dcmwrite(buf, ds, enforce_file_format=True)
+                dicom_bytes = buf.getvalue()
+            except Exception as e:
+                logging.error(
+                    "[STOW-RS] could not serialize SOP %s for the batch: %s",
+                    sop_uid,
+                    e,
+                )
+                pre_failed.append((sop_uid, 0xC000, None, f"Serialize error: {e}"))
+                continue
         else:
             dicom_bytes = raw_bytes
         body += b"--" + boundary.encode("ascii") + b"\r\n"
@@ -4609,6 +4767,15 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
         body += dicom_bytes
         body += b"\r\n"
     body += b"--" + boundary.encode("ascii") + b"--\r\n"
+
+    failed_uids = {entry[0] for entry in pre_failed}
+    live_payloads = [
+        (uid, ds, raw) for uid, ds, raw in payloads if uid not in failed_uids
+    ]
+    if not live_payloads:
+        # Every part was unwritable: nothing to POST, and the caller still gets
+        # the promised tuple with the per-SOP verdicts.
+        return pre_failed, None
 
     headers = {
         "Content-Type": (
@@ -4640,9 +4807,22 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
 
         if resp.status_code in (200, 201, 202):
             # Per-SOP outcome: server may reject a subset (0008,1198) in a 2xx.
-            failed = _parse_stow_failures_all(resp.text)
+            try:
+                failed = _parse_stow_failures_all(resp.text)
+            except StowBodyNotJsonObject as e:
+                # PS3.18 10.5.2: the response must be a DICOM JSON object. A
+                # list or scalar body states nothing about the batch, so it is
+                # a server-side reject, not a clean answer - and it must be
+                # returned in the SAME `(results, retryafter)` shape as every
+                # other outcome, or the caller unpacks two values from a
+                # three-tuple and dies with ValueError.
+                logging.error("[STOW-RS] malformed batch response body: %s", e)
+                return pre_failed + [
+                    (uid, 0xA700, resp.status_code, f"Malformed response: {e}")
+                    for uid, _ds, _raw in live_payloads
+                ], None
             failed_by_uid = {f["sop_uid"]: f["reason"] for f in failed}
-            sent = {uid for uid, _ds, _raw in payloads}
+            sent = {uid for uid, _ds, _raw in live_payloads}
             # PS3.18 10.5: a rejection the server reported for a SOP the client
             # did not send means the two sides disagree about the batch. Marking
             # every sent SOP as delivered would claim a success nobody stated,
@@ -4654,12 +4834,12 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     "whole batch retried",
                     len(unmatched),
                 )
-                return [
+                return pre_failed + [
                     (uid, 0xA700, resp.status_code, "Unmatched failure response")
-                    for uid in sent
+                    for uid, _ds, _raw in live_payloads
                 ], None
-            results = []
-            for sop_uid, ds, raw_bytes in payloads:
+            results = list(pre_failed)
+            for sop_uid, ds, raw_bytes in live_payloads:
                 if sop_uid in failed_by_uid:
                     results.append(
                         (sop_uid, 0xA700, resp.status_code, failed_by_uid[sop_uid])
@@ -4671,7 +4851,7 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     "[STOW-RS] Batch: %d/%d SOPs rejected by server - "
                     "will re-send individually on retry",
                     len(failed),
-                    len(payloads),
+                    len(live_payloads),
                 )
             return results, None
 
@@ -4686,29 +4866,1710 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 backoff,
             )
             msg = f"Disk full - retry after {backoff}s"
-            return [(uid, 0xA700, 507, msg) for uid, _, _ in payloads], backoff
+            return pre_failed + [
+                (uid, 0xA700, 507, msg) for uid, _, _ in live_payloads
+            ], backoff
 
         # non-2xx  -  whole batch shares one outcome.
         dimse_status, _, msg = _http_status_to_dimse(resp.status_code)
         return (
-            [(uid, dimse_status, resp.status_code, msg) for uid, _, _ in payloads],
+            pre_failed
+            + [
+                (uid, dimse_status, resp.status_code, msg)
+                for uid, _, _ in live_payloads
+            ],
             None,
         )
     except httpx.ConnectError:
         logging.warning("-> STOW-RS: CONNECTION REFUSED")
         stow_requests.labels(status="error").inc()
-        return [
-            (uid, 0xA700, None, "Connection refused") for uid, _, _ in payloads
+        return pre_failed + [
+            (uid, 0xA700, None, "Connection refused") for uid, _, _ in live_payloads
         ], None
     except httpx.TimeoutException:
         logging.warning("-> STOW-RS: TOTAL TIMEOUT after %.0fs", total_timeout)
         stow_requests.labels(status="error").inc()
-        return [(uid, 0xA700, None, "Total timeout") for uid, _, _ in payloads], None
+        return pre_failed + [
+            (uid, 0xA700, None, "Total timeout") for uid, _, _ in live_payloads
+        ], None
+    except httpx.TransportError as e:
+        # Transient mid-request transport break (Read/Write/RemoteProtocol):
+        # retryable, so 0xA700 per SOP, not the permanent 0xC000.
+        logging.warning("-> STOW-RS: TRANSPORT ERROR (%s)", e)
+        stow_requests.labels(status="error").inc()
+        return pre_failed + [
+            (uid, 0xA700, None, str(e)) for uid, _, _ in live_payloads
+        ], None
     except Exception as e:
         logging.warning("-> STOW-RS: ERROR (%s)", e)
         logging.debug("-> STOW-RS: Full traceback follows:", exc_info=True)
         stow_requests.labels(status="error").inc()
-        return [(uid, 0xC000, None, str(e)) for uid, _, _ in payloads], None
+        return pre_failed + [
+            (uid, 0xC000, None, str(e)) for uid, _, _ in live_payloads
+        ], None
+
+# ---------------------------------------------------------------------------
+# Bridge: http_server
+# ---------------------------------------------------------------------------
+
+"""Clarus Bridge  -  HTTP handler for /print, /metrics, /health, /version.
+
+BridgeHTTPHandler: POST /print (C-PRINT), GET /metrics (Prometheus), GET /health,
+GET /version (build identification).
+Includes JSON->DICOM Dataset converter and factory for dependency injection (MAJ-003).
+"""
+
+import base64
+import json
+import logging
+import socket
+import time
+from http.server import BaseHTTPRequestHandler
+
+from prometheus_client import generate_latest
+from pydicom import Dataset
+from pydicom.datadict import dictionary_VR, keyword_dict
+
+# Short git revision of the commit the bundle was generated from. bundle.py
+# rewrites this line when it assembles clbridge.py; in the source tree the
+# value is the placeholder, which is also the honest answer for a bundle cut
+# outside a repository.
+BUNDLE_STAMP = "e10f1134"
+
+# Per-socket-operation deadline for a request. A print job is a JSON body with
+# base64 images on a LAN, so 30 s is far beyond any legitimate transfer while
+# still bounding a stalled peer: without it one silent body holds the
+# connection (and the worker) open indefinitely. A peer that keeps sending a
+# byte just inside every window is not a stall, so the TOTAL body read is
+# bounded separately by BODY_TOTAL_TIMEOUT_SEC.
+HTTP_SOCKET_TIMEOUT_SEC = 30
+
+# Wall-clock budget for reading ONE request body. The largest legitimate body
+# is a 100 MB base64 print job (the size ceiling in do_POST); on the LAN and
+# even on a 10 Mbit link that is well under a minute, so 120 s leaves room for
+# a slow printer driver while still bounding a peer that would otherwise hold
+# the worker for as long as it cares to trickle.
+BODY_TOTAL_TIMEOUT_SEC = 120
+
+# Bytes per read in the body loop. The deadline bounds the total, so the chunk
+# only has to be large enough that a normal body costs a handful of reads.
+_BODY_CHUNK = 64 * 1024
+
+# Wall-clock budget for the request line PLUS headers. `self.timeout` bounds
+# one socket operation, so a peer sending a header byte every 29 s is never
+# a stall and keeps the single-threaded listener busy for as long as it
+# likes - while /health, the liveness probe, waits behind it. 30 s is far
+# beyond any legitimate request head (nginx's default client_header_timeout
+# is 60 s for a full request; a head is a fraction of that).
+HEAD_TOTAL_TIMEOUT_SEC = 30
+
+class _BodyDeadlineExceeded(Exception):
+    """The peer is too slow: the wall-clock body budget ran out."""
+
+class _BodyTruncated(Exception):
+    """The peer sent fewer bytes than its Content-Length announced."""
+
+class _HeadDeadlineExceeded(Exception):
+    """The peer took too long over the request line and headers."""
+
+class _HeadBudgetReader:
+    """Re-arms the raw socket's timeout to the remaining head budget per BYTE.
+
+    `parse_request` reads the headers through `self.rfile`, and `readline()`
+    on a buffered reader loops internally: one call issues as many `recv`s as
+    it needs, each of which would get its own fresh socket window. Re-arming
+    once per `readline` call therefore still let a peer trickle a byte inside
+    every window and hold the head read forever.
+
+    `readline` is implemented HERE as a byte-at-a-time loop over `read(1)`, so
+    the deadline is checked between every byte. The head is a few hundred
+    bytes, so the extra Python-level looping costs nothing measurable, and the
+    boundedness is what the head read exists for.
+    """
+
+    def __init__(self, inner, deadline, sock):
+        self._inner = inner
+        self._deadline = deadline
+        self._sock = sock
+
+    def _arm(self):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise _HeadDeadlineExceeded()
+        if self._sock is not None:
+            try:
+                self._sock.settimeout(max(0.1, remaining))
+            except OSError:
+                pass
+
+    def readline(self, limit=-1):
+        """One line, assembled byte by byte under the remaining budget."""
+        line = bytearray()
+        while True:
+            self._arm()
+            char = self._inner.read(1)
+            if not char:
+                # EOF: the caller sees a short/empty line and answers
+                # accordingly (empty request line = peer closed).
+                return bytes(line)
+            line += char
+            if char == b"\n":
+                return bytes(line)
+            if 0 < limit <= len(line):
+                # Same truncation contract as the buffered reader: a line
+                # longer than `limit` is returned without its terminator and
+                # the caller reports 414.
+                return bytes(line)
+
+    def read(self, n=-1):
+        self._arm()
+        return self._inner.read(n)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+# ---------------------------------------------------------------------------
+# Bridge: JSON -> DICOM Dataset converter for C-PRINT
+# ---------------------------------------------------------------------------
+class _UnknownPrintAttribute(ValueError):
+    """A print job names an attribute the DICOM dictionary does not know.
+
+    Raised instead of skipping the key: a typo in a film-session keyword used
+    to drop the attribute silently, and the print job then differed from what
+    the caller asked for with no error anywhere.
+    """
+
+# PS3.5 Table 6.2-1: the VRs whose value is a number on the wire. A JSON
+# number for one of these is passed through as a number; a JSON STRING is
+# still accepted (a caller may format IS/DS itself) and reaches pydicom as it
+# was written.
+_NUMERIC_VRS = frozenset({"US", "SS", "UL", "SL", "UV", "SV", "IS", "DS", "FL", "FD"})
+
+def _print_attr_value(vr, value):
+    """One attribute value, typed for the VR the dictionary gave the tag.
+
+    JSON can only carry strings, numbers, booleans and nulls, so a caller can
+    legitimately send `{"ImageBoxPosition": 1}` or `"1"` for a US attribute.
+    `str()`ing every scalar made the VALUE a string regardless - pydicom then
+    warns ("a value of type 'str' cannot be assigned to a tag with VR US") and
+    a strict SCP reads the element with the wrong value type. Numbers pass
+    through untouched and pydicom's own converter applies the VR's rules;
+    everything else keeps the historical string form.
+    """
+    if vr in _NUMERIC_VRS and isinstance(value, (int, float)) and not isinstance(
+        value, bool
+    ):
+        return value
+    return str(value)
+
+def _json_print_to_dataset(json_dict):
+    """Convert JSON dict of DICOM tags to pydicom Dataset.
+
+    Keys can be:
+        - DICOM tag hex string (e.g. "00100010" -> PatientName)
+        - DICOM keyword (e.g. "PatientName")
+
+    The VR comes from the DICOM data dictionary (PS3.6; pydicom mirrors it in
+    `pydicom.datadict.dictionary_VR`), never from the Python type of the JSON
+    value. A hardcoded "SH" for every scalar wrote IS/CS/LO/DS/US attributes
+    under the wrong VR, and "OB" for a list turned a multi-valued CS (such as
+    a Film Box attribute) into a byte string the print SCP cannot interpret.
+
+    An unknown keyword raises `_UnknownPrintAttribute` rather than being
+    skipped: the caller answers 400 and the operator sees the typo.
+    """
+    ds = Dataset()
+    for key, value in json_dict.items():
+        # Try hex tag
+        if len(key) == 8 and all(c in "0123456789ABCDEFabcdef" for c in key):
+            group = int(key[0:4], 16)
+            elem = int(key[4:8], 16)
+        else:
+            # Try keyword lookup
+            tag_int = keyword_dict.get(key)
+            if tag_int is None:
+                raise _UnknownPrintAttribute(f"unknown print attribute: {key}")
+            # keyword_dict values are ints like 0x00100010
+            group = tag_int >> 16
+            elem = tag_int & 0xFFFF
+
+        tag = (group, elem)
+        # PS3.6: the dictionary is the authority for the VR. It RAISES
+        # KeyError for a tag it does not know (private or simply absent), so
+        # the lookup is guarded rather than post-checked - `dictionary_VR`
+        # never returns an empty string on an unknown tag.
+        try:
+            vr = dictionary_VR(tag)
+        except KeyError:
+            raise _UnknownPrintAttribute(
+                f"unknown print attribute: {key} ({group:04X},{elem:04X})"
+            ) from None
+        if not vr:
+            raise _UnknownPrintAttribute(
+                f"unknown print attribute: {key} ({group:04X},{elem:04X})"
+            )
+
+        if vr == "SQ":
+            # A sequence carries items, not scalars: a dict is one item.
+            if isinstance(value, dict):
+                items = [_json_print_to_dataset(value)]
+            elif isinstance(value, list):
+                items = [
+                    _json_print_to_dataset(v) if isinstance(v, dict) else v
+                    for v in value
+                ]
+            else:
+                raise _UnknownPrintAttribute(
+                    f"{key} is SQ but the value is not a sequence"
+                )
+            ds.add_new(tag, vr, items)
+        elif isinstance(value, list):
+            # Multi-valued attribute keeps the TAG's VR (PS3.5 6.4 VM>1).
+            ds.add_new(tag, vr, [_print_attr_value(vr, v) for v in value])
+        else:
+            ds.add_new(tag, vr, _print_attr_value(vr, value))
+    return ds
+
+# ---------------------------------------------------------------------------
+# Bridge: HTTP Bridge Handler  -  /print + /metrics, /health
+# ---------------------------------------------------------------------------
+class BridgeHTTPHandler(BaseHTTPRequestHandler):
+    """HTTP handler for POST /print, GET /metrics, GET /health, GET /version.
+
+    POST /print  -  receives print jobs from ClarityX.
+        Request body: JSON with keys:
+            printer_name (str): key in printers.yaml
+            film_session (dict): DICOM Film Session attributes as JSON
+            images (list[str]): base64-encoded DICOM Part 10 files
+            calling_aet (str, optional): override AE Title
+        Response: JSON PrintResult
+
+    GET /metrics  -  Prometheus text format metrics.
+    GET /health  -  liveness probe (200 OK), pure and fast.
+    GET /version  -  build identification (version + generated-from revision).
+    """
+
+    # `socketserver` copies this onto the connection in BaseHTTPRequestHandler
+    # .setup(), so it bounds EVERY socket operation on the handler - including
+    # the body read below. It stops a peer that STALLS; a peer that trickles
+    # keeps every recv inside the window, and that is what the total deadline
+    # in `_read_body_with_deadline` bounds.
+    timeout = HTTP_SOCKET_TIMEOUT_SEC
+
+    # Dependencies injected via make_bridge_handler() factory  -  NO lazy imports in do_GET!
+    driver_registry = {}
+    printer_registry = {}
+    bridge_ae_title = "CLBRIDGE"    # BR-P31: cached references to avoid per-request imports (P2.10 bottleneck fix)
+    _outbox_ref = None  # OutboxQueue  -  reliable persistence queue
+    _health_checker_ref = None  # HealthChecker  -  real server health status
+    _commit_tracker_ref = None  # CommitTracker  -  Storage Commitment batches
+    _move_jobs_ref = None  # MoveJobManager  -  C-MOVE job table
+
+    def _read_body_with_deadline(self, content_length):
+        """Read exactly `content_length` bytes, bounded by a wall-clock budget.
+
+        `self.timeout` bounds one socket operation, so a peer that sends a
+        byte just inside every timeout window holds this thread for as long as
+        it likes while never tripping the socket timeout. The deadline makes
+        the TOTAL bounded, which is the property the class comment claims.
+
+        Checking the deadline BETWEEN reads is not enough on its own: a read
+        can block for the whole socket timeout (30 s), so a peer trickling one
+        byte per 29 s overran a 120 s budget by up to two windows. Each read is
+        therefore bounded by what is LEFT of the budget, and a read that
+        returns nothing before its own budget means the deadline passed inside
+        it - reported as the same `_BodyDeadlineExceeded` a between-read check
+        would raise.
+
+        `rfile.read(n)` cannot be used here: it is a BUFFERED reader whose
+        internal loop keeps issuing `recv`s until it has `n` bytes, so one call
+        can outlive the budget however the socket timeout is set (the timeout
+        applies per `recv`, not per call). The bytes are read from the RAW
+        socket instead - one `recv` per iteration, each preceded by a
+        budget-derived timeout - and any bytes the reader already buffered are
+        consumed from it first so the two sources cannot interleave.
+        """
+        deadline = time.monotonic() + BODY_TOTAL_TIMEOUT_SEC
+        sock = getattr(self, "connection", None)
+        prev_timeout = None
+        if sock is not None:
+            try:
+                prev_timeout = sock.gettimeout()
+            except OSError:
+                sock = None
+        chunks = []
+        remaining = content_length
+        try:
+            # Anything the buffered reader already pulled off the socket must
+            # be consumed first, or the raw reads below would start past it.
+            #
+            # `peek(0)` on an EMPTY body still enters the buffered reader and
+            # can block until the socket timeout (30 s) for a client that sent
+            # `Content-Length: 0` and is waiting for the response - the request
+            # then times out with nothing to read.
+            if sock is not None and remaining > 0:
+                try:
+                    buffered = self.rfile.peek(0)
+                except Exception:
+                    buffered = b""
+                if buffered:
+                    take = min(len(buffered), remaining)
+                    chunks.append(self.rfile.read(take))
+                    remaining -= take
+            while remaining > 0:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise _BodyDeadlineExceeded()
+                want = min(_BODY_CHUNK, remaining)
+                if sock is None:
+                    # No raw socket (an in-process caller): fall back to the
+                    # reader, still bounded between iterations.
+                    chunk = self.rfile.read(want)
+                else:
+                    # Never wait longer than the remaining budget: the socket
+                    # timeout is the only thing that bounds a blocking recv.
+                    try:
+                        sock.settimeout(min(budget, self.timeout or budget))
+                    except OSError:
+                        sock = None
+                        continue
+                    try:
+                        chunk = sock.recv(want)
+                    except socket.timeout:
+                        # Whose timeout fired decides the answer: ours means the
+                        # wall-clock budget ran out (408, retryable), the peer's
+                        # own stall is equally a 408 for the caller.
+                        if time.monotonic() >= deadline:
+                            raise _BodyDeadlineExceeded() from None
+                        raise
+                if not chunk:
+                    raise _BodyTruncated()
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+        finally:
+            if sock is not None and prev_timeout is not None:
+                try:
+                    sock.settimeout(prev_timeout)
+                except OSError:
+                    pass
+
+    def _read_head_with_deadline(self):
+        """Parse the request line and headers under one wall-clock budget.
+
+        `self.timeout` bounds ONE socket operation, and every received byte
+        resets it, so a peer that sends a header line every 29 s is never a
+        "stall" and holds this thread for as long as it likes. The listener
+        is single-threaded, so that also blocks /health.
+
+        The deadline is read ONCE here and travels with the reader: every
+        read of the request line and of each header re-arms the raw socket to
+        whatever is LEFT of the total, so a trickling peer exhausts the budget
+        even though every individual recv succeeds. The body has its own
+        budget (`_read_body_with_deadline`), which this one deliberately does
+        not touch.
+        """
+        deadline = time.monotonic() + HEAD_TOTAL_TIMEOUT_SEC
+        sock = getattr(self, "connection", None)
+        prev_timeout = None
+        if sock is not None:
+            try:
+                prev_timeout = sock.gettimeout()
+            except OSError:
+                sock = None
+        rfile = self.rfile
+        try:
+            self.rfile = _HeadBudgetReader(rfile, deadline, sock)
+            # Reset the parsed-request fields BEFORE reading: a head timeout
+            # escapes before `parse_request` ever runs, and `send_error` logs
+            # and quotes `self.requestline` - which `setup()` creates only
+            # when the previous request completed. A peer that stalled on the
+            # very first byte raised AttributeError out of the 408 path
+            # instead of answering it.
+            self.command = None
+            self.request_version = self.default_request_version
+            self.requestline = ""
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ""
+                self.request_version = ""
+                self.command = ""
+                self.send_error(414)  # HTTPStatus.REQUEST_URI_TOO_LONG
+                return False
+            if not self.raw_requestline:
+                # The peer closed before sending anything: not an error.
+                self.close_connection = True
+                return False
+            if not self.parse_request():
+                # parse_request already sent the error (400/505) or answered
+                # an Expect: 100-continue rejection.
+                return False
+            return True
+        finally:
+            self.rfile = rfile
+            if sock is not None and prev_timeout is not None:
+                try:
+                    sock.settimeout(prev_timeout)
+                except OSError:
+                    pass
+
+    def handle_one_request(self):
+        """Read one request under the head budget, then dispatch it.
+
+        Reimplemented only to route the request line and headers through
+        `_read_head_with_deadline`: the stdlib loop calls `readline` and
+        `parse_request` directly, and each of those resets the per-operation
+        socket timeout on every byte received. The body budget is applied
+        later, inside the handler, and is unaffected.
+        """
+        try:
+            self.raw_requestline = b""
+            self.command = None
+            self.request_version = self.default_request_version
+            self.requestline = ""
+            self.headers = None
+            if not self._read_head_with_deadline():
+                return
+            method = getattr(self, "do_" + str(self.command), None)
+            if method is None:
+                self.send_error(
+                    501, "Unsupported method (%r)" % self.command
+                )  # HTTPStatus.NOT_IMPLEMENTED
+                return
+            method()
+            self.wfile.flush()
+        except (socket.timeout, TimeoutError, _HeadDeadlineExceeded):
+            # The head budget ran out. 408 says what happened; dropping the
+            # connection silently leaves the peer with no answer at all.
+            self.close_connection = True
+            try:
+                self.send_error(408, "Request header timed out")
+            except OSError:
+                pass
+        except ConnectionError:
+            self.close_connection = True
+
+    def do_GET(self):
+        """Handle GET /metrics, GET /health and GET /version (P22d, P2.10).
+
+        P2.10: /health is a PURE liveness probe  -  no imports, no queue checks,
+        no health checker calls. Those are enforced at C-STORE level (handle_c_store).
+        /health MUST return in <1ms to avoid serialization bottleneck in
+        the single-threaded HTTP server (or thread pool starvation in
+        ThreadingHTTPServer).
+        """
+        if self.path == "/metrics":
+            # RSS comes straight from the OS and involves no handle to hold
+            # open, so there is nothing to cache between scrapes. A failure
+            # leaves the gauge at 0 rather than breaking the scrape.
+            memory_usage.set(get_process_rss_bytes())
+
+            # update Outbox queue metrics  -  use cached refs, NO imports
+            try:
+                _outbox = type(self)._outbox_ref
+                if _outbox is not None:
+                    outbox_pending.set(_outbox.pending_count())
+            except Exception:
+                pass
+
+            # update queue-depth gauges  -  cached refs, no imports.
+            # Every access is guarded: a broken tracker must not break a scrape.
+            try:
+                _ct = type(self)._commit_tracker_ref
+                if _ct is not None:
+                    _n = _ct.pending_count()
+                    commit_batches_pending.set(_n)
+                    naction_batches_pending.set(_n)
+            except Exception:
+                pass
+
+            try:
+                _mj = type(self)._move_jobs_ref
+                if _mj is not None:
+                    cmove_jobs_pending.set(_mj.count_pending())
+            except Exception:
+                pass
+
+            # server_health from real HealthChecker, NOT outbox pending
+            try:
+                _hc = type(self)._health_checker_ref
+                if _hc is not None:
+                    server_health.set(1 if _hc.is_healthy() else 0)
+            except Exception as e:
+                # A checker that raises must not keep reporting the last good
+                # value: a stale 1 tells the dashboards the server is alive
+                # while the very check that reports it is broken.
+                server_health.set(0)
+                logging.error("[METRICS] server_health update failed: %s", e)
+
+            metrics_data = generate_latest()  # pyright: ignore[reportOptionalCall]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.3; charset=utf-8")
+            self.send_header("Content-Length", str(len(metrics_data)))
+            self.end_headers()
+            self.wfile.write(metrics_data)
+        elif self.path == "/health":
+            # P2.10: /health is a PURE liveness probe. No imports, no queue checks,
+            # no health checker  -  just "is the HTTP server alive?".
+            # Backpressure (queue%, server health) is enforced at C-STORE level.
+            # This MUST be the fastest handler in the system.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        elif self.path == "/version":
+            # Which bundle is running? Same weight as /health: a constant join,
+            # no imports beyond the module constant.
+            body = f"clbridge {VERSION} ({BUNDLE_STAMP})".encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path != "/print":
+            self.send_error(404, "Not Found")
+            return
+
+        # Validate Content-Type. Compare the media-type ESSENCE, never a
+        # substring: `"application/json" in "text/plain; x=application/json"`
+        # is True, and text/plain is CORS-safelisted, so a cross-origin page
+        # could post a print job with no preflight at all (PS3.18 aside, this
+        # is the request boundary). Parameters (charset) are allowed.
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self.send_error(400, "Expected application/json")
+            return
+
+        # Read body. A non-numeric or negative length is a malformed request,
+        # not a reason to drop the connection without an answer: `int()` would
+        # raise out of the handler, and a negative length passes the size
+        # ceiling below while `read(-1)` blocks the worker on a body that never
+        # ends.
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._json_error(400, "Invalid Content-Length")
+            return
+        if content_length < 0:
+            self._json_error(400, "Invalid Content-Length")
+            return
+        if content_length > 100 * 1024 * 1024:  # 100 MB limit
+            self.send_error(413, "Payload too large")
+            return
+        # Two failure modes, two answers: too slow is a 408 (the peer can
+        # retry with less data), an early EOF is a 400 (the peer lied about
+        # the length). Neither may escape do_POST - an uncaught exception here
+        # drops the connection with no status at all.
+        try:
+            body = self._read_body_with_deadline(content_length)
+        except _BodyDeadlineExceeded:
+            self.send_error(408, "Request body timed out")
+            return
+        except _BodyTruncated:
+            self.send_error(400, "Request body truncated")
+            return
+        except socket.timeout:
+            # The peer STALLED mid-body: the socket read hit the per-connection
+            # timeout instead of the wall-clock budget. Same meaning as the
+            # deadline case - the request was never answered, so 408, not the
+            # dropped connection an uncaught OSError leaves behind.
+            self.send_error(408, "Request body read timed out")
+            return
+
+        try:
+            request_data = json.loads(body)
+        except ValueError as e:
+            # json.loads(bytes) decodes to str first: non-UTF-8 bytes raise
+            # UnicodeDecodeError (a ValueError), not JSONDecodeError. Both are
+            # malformed input and must yield a 400, never a dropped connection.
+            self._json_error(400, f"Invalid JSON: {e}")
+            return
+        # A syntactically valid array or scalar is still not a print request,
+        # and `request_data.get` would raise AttributeError out of the handler.
+        if not isinstance(request_data, dict):
+            self._json_error(400, "Expected a JSON object")
+            return
+
+        printer_name = request_data.get("printer_name")
+        if printer_name is None or printer_name == "":
+            self._json_error(400, "Missing printer_name")
+            return
+        # A list or object here reaches `printer_registry.get(...)` and raises
+        # TypeError (unhashable) out of the handler, dropping the connection
+        # without the JSON error the caller can act on.
+        if not isinstance(printer_name, str):
+            self._json_error(400, "printer_name must be a string")
+            return
+        # `images: null` iterates over None (TypeError), and a string or an
+        # object iterates character-by-character / key-by-key: both must be a
+        # JSON 400, not a dropped connection or a garbage print job. Checked
+        # with the rest of the request shape, before the registry lookup.
+        raw_images = request_data.get("images", [])
+        if not isinstance(raw_images, list):
+            self._json_error(400, "images must be a list")
+            return
+
+        printer_cfg = self.printer_registry.get(printer_name)
+        if not printer_cfg:
+            self._json_error(404, f"Printer '{printer_name}' not found in registry")
+            return
+
+        # Decode film_session from JSON -> pydicom Dataset
+        try:
+            film_session = _json_print_to_dataset(request_data.get("film_session", {}))
+        except Exception as e:
+            self._json_error(400, f"Invalid film_session: {e}")
+            return
+
+        # Decode images from base64 (validated as a list above).
+        images = []
+        for img_b64 in raw_images:
+            try:
+                # validate=True: without it b64decode DISCARDS every character
+                # outside the alphabet, so a truncated or corrupted image body
+                # decoded to some shorter byte string and failed deep inside
+                # the print driver instead of here, where the request shape is
+                # still known and a 400 is the honest answer.
+                if isinstance(img_b64, str):
+                    img_b64 = img_b64.encode("ascii")
+                images.append(base64.b64decode(img_b64, validate=True))
+            except Exception as e:
+                self._json_error(400, f"Invalid image base64: {e}")
+                return
+
+        # Get calling AE title
+        calling_aet = request_data.get("calling_aet", self.bridge_ae_title)
+
+        # Select driver
+        driver_name = printer_cfg.get("driver", "generic_dicom")
+        driver = self.driver_registry.get(driver_name)
+        if not driver:
+            self._json_error(500, f"Driver '{driver_name}' not registered")
+            return
+
+        # Execute print
+        try:
+            result = driver.print(
+                film_session=film_session,
+                images=images,
+                printer_host=printer_cfg["host"],
+                printer_port=printer_cfg["port"],
+                calling_aet=calling_aet,
+                # PS3.8 9.3.2.1: the Called AE Title is the PRINT SCP's, not
+                # ours. `printer_cfg["aet"]` is what the registry documents as
+                # the printer's identity; addressing it with the bridge's own
+                # title only works against a peer that accepts anything.
+                called_aet=printer_cfg.get("aet") or None,
+            )
+            self._json_response(200 if result.is_success else 502, result)
+        except Exception as e:
+            logging.error("[C-PRINT] Print job failed: %s", e)
+            logging.debug("[C-PRINT] Full traceback follows:", exc_info=True)
+            self._json_error(500, f"Print failed: {e}")
+
+    def _json_response(self, status_code, result):
+        """Send JSON PrintResult."""
+        body = json.dumps(
+            {
+                "job_id": result.job_id,
+                "status": f"0x{result.status:04X}",
+                "film_boxes_printed": result.film_boxes_printed,
+                "failed_images": result.failed_images,
+                "printer_message": result.printer_message,
+            }
+        ).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_error(self, status_code, message):
+        """Send JSON error."""
+        body = json.dumps({"error": message}).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        """Redirect HTTP server logs to Python logging.
+
+        The arguments are passed through, NOT pre-formatted: `format % args`
+        raises TypeError as soon as a caller's message does not match the
+        format string, and `send_error` passes through text that reached it
+        from the request. A logging call must never raise out of the handler.
+        """
+        logging.debug("[HTTP-BRIDGE] " + format, *args)
+
+# ---------------------------------------------------------------------------
+# Bridge: factory for BridgeHTTPHandler with injected dependencies
+# ---------------------------------------------------------------------------
+def make_bridge_handler(
+    driver_registry,
+    printer_registry,
+    bridge_ae_title,
+    health_checker=None,
+    outbox=None,
+    commit_tracker=None,
+    move_jobs=None,
+):
+    """Create BridgeHTTPHandler subclass with injected dependencies.
+
+    P2.10: Injects bridge runtime dependencies (outbox, etc.)
+    as class-level attributes so do_GET() never does lazy imports. This eliminates
+    the per-request import lock contention that was serializing /health behind
+    /metrics in the single-threaded HTTPServer.
+
+    PH-007: health_checker is stored for real server_health gauge.
+    """
+
+    class _Handler(BridgeHTTPHandler):
+        pass
+
+    _Handler.driver_registry = driver_registry
+    _Handler.printer_registry = printer_registry
+    _Handler.bridge_ae_title = bridge_ae_title
+    _Handler._outbox_ref = outbox
+    _Handler._health_checker_ref = health_checker
+    _Handler._commit_tracker_ref = commit_tracker
+    _Handler._move_jobs_ref = move_jobs
+    return _Handler
+
+# ---------------------------------------------------------------------------
+# Bridge: prefetch
+# ---------------------------------------------------------------------------
+
+"""Bounded FIFO prefetch for the C-MOVE read path (B1, 2508).
+
+A reader thread pulls `(dicom_bytes, idx)` from a source generator and fills a
+bounded queue; the sender drains it. Structural backpressure is the bounded
+queue itself: the reader blocks when it is full, the sender when it is empty,
+so memory is bounded by `max_parts` and the Clarus server leg stays busy while
+the sender is blocked on C-STORE network I/O - raising end-to-end C-MOVE
+toward the server ceiling (the serial pipeline left the server idle during
+each C-STORE).
+"""
+
+import logging
+import os
+import queue
+import threading
+
+# Default queue depth: 4 parts (~20 MB for typical CT slices), FIFO.
+# A module-level constant so production and tests observe the same value.
+DEFAULT_PREFETCH_PARTS = 4
+
+# Sentinel: the reader has finished (EOF) or hit a fatal error to surface.
+_EOF = object()
+
+class PartPrefetcher:
+    """Bounded FIFO prefetch bridging a reader thread and the sender loop.
+
+    Usage:
+        pref = PartPrefetcher(_stream_multipart_instances(resp)).start()
+        for dicom_bytes, idx in pref:
+            ... send ...
+        # On early exit (cancel / shutdown / fatal error):
+        pref.stop()
+    """
+
+    def __init__(self, source, max_parts=DEFAULT_PREFETCH_PARTS, on_stop=None):
+        self._q = queue.Queue(maxsize=max_parts)
+        self._source = source
+        self._error = None
+        self._stop = threading.Event()
+        # Called ONCE by `stop()` BEFORE the join. The reader may be blocked
+        # inside the source (an `iter_content` on a slow or half-open HTTP
+        # response), where no queue drain can reach it; closing the response
+        # makes that read return, so the join does not sit out its whole
+        # timeout on every early exit.
+        self._on_stop = on_stop
+        self._thread = threading.Thread(
+            target=self._fill, name="cmove-prefetch", daemon=True
+        )
+
+    def _fill(self):
+        try:
+            for item in self._source:
+                if self._stop.is_set():
+                    # The item is already pulled from the source and will
+                    # never be consumed - release a spilled part here, since
+                    # the queue cannot show it to the drain.
+                    self._discard(item)
+                    break
+                # Blocks when the queue is full - this is the backpressure.
+                self._q.put(item)
+                if self._stop.is_set():
+                    # Paired with the check above: a stop that landed while
+                    # we were blocked in put() is seen HERE, before the source
+                    # is asked for one more item that nothing would consume.
+                    break
+        except Exception as e:  # surface a reader failure to the sender
+            self._error = e
+        finally:
+            try:
+                self._q.put(_EOF)
+            except Exception:
+                pass
+
+    def start(self):
+        """Start the reader thread. Returns self."""
+        self._thread.start()
+        return self
+
+    def __iter__(self):
+        """Yield `(dicom_bytes, idx)` as the reader produces them, in order."""
+        while True:
+            item = self._q.get()
+            if item is _EOF:
+                if self._error is not None:
+                    raise self._error
+                return
+            yield item
+
+    def _drain(self):
+        """Discard queued items, unlinking any spilled part they carry."""
+        while True:
+            try:
+                item = self._q.get_nowait()
+            except queue.Empty:
+                return
+            self._discard(item)
+
+    @staticmethod
+    def _discard(item):
+        """Unlink the temp file of a discarded, never-consumed part."""
+        part = item[0] if isinstance(item, tuple) and item else None
+        if isinstance(part, SpilledPart):
+            try:
+                os.unlink(part.path)
+            except OSError:
+                pass
+
+    def stop(self):
+        """Force the reader to finish and wait for it (non-fatal, idempotent).
+
+        Called when the sender exits early (cancel / shutdown / fatal error).
+        The reader may be blocked on `put` while the queue is full; draining
+        the queue frees a slot so it can observe the stop flag and exit.
+        A drained part that was spilled to disk is unlinked here: nothing
+        downstream will ever consume it, so the temp file would otherwise
+        stay behind (the parser drops only malformed parts, and the sender
+        loop unlinks only the part it has already taken).
+
+        Drained TWICE: the first pass frees the slot the reader is blocked on,
+        and the reader then parks the part it was holding, so a pass that
+        finished before that wake-up would miss it and leave its spill file
+        behind. The second pass after the join catches exactly that item.
+
+        `on_stop` runs BEFORE the join: the drain only frees a reader blocked
+        in `put`, while a reader blocked inside the source (iterating a slow
+        or half-open response) is only reachable by closing what it reads.
+        Without the callback every early exit waited out the whole 5 s join.
+        """
+        self._stop.set()
+        if self._on_stop is not None:
+            try:
+                self._on_stop()
+            except Exception:
+                pass
+        self._drain()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logging.warning("[B1-prefetch] reader thread did not exit in 5s")
+        self._drain()
+
+# ---------------------------------------------------------------------------
+# Bridge: move_jobs
+# ---------------------------------------------------------------------------
+
+"""Clarus Bridge - C-MOVE job queue and SCP target registry (BR-007).
+
+MoveJobManager: SQLite-backed C-MOVE job queue with SCP target auto-registration.
+Thread-safe via SharedDb: one connection, one lock.
+Survives bridge restarts.
+
+Known limitations:
+- C-MOVE-CANCEL not supported. Client can close association;
+  Bridge finishes the current job (data won't be lost).
+- No duplicate SOP check before re-send after restart.
+- Double I/O: temp-file -> read -> send (streaming future).
+"""
+
+import ipaddress
+import logging
+import sqlite3
+import threading
+import time
+
+# ---------------------------------------------------------------------------
+# DB Migration helpers (subnet support, composite keys)
+# ---------------------------------------------------------------------------
+def _migrate_move_jobs(conn):
+    """Add target_host/target_port columns if missing (pre-existing DBs)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info('move_jobs')").fetchall()}
+    if "target_host" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN target_host TEXT NOT NULL DEFAULT ''"
+        )
+    if "target_port" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN target_port INTEGER NOT NULL DEFAULT 0"
+        )
+    # (0008,0058) Failed SOP Instance UID List - newline-joined UIDs of
+    # the slices that failed transfer in this job (PS3.4 C.4.2.1.4.2). The
+    # C-MOVE reactor reads it to put the list on the final Failed/Cancel/
+    # Warning C-MOVE-RSP Identifier.
+    if "failed_sops" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN failed_sops TEXT NOT NULL DEFAULT ''"
+        )
+    # Per-association expose flag: 1 when this job was requested over the
+    # Expose Rejected Instances AE. Carried on the job because the C-MOVE
+    # worker threads are long-lived and outlive the association that queued
+    # the work, so it cannot be read from the event when the job runs.
+    if "expose_rejected" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN expose_rejected INTEGER NOT NULL DEFAULT 0"
+        )
+    # PS3.4 C.4.2.1.2: the C-MOVE-RQ names the SCOPE (STUDY/SERIES/IMAGE) and
+    # the UIDs that scope it. The level and UIDs live on the job because the
+    # worker thread outlives the association that queued the work. An empty
+    # level means STUDY (the historical behaviour), so an existing row keeps
+    # the meaning it had.
+    if "request_level" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN request_level TEXT NOT NULL DEFAULT ''"
+        )
+    if "request_series_uid" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN request_series_uid TEXT"
+            " NOT NULL DEFAULT ''"
+        )
+    if "request_sop_uid" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN request_sop_uid TEXT NOT NULL DEFAULT ''"
+        )
+
+def _migrate_scp_targets(conn):
+    """Migrate scp_targets from single PK (ae_title) to composite (ae_title, host).
+
+    Preserves existing data. Idempotent  -  safe to run multiple times.
+    """
+    # Check if old schema (ae_title as sole PK) exists
+    cols = {r[1] for r in conn.execute("PRAGMA table_info('scp_targets')").fetchall()}
+    if not cols:
+        # Table doesn't exist yet  -  create with v2 schema
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS scp_targets ("
+            "  ae_title TEXT NOT NULL,"
+            "  host TEXT NOT NULL,"
+            "  port INTEGER NOT NULL DEFAULT 104,"
+            "  last_seen INTEGER NOT NULL,"
+            "  consecutive_failures INTEGER DEFAULT 0,"
+            "  PRIMARY KEY (ae_title, host)"
+            ")"
+        )
+        return
+
+    # Check if already migrated: composite PK present.
+    # SQLite PRAGMA table_info doesn't directly show composite PK.
+    # Check by trying to insert a duplicate (ae, host)  -  if UNIQUE constraint
+    # fails on (ae_title) alone, we're on old schema.
+    # Simpler: check if 'host' is part of PK by looking at the CREATE TABLE sql
+    create_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='scp_targets'"
+    ).fetchone()
+    if create_sql and "PRIMARY KEY (ae_title, host)" in create_sql[0]:
+        return  # Already v2
+
+    # Migrate: create v2, copy data, drop v1, rename.
+    #
+    # Crash-safe (each step is idempotent on its own):
+    #   * `scp_targets_v2` may already exist from a crashed run - IF NOT EXISTS
+    #     turns the leftover into a no-op instead of "table already exists";
+    #   * the copy is INSERT OR IGNORE, so re-running after a partial copy adds
+    #     only the rows that are still missing;
+    #   * DROP + RENAME happen together, so a crash between them leaves either
+    #     the old table intact (safe: the migration runs again) or v2 already
+    #     named `scp_targets` (safe: the PK check above returns early);
+    #   * a leftover `scp_targets_v2` from a crash AFTER the rename cannot
+    #     exist, because RENAME removes it.
+    # Before this, a crash after the CREATE left `scp_targets_v2` behind, and
+    # the next start died on "table scp_targets_v2 already exists" - a bridge
+    # that could not open its own database.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS scp_targets_v2 ("
+        "  ae_title TEXT NOT NULL,"
+        "  host TEXT NOT NULL,"
+        "  port INTEGER NOT NULL DEFAULT 104,"
+        "  last_seen INTEGER NOT NULL,"
+        "  consecutive_failures INTEGER DEFAULT 0,"
+        "  PRIMARY KEY (ae_title, host)"
+        ")"
+    )
+    # The v1 table may be gone already (a crash between DROP and RENAME): the
+    # copy then has nothing to read, which is not an error.
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO scp_targets_v2"
+            " SELECT ae_title, host, port, last_seen, consecutive_failures"
+            " FROM scp_targets"
+        )
+    except sqlite3.OperationalError:
+        logging.debug("[MOVE-JOBS] scp_targets_v1 already migrated away")
+    conn.execute("DROP TABLE IF EXISTS scp_targets")
+    conn.execute("ALTER TABLE scp_targets_v2 RENAME TO scp_targets")
+
+# ---------------------------------------------------------------------------
+# Bridge: C-MOVE job queue and SCP target registry
+# ---------------------------------------------------------------------------
+class MoveJobManager:
+    """SQLite-backed C-MOVE job queue with SCP target auto-registration.
+
+    Thread-safe via SharedDb  -  "one connection, one lock".
+    Survives bridge restarts.
+
+    Known limitations:
+    - C-MOVE-CANCEL not supported. Client can close association;
+      Bridge finishes the current job (data won't be lost).
+    - No duplicate SOP check before re-send after restart.
+    - Double I/O: temp-file -> read -> send (streaming future).
+    """
+
+    def __init__(self, shared_db, max_workers=2, scp_remove_failures=3):
+        """shared_db: SharedDb instance (NOT raw sqlite3.Connection).
+
+        Uses SharedDb.locked() for ALL DB operations - no own lock.
+        One connection, one lock: a single serialized writer avoids both lock
+        ordering bugs and SQLite busy-handler tuning.
+
+        scp_remove_failures: consecutive-failure threshold for the auto-remove
+        of an auto-registered SCP peer (CM-006). Fixed constant 3 (fed from
+        `_SCP_FAILURES_BEFORE_REMOVE` in main.py); there is no config knob.
+        """
+        self._db = shared_db  # SharedDb, NOT sqlite3.Connection
+        self._cond = (
+            threading.Condition()
+        )  # notify workers (own cond, not on SharedDb lock)
+        self.max_workers = max_workers
+        self.scp_remove_failures = max(1, int(scp_remove_failures or 3))
+        self._cancel_callbacks = {}  # job_id -> callable
+        self._last_peers_reload = 0.0  # timestamp of last peers reload
+        self.lazyload_peers_interval = (
+            30  # seconds between peers.conf reloads (0 = every call)
+        )
+
+        with self._db.locked() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS move_jobs ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  study_uid TEXT NOT NULL,"
+                "  move_dest_ae TEXT NOT NULL,"
+                "  target_host TEXT NOT NULL DEFAULT '',"
+                "  target_port INTEGER NOT NULL DEFAULT 0,"
+                "  status TEXT NOT NULL DEFAULT 'pending',"
+                "  total_instances INTEGER DEFAULT 0,"
+                "  completed_instances INTEGER DEFAULT 0,"
+                "  failed_instances INTEGER DEFAULT 0,"
+                "  error_message TEXT,"
+                "  failed_sops TEXT NOT NULL DEFAULT '',"
+                "  created_at INTEGER NOT NULL,"
+                "  updated_at INTEGER NOT NULL,"
+                "  attempts INTEGER DEFAULT 0,"
+                "  expose_rejected INTEGER NOT NULL DEFAULT 0"
+                ")"
+            )
+            # Migration: add target_host/target_port columns if missing (pre-existing DBs)
+            _migrate_move_jobs(conn)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_move_jobs_status ON move_jobs(status)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_move_jobs_created ON move_jobs(created_at)"
+            )
+            # scp_targets v2: composite primary key (ae_title, host) for subnet support
+            _migrate_scp_targets(conn)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scp_targets_ae ON scp_targets(ae_title)"
+            )
+            conn.commit()
+
+    # --- move_jobs CRUD ---
+
+    def create_job(
+        self,
+        study_uid,
+        move_dest_ae,
+        target_host="",
+        target_port=0,
+        expose_rejected=False,
+        request_level="",
+        request_series_uid="",
+        request_sop_uid="",
+    ):
+        """Create a new pending C-MOVE job. Returns job id.
+
+        target_host/target_port: resolved Move Destination address.
+        Stored so worker doesn't need to re-resolve (subnet support).
+        expose_rejected: the job was queued over the QA AE; the worker queries
+        the configured `[dicomweb] qa_url` endpoint instead of `clarus_url`.
+        Stored because the worker outlives the association.
+        request_level/request_series_uid/request_sop_uid: the Query/Retrieve
+        scope of the request (PS3.4 C.4.2.1.2), stored for the same reason -
+        a SERIES-level C-MOVE must not retrieve the whole study.
+        """
+        now = int(time.time())
+        with self._db.locked() as conn:
+            cur = conn.execute(
+                "INSERT INTO move_jobs"
+                " (study_uid, move_dest_ae, target_host, target_port,"
+                "  status, created_at, updated_at, expose_rejected,"
+                "  request_level, request_series_uid, request_sop_uid)"
+                " VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                (
+                    study_uid,
+                    move_dest_ae,
+                    target_host,
+                    target_port,
+                    now,
+                    now,
+                    1 if expose_rejected else 0,
+                    str(request_level or ""),
+                    str(request_series_uid or ""),
+                    str(request_sop_uid or ""),
+                ),
+            )
+            conn.commit()
+            job_id = cur.lastrowid
+        # NOTIFY AFTER the db lock is released. `pick_pending_job` takes
+        # `_cond` and then `_db` (it must, to make its empty-check and wait
+        # atomic against this notify); notifying while still holding `_db`
+        # made this path `_db -> _cond`, the exact opposite order. A worker
+        # holding `_cond` waiting for `_db` and a reactor holding `_db`
+        # waiting for `_cond` deadlock the whole C-MOVE subsystem, including
+        # the metrics scrape. The wakeup is only a hint, so releasing first
+        # costs nothing: a worker that cannot see the new row yet simply
+        # re-selects under `_cond`.
+        with self._cond:
+            self._cond.notify()
+        return job_id
+
+    def count_pending(self):
+        """Number of jobs in the 'pending' state (drain gauge).
+
+        Read-only and cheap (one indexed COUNT); never raises, so a metrics
+        scrape cannot be broken by a busy/locked database - returns 0 instead.
+        """
+        try:
+            with self._db.locked() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM move_jobs WHERE status = 'pending'"
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def _select_pending(self):
+        """The pending-row SELECT used by `pick_pending_job`.
+
+        Split out so the caller can run it while holding `self._cond`, which
+        is what makes the empty-check/wait pair atomic against `insert`'s
+        notify.
+        """
+        with self._db.locked() as conn:
+            return conn.execute(
+                "SELECT id, study_uid, move_dest_ae, attempts,"
+                " target_host, target_port"
+                " FROM move_jobs WHERE status = 'pending'"
+                " ORDER BY created_at ASC"
+            ).fetchall()
+
+    def pick_pending_job(self, timeout=5.0, skip=None):
+        """Atomically pick one pending job.
+
+        `skip(host, port, ae) -> bool` marks rows that must not be claimed
+        yet (a peer another worker is streaming to). A skipped row stays
+        pending and visible to the other workers; when every pending row is
+        skipped the caller waits exactly as for an empty queue.
+
+        Returns dict or None.
+        """
+        while True:
+            # The empty-check and the wait must be ONE atomic step against the
+            # notifier. `insert` wakes a waiter under `self._cond`; taking the
+            # same lock around the SELECT closes the lost-wakeup window where a
+            # row was inserted after an empty SELECT and before the wait, which
+            # left the worker asleep with pending work on disk until the
+            # timeout expired.
+            with self._cond:
+                rows = self._select_pending()
+                if skip is not None:
+                    rows = [
+                        r
+                        for r in rows
+                        if not skip(r[4] or "", r[5] or 0, r[2] or "")
+                    ]
+                if not rows:
+                    if not self._cond.wait(timeout=timeout):
+                        return None
+                    continue
+
+            row = rows[0]
+            job_id = row[0]
+            now = int(time.time())
+            with self._db.locked() as conn:
+                row2 = conn.execute(
+                    "SELECT id, study_uid, move_dest_ae, attempts,"
+                    " target_host, target_port, expose_rejected,"
+                    " request_level, request_series_uid, request_sop_uid"
+                    " FROM move_jobs WHERE status = 'pending' AND id = ?",
+                    (job_id,),
+                ).fetchone()
+                if not row2:
+                    continue  # Another worker claimed it
+
+                conn.execute(
+                    "UPDATE move_jobs SET status = 'in_progress',"
+                    " updated_at = ?, attempts = attempts + 1"
+                    " WHERE id = ?",
+                    (now, job_id),
+                )
+                conn.commit()
+                return {
+                    "id": job_id,
+                    "study_uid": row2[1],
+                    "move_dest_ae": row2[2],
+                    "attempts": row2[3],
+                    "target_host": row2[4],
+                    "target_port": row2[5],
+                    # The worker outlives the association that queued the job,
+                    # so which base URL to stream from has to come from the
+                    # row. Omitting it here silently sent every QA job to
+                    # clarus_url, i.e. the sequester was never lifted.
+                    "expose_rejected": int(row2[6] or 0),
+                    # PS3.4 C.4.2.1.2: the scope travels with the job for the
+                    # same reason - the worker no longer has the event.
+                    "request_level": str(row2[7] or ""),
+                    "request_series_uid": str(row2[8] or ""),
+                    "request_sop_uid": str(row2[9] or ""),
+                }
+
+    def requeue_job_without_retry(self, job_id):
+        """Return a claimed job to pending without charging it an attempt (R9).
+
+        The worker claims a job and THEN takes the per-peer gate, so with more
+        than one worker a job could be claimed for a peer another worker was
+        already streaming to. It was then invisible in `in_progress/` for the
+        whole of that transfer. This hands it back so other workers can see it;
+        `attempts` is decremented because the claim already incremented it and
+        nothing was attempted - otherwise a busy peer would burn the job's
+        retry budget without a single C-STORE.
+
+        Only a job still in `in_progress` for this claim is released: a job the
+        reaper or a cancel already moved is not ours to rewrite.
+        """
+        now = int(time.time())
+        with self._db.locked() as conn:
+            cur = conn.execute(
+                "UPDATE move_jobs SET status = 'pending', attempts = "
+                "CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,"
+                " updated_at = ? WHERE id = ? AND status = 'in_progress'",
+                (now, job_id),
+            )
+            conn.commit()
+            changed = cur.rowcount or 0
+        if changed:
+            with self._cond:
+                self._cond.notify()
+        return bool(changed)
+
+    def update_job_progress(self, job_id, completed, failed, total):
+        """Update job progress counters (CM-005)."""
+        now = int(time.time())
+        with self._db.locked() as conn:
+            conn.execute(
+                "UPDATE move_jobs SET completed_instances = ?,"
+                " failed_instances = ?, total_instances = ?,"
+                " updated_at = ? WHERE id = ?",
+                (completed, failed, total, now, job_id),
+            )
+            conn.commit()
+
+    def get_job_progress(self, job_id):
+        """Return (completed, total, status) for a job. Used by C-MOVE generator for 0xFF00 polling."""
+        with self._db.locked() as conn:
+            row = conn.execute(
+                "SELECT completed_instances, total_instances, status"
+                " FROM move_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return (0, 0, "unknown")
+            return (row[0], row[1], row[2])
+
+    def set_job_failed_sops(self, job_id, uids):
+        """Record the (0008,0058) Failed SOP Instance UID List for a job.
+
+        newline-joined UIDs of the slices that were attempted but not
+        delivered. Read back by the C-MOVE generator so the final
+        Failed/Cancel/Warning C-MOVE-RSP Identifier carries the list
+        (PS3.4 C.4.2.1.4.2). Call once at job end.
+        """
+        text = "\n".join(u for u in (uids or []) if u)
+        now = int(time.time())
+        with self._db.locked() as conn:
+            conn.execute(
+                "UPDATE move_jobs SET failed_sops = ?, updated_at = ? WHERE id = ?",
+                (text, now, job_id),
+            )
+            conn.commit()
+
+    def get_job_failed_sops(self, job_id):
+        """Return the (0008,0058) Failed SOP Instance UID list for a job."""
+        with self._db.locked() as conn:
+            row = conn.execute(
+                "SELECT failed_sops FROM move_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if not row or not row[0]:
+            return []
+        return [u for u in str(row[0]).split("\n") if u]
+
+    def finish_job(self, job_id, success=True, error_message=None):
+        """Mark job as success or failed. A terminal row is never rewritten.
+
+        Two wakers can finish the same job - the poll reactor on timeout and
+        the worker when it reaches the end of the instance list - and the last
+        writer would otherwise decide the outcome. A row that already says
+        `failed` must not turn into `success` (or the reverse), because the
+        viewer was already told the first verdict and the counter was already
+        incremented for it.
+
+        Returns True when THIS call moved the row to a terminal status, False
+        when another waker had already finished it. The caller must use that
+        answer before counting the outcome: a second waker that counts its own
+        call double-counts a job that only finished once.
+        """
+        status = "success" if success else "failed"
+        now = int(time.time())
+        with self._db.locked() as conn:
+            cur = conn.execute(
+                "UPDATE move_jobs SET status = ?, error_message = ?,"
+                " updated_at = ? WHERE id = ?"
+                " AND status NOT IN ('success', 'failed')",
+                (status, error_message or "", now, job_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def reset_job_to_pending(self, job_id, reason=""):
+        """Reset an in_progress job back to pending (viewer busy, retry later)."""
+        now = int(time.time())
+        with self._db.locked() as conn:
+            conn.execute(
+                "UPDATE move_jobs SET status = 'pending', error_message = ?,"
+                " updated_at = ? WHERE id = ?",
+                (reason, now, job_id),
+            )
+            conn.commit()
+        with self._cond:
+            self._cond.notify()  # Wake a worker to process the reset job (after fail_timeout)
+
+    def recover_in_progress_jobs(self):
+        """On startup: reset all in_progress jobs to pending (CM-007)."""
+        now = int(time.time())
+        with self._db.locked() as conn:
+            cur = conn.execute(
+                "UPDATE move_jobs SET status = 'pending', updated_at = ?"
+                " WHERE status = 'in_progress'",
+                (now,),
+            )
+            conn.commit()
+            return cur.rowcount
+
+    def cleanup_old_jobs(self, max_age_seconds=86400):
+        """Remove success/failed jobs older than max_age_seconds (default 24h) (CM-008)."""
+        with self._db.locked() as conn:
+            cutoff = int(time.time()) - max_age_seconds
+            conn.execute(
+                "DELETE FROM move_jobs WHERE status IN ('success', 'failed')"
+                " AND updated_at < ?",
+                (cutoff,),
+            )
+            conn.commit()
+
+    # --- scp_targets CRUD ---
+
+    def register_peer(self, ae_title, host, port=104):
+        """Register or update a manually configured peer from peers.conf.
+
+        Composite key (ae_title, host)  -  supports multiple entries per AE
+        (exact IP + CIDR subnet, or multiple subnets).
+        Non-CIDR (exact IP) entries: only ONE per AE title  -  re-registration
+        with a different host replaces the old one. CIDR entries coexist.
+        """
+        now = int(time.time())
+        with self._db.locked() as conn:
+            # Non-CIDR host: delete any existing non-CIDR entry for this AE
+            # so re-registration with a different IP replaces the old one.
+            if "/" not in host:
+                conn.execute(
+                    "DELETE FROM scp_targets"
+                    " WHERE ae_title = ? AND host NOT LIKE '%/%'",
+                    (ae_title,),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO scp_targets"
+                " (ae_title, host, port, last_seen, consecutive_failures)"
+                " VALUES (?, ?, ?, ?, 0)",
+                (ae_title, host, port, now),
+            )
+            conn.commit()
+        logging.info(
+            "[PEER] Registered %s at %s:%d",
+            ae_title,
+            host,
+            port,
+        )
+
+    # --- SCP peer lookup with subnet support --------------------
+
+    def lookup_scp(self, ae_title, client_ip=None):
+        """Look up SCP peer by AE Title, with optional IP subnet matching.
+
+        Args:
+            ae_title: Move Destination AE Title.
+            client_ip: IP address of the requesting SCU (for subnet matching).
+                If None, returns first exact-match (non-CIDR) entry.
+
+        Returns:
+            (host, port) tuple or None.
+
+        Subnet matching (CIDR):
+            peers.conf supports: WEASIS_AE  192.168.1.0/24  11113
+            When client_ip falls within the subnet, returns the CIDR host
+            (e.g. "192.168.1.0/24") and port. Caller uses the PORT for
+            association; the HOST is informational (routed via client_ip).
+        """
+        with self._db.locked() as conn:
+            rows = conn.execute(
+                "SELECT host, port FROM scp_targets WHERE ae_title = ?",
+                (ae_title,),
+            ).fetchall()
+
+        if not rows:
+            return None
+
+        if client_ip is None:
+            # No IP  -  return first exact (non-CIDR) match, else first entry
+            for host, port in rows:
+                if "/" not in host:
+                    return (host, port)
+            return (rows[0][0], rows[0][1])
+
+        # IP provided  -  match against subnets
+        try:
+            client = ipaddress.ip_address(client_ip)
+        except ValueError:
+            # Invalid IP string  -  fall back to exact match
+            for host, port in rows:
+                if "/" not in host:
+                    return (host, port)
+            return None
+
+        # Priority 1: exact address match (non-CIDR). Both sides are
+        # normalised so `VIEWER localhost 11112` matches a request from
+        # 127.0.0.1, and `::1` matches `[::1]`; a raw string compare made the
+        # operator see "Unknown Move Destination" (A801) instead of a match.
+        # CIDR entries are untouched here and only treated as networks below,
+        # so normalisation cannot promote a subnet to an exact hit.
+        want = normalize_host(client_ip)
+        for host, port in rows:
+            if "/" not in host and normalize_host(host) == want:
+                return (host, port)
+
+        # Priority 2: CIDR subnet match
+        for host, port in rows:
+            if "/" in host:
+                try:
+                    network = ipaddress.ip_network(host, strict=False)
+                    if client in network:
+                        return (host, port)
+                except ValueError:
+                    continue
+
+        return None
+
+    def reload_peers_from_file(self, peers_file):
+        """Reload peers from peers.conf into scp_targets table.
+
+        Respects lazyload_peers_interval. Composite key (ae_title, host)
+         -  multiple entries per AE (CIDR + exact) are preserved.
+        """
+        if self.lazyload_peers_interval > 0:
+            elapsed = time.time() - self._last_peers_reload
+            if elapsed < self.lazyload_peers_interval:
+                return 0
+
+        self._last_peers_reload = time.time()
+        new_count = 0
+        seen = set()
+        with self._db.locked() as conn:
+            for ae_title, host, port in parse_peers_conf(peers_file):
+                seen.add((ae_title, host))
+                row = conn.execute(
+                    "SELECT host, port FROM scp_targets"
+                    " WHERE ae_title = ? AND host = ?",
+                    (ae_title, host),
+                ).fetchone()
+                existing = (row[0], row[1]) if row else None
+                if existing is None or existing != (host, port):
+                    now = int(time.time())
+                    conn.execute(
+                        "INSERT OR REPLACE INTO scp_targets"
+                        " (ae_title, host, port, last_seen, consecutive_failures)"
+                        " VALUES (?, ?, ?, ?, 0)",
+                        (ae_title, host, port, now),
+                    )
+                    new_count += 1
+            # A peer removed from peers.conf is gone from the operator's view,
+            # so routing to the stale row was a destination the config no
+            # longer names. Deleting by (ae_title, host) keeps a peer that is
+            # still listed under a different port.
+            #
+            # An EMPTY parse result is the one case that must not delete
+            # anything: a file mid-save, a truncated write or a crash leaves a
+            # config that parses to zero peers, and treating that as "every
+            # peer was removed" silently unregistered the whole peer table.
+            if not seen:
+                logging.warning(
+                    "[PEER] %s parsed to no peers - keeping the existing table "
+                    "(a truncated or empty file must not wipe routing)",
+                    peers_file,
+                )
+                conn.commit()
+                return 0
+            stale = [
+                (ae, host)
+                for ae, host in conn.execute("SELECT ae_title, host FROM scp_targets")
+                if (ae, host) not in seen
+            ]
+            for ae, host in stale:
+                conn.execute(
+                    "DELETE FROM scp_targets WHERE ae_title = ? AND host = ?",
+                    (ae, host),
+                )
+            if stale:
+                logging.info(
+                    "[PEER] Removed %d peer(s) no longer in %s",
+                    len(stale),
+                    peers_file,
+                )
+            conn.commit()
+        if new_count:
+            logging.info(
+                "[PEER] Reloaded %d new/updated peer(s) from %s", new_count, peers_file
+            )
+        return new_count
+
+    # --- scp failure tracking ---
+
+    def record_scp_failure(self, ae_title, host=None):
+        """Record a failure to reach SCP.
+
+        Auto-remove after 3 consecutive failures (CM-006).
+        If host is provided, only updates that specific entry (subnet-safe).
+        """
+        with self._db.locked() as conn:
+            if host:
+                conn.execute(
+                    "UPDATE scp_targets SET consecutive_failures ="
+                    " consecutive_failures + 1"
+                    " WHERE ae_title = ? AND host = ?",
+                    (ae_title, host),
+                )
+                row = conn.execute(
+                    "SELECT consecutive_failures FROM scp_targets"
+                    " WHERE ae_title = ? AND host = ?",
+                    (ae_title, host),
+                ).fetchone()
+                if row and row[0] >= self.scp_remove_failures:
+                    conn.execute(
+                        "DELETE FROM scp_targets" " WHERE ae_title = ? AND host = ?",
+                        (ae_title, host),
+                    )
+                    logging.warning(
+                        "[SCP] Removed %s@%s after %d consecutive failures",
+                        ae_title,
+                        host,
+                        self.scp_remove_failures,
+                    )
+            else:
+                # Backward compat: update all entries for this AE
+                conn.execute(
+                    "UPDATE scp_targets SET consecutive_failures ="
+                    " consecutive_failures + 1 WHERE ae_title = ?",
+                    (ae_title,),
+                )
+                # Check and auto-remove entries with >= N failures
+                conn.execute(
+                    "DELETE FROM scp_targets"
+                    " WHERE ae_title = ? AND consecutive_failures >= ?",
+                    (ae_title, self.scp_remove_failures),
+                )
+            conn.commit()
+
+    def record_scp_success(self, ae_title, host=None):
+        """Reset failure counter on successful connection (CM-006).
+        If host is provided, only resets that specific entry (subnet-safe).
+        """
+        with self._db.locked() as conn:
+            if host:
+                conn.execute(
+                    "UPDATE scp_targets SET consecutive_failures = 0"
+                    " WHERE ae_title = ? AND host = ?",
+                    (ae_title, host),
+                )
+            else:
+                conn.execute(
+                    "UPDATE scp_targets SET consecutive_failures = 0"
+                    " WHERE ae_title = ?",
+                    (ae_title,),
+                )
+            conn.commit()
+
+    def close(self):
+        """no-op  -  SharedDb owns the connection, closed in main()."""
+
+    # --- C-MOVE-CANCEL support ---
+
+    def set_job_cancel_callback(self, job_id, callback):
+        """Store cancel callback for a job (BR-012)."""
+        self._cancel_callbacks[job_id] = callback
+
+    def is_job_cancelled(self, job_id):
+        """Check if job was cancelled by SCU (BR-012)."""
+        cb = self._cancel_callbacks.get(job_id)
+        if cb:
+            try:
+                return cb()
+            except Exception:
+                return False
+        return False
+
+    def clear_job_callback(self, job_id):
+        """Remove cancel callback after job completes (BR-012)."""
+        self._cancel_callbacks.pop(job_id, None)
 
 # ---------------------------------------------------------------------------
 # Bridge: outbox
@@ -4716,7 +6577,8 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
 
 """Outbox Queue  -  filesystem-backed reliable DICOM persistence + delivery.
 
-nginx-way: directories = queue state. Atomic os.rename = state transition.
+nginx-way: directories = queue state. os.rename = state transition; enqueue
+publishes with os.replace (retried - see replace_with_retry).
 No SQLite. No WAL. No busy_timeout. No _write_lock.
 
 Layout:
@@ -4731,7 +6593,13 @@ Layout:
 
 Guarantees:
   - Atomic claim: os.rename(pending/x.*, in_progress/x.*)  -  only ONE worker succeeds
-  - Crash-safe: recover_stuck() moves in_progress/* back to pending/ on startup
+  - Restart-safe, NOT power-loss-safe: recover_stuck() moves in_progress/*
+    back to pending/ on startup, so a crash or restart loses nothing that
+    reached the filesystem. Writes are flushed to the OS page cache, not
+    fsynced: an unclean power loss can lose an item already answered 0x0000.
+    That window is closed by the HOST (UPS / battery-backed write cache), not
+    by this process - fsync per instance would cost a disk round-trip per
+    C-STORE and still not survive a failing disk.
   - Idempotent: enqueue checks if {uid}.dcm already exists in any dir -> skip
   - No duplicate delivery: exactly one in_progress/ at a time
 
@@ -4757,6 +6625,14 @@ STUCK_ITEM_CHECK_INTERVAL = 60.0  # seconds
 
 # Items stuck in in_progress/ longer than this -> recovered.
 STUCK_ITEM_TIMEOUT = 300.0  # 5 minutes
+
+# A pending/ blob without its .meta is adopted as an orphan (crash between the
+# blob write and the ready-marker) only after this long. enqueue writes .dcm
+# first and .meta LAST, and the sweep runs on a 60 s timer while enqueue() is
+# in flight, so anything younger than one sweep interval may still be being
+# written. 60 s covers a large instance on slow storage and keeps the timer
+# and the grace period aligned.
+ENQUEUE_PUBLISH_GRACE_SEC = 60.0
 
 def _ensure_file_meta(dataset):
     """Ensure dataset has a valid FileMetaDataset with TransferSyntaxUID.
@@ -4810,9 +6686,15 @@ class OutboxQueue:
         retry_interval=0,
         pending_gauge=None,
         undelivered_total=None,
+        max_queue_bytes=0,
     ):
         self._dir = outbox_dir
         self.max_queue = max_queue
+        # R7: byte budget for the pending/ blobs, 0 = no byte limit. The slot
+        # count alone let a dead server plus store_forward pile up 20000 items
+        # of 0.5-50 MB (up to 10 GB) against a configured 500 MB: the memory
+        # budget was a documented knob the enqueue path never consulted.
+        self.max_queue_bytes = max_queue_bytes
         self.MAX_RETRIES = max_retries
         self.cleanup = cleanup
         self.retry_interval = retry_interval
@@ -4838,9 +6720,24 @@ class OutboxQueue:
         # In-memory pending counter (avoids os.listdir on hot C-STORE path).
         self._pending_count = 0
         self._pending_lock = threading.Lock()
-
+        # One guard per SOP Instance UID: two reactor threads receiving the
+        # same instance publish to the same `<uid>.dcm`. Unique temp names stop
+        # the writers from sharing a file; this serialises them so they do not
+        # all contend for the destination rename at once (the rename itself is
+        # retried inside `replace_with_retry`). Striped rather than one lock
+        # per UID: a per-UID dict grows for every instance the bridge ever
+        # receives and is never pruned.
+        self._publish_guards = LockStripes()
+        # `dequeue` sorts the pending/ .meta listing by mtime; the sorted list
+        # is reused until something claims the queue empty or publishes a new
+        # item (see dequeue's comment). None = must re-read the directory.
+        self._pending_meta_cache = None
         # Sync from what's already on disk (survives restart).
         self._sync_pending_count()
+
+    def _publish_guard_for(self, sop_uid):
+        """The guard serialising publishers of `sop_uid`."""
+        return self._publish_guards.for_key(sop_uid)
 
     def _set_pending_gauge(self):
         """Push the in-memory pending count to this queue's Prometheus gauge.
@@ -4856,7 +6753,40 @@ class OutboxQueue:
     # -- path helpers --------------------------------------------------
 
     def _safe_uid(self, sop_uid):
-        return sop_uid.replace("\x00", "_").replace("/", "_").replace("\\", "_")
+        """File-name form of a SOP Instance UID, injective over its input.
+
+        A UID is digits and dots, so nothing needs escaping in the normal case.
+        The three bytes that cannot appear in a path (`\\x00`, `/`, `\\`) are
+        percent-escaped rather than replaced with `_`: collapsing them all to
+        one character made two different UIDs name one file, and the second
+        instance then published over the first. `%` itself is escaped first so
+        the mapping cannot be spoofed into producing an escape sequence.
+        """
+        return (
+            sop_uid.replace("%", "%25")
+            .replace("\x00", "%00")
+            .replace("/", "%2F")
+            .replace("\\", "%5C")
+        )
+
+    @staticmethod
+    def _unsafe_uid(name):
+        """Inverse of `_safe_uid`, applied ONLY to a UID read back from a
+        filename (never to a UID already held in memory).
+
+        `dequeue` and `recover_stuck` derive the UID from `name[:-4]` /
+        `name[:-5]`, which is the ESCAPED form; passing it back through
+        `_safe_uid` escaped it a second time (`%2F` -> `%252F`) and the item
+        was skipped forever. Unescape in the REVERSE order of `_safe_uid`,
+        so `%25` is decoded LAST (a literal `%` in the UID must not turn the
+        two characters `%25` into a `%` before the other escapes run).
+        """
+        return (
+            name.replace("%5C", "\\")
+            .replace("%2F", "/")
+            .replace("%00", "\x00")
+            .replace("%25", "%")
+        )
 
     def _dcm_path(self, dir_, sop_uid):
         return os.path.join(dir_, f"{self._safe_uid(sop_uid)}.dcm")
@@ -4867,18 +6797,51 @@ class OutboxQueue:
     def _mods_path(self, dir_, sop_uid):
         return os.path.join(dir_, f"{self._safe_uid(sop_uid)}.mods")
 
+    def _is_undelivered(self, sop_uid):
+        """True when the SOP is already parked in undelivered/.
+
+        `move_to_undelivered` is not idempotent from the caller's point of
+        view: it moves whatever it finds and counts it. A failure path that
+        reaches it after `mark_failed` has already parked the same item would
+        move nothing but still bump `undelivered_total`, so callers check here
+        first.
+        """
+        return os.path.isfile(self._dcm_path(self._undelivered, sop_uid))
+
     # -- atomic file write ---------------------------------------------
+
+    @staticmethod
+    def _tmp_path(path):
+        """A temporary path that only THIS write operation can own.
+
+        The whole queue is keyed by SOP Instance UID, so two reactor threads
+        receiving the same instance write the SAME final path. A shared
+        `<path>.tmp` made them interleave into one file and both `os.replace`
+        it; the dedup `isfile` check above is check-then-act and cannot
+        serialise them. PID plus thread id is unique among the writers that
+        can race here without leaving a lock or a file handle behind.
+        """
+        return f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
 
     @staticmethod
     def _atomic_write(path, data, binary=False):
         """Write data atomically: tmp -> flush -> os.replace."""
-        tmp = path + ".tmp"
+        tmp = OutboxQueue._tmp_path(path)
         mode = "wb" if binary else "w"
         encoding = None if binary else "utf-8"
-        with open(tmp, mode, encoding=encoding) as f:
-            f.write(data)
-            f.flush()
-        os.replace(tmp, path)
+        try:
+            with open(tmp, mode, encoding=encoding) as f:
+                f.write(data)
+                f.flush()
+            replace_with_retry(tmp, path)
+        except Exception:
+            # A failed write must not leave its temp file behind: the next
+            # attempt would pile another one next to it.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     # -- modifications sidecar -----------------------------------------
 
@@ -4942,44 +6905,71 @@ class OutboxQueue:
             logging.error("[OUTBOX] Dataset has no SOPInstanceUID - cannot enqueue")
             return False
 
-        # Check if already in any queue directory (dedup).
-        for d in [self._pending, self._in_progress, self._done]:
-            if os.path.isfile(self._dcm_path(d, sop_uid)):
-                logging.info(
-                    "[OUTBOX] SOP %s already in queue - duplicate, 0x0000", sop_uid
-                )
-                return "duplicate"
-
         dcm_path = self._dcm_path(self._pending, sop_uid)
 
-        # Step 1: Write DICOM blob (atomic).
-        _ensure_file_meta(dataset)
-        try:
-            tmp = dcm_path + ".tmp"
-            dcmwrite(tmp, dataset, enforce_file_format=True)
-            os.replace(tmp, dcm_path)
-        except Exception as e:
-            logging.error("[OUTBOX] Failed to write blob for %s: %s", sop_uid, e)
+        # Dedup and publish are one critical section per SOP Instance UID:
+        # the `isfile` scan is check-then-act, so it is only a decision when
+        # nothing else can create the file between the scan and the write.
+        guard = self._publish_guard_for(sop_uid)
+        with guard:
+            for d in [self._pending, self._in_progress, self._done]:
+                if os.path.isfile(self._dcm_path(d, sop_uid)):
+                    logging.info(
+                        "[OUTBOX] SOP %s already in queue - duplicate, 0x0000",
+                        sop_uid,
+                    )
+                    return "duplicate"
+
+            # Step 1: Write DICOM blob (atomic).
+            _ensure_file_meta(dataset)
+            tmp = self._tmp_path(dcm_path)
             try:
-                os.unlink(dcm_path + ".tmp")
-            except OSError:
-                pass
-            return False
+                dcmwrite(tmp, dataset, enforce_file_format=True)
+                replace_with_retry(tmp, dcm_path)
+            except Exception as e:
+                logging.error("[OUTBOX] Failed to write blob for %s: %s", sop_uid, e)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return False
 
-        # Step 2: Write modifications sidecar (best-effort, BEFORE .meta).
-        if modifications:
-            self._write_mods_sidecar(sop_uid, modifications)
+            # Step 2: Write modifications sidecar (best-effort, BEFORE .meta).
+            if modifications:
+                self._write_mods_sidecar(sop_uid, modifications)
 
-        # Step 3: Write metadata (LAST  -  signals "this item is ready").
-        now = time.time()
-        meta = {
-            "created_at": now,
-            "retry_count": 0,
-            "next_retry_at": now,
-            "last_error": None,
-        }
-        meta_path = self._meta_path(self._pending, sop_uid)
-        self._atomic_write(meta_path, json.dumps(meta))
+            # Step 3: Write metadata (LAST  -  signals "this item is ready").
+            now = time.time()
+            meta = {
+                "created_at": now,
+                "retry_count": 0,
+                "next_retry_at": now,
+                "last_error": None,
+            }
+            meta_path = self._meta_path(self._pending, sop_uid)
+            try:
+                self._atomic_write(meta_path, json.dumps(meta))
+                # A published item must be visible to the very next dequeue.
+                self._pending_meta_cache = None
+            except Exception as e:
+                # `.meta` is what makes an item VISIBLE to the queue (the
+                # pending walk trusts "no .meta = interrupted earlier, clean
+                # up"). Leaving the blob behind on a failed write produced an
+                # orphan that the next sweep would delete out from under a
+                # caller that had already been told the enqueue failed. Undo
+                # the blob so enqueue either succeeds whole or leaves nothing.
+                logging.error(
+                    "[OUTBOX] Failed to write .meta for %s: %s - removing the "
+                    "orphan blob",
+                    sop_uid,
+                    e,
+                )
+                for orphan in (dcm_path, self._mods_path(self._pending, sop_uid)):
+                    try:
+                        os.unlink(orphan)
+                    except OSError:
+                        pass
+                return False
 
         with self._pending_lock:
             self._pending_count += 1
@@ -5023,13 +7013,13 @@ class OutboxQueue:
         except OSError:
             pass
         try:
-            tmp = dst + ".tmp"
+            tmp = self._tmp_path(dst)
             shutil.copyfile(src, tmp)
-            os.replace(tmp, dst)
+            replace_with_retry(tmp, dst)
             return True
         except OSError:
             try:
-                os.unlink(dst + ".tmp")
+                os.unlink(tmp)
             except OSError:
                 pass
             return False
@@ -5115,6 +7105,8 @@ class OutboxQueue:
         }
         meta_path = self._meta_path(self._pending, sop_uid)
         self._atomic_write(meta_path, json.dumps(meta))
+        # A published item must be visible to the very next dequeue.
+        self._pending_meta_cache = None
 
         with self._pending_lock:
             self._pending_count += 1
@@ -5122,6 +7114,29 @@ class OutboxQueue:
 
         logging.debug("[OUTBOX] Forward-enqueued SOP %s", sop_uid)
         return True
+
+    def _list_pending_names(self):
+        """`os.listdir` of pending/, or [] when the directory is unreadable."""
+        try:
+            return os.listdir(self._pending)
+        except OSError:
+            return []
+
+    def _scan_pending_metas(self, names):
+        """`[(mtime, name)]` for every `.meta` in `names`, oldest first."""
+        # Only the .meta NAMES are sorted here, so a busy queue costs one stat
+        # per item instead of a full JSON re-read.
+        metas = []
+        for name in names:
+            if not name.endswith(".meta"):
+                continue
+            meta_path = os.path.join(self._pending, name)
+            try:
+                metas.append((os.path.getmtime(meta_path), name))
+            except OSError:
+                continue
+        metas.sort()
+        return metas
 
     def dequeue(self):
         """Atomically claim the oldest ready SOP.
@@ -5136,16 +7151,33 @@ class OutboxQueue:
         now = time.time()
         sop_uid = None
 
-        try:
-            names = os.listdir(self._pending)
-        except OSError:
-            return (None, None, None, None)
+        # OLDEST FIRST. `os.listdir` returns directory order, which is neither
+        # creation order nor stable across filesystems, so the queue could
+        # deliver a newer instance before an older one waiting on the same
+        # study - and a backlog drained in arrival order is the whole point of
+        # a queue. The sort key is the mtime of the .meta, which `enqueue`
+        # writes LAST and nothing rewrites: it is the publish time, exactly the
+        # ordering the queue means.
+        #
+        # The listing is CACHED and only re-read when nothing in it was
+        # claimable. Dequeue runs once per delivered item, and re-listing a
+        # backlog of `max_queue` (20000) entries with a stat per entry turned
+        # a drain into O(n^2) filesystem calls - hours of stat traffic on
+        # NTFS after a crash. The cache is dropped wholesale on every enqueue
+        # (an item must become visible at once) and whenever the cached rows
+        # yield nothing, so a newly ready retry is still found on the next
+        # call.
+        metas = self._pending_meta_cache
+        if metas is None:
+            metas = self._scan_pending_metas(self._list_pending_names())
+            self._pending_meta_cache = metas
 
-        # Find first ready item.
-        for name in names:
-            if not name.endswith(".meta"):
-                continue
-            uid = name[:-5]  # strip .meta
+        # Find the first READY item in age order.
+        for _mtime, name in metas:
+            # `name` is the ESCAPED form on disk; unescape before any path
+            # helper re-escapes it, or `1.2%2F3.meta` would be looked up as
+            # `1.2%252F3.meta` and skipped on every pass.
+            uid = self._unsafe_uid(name[:-5])  # strip .meta
             meta_path = self._meta_path(self._pending, uid)
 
             try:
@@ -5168,6 +7200,18 @@ class OutboxQueue:
                 if os.path.isfile(mods):
                     os.rename(mods, self._mods_path(self._in_progress, uid))
                 os.rename(meta_path, self._meta_path(self._in_progress, uid))
+                # `rename` preserves the mtime the blob got when it was
+                # ENQUEUED, but `recover_stuck` reads that mtime as "how long
+                # has this been in progress". An item that waited in pending/
+                # longer than STUCK_ITEM_TIMEOUT (a backlog after an incident,
+                # parking, a 507 pause) therefore reads as stuck the instant it
+                # is claimed, the sweep puts it back, and the same instance is
+                # delivered twice while `_pending_count` drops by two.
+                claimed = self._dcm_path(self._in_progress, uid)
+                try:
+                    os.utime(claimed, None)
+                except OSError:
+                    pass
                 sop_uid = uid
                 break
             except OSError:
@@ -5175,6 +7219,10 @@ class OutboxQueue:
                 continue
 
         if sop_uid is None:
+            # Nothing in the cached listing was claimable: a new item or a
+            # newly ready retry may have appeared since it was taken, so the
+            # next call re-reads the directory.
+            self._pending_meta_cache = None
             return (None, None, None, None)
 
         # Read DICOM from claimed file.
@@ -5199,7 +7247,14 @@ class OutboxQueue:
             logging.error("[OUTBOX] Failed to read blob %s: %s", blob_path, e)
             self.mark_failed(sop_uid, f"Blob read error: {e}")
             retries = self._get_retry_count(sop_uid)
-            if retries >= self.MAX_RETRIES:
+            # mark_failed ALREADY parks the item once it hits MAX_RETRIES
+            # (outbox.py mark_failed -> move_to_undelivered). Calling it again
+            # here moved an item that was no longer in pending/ or
+            # in_progress/ and, worse, could move a SECOND time on a
+            # concurrent path, producing two undelivered entries and a double
+            # `undelivered_total` bump for one failure. Only act when the
+            # failed item is still present somewhere movable.
+            if retries >= self.MAX_RETRIES and not self._is_undelivered(sop_uid):
                 self.move_to_undelivered(sop_uid)
             return (None, None, None, None)
 
@@ -5207,6 +7262,16 @@ class OutboxQueue:
 
     def mark_delivered(self, sop_uid):
         """Mark SOP as successfully delivered."""
+        # A previous delivery attempt may have exhausted its retries and left
+        # undelivered/{uid}.dcm behind. If a LATER attempt of the SAME SOP
+        # succeeds, that stale marker must go: delivered() checks undelivered/
+        # FIRST, so the saved instance would otherwise keep reading as a
+        # Storage Commitment failure forever.
+        try:
+            os.unlink(self._dcm_path(self._undelivered, sop_uid))
+        except OSError:
+            pass
+
         # Find which dir the SOP is in (normally in_progress/, but allow pending/ for test flexibility).
         dir_ = self._in_progress
         if not os.path.isfile(self._dcm_path(dir_, sop_uid)):
@@ -5290,11 +7355,11 @@ class OutboxQueue:
         }
 
         # Atomic update of .meta.
-        tmp = meta_path + ".tmp"
+        tmp = self._tmp_path(meta_path)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f)
             f.flush()
-        os.replace(tmp, meta_path)
+        replace_with_retry(tmp, meta_path)
 
         # If in in_progress/, move back to pending/.
         if dir_ == self._in_progress:
@@ -5390,13 +7455,30 @@ class OutboxQueue:
                 "[OUTBOX] Failed to move %s to undelivered: %s", sop_uid, e
             )
 
-        # Clean up .meta and .mods.
+        # Carry the audit sidecars WITH the blob. `.mods` is the record of what
+        # the bridge changed (Modified Attributes Sequence material) and `.meta`
+        # is why the item gave up - deleting them on the way to `undelivered/`
+        # destroyed the trail exactly where an operator needs it to decide what
+        # to do with a saved instance. The forward path already carries both.
+        moved_sidecars = set()
         for dir_ in [self._pending, self._in_progress]:
-            for p in [self._meta_path(dir_, sop_uid), self._mods_path(dir_, sop_uid)]:
+            for src_sidecar, dst_sidecar in (
+                (self._meta_path(dir_, sop_uid), self._meta_path(self._undelivered, sop_uid)),
+                (self._mods_path(dir_, sop_uid), self._mods_path(self._undelivered, sop_uid)),
+            ):
+                if dst_sidecar in moved_sidecars:
+                    continue
+                if not os.path.isfile(src_sidecar):
+                    continue
                 try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+                    shutil.move(src_sidecar, dst_sidecar)
+                    moved_sidecars.add(dst_sidecar)
+                except OSError as e:
+                    logging.warning(
+                        "[OUTBOX] Could not carry sidecar %s to undelivered: %s",
+                        src_sidecar,
+                        e,
+                    )
 
         with self._pending_lock:
             self._pending_count = max(0, self._pending_count - 1)
@@ -5408,15 +7490,22 @@ class OutboxQueue:
 
     # -- recovery ------------------------------------------------------
 
-    def recover_stuck(self):
+    def recover_stuck(self, force=False):
         """Move stuck in_progress/ items back to pending/. Called at startup and periodically.
 
         Two categories:
           1. in_progress/ files with mtime older than STUCK_ITEM_TIMEOUT -> back to pending/
           2. pending/ items with retry_count >= MAX_RETRIES -> move to undelivered/
+
+        `force=True` is the startup sweep: a crash + fast restart leaves the
+        dead worker's in_progress/ items with a FRESH mtime, so the normal
+        cutoff would hide them from `_sync_pending_count` and `delivered()`
+        until the next periodic sweep (up to 300 s later) - long enough for a
+        commitment tracker to answer "not committed" for a delivered SOP.
+        Force treats every in_progress item as stuck (cutoff = now).
         """
         now = time.time()
-        cutoff = now - STUCK_ITEM_TIMEOUT
+        cutoff = now if force else now - STUCK_ITEM_TIMEOUT
         recovered = 0
         undelivered_count = 0
 
@@ -5425,13 +7514,16 @@ class OutboxQueue:
             for name in os.listdir(self._in_progress):
                 if not name.endswith(".dcm"):
                     continue
-                uid = name[:-4]
+                # `name` is the ESCAPED form; unescape so the rename paths
+                # below (re-escaped by _safe_uid) name the same file.
+                uid = self._unsafe_uid(name[:-4])
+                safe_uid = self._safe_uid(uid)
                 dcm_path = os.path.join(self._in_progress, name)
                 try:
                     if os.path.getmtime(dcm_path) < cutoff:
                         for ext in [".dcm", ".meta", ".mods"]:
-                            src = os.path.join(self._in_progress, uid + ext)
-                            dst = os.path.join(self._pending, uid + ext)
+                            src = os.path.join(self._in_progress, safe_uid + ext)
+                            dst = os.path.join(self._pending, safe_uid + ext)
                             if os.path.isfile(src):
                                 os.rename(src, dst)
                         recovered += 1
@@ -5442,13 +7534,30 @@ class OutboxQueue:
 
         # Category 1b: orphan .dcm files in pending/ without .meta (crashed before metadata write).
         # Create a .meta so dequeue() can find them.
+        #
+        # A blob whose .meta is missing is only an orphan once it has stopped
+        # being written. The sweep also runs on a timer while enqueue() is in
+        # flight, and enqueue writes .dcm first and .meta LAST - adopting a
+        # blob that is still being written publishes a half-written instance as
+        # ready. Earlier than ENQUEUE_PUBLISH_GRACE_SEC, it is not ours to adopt.
+        orphan_cutoff = now - ENQUEUE_PUBLISH_GRACE_SEC
         try:
             for name in os.listdir(self._pending):
                 if not name.endswith(".dcm"):
                     continue
-                uid = name[:-4]
+                # `name` is the ESCAPED form; unescape before `_meta_path`
+                # re-escapes it - the same double-escape as dequeue. A UID
+                # with % or / would otherwise adopt a .meta under a name no
+                # read path can ever match.
+                uid = self._unsafe_uid(name[:-4])
                 meta_path = self._meta_path(self._pending, uid)
                 if not os.path.isfile(meta_path):
+                    dcm_path = os.path.join(self._pending, name)
+                    try:
+                        if os.path.getmtime(dcm_path) > orphan_cutoff:
+                            continue
+                    except OSError:
+                        continue
                     now_ts = time.time()
                     meta = {
                         "created_at": now_ts,
@@ -5472,7 +7581,9 @@ class OutboxQueue:
             for name in os.listdir(self._pending):
                 if not name.endswith(".meta"):
                     continue
-                uid = name[:-5]
+                # `name` is the ESCAPED form; unescape before `_dcm_path`
+                # re-escapes it (the same double-escape as `dequeue`).
+                uid = self._unsafe_uid(name[:-5])
                 meta_path = os.path.join(self._pending, name)
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
@@ -5504,8 +7615,57 @@ class OutboxQueue:
         with self._pending_lock:
             return self._pending_count
 
+    def pending_bytes(self):
+        """Bytes currently held in pending/ (O(n) walk, size of each blob).
+
+        R7: a walk, not a counter. `enqueue` runs once per instance, not in a
+        loop, and the blob count it walks is bounded by `max_queue`, so the
+        scan is cheap; a byte counter would have to be kept in step with
+        every path that writes, moves or deletes a blob (deliver, requeue,
+        undelivered, recovery), which is where drift comes from.
+
+        R7b: the walk runs on EVERY admitted C-STORE (the admission gate
+        calls it per instance), and each blob in it costs a `getsize` stat.
+        With a dead server and store_forward the pending/ directory holds up
+        to `max_queue` blobs, so thousands of stats per C-STORE, multiplied
+        by the concurrent handlers, collapse throughput exactly when the
+        backlog is worst. A 1 s TTL cache keeps the same walk but not per
+        instance: the backpressure ratio only needs to move on the order of
+        a second, not per blob.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_pending_bytes_cache", None)
+        if cached is not None and now - cached[0] < 1.0:
+            return cached[1]
+        total = 0
+        try:
+            names = os.listdir(self._pending)
+        except OSError:
+            return 0
+        for name in names:
+            if not name.endswith(".dcm"):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(self._pending, name))
+            except OSError:
+                continue
+        self._pending_bytes_cache = (now, total)
+        return total
+
+    def _over_byte_budget(self, incoming_bytes):
+        """True when accepting `incoming_bytes` would exceed the byte budget.
+
+        Checked BEFORE the blob is published: refusing afterwards would mean
+        writing the bytes that caused the overflow and then deleting them.
+        """
+        if not self.max_queue_bytes:
+            return False
+        return self.pending_bytes() + max(0, incoming_bytes) > self.max_queue_bytes
+
     def _sync_pending_count(self):
         """Recalculate pending count from FS (startup / recovery only)."""
+        # The directory was just swept: the cached listing is stale.
+        self._pending_meta_cache = None
         try:
             count = sum(1 for n in os.listdir(self._pending) if n.endswith(".dcm"))
         except OSError:
@@ -5561,457 +7721,175 @@ class OutboxQueue:
         """No-op on filesystem."""
 
 # ---------------------------------------------------------------------------
-# Bridge: http_server
+# Bridge: sop_index
 # ---------------------------------------------------------------------------
 
-"""Clarus Bridge  -  HTTP handler for /print, /metrics, /health, /version.
+"""SOP Instance UID index  -  filesystem-backed key-value store.
 
-BridgeHTTPHandler: POST /print (C-PRINT), GET /metrics (Prometheus), GET /health,
-GET /version (build identification).
-Includes JSON->DICOM Dataset converter and factory for dependency injection (MAJ-003).
+nginx-way: one JSON file per SOP UID. Directory = index.
+No SQLite. No locks. No busy_timeout.
 """
 
-import base64
 import json
 import logging
-from http.server import BaseHTTPRequestHandler
-
-from prometheus_client import generate_latest
-from pydicom import Dataset
-from pydicom.datadict import keyword_dict
-
-# Short git revision of the commit the bundle was generated from. bundle.py
-# rewrites this line when it assembles clbridge.py; in the source tree the
-# value is the placeholder, which is also the honest answer for a bundle cut
-# outside a repository.
-BUNDLE_STAMP = "1303ccd9"
-
-# ---------------------------------------------------------------------------
-# Bridge: JSON -> DICOM Dataset converter for C-PRINT
-# ---------------------------------------------------------------------------
-def _json_print_to_dataset(json_dict):
-    """Convert JSON dict of DICOM tags to pydicom Dataset.
-
-    Keys can be:
-        - DICOM tag hex string (e.g. "00100010" -> PatientName)
-        - DICOM keyword (e.g. "PatientName")
-    """
-    ds = Dataset()
-    for key, value in json_dict.items():
-        # Try hex tag
-        if len(key) == 8 and all(c in "0123456789ABCDEFabcdef" for c in key):
-            group = int(key[0:4], 16)
-            elem = int(key[4:8], 16)
-        else:
-            # Try keyword lookup
-            tag_int = keyword_dict.get(key)
-            if tag_int is None:
-                logging.debug("[C-PRINT] Unknown DICOM keyword: %s", key)
-                continue
-            # keyword_dict values are ints like 0x00100010
-            group = tag_int >> 16
-            elem = tag_int & 0xFFFF
-
-        # Handle nested dicts as sequences
-        if isinstance(value, dict):
-            item = _json_print_to_dataset(value)
-            ds.add_new((group, elem), "SQ", [item])
-        elif isinstance(value, list):
-            # Could be VR mismatch; set raw
-            ds.add_new((group, elem), "OB", value)
-        else:
-            ds.add_new((group, elem), "SH", str(value))  # default VR; may be overridden
-    return ds
-
-# ---------------------------------------------------------------------------
-# Bridge: HTTP Bridge Handler  -  /print + /metrics, /health
-# ---------------------------------------------------------------------------
-class BridgeHTTPHandler(BaseHTTPRequestHandler):
-    """HTTP handler for POST /print, GET /metrics, GET /health, GET /version.
-
-    POST /print  -  receives print jobs from ClarityX.
-        Request body: JSON with keys:
-            printer_name (str): key in printers.yaml
-            film_session (dict): DICOM Film Session attributes as JSON
-            images (list[str]): base64-encoded DICOM Part 10 files
-            calling_aet (str, optional): override AE Title
-        Response: JSON PrintResult
-
-    GET /metrics  -  Prometheus text format metrics.
-    GET /health  -  liveness probe (200 OK), pure and fast.
-    GET /version  -  build identification (version + generated-from revision).
-    """
-
-    # Dependencies injected via make_bridge_handler() factory  -  NO lazy imports in do_GET!
-    driver_registry = {}
-    printer_registry = {}
-    bridge_ae_title = "CLARUS_BRIDGE"
-    # BR-P31: cached references to avoid per-request imports (P2.10 bottleneck fix)
-    _outbox_ref = None  # OutboxQueue  -  reliable persistence queue
-    _health_checker_ref = None  # HealthChecker  -  real server health status
-    _commit_tracker_ref = None  # CommitTracker  -  Storage Commitment batches
-    _move_jobs_ref = None  # MoveJobManager  -  C-MOVE job table
-
-    def do_GET(self):
-        """Handle GET /metrics, GET /health and GET /version (P22d, P2.10).
-
-        P2.10: /health is a PURE liveness probe  -  no imports, no queue checks,
-        no health checker calls. Those are enforced at C-STORE level (handle_c_store).
-        /health MUST return in <1ms to avoid serialization bottleneck in
-        the single-threaded HTTP server (or thread pool starvation in
-        ThreadingHTTPServer).
-        """
-        if self.path == "/metrics":
-            # RSS comes straight from the OS and involves no handle to hold
-            # open, so there is nothing to cache between scrapes. A failure
-            # leaves the gauge at 0 rather than breaking the scrape.
-            memory_usage.set(get_process_rss_bytes())
-
-            # update Outbox queue metrics  -  use cached refs, NO imports
-            try:
-                _outbox = type(self)._outbox_ref
-                if _outbox is not None:
-                    outbox_pending.set(_outbox.pending_count())
-            except Exception:
-                pass
-
-            # update queue-depth gauges  -  cached refs, no imports.
-            # Every access is guarded: a broken tracker must not break a scrape.
-            try:
-                _ct = type(self)._commit_tracker_ref
-                if _ct is not None:
-                    _n = _ct.pending_count()
-                    commit_batches_pending.set(_n)
-                    naction_batches_pending.set(_n)
-            except Exception:
-                pass
-
-            try:
-                _mj = type(self)._move_jobs_ref
-                if _mj is not None:
-                    cmove_jobs_pending.set(_mj.count_pending())
-            except Exception:
-                pass
-
-            # server_health from real HealthChecker, NOT outbox pending
-            try:
-                _hc = type(self)._health_checker_ref
-                if _hc is not None:
-                    server_health.set(1 if _hc.is_healthy() else 0)
-            except Exception as e:
-                logging.error("[METRICS] server_health update failed: %s", e)
-
-            metrics_data = generate_latest()  # pyright: ignore[reportOptionalCall]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; version=0.0.3; charset=utf-8")
-            self.send_header("Content-Length", str(len(metrics_data)))
-            self.end_headers()
-            self.wfile.write(metrics_data)
-        elif self.path == "/health":
-            # P2.10: /health is a PURE liveness probe. No imports, no queue checks,
-            # no health checker  -  just "is the HTTP server alive?".
-            # Backpressure (queue%, server health) is enforced at C-STORE level.
-            # This MUST be the fastest handler in the system.
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-        elif self.path == "/version":
-            # Which bundle is running? Same weight as /health: a constant join,
-            # no imports beyond the module constant.
-            body = f"clbridge {VERSION} ({BUNDLE_STAMP})".encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        if self.path != "/print":
-            self.send_error(404, "Not Found")
-            return
-
-        # Validate Content-Type
-        content_type = self.headers.get("Content-Type", "")
-        if "application/json" not in content_type:
-            self.send_error(400, "Expected application/json")
-            return
-
-        # Read body. A non-numeric or negative length is a malformed request,
-        # not a reason to drop the connection without an answer: `int()` would
-        # raise out of the handler, and a negative length passes the size
-        # ceiling below while `read(-1)` blocks the worker on a body that never
-        # ends.
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            self._json_error(400, "Invalid Content-Length")
-            return
-        if content_length < 0:
-            self._json_error(400, "Invalid Content-Length")
-            return
-        if content_length > 100 * 1024 * 1024:  # 100 MB limit
-            self.send_error(413, "Payload too large")
-            return
-        body = self.rfile.read(content_length)
-
-        try:
-            request_data = json.loads(body)
-        except json.JSONDecodeError as e:
-            self._json_error(400, f"Invalid JSON: {e}")
-            return
-        # A syntactically valid array or scalar is still not a print request,
-        # and `request_data.get` would raise AttributeError out of the handler.
-        if not isinstance(request_data, dict):
-            self._json_error(400, "Expected a JSON object")
-            return
-
-        printer_name = request_data.get("printer_name")
-        if not printer_name:
-            self._json_error(400, "Missing printer_name")
-            return
-
-        printer_cfg = self.printer_registry.get(printer_name)
-        if not printer_cfg:
-            self._json_error(404, f"Printer '{printer_name}' not found in registry")
-            return
-
-        # Decode film_session from JSON -> pydicom Dataset
-        try:
-            film_session = _json_print_to_dataset(request_data.get("film_session", {}))
-        except Exception as e:
-            self._json_error(400, f"Invalid film_session: {e}")
-            return
-
-        # Decode images from base64
-        images = []
-        for img_b64 in request_data.get("images", []):
-            try:
-                images.append(base64.b64decode(img_b64))
-            except Exception as e:
-                self._json_error(400, f"Invalid image base64: {e}")
-                return
-
-        # Get calling AE title
-        calling_aet = request_data.get("calling_aet", self.bridge_ae_title)
-
-        # Select driver
-        driver_name = printer_cfg.get("driver", "generic_dicom")
-        driver = self.driver_registry.get(driver_name)
-        if not driver:
-            self._json_error(500, f"Driver '{driver_name}' not registered")
-            return
-
-        # Execute print
-        try:
-            result = driver.print(
-                film_session=film_session,
-                images=images,
-                printer_host=printer_cfg["host"],
-                printer_port=printer_cfg["port"],
-                calling_aet=calling_aet,
-            )
-            self._json_response(200 if result.is_success else 502, result)
-        except Exception as e:
-            logging.error("[C-PRINT] Print job failed: %s", e)
-            logging.debug("[C-PRINT] Full traceback follows:", exc_info=True)
-            self._json_error(500, f"Print failed: {e}")
-
-    def _json_response(self, status_code, result):
-        """Send JSON PrintResult."""
-        body = json.dumps(
-            {
-                "job_id": result.job_id,
-                "status": f"0x{result.status:04X}",
-                "film_boxes_printed": result.film_boxes_printed,
-                "failed_images": result.failed_images,
-                "printer_message": result.printer_message,
-            }
-        ).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _json_error(self, status_code, message):
-        """Send JSON error."""
-        body = json.dumps({"error": message}).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        """Redirect HTTP server logs to Python logging."""
-        logging.debug("[HTTP-BRIDGE] " + format % args)
-
-# ---------------------------------------------------------------------------
-# Bridge: factory for BridgeHTTPHandler with injected dependencies
-# ---------------------------------------------------------------------------
-def make_bridge_handler(
-    driver_registry,
-    printer_registry,
-    bridge_ae_title,
-    health_checker=None,
-    outbox=None,
-    commit_tracker=None,
-    move_jobs=None,
-):
-    """Create BridgeHTTPHandler subclass with injected dependencies.
-
-    P2.10: Injects bridge runtime dependencies (outbox, etc.)
-    as class-level attributes so do_GET() never does lazy imports. This eliminates
-    the per-request import lock contention that was serializing /health behind
-    /metrics in the single-threaded HTTPServer.
-
-    PH-007: health_checker is stored for real server_health gauge.
-    """
-
-    class _Handler(BridgeHTTPHandler):
-        pass
-
-    _Handler.driver_registry = driver_registry
-    _Handler.printer_registry = printer_registry
-    _Handler.bridge_ae_title = bridge_ae_title
-    _Handler._outbox_ref = outbox
-    _Handler._health_checker_ref = health_checker
-    _Handler._commit_tracker_ref = commit_tracker
-    _Handler._move_jobs_ref = move_jobs
-    return _Handler
-
-# ---------------------------------------------------------------------------
-# Bridge: prefetch
-# ---------------------------------------------------------------------------
-
-"""Bounded FIFO prefetch for the C-MOVE read path (B1, 2508).
-
-A reader thread pulls `(dicom_bytes, idx)` from a source generator and fills a
-bounded queue; the sender drains it. Structural backpressure is the bounded
-queue itself: the reader blocks when it is full, the sender when it is empty,
-so memory is bounded by `max_parts` and the Clarus server leg stays busy while
-the sender is blocked on C-STORE network I/O - raising end-to-end C-MOVE
-toward the server ceiling (the serial pipeline left the server idle during
-each C-STORE).
-"""
-
-import logging
 import os
-import queue
 import threading
+import time
 
-# Default queue depth: 4 parts (~20 MB for typical CT slices), FIFO.
-# A module-level constant so production and tests observe the same value.
-DEFAULT_PREFETCH_PARTS = 4
+class SopIndexManager:
+    """Filesystem-backed index: SOPInstanceUID -> (StudyInstanceUID, SeriesInstanceUID).
 
-# Sentinel: the reader has finished (EOF) or hit a fatal error to surface.
-_EOF = object()
+    Layout:
+        sop_index/{sop_uid}.json -> {"study_uid": "...", "series_uid": "...",
+                                     "ts": ..., "is_verified": false}
 
-class PartPrefetcher:
-    """Bounded FIFO prefetch bridging a reader thread and the sender loop.
-
-    Usage:
-        pref = PartPrefetcher(_stream_multipart_instances(resp)).start()
-        for dicom_bytes, idx in pref:
-            ... send ...
-        # On early exit (cancel / shutdown / fatal error):
-        pref.stop()
+    Populated at C-STORE time after successful STOW-RS (HTTP 200/201/202).
+    Looked up at N-ACTION time to verify Storage Commitment.
     """
 
-    def __init__(self, source, max_parts=DEFAULT_PREFETCH_PARTS):
-        self._q = queue.Queue(maxsize=max_parts)
-        self._source = source
-        self._error = None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._fill, name="cmove-prefetch", daemon=True
+    def __init__(self, index_dir):
+        """index_dir: path to sop_index directory (created if absent)."""
+        self._dir = index_dir
+        os.makedirs(self._dir, exist_ok=True)
+        # One guard per index file. A unique temp name stops two writers from
+        # sharing a file, but they still rename onto the SAME destination, and
+        # on Windows the second `os.replace` fails with a sharing violation
+        # while the first destination handle is open - which loses the entry.
+        # The guard covers readers too: `lookup_sop` holds the destination open
+        # while it parses it, and that open handle blocks the rename just as
+        # surely as a competing writer would. Striped rather than one lock per
+        # path: cleanup() deletes index files but cannot reclaim their locks,
+        # so a per-path dict grows for the life of the process.
+        self._publish_guards = LockStripes()
+
+    def _guard_for(self, path):
+        """The guard serialising access to one index file."""
+        return self._publish_guards.for_key(path)
+
+    def _path(self, sop_uid):
+        # Percent-escape rather than substitute: collapsing `\x00`, `/` and `\`
+        # all to `_` made two distinct UIDs share one index file, so one SOP
+        # silently overwrote the other's entry. See OutboxQueue._safe_uid.
+        safe = (
+            sop_uid.replace("%", "%25")
+            .replace("\x00", "%00")
+            .replace("/", "%2F")
+            .replace("\\", "%5C")
         )
+        return os.path.join(self._dir, f"{safe}.json")
 
-    def _fill(self):
+    def _write_unlocked(self, path, data):
+        """Write `data` to `path` atomically. The caller holds the guard.
+
+        The index is keyed by SOP UID, so two reactor threads handling the same
+        instance write the SAME path. A shared `<path>.tmp` made them interleave
+        into one file and both `os.replace` it, which loses an entry outright (a
+        stored SOP then reads as unconfirmed) and leaves stray `.json.tmp` files
+        behind when a write fails.
+        """
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
-            for item in self._source:
-                if self._stop.is_set():
-                    # The item is already pulled from the source and will
-                    # never be consumed - release a spilled part here, since
-                    # the queue cannot show it to the drain.
-                    self._discard(item)
-                    break
-                # Blocks when the queue is full - this is the backpressure.
-                self._q.put(item)
-                if self._stop.is_set():
-                    # Paired with the check above: a stop that landed while
-                    # we were blocked in put() is seen HERE, before the source
-                    # is asked for one more item that nothing would consume.
-                    break
-        except Exception as e:  # surface a reader failure to the sender
-            self._error = e
-        finally:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+                f.flush()
+            replace_with_retry(tmp, path)
+        except Exception:
             try:
-                self._q.put(_EOF)
-            except Exception:
-                pass
-
-    def start(self):
-        """Start the reader thread. Returns self."""
-        self._thread.start()
-        return self
-
-    def __iter__(self):
-        """Yield `(dicom_bytes, idx)` as the reader produces them, in order."""
-        while True:
-            item = self._q.get()
-            if item is _EOF:
-                if self._error is not None:
-                    raise self._error
-                return
-            yield item
-
-    def _drain(self):
-        """Discard queued items, unlinking any spilled part they carry."""
-        while True:
-            try:
-                item = self._q.get_nowait()
-            except queue.Empty:
-                return
-            self._discard(item)
-
-    @staticmethod
-    def _discard(item):
-        """Unlink the temp file of a discarded, never-consumed part."""
-        part = item[0] if isinstance(item, tuple) and item else None
-        if isinstance(part, SpilledPart):
-            try:
-                os.unlink(part.path)
+                os.unlink(tmp)
             except OSError:
                 pass
+            raise
 
-    def stop(self):
-        """Force the reader to finish and wait for it (non-fatal, idempotent).
+    def _write(self, path, data):
+        """Write `data` to `path` atomically, as one publish operation."""
+        with self._guard_for(path):
+            self._write_unlocked(path, data)
 
-        Called when the sender exits early (cancel / shutdown / fatal error).
-        The reader may be blocked on `put` while the queue is full; draining
-        the queue frees a slot so it can observe the stop flag and exit.
-        A drained part that was spilled to disk is unlinked here: nothing
-        downstream will ever consume it, so the temp file would otherwise
-        stay behind (the parser drops only malformed parts, and the sender
-        loop unlinks only the part it has already taken).
+    def insert_sop(self, sop_uid, study_uid, series_uid):
+        """Insert or replace a SOP entry. Idempotent."""
+        data = {
+            "study_uid": study_uid,
+            "series_uid": series_uid,
+            "ts": int(time.time()),
+            "is_verified": False,
+        }
+        path = self._path(sop_uid)
+        self._write(path, data)
 
-        Drained TWICE: the first pass frees the slot the reader is blocked on,
-        and the reader then parks the part it was holding, so a pass that
-        finished before that wake-up would miss it and leave its spill file
-        behind. The second pass after the join catches exactly that item.
+    def _read_unlocked(self, path):
+        """Read one index file. The caller holds the guard."""
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def lookup_sop(self, sop_uid):
+        """Look up a SOP UID. Returns dict or None."""
+        path = self._path(sop_uid)
+        if not os.path.isfile(path):
+            return None
+        try:
+            # Under the per-file guard: on Windows this open handle would
+            # otherwise block a concurrent writer's `os.replace` with a
+            # sharing violation, which loses the entry it was writing.
+            with self._guard_for(path):
+                return self._read_unlocked(path)
+        except (json.JSONDecodeError, OSError) as e:
+            logging.warning("[SOP-INDEX] Corrupt %s: %s", path, e)
+            return None
+
+    def mark_verified(self, sop_uid):
+        """Mark a SOP as verified after successful N-ACTION check.
+
+        The read, the update and the write are ONE locked step. Reading with
+        the guard released (`lookup_sop` then `_write`) let an `insert_sop`
+        publish a fresh replacement in between, which this path then
+        overwrote with the stale scope it had read and marked verified.
         """
-        self._stop.set()
-        self._drain()
-        if self._thread.is_alive():
-            self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
-                logging.warning("[B1-prefetch] reader thread did not exit in 5s")
-        self._drain()
+        path = self._path(sop_uid)
+        with self._guard_for(path):
+            if not os.path.isfile(path):
+                return
+            try:
+                entry = self._read_unlocked(path)
+            except (json.JSONDecodeError, OSError) as e:
+                logging.warning("[SOP-INDEX] Corrupt %s: %s", path, e)
+                return
+            entry["is_verified"] = True
+            self._write_unlocked(path, entry)
+
+    def cleanup(self, max_age_seconds=86400):
+        """Remove entries older than max_age_seconds (default: 24h)."""
+        cutoff = time.time() - max_age_seconds
+        removed = 0
+        try:
+            for name in os.listdir(self._dir):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(self._dir, name)
+                try:
+                    # The guard spans the mtime check AND the unlink: an
+                    # `insert_sop` between them publishes a fresh replacement
+                    # that the unlink would then delete (TOCTOU). Holding it
+                    # serialises the sweep against a publisher of this file.
+                    with self._guard_for(path):
+                        if os.path.getmtime(path) < cutoff:
+                            os.unlink(path)
+                            removed += 1
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        if removed > 0:
+            logging.info("[SOP-INDEX] Cleaned %d entries", removed)
+
+    def count(self):
+        """Return total number of entries."""
+        try:
+            return sum(1 for n in os.listdir(self._dir) if n.endswith(".json"))
+        except OSError:
+            return 0
+
+    def close(self):
+        """No-op on filesystem."""
 
 # ---------------------------------------------------------------------------
 # Bridge: health_checker
@@ -6080,6 +7958,12 @@ class HealthChecker:
         self._consecutive_failures = 0
         self._disabled_until_restart = False  # set on 404 in "probe" mode
         self._last_reason = ""
+        # R11: set when /health answers 4xx. That is the server being reachable
+        # but refusing the probe (bad auth, wrong verb, throttling), which says
+        # nothing about whether it can store. The gate is restored while this
+        # is set, so a transient probe rejection cannot pin every C-STORE to
+        # 0xA700 for the life of the process.
+        self._probe_rejected = False
 
         # Background thread
         self._thread = None
@@ -6172,45 +8056,79 @@ class HealthChecker:
     def _run(self):
         """Background loop: poll /health, update Event."""
 
-        url = self._health_url
         was_dead = False
-
         while not _shutdown_requested.is_set():
-            try:
-                resp = requests.get(url, timeout=self._http_timeout, cert=self._tls)
-                if resp.status_code == 200:
-                    self._on_healthy()
-                    was_dead = False
-                elif resp.status_code == 404 and self._mode == "probe":
-                    # Server has no /health - disable checks permanently
-                    self._disabled_until_restart = True
-                    logging.warning(
-                        "[HEALTH] Server returned 404 on /health - "
-                        "health check disabled until bridge restart "
-                        "(mode=probe). Server: %s",
-                        self._clarus_url,
-                    )
-                    return  # Exit poller thread - nothing to poll
-                else:
-                    self._on_unhealthy(
-                        f"Server returned HTTP {resp.status_code}",
-                        was_dead,
-                    )
-                    was_dead = True
-            except requests.exceptions.Timeout:
-                self._on_unhealthy(
-                    f"/health timeout after {self._http_timeout}s",
-                    was_dead,
-                )
-                was_dead = True
-            except requests.exceptions.ConnectionError as e:
-                self._on_unhealthy(f"Connection refused: {e}", was_dead)
-                was_dead = True
-            except Exception as e:
-                self._on_unhealthy(f"/health error: {e}", was_dead)
-                was_dead = True
-
+            was_dead = self._poll_once(was_dead)
+            if self._disabled_until_restart:
+                return  # Probe mode found no /health - nothing to poll
             time.sleep(self._interval)
+
+    def _poll_once(self, was_dead):
+        """One /health fetch; update the healthy Event. Returns the new
+        `was_dead` flag.
+
+        Split out of the loop so each verdict is reachable without a thread:
+        the 4xx/5xx distinction is the whole point of the branch and could not
+        be exercised while it lived inside an infinite loop.
+        """
+        url = self._health_url
+        try:
+            resp = requests.get(url, timeout=self._http_timeout, cert=self._tls)
+            if resp.status_code == 200:
+                self._on_healthy()
+                return False
+            if resp.status_code == 404 and self._mode == "probe":
+                # Server has no /health - disable checks permanently
+                self._disabled_until_restart = True
+                logging.warning(
+                    "[HEALTH] Server returned 404 on /health - "
+                    "health check disabled until bridge restart "
+                    "(mode=probe). Server: %s",
+                    self._clarus_url,
+                )
+                return was_dead
+            if 400 <= resp.status_code < 500:
+                # A 4xx is the SERVER ANSWERING: it is alive and refusing this
+                # particular request. 401/403 mean the probe is unauthenticated
+                # or the config is wrong, 405 that the verb is wrong, 429 that
+                # the probe is being throttled. Reporting "down" for them
+                # cleared the health Event and made every C-STORE answer
+                # 0xA700 - a bridge that stores nothing because its own probe
+                # is unauthorised is worse than one that stores and lets the
+                # real request fail on its own merits.
+                #
+                # The probe's own "not found" is the 404 case above. Any other
+                # 4xx therefore means the endpoint exists but this request
+                # cannot use it: keep the last verdict, and say so once so the
+                # operator can fix the probe.
+                reason = f"probe rejected HTTP {resp.status_code}"
+                if not self._probe_rejected:
+                    logging.warning(
+                        "[HEALTH] /health answered HTTP %d - server is "
+                        "reachable but the probe is not accepted; keeping "
+                        "C-STORE enabled (check auth/config)",
+                        resp.status_code,
+                    )
+                self._probe_rejected = True
+                self._last_reason = reason
+                # The server ANSWERED, so it is up for our purposes: restore
+                # the gate. Leaving it cleared because the probe is unauthorised
+                # made the bridge refuse every instance after a single 401.
+                self._server_healthy.set()
+                self._consecutive_failures = 0
+                self._last_ok_time = time.monotonic()
+                return was_dead
+            self._on_unhealthy(f"Server returned HTTP {resp.status_code}", was_dead)
+            return True
+        except requests.exceptions.Timeout:
+            self._on_unhealthy(f"/health timeout after {self._http_timeout}s", was_dead)
+            return True
+        except requests.exceptions.ConnectionError as e:
+            self._on_unhealthy(f"Connection refused: {e}", was_dead)
+            return True
+        except Exception as e:
+            self._on_unhealthy(f"/health error: {e}", was_dead)
+            return True
 
     def _on_healthy(self):
         """Called when /health returns 200."""
@@ -6224,6 +8142,7 @@ class HealthChecker:
         self._consecutive_failures = 0
         self._last_ok_time = time.monotonic()
         self._last_reason = ""
+        self._probe_rejected = False
 
     def _on_unhealthy(self, reason: str, was_dead: bool):
         """Called when /health fails."""
@@ -6395,14 +8314,20 @@ _MASKED_LOG_KEYS = frozenset(
         "InstitutionName",
         "ReferringPhysicianName",
         "PerformingPhysicianName",
+        "NameOfPhysiciansReadingStudy",
         "RequestingPhysician",
         "AdmittingDiagnosesDescription",
         "StudyID",
     )
 )
-# The same keys by tag, for a caller that passed numeric tags.
+# The same keys by tag, for a caller that passed numeric tags. Normalised to
+# lower case because `_masked_query` lower-cases the key before the lookup:
+# a tag whose element component contains a hex letter (0008,103E, 0008,1060,
+# 0008,1080) is stored with that letter in upper case by convention, and an
+# exact comparison against the canonical spelling let the whole tag - and the
+# PHI it carries - through unmasked.
 _MASKED_LOG_TAGS = frozenset(
-    tag
+    tag.lower()
     for tag in (
         "00100010",
         "00100020",
@@ -6433,7 +8358,10 @@ def _masked_query(params):
     from urllib.parse import unquote
 
     parts = []
-    for key in sorted(params):
+    # The error path calls this with whatever `params` holds, and a caller may
+    # pass `default_param=None` (no default search key). Masking must never be
+    # the reason a status is not sent, so a missing map logs as empty.
+    for key in sorted(params or {}):
         bare = unquote(str(key)).strip().lower().replace(",", "")
         if bare in _MASKED_LOG_KEYS or bare in _MASKED_LOG_TAGS:
             parts.append(f"{key}=***")
@@ -6506,21 +8434,44 @@ def _handle_qido_search(
         if not isinstance(results, list):
             results = []
     except httpx.HTTPStatusError as exc:
-        # 31.08 honest log: a 400 here is the BRIDGE's fault (bad query,
-        # e.g. series keys on the study level) - never a "connection
-        # failure". The response body is not logged (may echo the query).
+        # Status class decides the refusal: 4xx is the BRIDGE's own bad
+        # query (e.g. series keys on the study level), 5xx is the server or
+        # a proxy failing for a reason unrelated to this query. The response
+        # body is not logged (may echo the query).
+        #
+        # R14: 429 is NOT a bad query - it is the upstream rate-limiting us,
+        # and it is TRANSIENT. `_http_status_to_dimse` already classifies it
+        # (and 5xx) as 0xA700; a bare `>= 500` check turned rate-limiting into
+        # 0xC000, which told the SCU to give up on a query that would succeed
+        # a moment later.
         logging.warning(
             "[C-FIND] QIDO HTTP %d: %s?%s",
             exc.response.status_code,
             url,
             _masked_query(params),
         )
-        yield 0xC000, None
+        dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+        yield dimse, None
+        return
+    except QidoMalformedBodyError as exc:
+        # R16: a 2xx whose body is not a DICOM JSON array is an unreadable
+        # ANSWER, not an empty result (batch-2 raised it instead of returning
+        # []). It is a ValueError, so without this clause it escaped the
+        # generator: no warning was logged, `find_responses` was never
+        # incremented, and the SCU got whatever pynettyic picked. Treat it as
+        # the transient upstream failure it is.
+        logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+        yield 0xA700, None
         return
     except httpx.HTTPError:
-        # Transport errors only: ReadError / ConnectError / Timeout.
+        # Transport errors only: ReadError / ConnectError / Timeout. A broken
+        # TCP link is TRANSIENT - answering 0xC000 told the SCU the query was
+        # permanently refused, so it would never retry. 0xA700 (Refused: Out
+        # of Resources) is the retryable refusal. HTTPStatusError above maps
+        # by status class: 4xx -> 0xC000 (this bridge's bad query), 5xx ->
+        # 0xA700 (transient upstream outage).
         logging.warning("[C-FIND] QIDO error: connection failed")
-        yield 0xC000, None
+        yield 0xA700, None
         return
 
     count = 0
@@ -6569,7 +8520,44 @@ def _handle_patient_root(
     expose_rejected=False,
     qa_url="",
 ):
-    """C-FIND Patient Root -> QIDO-RS studies."""
+    """C-FIND Patient Root -> QIDO-RS.
+
+    STUDY level (or level absent): GET /studies - unchanged.
+    SERIES level (31.08): two-step series search, the same routing Study
+    Root already applies - a patient-root SERIES query used to fall through
+    to the study path and relabel study rows as SERIES, so the SCU received
+    rows with no SeriesInstanceUID.
+    PATIENT level: NOT implemented - refused with 0xA900. Returning study
+    rows labelled PATIENT duplicated one patient per study, which is worse
+    than an honest refusal.
+    """
+    level = (
+        str(getattr(event.identifier, "QueryRetrieveLevel", "") or "").strip().upper()
+    )
+    if level == "SERIES":
+        yield from _handle_series_search(
+            event,
+            clarus_url,
+            verbose,
+            max_responses,
+            http_timeout,
+            tls,
+            expose_rejected=expose_rejected,
+            qa_url=qa_url,
+        )
+        return
+    if level == "PATIENT":
+        yield 0xA900, None
+        return
+    if level not in ("", "STUDY"):
+        # R5: IMAGE (and anything unrecognised) has no study-level equivalent.
+        # Falling through relabelled study rows with QueryRetrieveLevel=IMAGE
+        # and no SOPInstanceUID, which the SCU cannot use - and the server
+        # drops a return key it cannot honour, so the rows looked plausible.
+        # PS3.4 C.4.1.1.4 / PS3.7: the honest answer is Identifier Does Not
+        # Match SOP Class. Same refusal the PATIENT branch above already makes.
+        yield 0xA900, None
+        return
     yield from _handle_qido_search(
         event,
         clarus_url,
@@ -6598,9 +8586,9 @@ def _handle_study_root(
     STUDY level (or level absent): GET /studies - unchanged.
     SERIES level (31.08, MicroDicom series search): two-step search
     (study -> per-study series), see _handle_series_search.
-    IMAGE level is NOT implemented - out of scope, documented in the
-    report; such a query falls through to the study-level path and the
-    server answers 400 for the foreign SOPInstanceUID key (honest log).
+    IMAGE level is NOT implemented: such a query is refused with 0xA900.
+    It used to fall through to the study-level path, which relabelled study
+    rows as IMAGE with no SOPInstanceUID - rows the SCU cannot use.
     """
     level = (
         str(getattr(event.identifier, "QueryRetrieveLevel", "") or "").strip().upper()
@@ -6616,6 +8604,10 @@ def _handle_study_root(
             expose_rejected=expose_rejected,
             qa_url=qa_url,
         )
+        return
+    if level not in ("", "STUDY"):
+        # R5: see _handle_patient_root - IMAGE has no study-row equivalent.
+        yield 0xA900, None
         return
     yield from _handle_qido_search(
         event,
@@ -6676,17 +8668,31 @@ def _handle_series_search(
         if not isinstance(study_rows, list):
             study_rows = []
     except httpx.HTTPStatusError as exc:
+        # Status class decides the refusal: 4xx is this query's fault
+        # (0xC000), 5xx is the server or a proxy failing (0xA700, retryable).
+        # R14: 429 is upstream rate-limiting and is transient, so the shared
+        # classifier decides rather than a bare `>= 500` threshold.
         logging.warning(
             "[C-FIND] QIDO HTTP %d: %s?%s",
             exc.response.status_code,
             studies_url,
             _masked_query(study_params),
         )
-        yield 0xC000, None
+        dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+        yield dimse, None
+        return
+    except QidoMalformedBodyError as exc:
+        # R16: an unreadable 2xx body is a transient upstream failure, not an
+        # empty result; see the single-study handler above.
+        logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+        yield 0xA700, None
         return
     except httpx.HTTPError:
+        # A broken transport is transient: 0xA700 tells the SCU to retry,
+        # while 0xC000 would read as a permanent refusal and lose a query
+        # the network happened to interrupt.
         logging.warning("[C-FIND] QIDO error: connection failed")
-        yield 0xC000, None
+        yield 0xA700, None
         return
 
     study_by_uid = {}
@@ -6710,6 +8716,19 @@ def _handle_series_search(
     count = 0
     truncated = False
     for study_uid, study_row in study_by_uid.items():
+        # A C-CANCEL from the SCU, or a bridge shutdown, must stop a broad
+        # SERIES walk: each iteration can block for http_timeout and the walk
+        # otherwise has no way out. Mirror the metric bookkeeping the terminal
+        # paths do: count the rows already sent before the non-Pending yield
+        # (nothing after a non-Pending status is ever executed).
+        if getattr(event, "is_cancelled", False):
+            find_responses.labels(type="series").inc(count)
+            yield 0xFE00, None
+            return
+        if _shutdown_requested.is_set():
+            find_responses.labels(type="series").inc(count)
+            yield 0xC000, None
+            return
         if max_responses and count >= max_responses:
             truncated = True
             logging.warning(
@@ -6729,17 +8748,28 @@ def _handle_series_search(
             if not isinstance(series_rows, list):
                 series_rows = []
         except httpx.HTTPStatusError as exc:
+            # Status class decides the refusal: 4xx is this query's fault
+            # (0xC000), 5xx is the server or a proxy failing (0xA700).
+            # R14: 429 is transient and the shared classifier already says so.
             logging.warning(
                 "[C-FIND] QIDO HTTP %d: %s?%s",
                 exc.response.status_code,
                 series_url,
                 _masked_query(series_params),
             )
-            yield 0xC000, None
+            dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+            yield dimse, None
+            return
+        except QidoMalformedBodyError as exc:
+            # R16: same class as the single-study handler - an unreadable 2xx
+            # body is a transient upstream failure, not an empty result.
+            logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+            yield 0xA700, None
             return
         except httpx.HTTPError:
+            # Same class as step (a): a transport break is retryable.
             logging.warning("[C-FIND] QIDO error: connection failed")
-            yield 0xC000, None
+            yield 0xA700, None
             return
         for row in series_rows:
             if max_responses and count >= max_responses:
@@ -6808,6 +8838,11 @@ import struct
 import threading
 import time
 
+from pydicom.datadict import keyword_dict, keyword_for_tag
+from pydicom.dataset import Dataset
+from pydicom.multival import MultiValue
+from pydicom.tag import BaseTag, Tag
+
 # ---------------------------------------------------------------------------
 # Backpressure: limit concurrent C-STORE handlers (like nginx worker_connections)
 # ---------------------------------------------------------------------------
@@ -6827,7 +8862,7 @@ def set_max_concurrent_cstore(n: int) -> None:
 # ---------------------------------------------------------------------------
 # PROD-HARDENING: Unified backpressure  -  single function for outbox
 # ---------------------------------------------------------------------------
-def _check_backpressure(pending, max_queue):
+def _check_backpressure(pending, max_queue, pending_bytes=0, max_queue_bytes=0):
     """Unified adaptive backpressure with hysteresis.
 
     Returns DIMSE status:
@@ -6839,9 +8874,19 @@ def _check_backpressure(pending, max_queue):
     Args:
         pending: Current queue depth (integer count).
         max_queue: Maximum queue capacity (integer count).
+        pending_bytes: Bytes currently held by the queue (0 = not measured).
+        max_queue_bytes: Byte budget (0 = no byte limit).
+
+    The fill ratio is the WORSE of the slot ratio and the byte ratio. Slots
+    alone let `advanced.stow_queue_max_mb` be a documented knob that nothing
+    read: 20000 slots of 0.5-50 MB is up to 10 GB against a configured 500 MB
+    budget, and a queue that is 2% full by count can be far past its memory
+    budget.
     """
     max_q = max_queue if max_queue > 0 else 5000
     ratio = pending / max_q if max_q > 0 else 0.0
+    if max_queue_bytes > 0 and pending_bytes > 0:
+        ratio = max(ratio, pending_bytes / max_queue_bytes)
 
     if ratio >= 0.95:
         logging.critical(
@@ -6931,9 +8976,20 @@ class _AdmissionController:
                     return status, reason or "server degraded"
 
         if self._outbox is not None:
+            # The byte budget is optional: a queue that cannot report its
+            # pending bytes (or has no budget configured) is judged on slots
+            # alone, exactly as before.
+            _pending_bytes = 0
+            try:
+                if getattr(self._outbox, "max_queue_bytes", 0):
+                    _pending_bytes = self._outbox.pending_bytes()
+            except Exception:
+                _pending_bytes = 0
             bp = _check_backpressure(
                 self._outbox.pending_count(),
                 self._outbox.max_queue,
+                pending_bytes=_pending_bytes,
+                max_queue_bytes=getattr(self._outbox, "max_queue_bytes", 0),
             )
             if bp != 0x0000:
                 return bp, "queue backpressure"
@@ -6975,6 +9031,14 @@ def _fix_cp1251_krakozyabry(ds):
             charset_conversions.labels(from_encoding="utf8").inc()
             return ds
 
+    # Every TEXT-valued element is a candidate, not just five named fields.
+    # Setting ISO_IR 192 for the whole dataset while repairing only PatientName
+    # and friends relabelled the remaining cp1251 bytes (ReferringPhysicianName,
+    # PerformingPhysicianName, OperatorsName, comments, ...) as UTF-8, which
+    # turns readable Cyrillic into replacement characters downstream. The walk
+    # below visits all of them (PS3.5 Table 6.2-1 text VRs).
+    _TEXT_VRS = frozenset({"PN", "LO", "SH", "ST", "LT", "UT", "UC", "DA", "TM"})
+
     fields_to_fix = [
         "PatientName",
         "PatientID",
@@ -7010,28 +9074,40 @@ def _fix_cp1251_krakozyabry(ds):
             and all(ch in _CYRILLIC_BLOCK for ch in text)
         )
 
-    fixed_any = False
-    for field in fields_to_fix:
-        if field not in ds:
-            continue
-        element = ds.data_element(field)
-        if element is None:
-            continue
-        value = element.value
-        if not isinstance(value, (str, bytes)):
-            try:
-                value = str(value)
-            except Exception:
-                continue
-        if not value:
-            continue
+    def _cp1251_fix_one(value):
+        """Repair one text value. Returns (new_value, examined).
 
+        `examined` is False when the value could not be tested at all; the
+        caller then keeps the dataset's original charset, because relabelling
+        UTF-8 over a field nobody checked is exactly the mislabel this repair
+        must not create.
+        """
         try:
-            raw_bytes = value.encode("latin-1")
-            fixed = raw_bytes.decode("cp1251", errors="replace")
-        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            raw_bytes = str(value).encode("latin-1")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            # Not representable byte-for-byte, so it was never cp1251-as-
+            # latin-1; it is already something else and is left alone.
             malformed_tags.inc()
-            continue
+            return value, False
+        except Exception:
+            malformed_tags.inc()
+            return value, False
+
+        # R6: a value whose Latin-1 bytes decode STRICTLY as UTF-8 is text
+        # that reached us through a missing SpecificCharacterSet: pydicom
+        # read the UTF-8 bytes as Latin-1, so `str(value)` looks like
+        # mojibake but its byte content is valid UTF-8. Re-decoding those
+        # bytes as cp1251 turned "Петров" into permanent garbage and then
+        # relabelled the dataset ISO_IR 192. The strict probe runs FIRST and
+        # returns on success; only a strict-decode failure falls through to
+        # the cp1251 repair (genuine cp1251 Cyrillic is almost never valid
+        # UTF-8).
+        try:
+            return raw_bytes.decode("utf-8"), True
+        except UnicodeDecodeError:
+            pass
+
+        fixed = raw_bytes.decode("cp1251", errors="replace")
 
         # Only accept the fix if the result contains >=3 consecutive Cyrillic
         # characters OR is a short all-Cyrillic name (1-4 chars, no long run).
@@ -7040,43 +9116,206 @@ def _fix_cp1251_krakozyabry(ds):
             and not _has_cyrillic_run(fixed, 3)
             and not _is_all_cyrillic(fixed)
         ):
-            continue
+            return value, True
+        return fixed, True
 
-        if fixed != value:
-            element.value = fixed
-            fixed_any = True
-            if field == "PatientName":
-                logging.debug(
-                    "  [CP1251] Fixed %s: %s -> %s",
-                    field,
-                    mask_patient_name(str(value)),
-                    mask_patient_name(str(fixed)),
-                )
-            elif field == "PatientID":
-                # A modality's PatientID is the real identifier, not the
-                # bridge's AUTOPAT_ placeholder: it goes through the keyed
-                # token like every other log line that carries one.
-                logging.debug(
-                    "  [CP1251] Fixed %s: %s -> %s",
-                    field,
-                    mask_patient_id(str(value)),
-                    mask_patient_id(str(fixed)),
-                )
-            else:
-                logging.debug(
-                    "  [CP1251] Fixed %s: %.40s → %.40s",
-                    field,
-                    str(value)[:40],
-                    str(fixed)[:40],
-                )
+    fixed_any = False
+    # Set when some text element was NOT examined or its repair was uncertain:
+    # the dataset then keeps its original charset instead of being relabelled
+    # UTF-8 over a mixture of encodings.
+    uncertain = False
+    # id(element) -> (element, value BEFORE any repair), so a partial repair can
+    # be undone whole (`_repair_dataset` writes into `element.value` as it
+    # walks, and the decision to keep the original charset is only made at the
+    # top).
+    #
+    # Keyed by the ELEMENT IDENTITY, not by tag: the SAME tag appears in every
+    # item of a sequence (two SR Content Items each carry a TextValue, two
+    # nested items each carry a CodeMeaning). Keying by tag kept only the
+    # first item's original and then wrote it into EVERY element with that
+    # tag on undo - silently replacing one item's clinical text with
+    # another's.
+    #
+    # `id()` rather than the element itself: pydicom's DataElement defines no
+    # `__hash__`, so it cannot be a dict key. The element is stored beside its
+    # original, which also keeps the object alive for the life of the map.
+    _uncertain_replaced = {}
+
+    # Built from the walk so a tag added to the dataset later is not silently
+    # missed: the five historical names stay FIRST (their log lines are
+    # field-specific), then every other text-valued element.
+    #
+    # PS3.5 SpecificCharacterSet (0008,0005) applies to the WHOLE data set,
+    # including every nested Sequence item: (0040,A730) Content Sequence and
+    # any other SQ carries text elements in the same source encoding. Relabelling
+    # the top level to ISO_IR 192 while repairing only top-level elements left
+    # every nested PN/LO/ST as cp1251 bytes declared UTF-8. The walk therefore
+    # descends into sequences (`_top_level=False` below).
+    def _repair_dataset(ds_obj, top_level):
+        """Repair one dataset level. Returns (fixed_any, uncertain)."""
+        fixed_here = False
+        uncertain_here = False
+        _walk_tags = []
+        for elem in ds_obj:
+            # A sequence ELEMENT is a DataElement whose VR is 'SQ' and whose
+            # .value is the Sequence - it is NOT itself a Sequence instance.
+            # Testing `isinstance(elem, Sequence)` therefore never matched, so
+            # the descent below never ran and nested text was never repaired.
+            if elem.VR == "SQ":
+                continue
+            if elem.VR in _TEXT_VRS or (
+                top_level and elem.keyword in fields_to_fix
+            ):
+                _walk_tags.append(elem.tag)
+        _ordered_tags = []
+        if top_level:
+            for field in fields_to_fix:
+                tag = keyword_dict.get(field)
+                if tag is not None:
+                    _ordered_tags.append(Tag(tag))
+        for tag in _walk_tags:
+            if tag not in _ordered_tags:
+                _ordered_tags.append(tag)
+
+        for _tag in _ordered_tags:
+            # `keyword_dict` yields a Tag and the walk yields a Tag: normalise
+            # once so the dataset lookup and the element access agree on the
+            # key. (`pydicom.tag.Tag` is a FACTORY function, so `isinstance`
+            # has to test the concrete `BaseTag` class.)
+            tag = _tag if isinstance(_tag, BaseTag) else Tag(_tag)
+            # The keyword only drives the LOG wording; an unknown/private tag
+            # has none and falls into the redacted branch.
+            field = keyword_for_tag(tag)
+            if tag not in ds_obj:
+                continue
+            element = ds_obj[tag]
+            if element is None:
+                continue
+            if element.VR not in _TEXT_VRS:
+                # A keyword listed above whose VR is not text (PatientID is
+                # LO, so this is only reachable for a non-conformant file):
+                # leave it and mark the walk partial.
+                uncertain_here = True
+                continue
+            value = element.value
+            if isinstance(value, (list, tuple, MultiValue)):
+                # A multi-valued text element is repaired value by value; if
+                # any component cannot be examined the element is uncertain.
+                new_values = []
+                for part in value:
+                    fixed_part, ok = _cp1251_fix_one(part)
+                    if not ok:
+                        uncertain_here = True
+                    new_values.append(fixed_part)
+                    if fixed_part != part:
+                        fixed_here = True
+                        if id(element) not in _uncertain_replaced:
+                            _uncertain_replaced[id(element)] = (element, list(value))
+                element.value = new_values
+                continue
+            if not isinstance(value, (str, bytes)):
+                try:
+                    value = str(value)
+                except Exception:
+                    uncertain_here = True
+                    continue
+            if not value:
+                continue
+            fixed, ok = _cp1251_fix_one(value)
+            if not ok:
+                uncertain_here = True
+                continue
+            if fixed != value:
+                if id(element) not in _uncertain_replaced:
+                    _uncertain_replaced[id(element)] = (element, value)
+                element.value = fixed
+                fixed_here = True
+                if field == "PatientName":
+                    logging.debug(
+                        "  [CP1251] Fixed %s: %s -> %s",
+                        field,
+                        mask_patient_name(str(value)),
+                        mask_patient_name(str(fixed)),
+                    )
+                elif field == "PatientID":
+                    # A modality's PatientID is the real identifier, not the
+                    # bridge's AUTOPAT_ placeholder: it goes through the keyed
+                    # token like every other log line that carries one.
+                    logging.debug(
+                        "  [CP1251] Fixed %s: %s -> %s",
+                        field,
+                        mask_patient_id(str(value)),
+                        mask_patient_id(str(fixed)),
+                    )
+                else:
+                    # Free text a site fills with names and addresses, and on a
+                    # cp1251-fixed instance exactly as identifying as
+                    # PatientName. Neither masker applies (not a PN, not a keyed
+                    # ID), so the value is NOT logged at all: the tag and the
+                    # length are enough to confirm the repair happened.
+                    logging.debug(
+                        "  [CP1251] Fixed %s: value redacted (%d -> %d chars)",
+                        field,
+                        len(str(value)),
+                        len(str(fixed)),
+                    )
+
+        # Descend into every sequence at this level, including sequences
+        # nested inside items of other sequences.
+        for elem in ds_obj:
+            if elem.VR != "SQ":
+                continue
+            for item in elem.value or []:
+                if not isinstance(item, Dataset):
+                    # A non-Dataset item cannot carry tagged text elements;
+                    # it is not an encoding question, so it is not "uncertain".
+                    continue
+                sub_fixed, sub_uncertain = _repair_dataset(item, False)
+                fixed_here = fixed_here or sub_fixed
+                uncertain_here = uncertain_here or sub_uncertain
+        return fixed_here, uncertain_here
+
+    fixed_any, uncertain = _repair_dataset(ds, True)
+    fixed_any = bool(fixed_any)
+    uncertain = bool(uncertain)
 
     if fixed_any:
-        ds.SpecificCharacterSet = "ISO_IR 192"
-        charset_conversions.labels(from_encoding="cp1251").inc()
-        logging.info(
-            "  [CP1251] Detected and fixed cp1251 mojibake in %s",
-            mask_patient_name(str(ds.get("PatientName", "unknown"))),
-        )
+        if uncertain:
+            # Some text element could not be examined, so the dataset is not
+            # uniformly repairable. Relabelling UTF-8 would declare a charset
+            # the unexamined element does not honour; but KEEPING the repaired
+            # values under the original charset is just as wrong in the other
+            # direction - PS3.5 (0008,0005) applies to the whole data set, so a
+            # Cyrillic string left under ISO_IR 100 is written out as Latin-1
+            # bytes (or raises) and the text is corrupted on the wire. Neither
+            # half-label is acceptable, so the whole repair is undone: value
+            # and charset stay exactly as received, mutually consistent.
+            #
+            # The recorded ELEMENTS are restored directly, so each one gets its
+            # OWN original back and no walking is needed (nor would a walk
+            # help: `ds[tag]` reaches only the top level, and matching by tag
+            # is exactly the swap this undo must not make).
+            for _element, _orig in list(_uncertain_replaced.values()):
+                try:
+                    _element.value = _orig
+                except Exception:
+                    pass
+            # Nothing was changed after the undo, so the caller must not treat
+            # this instance as repaired (the metric below records the no-op).
+            fixed_any = False
+            logging.warning(
+                "  [CP1251] Repaired text elements but could not examine every "
+                "text value - reverting the repair so the charset and the "
+                "bytes stay consistent",
+            )
+            charset_conversions.labels(from_encoding="latin1").inc()
+        else:
+            ds.SpecificCharacterSet = "ISO_IR 192"
+            charset_conversions.labels(from_encoding="cp1251").inc()
+            logging.info(
+                "  [CP1251] Detected and fixed cp1251 mojibake in %s",
+                mask_patient_name(str(ds.get("PatientName", "unknown"))),
+            )
     else:
         charset_conversions.labels(from_encoding="latin1").inc()
 
@@ -7102,7 +9341,7 @@ def handle_c_store(
     bridge_name_prefix="Anonymous^",
     tls=None,
     forward_outbox=None,
-    bridge_ae_title="CLARUS_BRIDGE",
+    bridge_ae_title="CLBRIDGE",
 ):
     """Handle C-STORE: validate, enqueue to OutboxQueue, return immediately.
 
@@ -7123,7 +9362,13 @@ def handle_c_store(
     # Backpressure: if all slots busy -> 0xA700 Out of Resources
     # Modality will retry  -  this is standard DICOM behavior (PS3.7 sec.C.4).
     # Like nginx worker_connections: accept only what you can process.
-    if not _cstore_semaphore.acquire(blocking=False):
+    # R17: bind the semaphore to a LOCAL before the acquire and release that
+    # same object in the finally. A reloaded [advanced] max_concurrent_cstore
+    # replaces the module global, and a handler still holding the OLD
+    # semaphore then released the NEW one - raising its counter above the
+    # configured limit for the rest of the process.
+    sem = _cstore_semaphore
+    if not sem.acquire(blocking=False):
         logging.warning(
             "[C-STORE] Backpressure: all %d slots busy - rejecting with 0xA700",
             _MAX_CONCURRENT_CSTORE,
@@ -7175,6 +9420,15 @@ def handle_c_store(
         # Bridge: detect malformed tags  -  missing SOPInstanceUID
         if not sop_uid:
             malformed_tags.inc()
+            # SOPInstanceUID (0008,0018) is Type 1 for every Storage SOP
+            # Class (PS3.4 B.2 / PS3.3 C.12.1.1.2). Enqueueing an instance
+            # without it produced an empty outbox key: the row read as a
+            # perpetual "duplicate", the blob was never persisted, and the
+            # modality still got 0x0000 for an instance nobody stored.
+            # 0xA900 "Data Set Does Not Match SOP Class" (PS3.4 Table B.2-1)
+            # is the honest refusal.
+            logging.warning("[C-STORE] Missing SOPInstanceUID - rejecting 0xA900")
+            return 0xA900
 
         # Bridge: C-STORE size limit guard. The size is measured in both
         # branches: with a limit it gates the store, without one it feeds the
@@ -7220,7 +9474,9 @@ def handle_c_store(
             assoc_id = 0
         patient_id_raw = str(getattr(ds, "PatientID", "?"))
         modality = str(getattr(ds, "Modality", "??"))
-        is_new_study = record_cstore(assoc_id, study_uid, patient_id_raw, modality)
+        # The tracker is told the modality only: it summarises per-study
+        # counts, and PatientID has no reader there.
+        is_new_study = record_cstore(assoc_id, study_uid, modality)
         if is_new_study:
             logging.info(
                 "[C-STORE] Receiving: study=%s patient=%s modality=%s",
@@ -7273,10 +9529,13 @@ def handle_c_store(
                     display_new = (
                         mask_patient_name(new) if tag == (0x0010, 0x0010) else new
                     )
+                    # The log needs a readable placeholder for an empty old
+                    # value; the audit tuple that travelled with this line
+                    # carries the raw empty string, never "(empty)".
                     logging.debug(
                         "Coerced %s: '%s' -> '%s' (audit trail deferred to worker)",
                         tag,
-                        old,
+                        old or "(empty)",
                         display_new,
                     )
         except ValueError as e:
@@ -7318,7 +9577,15 @@ def handle_c_store(
                 try:
                     # Blob is already atomically on disk in the primary outbox;
                     # hardlink (EXDEV fallback copy) it into forward/pending.
+                    #
+                    # The drain worker can claim the item (pending/ ->
+                    # in_progress/) between the enqueue returning and this
+                    # hook running, so pending/ alone is not where the blob has
+                    # to be. A hardlink to either name is safe: mark_delivered
+                    # only unlinks the name the PRIMARY owns.
                     primary_blob = outbox._dcm_path(outbox._pending, sop_uid)
+                    if not os.path.isfile(primary_blob):
+                        primary_blob = outbox._dcm_path(outbox._in_progress, sop_uid)
                     _ = forward_outbox.enqueue_from_blob(
                         primary_blob,
                         sop_uid,
@@ -7361,7 +9628,7 @@ def handle_c_store(
 
         return status
     finally:
-        _cstore_semaphore.release()
+        sem.release()
 
 # ---------------------------------------------------------------------------
 # Bridge: C-ECHO handler
@@ -7383,6 +9650,7 @@ RSP->report loop).
 """
 
 import logging
+from urllib.parse import quote
 
 import httpx
 
@@ -7404,9 +9672,15 @@ def _sop_confirm(sop_uid, sop_index, clarus_url, http_timeout, tls=None):
     study_uid = entry["study_uid"]
     series_uid = entry["series_uid"]
     base = dicomweb_base(clarus_url)
+    # `safe=""` per segment: a UID is one path element, so `/`, `?` and `#`
+    # inside it must not change which resource the GET addresses
+    # (PS3.18 10.1 resource paths). Unescaped, a crafted UID of `1.2?a=b`
+    # pointed the verification at a DIFFERENT resource, and a 200 there
+    # confirmed a SOP the server never stored.
     url = (
-        f"{base}/studies/{study_uid}"
-        f"/series/{series_uid}/instances/{sop_uid}/metadata"
+        f"{base}/studies/{quote(study_uid, safe='')}"
+        f"/series/{quote(series_uid, safe='')}/instances/{quote(sop_uid, safe='')}"
+        "/metadata"
     )
     try:
         resp = _wado_metadata_request(url, http_timeout, tls=tls)
@@ -7448,6 +9722,11 @@ def _register_commit(
     closes. The destination port therefore comes from the peer config (the same
     lookup C-MOVE uses) and nowhere else. A peer that cannot be resolved is
     reported as skipped rather than guessed at.
+
+    Returns True when the batch was registered (its N-EVENT-REPORT will be
+    pushed); False when there is no resolvable requestor address/port, so the
+    caller can refuse the request instead of acknowledging a commitment whose
+    report can never go out.
     """
     requestor = getattr(getattr(event, "assoc", None), "requestor", None)
     address = getattr(requestor, "address", None)
@@ -7461,12 +9740,23 @@ def _register_commit(
             logging.warning("[N-ACTION] resolve_scp for %s failed: %s", calling_ae, e)
 
     if address and port_:
-        commit_tracker.register(tx_uid, calling_ae, address, int(port_), sop_list)
-    else:
-        logging.warning(
-            "[N-ACTION] No requestor address/port for tx=%s - report skipped",
-            tx_uid,
-        )
+        try:
+            commit_tracker.register(tx_uid, calling_ae, address, int(port_), sop_list)
+        except Exception as e:
+            # Persistence failed, so the commitment cannot be honoured later.
+            # Answer Failure (0x0110) instead of acknowledging a request whose
+            # N-EVENT-REPORT would never be pushed (PS3.4 J.3.3.1).
+            logging.error(
+                "[N-ACTION] tx=%s could not be registered: %s", tx_uid, e
+            )
+            return False
+        return True
+
+    logging.warning(
+        "[N-ACTION] No requestor address/port for tx=%s - report skipped",
+        tx_uid,
+    )
+    return False
 
 def handle_n_action(
     event,
@@ -7502,16 +9792,16 @@ def handle_n_action(
         return 0xC000, None
 
     # Validate action_type (1 = Storage Commitment Request).
-    # 0x0122 "No such action" is part of the PS3.7 general-refusal set - a
-    # clean refusal, NOT an implementation 0xC2xx code a modality is not
-    # required to understand.
+    # 0x0123 "No Such Action" (PS3.7): this action_type is not one the bridge
+    # implements. 0x0122 would claim the SOP CLASS is unsupported - a different
+    # refusal - so it must not be used here.
     action_type = getattr(event, "action_type", None)
     if action_type is not None and action_type != 1:
         logging.warning(
             "[N-ACTION] Unsupported action_type=%s (only type 1 supported)",
             action_type,
         )
-        return 0x0122, None
+        return 0x0123, None
 
     calling_ae = event.assoc.requestor.ae_title
     logging.debug("[DIMSE] N-ACTION from %s", calling_ae)
@@ -7529,10 +9819,12 @@ def handle_n_action(
         logging.warning("[N-ACTION] Parse error: %s", e)
         return 0x0110, None
     except Exception as e:
-        # 0x0213 Processing Failure (general-refusal set).
+        # 0x0110 Processing Failure: the request cannot be parsed and will
+        # never succeed, so the SCU must not read this as a temporary
+        # condition (0x0213 Resource Limitation invites a retry).
         logging.error("[N-ACTION] Unexpected parse error: %s", e)
         logging.debug("[N-ACTION] Full traceback follows:", exc_info=True)
-        return 0x0213, None
+        return 0x0110, None
 
     logging.info(
         "[N-ACTION] TransactionUID: %s, SOPs to verify: %d", tx_uid, len(sop_list)
@@ -7579,16 +9871,36 @@ def handle_n_action(
             len(sop_list),
         )
 
-    # Register the batch for the async N-EVENT-REPORT.
-    if commit_tracker is not None and sop_list:
-        _register_commit(
+    # Register the batch for the async N-EVENT-REPORT. A batch that cannot be
+    # registered (no resolvable requestor address/port) would otherwise be
+    # answered 0x0000 while its N-EVENT-REPORT can never go out, leaving the
+    # Transaction UID hanging at the modality. Refuse with 0x0110 (Processing
+    # Failure) so the SCU knows the request is not being processed.
+    #
+    # A request that NAMES SOPs has committed the SCP to reporting on them, so
+    # it is refused when no tracker exists either: with `commit_tracker=None`
+    # nothing was registered and nothing guarantees the N-EVENT-REPORT
+    # (PS3.4 J.3.3.1 - the report IS the result), yet the request was
+    # acknowledged 0x0000. Answering success for work that was silently
+    # dropped is worse than refusing it.
+    if sop_list:
+        if commit_tracker is None:
+            logging.error(
+                "[N-ACTION] tx=%s references %d SOP(s) but no commitment "
+                "tracker is available - refusing (no N-EVENT-REPORT possible)",
+                tx_uid,
+                len(sop_list),
+            )
+            return 0x0110, None
+        if not _register_commit(
             commit_tracker,
             tx_uid,
             calling_ae,
             sop_list,
             event,
             resolve_scp=resolve_scp,
-        )
+        ):
+            return 0x0110, None
 
     # A correctly-parsed request is ALWAYS acknowledged 0x0000 (J.3.2.1.4: no
     # service-class specific values; RSP only says "received / not handling").
@@ -7673,15 +9985,18 @@ from pynetdicom.sop_class import (
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# simple bool to suppress pynetdicom noise during streaming/SC
+# per-thread flag to suppress pynetdicom noise during streaming/SC
 # ---------------------------------------------------------------------------
-_suppress_pynetdicom = False
+# Thread-local, not a module global: the module global silenced pynetdicom
+# logs for EVERY thread (C-STORE, C-FIND, incoming associations) while any
+# single C-MOVE was streaming, hiding real errors from unrelated dialogs.
+_suppress_state = threading.local()
 
 class _SuppressPynetdicomFilter(logging.Filter):
-    """Simple filter: suppress pynetdicom logs when _suppress_pynetdicom is True."""
+    """Suppress pynetdicom logs only on the thread that requested it."""
 
     def filter(self, record):
-        return not _suppress_pynetdicom
+        return not getattr(_suppress_state, "suppress", False)
 
 _pynetdicom_suppress = _SuppressPynetdicomFilter()
 logging.getLogger("pynetdicom").addFilter(_pynetdicom_suppress)
@@ -7710,6 +10025,49 @@ _assoc_module.LOGGER.error = _patched_assoc_error
 # ---------------------------------------------------------------------------
 # Bridge: C-MOVE  -  extract MoveDestination from C-MOVE-RQ
 # ---------------------------------------------------------------------------
+def _parse_scoped_uid(ds, keyword, tag_text):
+    """One SINGLE-VALUE scoped UID from the C-MOVE identifier.
+
+    SeriesInstanceUID (0020,000E) and SOPInstanceUID (0008,0018) are Type 1
+    single-value keys in the C-MOVE identifier (PS3.4 C.4.2.1.2), but a
+    request can still carry several values. `str()` on a pydicom MultiValue
+    renders the Python list ("['1.2.3', '1.2.4']"), which then becomes a path
+    segment of the WADO-RS GET - an unroutable URL, a 404 and a failed job for
+    what was a legitimate request. Only the first value is used (the level
+    scopes ONE series / ONE instance); a value list is truncated rather than
+    collapsed into a string, and an unusable value is refused.
+    """
+    raw = getattr(ds, keyword, None)
+    if raw is None:
+        return ""
+    # pydicom's MultiValue is NOT a list/tuple subclass, so an isinstance test
+    # alone let it reach `str(raw)` and rendered "['1.2.3', '1.2.4']" into the
+    # URL path. Iterating on "has __iter__ and is not a str" covers both the
+    # decoded wire form and a plain container.
+    if not isinstance(raw, (str, bytes)) and hasattr(raw, "__iter__"):
+        values = [str(v).strip() for v in raw if v is not None and str(v).strip()]
+    else:
+        values = [str(raw).strip()]
+    values = [v for v in values if v]
+    if not values:
+        return ""
+    value = values[0]
+    if "[" in value or "]" in value or "," in value:
+        # A rendered container reached here (a caller stringified it before
+        # storing it): `str(MultiValue)` -> "['1.2.3', '1.2.4']". Never let
+        # that text into a URL path. A SINGLE-element container still scopes
+        # one series/instance, so its UID is recovered; two or more values are
+        # an identifier conflict the level cannot resolve, so they are refused
+        # rather than silently narrowed to the first.
+        inner = value.strip().strip("[]").strip()
+        if "," in inner:
+            raise ValueError(f"C-MOVE-RQ: invalid {keyword} ({tag_text})")
+        head = inner.strip("'\"").strip()
+        if not head or any(ch in head for ch in "[]'\" "):
+            raise ValueError(f"C-MOVE-RQ: invalid {keyword} ({tag_text})")
+        return head
+    return value
+
 def _parse_c_move_rq(event):
     """Extract StudyInstanceUID(s) and MoveDestination from C-MOVE-RQ.
 
@@ -7746,7 +10104,31 @@ def _parse_c_move_rq(event):
     if not study_uids:
         raise ValueError("C-MOVE-RQ: empty StudyInstanceUID list")
 
-    return study_uids, str(move_dest)
+    # PS3.4 C.4.2.1.2: the level decides the SCOPE. A SERIES-level C-MOVE must
+    # retrieve the named series, not the whole study - ignoring the level
+    # transferred every instance of the study to a viewer that asked for one
+    # series. The identifier carries SeriesInstanceUID (0020,000E) at SERIES
+    # and additionally SOPInstanceUID (0008,0018) at IMAGE.
+    level = str(getattr(ds, "QueryRetrieveLevel", "") or "").strip().upper()
+    series_uid = _parse_scoped_uid(ds, "SeriesInstanceUID", "0020,000E")
+    sop_instance_uid = _parse_scoped_uid(ds, "SOPInstanceUID", "0008,0018")
+
+    if level == "SERIES" and not series_uid:
+        raise ValueError(
+            "C-MOVE-RQ: SERIES level without SeriesInstanceUID (0020,000E)"
+        )
+    if level == "IMAGE" and not (series_uid and sop_instance_uid):
+        raise ValueError(
+            "C-MOVE-RQ: IMAGE level without SeriesInstanceUID and "
+            "SOPInstanceUID (0020,000E / 0008,0018)"
+        )
+    if level not in ("", "STUDY", "SERIES", "IMAGE"):
+        # An unknown level cannot be honoured; refuse rather than fall back to
+        # whole-study retrieval, which would hand the SCU data it did not ask
+        # for (PS3.4 Table C.4-2 'Unable to process').
+        raise ValueError(f"C-MOVE-RQ: unsupported QueryRetrieveLevel {level!r}")
+
+    return study_uids, str(move_dest), level, series_uid, sop_instance_uid
 
 def _json_loads(payload):
     """json.loads over bytes/str - no new dependency, no external stream."""
@@ -7813,16 +10195,17 @@ def split_multipart_parts(raw, boundary):
 # ---------------------------------------------------------------------------
 # R1 pre-flight (0609): learn each class's stored TS BEFORE the association.
 # Source: the standard per-instance metadata resource (PS3.18 10.4.4)
-# /studies/{study}/series/{series}/metadata, whose elements ALWAYS carry
-# (0002,0010) TransferSyntaxUID (and (0008,0016) SOPClassUID). Series are
-# enumerated via QIDO-RS /studies/{study}/series.
+# /studies/{study}/series/{series}/instances/{sop}/metadata, whose elements
+# ALWAYS carry (0002,0010) TransferSyntaxUID (and (0008,0016) SOPClassUID).
+# Series are enumerated via QIDO-RS /studies/{study}/series, and the probe
+# instance via QIDO-RS /studies/{study}/series/{series}/instances.
 # ---------------------------------------------------------------------------
 # TTL cache of successful pre-flights (0609 field): a repeated C-MOVE of
-# the same study skips the PS3.18 10.4.4 metadata walk (field: 2.3 s for a
-# 432-instance series + parse, plus the association waits on it). Failures
-# are NOT cached - the degrade path must retry. A new stored TS appearing
-# inside the TTL window stays deliverable: such an instance misses its
-# context and takes the legacy fallback path (spec R4 rule 3).
+# the same study skips the probe walk (one QIDO instance list + one metadata
+# GET per series) plus the association's wait on it. Failures are NOT cached
+# - the degrade path must retry. A new stored TS appearing inside the TTL
+# window stays deliverable: such an instance misses its context and takes the
+# legacy fallback path (spec R4 rule 3).
 _PREFLIGHT_TTL_S = 120.0
 _preflight_cache = {}  # study_uid -> (expires_monotonic, result dict)
 
@@ -7837,14 +10220,33 @@ def _cache_evict(cache, now):
     """Drop expired entries, then the oldest until the cache fits the cap."""
     for key, value in list(cache.items()):
         if now >= value[0]:
-            del cache[key]
+            # pop, not del: two workers can evict the same expired key, and a
+            # plain `del` on the second one raised KeyError (a race on shared
+            # mutable state with no lock). pop(key, None) is idempotent.
+            cache.pop(key, None)
     if len(cache) <= _CACHE_MAX_ENTRIES:
         return
     # Oldest-expiring first: those are the entries closest to being useless.
     for key, _value in sorted(cache.items(), key=lambda kv: kv[1][0])[
         : len(cache) - _CACHE_MAX_ENTRIES
     ]:
-        del cache[key]
+        cache.pop(key, None)
+
+def _split_preflight(result):
+    """Normalise a pre-flight answer into `(map_or_None, partial)`.
+
+    The walk returns `(map, partial)`. A caller (or a test) may hand back a
+    bare map or None, which is the pre-batch-8 shape: that result carried no
+    completeness signal, so it can only be treated as COMPLETE - filling in
+    the registry from an answer of unknown coverage is what spent the whole
+    context budget on classes the study does not hold.
+    """
+    if result is None:
+        return None, False
+    if isinstance(result, tuple):
+        value, partial = (result + (False,))[:2]
+        return value, bool(partial)
+    return result, False
 
 def _preflight_study_ts_by_class(
     study_uid,
@@ -7855,8 +10257,14 @@ def _preflight_study_ts_by_class(
     expose_rejected=False,
     qa_url="",
 ):
-    """Return dict[sop_class -> set[stored transfer syntax UID]] for a
-    C-MOVE study, or None when pre-flight cannot be completed.
+    """Return (dict[sop_class -> set[stored transfer syntax UID]], partial).
+
+    `partial` is True when the walk could not cover every series (a timeout,
+    a budget stop, a failed probe), so the class map is a SUBSET of the study.
+    It is False for a complete walk, including the empty answer of a study
+    with no series.
+
+    The map is None when pre-flight cannot be completed at all.
 
     Used to shape the outbound association's per-TS contexts so the stored
     transfer syntax of every instance is PROPOSED and its acceptance is
@@ -7865,9 +10273,31 @@ def _preflight_study_ts_by_class(
     the fixed [EVRLE, IVRLE, 4.80, 4.70] proposal (today's behavior).
 
     1. QIDO series lookup /studies/{study}/series -> SeriesInstanceUIDs.
-    2. Per series, WADO metadata /studies/{study}/series/{series}/metadata
-       (Accept application/dicom+json) -> one JSON array; each element
-       contributes (SOPClassUID from 00080016, TS from 00020010).
+    2. Per series, QIDO instance list /studies/{study}/series/{series}/instances
+       -> the FIRST instance's SOP Instance UID.
+    3. Per series, WADO metadata for that ONE instance
+       /studies/{study}/series/{series}/instances/{sop}/metadata
+       (Accept application/dicom+json) -> (0008,0016) and (0002,0010).
+
+    The series-level metadata resource renders every non-PixelData element of
+    EVERY instance: measured on the stand, 432 instances answered 1.45 MB in
+    663 ms while the same two tags from one instance answered 3.5 KB in 26 ms
+    - about 100x the bytes and the time for the same answer, because the two
+    tags repeat on every instance. A series-level response also costs more
+    than the 2.0 s request timeout on the slow runs, which is why the old
+    pre-flight lost the race and the proposal fell back to registry-wide.
+
+    The probe is EVIDENCE BY CONVENTION, not by conformance: PS3.3 does not
+    require every instance of a series to share a transfer syntax. That is
+    acceptable because a wrong probe is RECOVERABLE - an instance whose
+    stored TS misses its context takes the existing per-instance refetch
+    path (R4 rule 3), which is unchanged. A probe that says nothing at all
+    (today's degrading behaviour) is strictly worse.
+
+    A series-level failure no longer abandons the study: a slow series 9 of
+    30 used to discard the 8 series already probed, which left the caller
+    with no stored-TS information at all. The probed series are returned and
+    the missed instances fall back to the refetch path.
 
     The metadata resource is answered with the mandatory media type
     multipart/related; type="application/dicom+json" (PS3.18 10.4.4) - the
@@ -7888,7 +10318,7 @@ def _preflight_study_ts_by_class(
             _PREFLIGHT_TTL_S,
             len(_hit[1]),
         )
-        return {k: set(v) for k, v in _hit[1].items()}
+        return {k: set(v) for k, v in _hit[1].items()}, False
     _preflight_cache.pop(_cache_key, None)
     base = service_base_url(clarus_url, qa_url, expose_rejected)
     start = time.monotonic()
@@ -7972,9 +10402,9 @@ def _preflight_study_ts_by_class(
             "contexts proposed",
             str(study_uid)[:50],
         )
-        return None
+        return None, False
     if _over_budget():
-        return None
+        return None, False
 
     series_uids = []
     for row in series_rows:
@@ -7986,17 +10416,56 @@ def _preflight_study_ts_by_class(
     if not series_uids:
         # Empty study (no series) - nothing to pre-liquidate; caller uses the
         # default proposal and the study stream will simply return 0 parts.
-        return {}
+        return {}, False
 
     result = {}
+    probed = 0
+    missed = 0
     for suid in series_uids:
         if _over_budget():
-            return None  # give up cleanly, degrade to default proposal
-        meta_url = (
-            f"{base}/studies/{_quote(study_uid, safe='')}"
-            f"/series/{_quote(suid, safe='')}/metadata"
-        )
+            # Circuit breaker only. With per-instance probes a 4.0 s budget
+            # fits ~180 series (measured 22-26 ms each), so this firing means
+            # the server is sick, not that the study is large.
+            logging.warning(
+                "[C-MOVE] pre-flight %s: budget %.1fs exhausted after %d/%d "
+                "series - returning what was probed",
+                str(study_uid)[:50],
+                budget_s,
+                probed,
+                len(series_uids),
+            )
+            break
         try:
+            inst_url = (
+                f"{base}/studies/{_quote(study_uid, safe='')}"
+                f"/series/{_quote(suid, safe='')}/instances"
+            )
+            inst_rows = _qido_request(
+                inst_url, {}, http_timeout, limit=None, tls=tls
+            )
+            if not isinstance(inst_rows, list) or not inst_rows:
+                missed += 1
+                continue
+            sop_uid = ""
+            for inst_row in inst_rows:
+                if not isinstance(inst_row, dict):
+                    continue
+                sop_uid = _json_first_value(inst_row, "00080018")
+                if sop_uid:
+                    # The first instance is the probe: measured 3.5 KB / 26 ms
+                    # against 1.45 MB / 663 ms for the whole series. A second
+                    # probe at the far end would catch a series mixed by two
+                    # acquisitions, but this one already removes the whole
+                    # reason the pre-flight was failing.
+                    break
+            if not sop_uid:
+                missed += 1
+                continue
+            meta_url = (
+                f"{base}/studies/{_quote(study_uid, safe='')}"
+                f"/series/{_quote(suid, safe='')}"
+                f"/instances/{_quote(sop_uid, safe='')}/metadata"
+            )
             mresp = requests.get(
                 meta_url,
                 headers={"Accept": "application/dicom+json"},
@@ -8019,17 +10488,22 @@ def _preflight_study_ts_by_class(
                     len(mresp.content) if hasattr(mresp, "content") else -1,
                     _mh.get("Content-Type", "?"),
                 )
+                missed += 1
                 continue
         except Exception as _pref_exc:
-            # Any series metadata failure -> abandon the whole pre-flight
-            # (partial data could shape a wrong proposal).
+            # ONE series failing must not discard the rest: the probed series
+            # are real information, and the missed ones take the per-instance
+            # refetch path (R4 rule 3) instead of costing the whole study its
+            # stored-TS contexts.
             logging.debug(
-                "[C-MOVE] pre-flight: metadata for series %s failed (%s) - "
-                "no stored-TS contexts proposed",
+                "[C-MOVE] pre-flight: probe for series %s failed (%s) - "
+                "skipped, its instances fall back to per-instance refetch",
                 str(suid)[:50],
                 _pref_exc,
             )
-            return None
+            missed += 1
+            continue
+        probed += 1
         for inst in rows:
             if not isinstance(inst, dict):
                 continue
@@ -8042,19 +10516,33 @@ def _preflight_study_ts_by_class(
     n_classes = len(result)
     n_ts = sum(len(v) for v in result.values())
     logging.info(
-        "[C-MOVE] pre-flight %s: %d class(es), %d stored TS total "
-        "(PS3.18 10.4.4 metadata)",
+        "[C-MOVE] pre-flight %s: %d class(es), %d stored TS total from %d/%d "
+        "probed series (%d not probed)",
         str(study_uid)[:50],
         n_classes,
         n_ts,
+        probed,
+        len(series_uids),
+        missed,
     )
-    if result:
+    # A partial walk must not be cached: the missed series would stay out of
+    # the proposal for the whole TTL, and every C-MOVE in that window falls
+    # back to the registry-wide set - the failure mode this probe exists to
+    # remove. The partial result is still RETURNED below; it is useful for
+    # this C-MOVE, it is just not remembered.
+    if result and not missed and probed == len(series_uids):
         _preflight_cache[(study_uid, bool(expose_rejected))] = (
             time.monotonic() + _PREFLIGHT_TTL_S,
             {k: set(v) for k, v in result.items()},
         )
         _cache_evict(_preflight_cache, time.monotonic())
-    return result
+    # `partial` is what decides the registry fill-in: a walk that missed a
+    # series has an INCOMPLETE class map, so the registry supplies the classes
+    # it could not learn. A COMPLETE walk already lists the study's real class
+    # set (PS3.18 10.4.4 metadata is per-instance), and adding the registry to
+    # it only spends the 128-context budget on classes the study does not hold.
+    partial = bool(missed) or probed != len(series_uids)
+    return result, partial
 
 # ---------------------------------------------------------------------------
 # _study_sop_uids - ordered, de-duplicated SOP instance UID list of a study
@@ -8066,7 +10554,7 @@ def _preflight_study_ts_by_class(
 # SOP UIDs, or None when the study metadata cannot be enumerated (the worker
 # then degrades to the per-attempt failed list).
 # ---------------------------------------------------------------------------
-_study_sop_uids_cache = {}  # study_uid -> (expires_monotonic, list[uid])
+_study_sop_uids_cache = {}  # (study, expose, level, series, sop) -> (exp, uids)
 
 def _study_sop_uids(
     study_uid,
@@ -8076,10 +10564,20 @@ def _study_sop_uids(
     budget_s=4.0,
     expose_rejected=False,
     qa_url="",
+    request_level="",
+    request_series_uid="",
+    request_sop_uid="",
 ):
     """Return ordered, de-duplicated SOP instance UID list of a study from
     the standard per-instance metadata resources (PS3.18 10.4.4), or None if
-    the study cannot be enumerated (best effort; the caller degrades)."""
+    the study cannot be enumerated (best effort; the caller degrades).
+
+    PS3.4 C.4.2.1.2: the list is filtered to the requested Query/Retrieve
+    SCOPE. A SERIES-level C-MOVE must not enumerate (and later report) the
+    study's other series, and an IMAGE-level one must not report its sibling
+    instances - this list is the authority for `total` and for the (0008,0058)
+    tail, so an unscoped list made a correctly-scoped transfer look partial.
+    """
 
     def _normalize(value):
         if isinstance(value, list):
@@ -8114,10 +10612,19 @@ def _study_sop_uids(
             return []
 
     now = time.monotonic()
-    hit = _study_sop_uids_cache.get((study_uid, bool(expose_rejected)))
+    # The cache key carries the SCOPE: a SERIES-scoped list must not be served
+    # to a whole-study C-MOVE of the same study.
+    _cache_key = (
+        study_uid,
+        bool(expose_rejected),
+        request_level,
+        request_series_uid,
+        request_sop_uid,
+    )
+    hit = _study_sop_uids_cache.get(_cache_key)
     if hit is not None and now < hit[0]:
         return list(hit[1])
-    _study_sop_uids_cache.pop((study_uid, bool(expose_rejected)), None)
+    _study_sop_uids_cache.pop(_cache_key, None)
     base = service_base_url(clarus_url, qa_url, expose_rejected)
     start = time.monotonic()
 
@@ -8136,6 +10643,15 @@ def _study_sop_uids(
                 s = _json_first_value(row, "0020000E")
                 if s:
                     series_uids.append(s)
+    # SERIES / IMAGE scope: only the series named in the request is walked.
+    if request_level in ("SERIES", "IMAGE") and request_series_uid:
+        series_uids = [s for s in series_uids if s == request_series_uid]
+        if not series_uids:
+            logging.info(
+                "[C-MOVE] requested series %s is not in study %s - empty scope",
+                str(request_series_uid)[:50],
+                str(study_uid)[:50],
+            )
     if not series_uids:
         return []
     uids = []
@@ -8143,29 +10659,48 @@ def _study_sop_uids(
     for suid in series_uids:
         if _over_budget():
             return None
-        meta_url = (
+        # Only the SOP Instance UIDs are needed, and the QIDO instance list
+        # returns exactly those: one row per instance with (0008,0018) plus
+        # InstanceNumber. The previous series-level /metadata call rendered
+        # every non-PixelData element of every instance (measured 1.4 MB /
+        # ~500 ms for a 432-instance series) and ran while the outbound
+        # association was already open, so the viewer waited on a rendering
+        # that carried nothing this function uses.
+        inst_url = (
             f"{base}/studies/{_quote(study_uid, safe='')}"
-            f"/series/{_quote(suid, safe='')}/metadata"
+            f"/series/{_quote(suid, safe='')}/instances"
         )
         try:
-            mresp = requests.get(
-                meta_url,
-                headers={"Accept": "application/dicom+json"},
-                timeout=http_timeout,
-                cert=tls,
+            inst_rows = _qido_request(
+                inst_url, {}, http_timeout, limit=None, tls=tls
             )
-            mresp.raise_for_status()
-            _mh = getattr(mresp, "headers", {}) or {}
-            rows = _parse_body(_mh.get("Content-Type", ""), mresp)
         except Exception:
             return None
-        for inst in rows:
+        if not isinstance(inst_rows, list):
+            return None
+        for inst in inst_rows:
+            if not isinstance(inst, dict):
+                continue
             sop = _json_first_value(inst, "00080018")
+            # IMAGE scope: exactly one instance.
+            if request_level == "IMAGE" and request_sop_uid:
+                if sop != request_sop_uid:
+                    continue
             if sop and sop not in seen:
                 seen.add(sop)
                 uids.append(sop)
     if uids:
-        _study_sop_uids_cache[(study_uid, bool(expose_rejected))] = (
+        # The cache key carries the SCOPE: a SERIES-scoped list must not be
+        # served to a whole-study C-MOVE of the same study.
+        _study_sop_uids_cache[
+            (
+                study_uid,
+                bool(expose_rejected),
+                request_level,
+                request_series_uid,
+                request_sop_uid,
+            )
+        ] = (
             time.monotonic() + _PREFLIGHT_TTL_S,
             list(uids),
         )
@@ -8175,6 +10710,11 @@ def _study_sop_uids(
 # ---------------------------------------------------------------------------
 # (2608): self-delivery guard  -  is the target the bridge's own listener?
 # ---------------------------------------------------------------------------
+# The comparison rule lives in utils so the peer lookup in move_jobs can use
+# the same one without importing a handler (manager -> handler is the wrong
+# direction). Re-exported here under the name this module has always used.
+_normalize_host = normalize_host
+
 def _is_self_delivery_target(
     target_host, target_port, bridge_dimse_host, bridge_dimse_port
 ):
@@ -8190,16 +10730,10 @@ def _is_self_delivery_target(
     if target_host is None:
         return False
 
-    def _normalize(host):
-        h = str(host).strip().lower()
-        if h in ("0.0.0.0", "::", "[::]"):
-            return "127.0.0.1"
-        return h
-
-    aliases = {"127.0.0.1", "localhost", "::1"}
+    aliases = {"127.0.0.1", "::1"}
     if bridge_dimse_host:
-        aliases.add(_normalize(bridge_dimse_host))
-    return _normalize(target_host) in aliases
+        aliases.add(_normalize_host(bridge_dimse_host))
+    return _normalize_host(target_host) in aliases
 
 def _failure_dataset(uids, error_comment=None):
     """Response-Identifier Data Set for a non-success C-MOVE-RSP final status.
@@ -8207,18 +10741,15 @@ def _failure_dataset(uids, error_comment=None):
     - (0008,0058) Failed SOP Instance UID List (UI, VM 1-n): the SOP instance
       UIDs that were attempted but not delivered - PS3.4 Table C.4-2 requires
       Cancel, Failure and Warning to contain it (PS3.4 C.4.2.1.4.2).
-    - (0000,0902) Error Comment (LO): honest reason, carried on a Failure
-      status when nothing conclusive was listed.
 
-    Both elements use add_new (keyword-independent) so the command/data set
-    round-trips regardless of pynetdicom property mapping.
+    `error_comment` is logged, NOT carried in the Identifier: (0000,0902)
+    Error Comment is a COMMAND-SET element (PS3.7 Table 9.1-1), and the
+    C-MOVE-RSP Identifier is a data set. A command element in a data set is
+    a protocol violation a strict SCU rejects.
     """
-    ds = Dataset()
     if error_comment:
-        try:
-            ds.add_new((0x0000, 0x0902), "LO", str(error_comment)[:64])
-        except Exception:
-            pass
+        logging.warning("[C-MOVE] %s", error_comment)
+    ds = Dataset()
     if uids:
         try:
             ds.add_new((0x0008, 0x0058), "UI", [str(u) for u in uids])
@@ -8305,8 +10836,17 @@ def handle_c_move(
     )
 
     try:
-        study_uids, move_dest_ae = _parse_c_move_rq(event)
+        (
+            study_uids,
+            move_dest_ae,
+            request_level,
+            request_series_uid,
+            request_sop_uid,
+        ) = _parse_c_move_rq(event)
     except ValueError as e:
+        # An unhonourable level (SERIES without a series UID, an unknown
+        # level) arrives here: refusing is right, because falling back to
+        # whole-study retrieval would send the viewer data it did not ask for.
         logging.warning("[C-MOVE] Parse error: %s", e)
         yield 0xC000, None
         return
@@ -8358,12 +10898,15 @@ def handle_c_move(
         yield 0xA801, None
         return
 
-    if target_host != calling_ip:
+    if _normalize_host(target_host) != _normalize_host(calling_ip):
         logging.warning(
-            "[C-MOVE] IP MISMATCH: %s registered at %s but C-MOVE from %s.",
+            "[C-MOVE] IP MISMATCH: %s registered at %s but C-MOVE from %s "
+            "(normalised: %s vs %s).",
             move_dest_ae,
             target_host,
             calling_ip,
+            _normalize_host(target_host),
+            _normalize_host(calling_ip),
         )
         yield 0xA801, None
         return
@@ -8378,13 +10921,17 @@ def handle_c_move(
             target_host,
             target_port,
             expose_rejected=expose_rejected,
+            request_level=request_level,
+            request_series_uid=request_series_uid,
+            request_sop_uid=request_sop_uid,
         )
         job_ids.append(job_id)
         logging.info(
-            "[C-MOVE] Job #%d created for Study %s -> %s",
+            "[C-MOVE] Job #%d created for Study %s -> %s (level=%s)",
             job_id,
             study_uid,
             move_dest_ae,
+            request_level or "STUDY",
         )
 
     logging.info(
@@ -8437,11 +10984,24 @@ def handle_c_move(
         move_jobs.set_job_cancel_callback(job_id, _is_cancelled)
 
     def _clear_callbacks():
-        # The callback closes over `event` (and through it the association).
-        # Leaving it in the registry keeps the whole request object alive for
-        # the life of the process, so every cancel path drops it.
+        # Terminal cleanup: the callback closes over `event` (and through it
+        # the association). Leaving it in the registry keeps the whole
+        # request object alive for the life of the process, so the terminal
+        # path drops it once every job is finished and no worker will poll it
+        # again.
         for job_id in job_ids:
             move_jobs.clear_job_callback(job_id)
+
+    def _latch_cancelled():
+        # Cancel path: the callback also closes over `event`, so it must be
+        # dropped - but CLEARING it makes the worker's is_job_cancelled() see
+        # "no callback" -> False, so a worker mid-stream would keep sending
+        # the rest of the study (and push Storage Commitment) after the
+        # reactor already answered Cancel. The latch answers True forever and
+        # holds NO reference to `event`: the worker reads "cancelled", stops,
+        # and removes the latch itself in its own finally.
+        for job_id in job_ids:
+            move_jobs.set_job_cancel_callback(job_id, lambda: True)
 
     # yield 1: (addr, port)  -  pynetdicom primes store_assoc
     yield (target_host, target_port)
@@ -8463,11 +11023,13 @@ def handle_c_move(
 
     def _finish_jobs_cancelled():
         for job_id in job_ids:
-            move_jobs.finish_job(
+            if move_jobs.finish_job(
                 job_id, success=False, error_message="Cancelled by SCU"
-            )
-            move_jobs_counter.labels(status="failed").inc()
-        _clear_callbacks()
+            ):
+                # Count only when THIS call finished the job: the worker can
+                # finish it first, and a second counter bump would double-count.
+                move_jobs_counter.labels(status="failed").inc()
+        _latch_cancelled()
 
     # yield 2+: hold the DIMSE dialog (0.5 s DB poll, bounded by
     # move_poll_timeout) until every job is terminal  -  the final response is
@@ -8485,6 +11047,30 @@ def handle_c_move(
     # instead of a hung association.
     poll_started = time.monotonic()
 
+    # The bare count yielded just before a terminal status decides whether
+    # pynetdicom 3.0.4 reads that status at all. Its C-MOVE SCP branch
+    #
+    #     if nr_suboperations < 1:
+    #         rsp.Status = 0x0000
+    #         self.dimse.send_msg(rsp, cx_id)
+    #         return            # the generator is NOT read again
+    #
+    # sends 0x0000 Success and stops reading, so yielding 0 before an honest
+    # 0xB000/0xC000 replaced the failure with Success. The count is therefore
+    # derived from what the jobs actually did:
+    #
+    #     completed_total >= expected_total (and expected_total > 0) -> 0
+    #         every attempted instance was delivered: 0x0000 is truthful and
+    #         pynetdicom opens NO move-destination association (the 0909
+    #         policy, one association fewer per C-MOVE);
+    #     otherwise -> max(1, expected_total)
+    #         a non-zero count opens the move-destination association before
+    #         the status is read. That is accepted deliberately: if that
+    #         association fails, pynetdicom answers 0xA801 ("move destination
+    #         unreachable"), a truthful report - while 0x0000 on a failed
+    #         transfer is not.
+    #
+    # Evidence: tmp/1111_cmove_yield_probe.py (pynetdicom 3.0.4).
     while True:
         if _is_cancelled():
             _finish_jobs_cancelled()
@@ -8498,30 +11084,33 @@ def handle_c_move(
 
         # Aggregate terminal state across all jobs
         total_completed = 0
+        expected_total = 0
         all_finished = True
         any_failed = False
         for job_id in job_ids:
-            completed, _total, status = move_jobs.get_job_progress(job_id)
+            completed, total, status = move_jobs.get_job_progress(job_id)
             total_completed += completed
+            expected_total += total
             if status not in ("success", "failed"):
                 all_finished = False
             if status == "failed":
                 any_failed = True
 
+        # 0 is reserved for a CONFIRMED all-success transfer. On a failure path
+        # the counters cannot prove completeness: `_stream_and_send_study`
+        # writes total = idx + 1 per instance as it streams, so
+        # completed == total holds for a job that delivered its last instance
+        # and then lost the association. A 0 there makes pynetdicom send 0x0000
+        # Success and stop reading, and the 0xB000/0xC000 never reaches the
+        # viewer. Keep the dialog open with a non-zero count.
+        failure_count = max(1, expected_total)
+
         if all_finished:
             if any_failed:
-                # A terminal status carries NO sub-operations: the count is
-                # what tells pynetdicom whether to open the move-destination
-                # association before it reads the failure, and a non-zero
-                # count there makes it associate once more - a failure of that
-                # association then replaces the honest 0xB000/0xC000 with
-                # 0xA801, and the (0008,0058) list never reaches the viewer.
-                # `0` is the truthful count: nothing is still in flight.
                 failed_uids = _agg_failed_uids()
                 # Two yields, not one tuple: the reactor protocol is a bare
-                # sub-operation count followed by (status, identifier), and a
-                # bare 0 is the truthful count here.
-                yield 0
+                # sub-operation count followed by (status, identifier).
+                yield failure_count
                 if total_completed == 0:
                     # Zero sub-operations completed: B000 ("Sub-operations
                     # Complete") would be a lie - say Failure (PS3.4 Table
@@ -8555,11 +11144,12 @@ def handle_c_move(
             for job_id in job_ids:
                 _, _, job_status = move_jobs.get_job_progress(job_id)
                 if job_status not in ("success", "failed"):
-                    move_jobs.finish_job(
+                    if move_jobs.finish_job(
                         job_id, success=False, error_message="Move poll timeout"
-                    )
-                    move_jobs_counter.labels(status="failed").inc()
-                    timed_out_jobs.append(job_id)
+                    ):
+                        # Count only when THIS call finished the job.
+                        move_jobs_counter.labels(status="failed").inc()
+                        timed_out_jobs.append(job_id)
             # The worker streams instances and only finishes the job when it
             # runs out of them, so marking the row failed is not enough: it
             # would keep sending and then rewrite the row to success. The
@@ -8577,7 +11167,7 @@ def handle_c_move(
                 ),
                 "0xC000" if total_completed == 0 else "0xB000",
             )
-            yield 0
+            yield failure_count
             failed_uids = _agg_failed_uids()
             if total_completed == 0:
                 # Nothing delivered before the poll timeout -> Failure, not a
@@ -8588,7 +11178,7 @@ def handle_c_move(
                 )
             else:
                 yield 0xB000, _failure_dataset(failed_uids)
-            _clear_callbacks()
+            _latch_cancelled()
             return
 
         time.sleep(0.5)
@@ -8596,10 +11186,24 @@ def handle_c_move(
 # ---------------------------------------------------------------------------
 # Bridge: Storage Commitment push after C-MOVE (CMP-008)
 # ---------------------------------------------------------------------------
+# PS3.4 J.3.2: the N-ACTION primitive operates on the Storage Commitment
+# Push Model's CONSTANT well-known SOP Instance (conceptually created at SCP
+# startup). The Transaction UID is NOT the Affected SOP Instance UID - it
+# travels inside the data set as (0008,1195). Sending the Transaction UID as
+# the instance UID makes a strict SCP reject the request it cannot correlate.
+WELL_KNOWN_SOP_INSTANCE_UID = "1.2.840.10008.1.20.1.1"
+
 def _send_storage_commitment(
-    move_dest_ae, target_host, target_port, sop_list, bridge_ae_title
+    move_dest_ae, target_host, target_port, sop_list, bridge_ae_title, assoc=None
 ):
     """Send N-ACTION Storage Commitment Request to move destination AE.
+
+    `assoc` is the C-MOVE association that just delivered `sop_list`. It is
+    reused when Storage Commitment was negotiated on it, which is the normal
+    case: `_associate_for_move` proposes the push-model context up front, so
+    the N-ACTION rides a context that already exists instead of paying a
+    second ACSE round trip to the same peer. The old separate association is
+    kept only as the fallback for a caller that has no live association.
 
     Args:
         move_dest_ae: AE Title of the move destination (SCU)
@@ -8607,6 +11211,7 @@ def _send_storage_commitment(
         target_port: port of the move destination
         sop_list: list of (sop_class_uid, sop_instance_uid) tuples
         bridge_ae_title: Bridge's own AE Title
+        assoc: live association to the move destination, or None
 
     Returns:
         True if commitment request was sent successfully.
@@ -8619,27 +11224,35 @@ def _send_storage_commitment(
         len(sop_list),
     )
 
-    ae = AE(ae_title=bridge_ae_title)
-    # Storage Commitment is optional (PS3.4 sec.C.4.2.5). Fast-fail ACSE:
-    # if viewer doesn't respond in 3s, it doesn't support SC. Don't
-    # waste 10s on a feature that most viewers don't implement.
-    ae.network_timeout = 5
-    ae.acse_timeout = 3
-    ae.dimse_timeout = 30
-    ae.add_requested_context(StorageCommitmentPushModel)
-    ae.add_requested_context(
-        Verification
-    )  # Fallback: allows association even if no SC support
+    # `owned_assoc` is the association THIS call opened (fallback path); it is
+    # the only one this call may release. On the reuse path the caller still
+    # owns `assoc` and releases it itself.
+    owned_assoc = None
+    if assoc is None or not assoc.is_established:
+        ae = AE(ae_title=bridge_ae_title)
+        # Storage Commitment is optional (PS3.4 sec.C.4.2.5). Fast-fail ACSE:
+        # if viewer doesn't respond in 3s, it doesn't support SC. Don't
+        # waste 10s on a feature that most viewers don't implement.
+        ae.network_timeout = 5
+        ae.acse_timeout = 3
+        ae.dimse_timeout = 30
+        # Symmetric with nevent.py: bound the raw TCP connect too, or a
+        # black-hole peer holds this fallback association on the OS SYN
+        # timeout. 5 s matches the fast-fail ACSE posture below.
+        ae.connection_timeout = 5
+        ae.add_requested_context(StorageCommitmentPushModel)
+        ae.add_requested_context(
+            Verification
+        )  # Fallback: allows association even if no SC support
 
-    # suppress pynetdicom's "No accepted presentation contexts" ERROR  -
-    # it's normal for SCPs that don't support Storage Commitment.
-    global _suppress_pynetdicom
-    _suppress_pynetdicom = True
-    try:
-        assoc = ae.associate(target_host, target_port, ae_title=move_dest_ae)
-    finally:
-        _suppress_pynetdicom = False
-
+        # suppress pynetdicom's "No accepted presentation contexts" ERROR  -
+        # it's normal for SCPs that don't support Storage Commitment.
+        _suppress_state.suppress = True
+        try:
+            owned_assoc = ae.associate(target_host, target_port, ae_title=move_dest_ae)
+        finally:
+            _suppress_state.suppress = False
+        assoc = owned_assoc
     if not assoc.is_established:
         logging.info(
             "[C-MOVE-COMMIT] SCP %s:%d unavailable - skipping Storage Commitment",
@@ -8657,7 +11270,8 @@ def _send_storage_commitment(
             "[C-MOVE-COMMIT] SCP %s does not support Storage Commitment - skipping",
             move_dest_ae,
         )
-        _release_or_abort(assoc, timeout=2.0)
+        if owned_assoc is not None:
+            _release_or_abort(owned_assoc, timeout=2.0)
         return False
 
     try:
@@ -8677,31 +11291,42 @@ def _send_storage_commitment(
         # pynetdicom 3.x signature: send_n_action(dataset, action_type, class_uid,
         #   meta_uid=None, instance_uid=None)
         # action_type=1 (PS3.4 sec.J.3.1), class_uid=StorageCommitmentPushModel.
+        # instance_uid is the well-known constant (PS3.4 J.3.2); the
+        # Transaction UID already travels in the data set as (0008,1195).
         status, response = assoc.send_n_action(
             ds,
             1,  # action_type: Storage Commitment Request (PS3.4 sec.J.3.1)
             StorageCommitmentPushModel,
-            instance_uid=ds.TransactionUID,
+            instance_uid=WELL_KNOWN_SOP_INSTANCE_UID,
         )
 
         if status:
             status_code = status.Status if hasattr(status, "Status") else status
+            # PS3.4 J.3.2 + PS3.7: the Storage Commitment Push Model N-ACTION
+            # Response carries exactly two outcomes - 0x0000 (Success: the
+            # transaction was opened) and 0x0110 (Processing Failure). The
+            # Warning class there is 0x0107/0x0116 (attribute notes); 0x0001 and
+            # 0x0002 are the C-* space "warning - SOP class/instance not
+            # supported", which this service does not define at all. Claiming a
+            # commitment for them reported a transaction no SCP holds; only
+            # Success means the SCP accepted the request.
             if status_code == 0x0000:
                 logging.info(
                     "[C-MOVE-COMMIT] %s: Storage Commitment %s.",
                     move_dest_ae,
                     _dimse_status_name(status_code),
                 )
-            else:
-                # Any SC failure is non-fatal: the move already succeeded and
-                # Storage Commitment is optional (PS3.4 C.4.2.5).
-                logging.info(
-                    "[C-MOVE-COMMIT] %s: Storage Commitment %s. "
-                    "Non-fatal (SC optional, PS3.4 C.4.2.5).",
-                    move_dest_ae,
-                    _dimse_status_name(status_code),
-                )
-            return True
+                return True
+            # Any non-Success answer - warning included - is non-fatal: the move
+            # already succeeded and Storage Commitment is optional (PS3.4
+            # C.4.2.5). Non-fatal is not the same as successful, hence False.
+            logging.warning(
+                "[C-MOVE-COMMIT] %s: Storage Commitment %s - not committed. "
+                "Non-fatal (SC optional, PS3.4 C.4.2.5).",
+                move_dest_ae,
+                _dimse_status_name(status_code),
+            )
+            return False
         else:
             logging.warning(
                 "[C-MOVE-COMMIT] N-ACTION no status returned for %s",
@@ -8716,7 +11341,10 @@ def _send_storage_commitment(
         )
         return False
     finally:
-        _release_or_abort(assoc, timeout=2.0)
+        # Only an association this call opened is this call's to release: the
+        # caller's own association outlives the N-ACTION.
+        if owned_assoc is not None:
+            _release_or_abort(owned_assoc, timeout=2.0)
 
 # ---------------------------------------------------------------------------
 # Lazy-load Clarus capabilities (GET /dicomweb) at first C-MOVE.
@@ -8930,17 +11558,40 @@ def _trim_optional_ts(num_classes, has_sc, optional_tokens):
 # as the peer is free.
 # No client-specific logic involved - the gate applies equally to any peer.
 _ASSOC_GATE_LOCK = threading.Lock()
-_ASSOC_BUSY = set()  # peers with a job currently between gate-enter/exit
+_ASSOC_BUSY = {}  # peer -> (owner_thread_ident, acquisition_depth)
 # Peer -> monotonic time of the LAST "busy - waiting" DEBUG line (throttled
 # to at most one per _ASSOC_GATE_LOG_INTERVAL seconds, C3).
 _ASSOC_GATE_LOG_LAST = {}
 _ASSOC_GATE_LOG_INTERVAL = 10.0
 
-def _job_gate_enter(host, port, ae_title):
+class _AssocGateAborted(Exception):
+    """The peer gate was abandoned because the bridge is stopping or the job
+    was cancelled. Separate from RuntimeError so a caller can distinguish
+    "could not get the peer" from "we gave up waiting for it"."""
+
+    def __init__(self, host, port, ae_title):
+        super().__init__(f"{ae_title}@{host}:{port}: gate wait abandoned")
+        self.host = host
+        self.port = port
+        self.ae_title = ae_title
+
+def _job_gate_enter(host, port, ae_title, give_up=None):
     """Serialise concurrent jobs toward the same peer (busy exclusion).
 
     Waits until the peer has no actively running job, then marks it busy and
     returns; there is no post-job cooldown (immediate start once free).
+
+    RE-ENTRANT for the thread that already owns the peer: a worker that holds
+    a claimed job and reaches the gate again (the resume path re-associates,
+    and any helper that runs the same job re-takes the gate) used to block on
+    a gate it was holding itself - forever. The owner is recorded per peer and
+    the same thread passes straight through, with the acquisition counted so
+    the matching `_job_gate_exit` calls unwind it.
+
+    The wait is bounded by `give_up` (a zero-arg predicate): shutdown and
+    job cancellation both end a wait that could otherwise last as long as a
+    slow peer holds the gate, which is what made a stopped bridge hang on the
+    worker join. Raises `_AssocGateAborted` when the predicate fires.
 
     Logging: the per-tick "busy - waiting" DEBUG line is throttled to
     no more than one per _ASSOC_GATE_LOG_INTERVAL (default 10 s) seconds per
@@ -8948,12 +11599,16 @@ def _job_gate_enter(host, port, ae_title):
     the caller waited for the peer.
     """
     key = (host, port, ae_title)
+    me = threading.get_ident()
     started = time.monotonic()
     waited_any = False
+    if give_up is None:
+        give_up = _shutdown_requested.is_set
     while True:
         with _ASSOC_GATE_LOCK:
-            if key not in _ASSOC_BUSY:
-                _ASSOC_BUSY.add(key)
+            owner = _ASSOC_BUSY.get(key)
+            if owner is None:
+                _ASSOC_BUSY[key] = (me, 1)
                 if waited_any:
                     logging.info(
                         "[ASSOC-GATE] %s@%s:%s waited %.1fs for the peer",
@@ -8963,7 +11618,21 @@ def _job_gate_enter(host, port, ae_title):
                         time.monotonic() - started,
                     )
                 return
+            if owner[0] == me:
+                # Same thread, same peer: it already holds the claim, so
+                # waiting here would deadlock against itself.
+                _ASSOC_BUSY[key] = (me, owner[1] + 1)
+                return
             waited_any = True
+        if give_up():
+            logging.info(
+                "[ASSOC-GATE] %s@%s:%s abandoned after %.1fs (stopping)",
+                ae_title,
+                host,
+                port,
+                time.monotonic() - started,
+            )
+            raise _AssocGateAborted(host, port, ae_title)
         # Sleep OUTSIDE the lock so other workers can gate.
         now = time.monotonic()
         with _ASSOC_GATE_LOCK:
@@ -8978,11 +11647,34 @@ def _job_gate_enter(host, port, ae_title):
                 )
         time.sleep(0.05)
 
+def _peer_is_busy(host, port, ae_title):
+    """True when another thread holds the gate for this peer (R9).
+
+    The worker pool picks a job BEFORE it takes the gate, so with two workers
+    one of them could claim a second job for a peer the other one is already
+    streaming to and then sit blocked in the gate. That job is invisible to
+    the queue (already claimed) while it waits, and a different viewer's job
+    behind it waits too - a long transfer can push the second request past the
+    modality's own timeout. Asking before claiming keeps a gate-blocked job in
+    pending, where the other workers can see it.
+    """
+    key = (host, port, ae_title)
+    with _ASSOC_GATE_LOCK:
+        owner = _ASSOC_BUSY.get(key)
+        return owner is not None and owner[0] != threading.get_ident()
+
 def _job_gate_exit(host, port, ae_title):
     """Release the peer so the next queued job to it can start."""
     key = (host, port, ae_title)
     with _ASSOC_GATE_LOCK:
-        _ASSOC_BUSY.discard(key)
+        owner = _ASSOC_BUSY.get(key)
+        me = threading.get_ident()
+        if owner is not None and owner[0] == me:
+            # Nested acquisition by the owner: unwind one level.
+            if owner[1] > 1:
+                _ASSOC_BUSY[key] = (me, owner[1] - 1)
+                return
+        _ASSOC_BUSY.pop(key, None)
         # Drop the throttle timestamp so the next wait starts clean.
         _ASSOC_GATE_LOG_LAST.pop(key, None)
 
@@ -8997,6 +11689,7 @@ def _associate_for_move(
     acse_timeout=15,
     outbound_assoc_attempts=3,
     study_ts_by_class=None,
+    partial_preflight=False,
 ):
     """Establish C-STORE association with target SCP (multi-context).
 
@@ -9031,6 +11724,10 @@ def _associate_for_move(
         acse_timeout: A-ASSOCIATE negotiation.
         outbound_assoc_attempts: total A-ASSOCIATE attempts (main), immediate.
         study_ts_by_class: dict[sop_class -> set[ts]] from pre-flight, or None.
+        partial_preflight: True when `study_ts_by_class` covers only PART of
+            the study. The registry fill-in (proposing classes the pre-flight
+            could not learn) runs only then; a complete pre-flight already
+            names the study's real class set.
 
     Returns:
         (assoc, accepted_contexts_map) tuple.
@@ -9043,6 +11740,13 @@ def _associate_for_move(
     ae.network_timeout = network_timeout
     ae.acse_timeout = acse_timeout
     ae.dimse_timeout = dimse_timeout
+    # `connection_timeout` is the ONLY bound on the raw TCP connect:
+    # pynetdicom does `socket.settimeout(assoc.connection_timeout)` before
+    # `connect()`, and the AE default (None) leaves a black-hole peer parked
+    # on the OS SYN timeout for minutes per attempt - while this worker holds
+    # the per-peer gate, so two such jobs block every C-MOVE. The ACSE
+    # timeout is a sane connect bound (same order as the negotiation itself).
+    ae.connection_timeout = acse_timeout
 
     # Proposal is shaped from the canonical order: uncompressed family first,
     # then compressed in the taxonomy order (RLE, JPEG lossless, JPEG-LS,
@@ -9060,6 +11764,35 @@ def _associate_for_move(
     has_preflight = bool(study_ts_by_class)
     if has_preflight:
         class_uids = sorted(study_ts_by_class.keys())
+        # A pre-flight that timed out or answered only partly covers a SUBSET
+        # of the classes. Proposing just that subset made every unlearned
+        # class fail with "no presentation context" - a whole SOP class
+        # silently dropped from the move because of a partial answer. Learn
+        # what we can and fall back to the registry for the rest.
+        #
+        # The fill-in runs ONLY on a PARTIAL pre-flight. Keying it on "a
+        # registry was supplied" meant the full registry was added to EVERY
+        # move: with a 60+ class registry the baseline pairs alone then ate
+        # the 128-context budget, `_trim_optional_ts` was left with a
+        # non-positive budget, and the study's OWN stored syntaxes (RLE,
+        # JPEG-LS, J2K) were trimmed away - so a compressed study on a
+        # passthrough server proposed only EVRLE/IVRLE and every instance
+        # failed the send-path decision.
+        if sop_registry is not None and partial_preflight:
+            known = set(class_uids)
+            missing = sorted(
+                uid
+                for uid in _proposed_ts_per_class(sop_registry)
+                if uid not in known
+            )
+            if missing:
+                logging.info(
+                    "[C-MOVE] partial pre-flight covers %d class(es); "
+                    "proposing %d registry class(es) alongside",
+                    len(known),
+                    len(missing),
+                )
+                class_uids = sorted(known | set(missing))
     else:
         class_uids = _proposed_ts_per_class(sop_registry)
     # Per-class optional (non-baseline) TS, in canonical ascending order, each
@@ -9086,14 +11819,16 @@ def _associate_for_move(
                 if t not in (ExplicitVRLittleEndian, ImplicitVRLittleEndian)
             ]
     flat = [tok for cls in per_class_optional.values() for tok in cls]
-    kept_tokens = set(_trim_optional_ts(len(class_uids), True, flat))
+    # NOTE: the optional-TS trim runs AFTER the whole-class drop below. It used
+    # to run here, against the FULL class list: with a large registry the
+    # baselines alone exceeded the budget, `_trim_optional_ts` got a
+    # non-positive budget and dropped every stored token - and the class drop
+    # that followed removed fill-in classes but brought no stored token back.
+    # Trim what actually survived, so the syntaxes a class really needs are
+    # only sacrificed when the surviving classes genuinely do not fit.
     proposals = {}
     for sop_uid in class_uids:
-        ts_list = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
-        for tok in per_class_optional[sop_uid]:
-            if tok in kept_tokens and tok[1] not in ts_list:
-                ts_list.append(tok[1])
-        proposals[sop_uid] = ts_list
+        proposals[sop_uid] = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
 
     # PS3.8 7.1.1.13: PCIDs are the odd bytes 1..255 -> at most 128
     # contexts, one reserved for Storage Commitment. Baselines alone can
@@ -9101,11 +11836,27 @@ def _associate_for_move(
     # classes from the END of the list (reverse registry priority) until
     # the budget fits. Never truncate a class's own baseline pair -
     # EVRLE/IVRLE are the refetch targets (spec R2).
+    #
+    # A class the pre-flight actually SAW is never a drop candidate: it is
+    # known to be in the study, so dropping it makes the move silently
+    # incomplete. The registry fill-in classes (CM7) are the ones dropped.
     budget = _MAX_CONTEXTS - 1  # Storage Commitment slot
+    protected = set(study_ts_by_class.keys()) if has_preflight else set()
+    if len(protected) * 2 > budget:
+        logging.warning(
+            "[C-MOVE] %d class(es) known to be in the study need %d baseline "
+            "contexts, over the %d budget - the excess may be dropped",
+            len(protected),
+            len(protected) * 2,
+            budget,
+        )
+        protected = set()
     while sum(len(v) for v in proposals.values()) > budget:
-        if not proposals:
+        candidates = [uid for uid in proposals if uid not in protected]
+        if not candidates:
             raise RuntimeError("presentation-context budget cannot fit")
-        dropped_cls, dropped_ts = proposals.popitem()
+        dropped_cls = candidates[-1]
+        dropped_ts = proposals.pop(dropped_cls)
         logging.info(
             "[C-MOVE] 128-context budget (PS3.8 7.1.1.13): dropped class "
             "%s (%d TS contexts) from the proposal",
@@ -9113,13 +11864,34 @@ def _associate_for_move(
             len(dropped_ts),
         )
 
+    # Optional-TS trim, over what SURVIVED the class drop: the classes still
+    # proposed keep their stored syntaxes as far as the budget allows.
+    survivors = set(proposals)
+    flat = [
+        tok for cls_uid, toks in per_class_optional.items() if cls_uid in survivors
+        for tok in toks
+    ]
+    kept_tokens = set(_trim_optional_ts(len(survivors), True, flat))
+    for tok in flat:
+        if tok in kept_tokens:
+            sop_uid, ts_uid, _kind = tok
+            if ts_uid not in proposals[sop_uid]:
+                proposals[sop_uid].append(ts_uid)
+
     # ----- add requested contexts -----
     contexts_req = 0
     for sop_uid in proposals:
         for ts_uid in proposals[sop_uid]:
             ae.add_requested_context(sop_uid, ts_uid)
             contexts_req += 1
-    contexts_dropped = len(flat) - len(kept_tokens)
+    contexts_dropped = len(
+        [
+            tok
+            for cls_uid, toks in per_class_optional.items()
+            for tok in toks
+            if cls_uid not in survivors
+        ]
+    ) + (len(flat) - len(kept_tokens))
 
     # Storage Commitment on the main association, as today (a separate SC
     # association burned ACSE timeouts; see _send_storage_commitment).
@@ -9228,6 +12000,25 @@ _LONG_VRS = {
     b"UT",
 }
 
+# The VRs that use the 12-byte header inside the FILE META group. pydicom's
+# own writer emits (0002,0000) UL and (0002,0001) OB with the 8-byte SHORT
+# header (verified against a dcmwrite() Part 10 file), so the meta group uses
+# this narrower set - using `_LONG_VRS` here made the walk demand four bytes
+# that the writer never wrote and stop after the group length.
+_META_LONG_VRS = {
+    b"OB",
+    b"OD",
+    b"OF",
+    b"OL",
+    b"OV",
+    b"OW",
+    b"SQ",
+    b"UC",
+    b"UN",
+    b"UR",
+    b"UT",
+}
+
 def _meta_data_start(dicom_bytes):
     """Preamble-aware start of the meta group: 132 (full preamble), 4
     (bare DICM) or 0 (no magic at all)."""
@@ -9240,7 +12031,13 @@ def _meta_data_start(dicom_bytes):
 def _walk_meta(dicom_bytes):
     """Walk group 0002 (explicit VR LE); return (data_start, elements,
     meta_end). Reader-side tolerance: the value skip is vlen + (vlen % 2),
-    so old externally-padded files keep parsing."""
+    so old externally-padded files keep parsing.
+
+    A TRUNCATED group ends the walk at the last element that parsed instead
+    of discarding the group: the caller replaces the whole group anyway, and
+    returning `meta_end = data_start` made it splice its new group in front of
+    the OLD one - leaving two group 0002 blocks in the file.
+    """
     data_start = _meta_data_start(dicom_bytes)
     pos = data_start
     elems = []
@@ -9250,7 +12047,7 @@ def _walk_meta(dicom_bytes):
             break
         elem = struct.unpack_from("<H", dicom_bytes, pos + 2)[0]
         vr = dicom_bytes[pos + 4 : pos + 6]
-        if vr in _LONG_VRS:
+        if vr in _META_LONG_VRS:
             if pos + 12 > len(dicom_bytes):
                 break
             vlen = struct.unpack_from("<I", dicom_bytes, pos + 8)[0]
@@ -9408,6 +12205,12 @@ def _extract_dataset_ui(dicom_bytes, elem, group=0x0008, implicit_vr=False):
         pos = vo + vlen + (vlen % 2)
     return None
 
+# PS3.10 7.1 Table 7.1-1: (0002,0012) Implementation Class UID is Type 1 - it
+# names the implementation that wrote the file. A single constant keeps every
+# repaired instance in one implementation family without inventing a per-build
+# UID (the version element (0002,0013) is Type 3 and is not emitted).
+_BRIDGE_IMPLEMENTATION_CLASS_UID = "1.2.826.0.1.3680043.10.1316"
+
 def _ensure_file_meta_bytes(dicom_bytes, sop_class_uid, sop_uid, ts_uid):
     """Return bytes whose meta group is the canonical ascending trio -
     (0002,0002) MediaStorageSOPClassUID, (0002,0003)
@@ -9415,6 +12218,10 @@ def _ensure_file_meta_bytes(dicom_bytes, sop_class_uid, sop_uid, ts_uid):
     Explicit VR LE UI with an even value length and the trailing NULL
     INSIDE the length (PS3.5 sec 6.2).
 
+    The group also carries the other Table 7.1-1 Type 1 elements: Group Length
+    (0002,0000) as the first element, Version (0002,0001) after it and
+    Implementation Class UID (0002,0012) after the transfer syntax - ascending
+    order is the encoding requirement (PS3.5 7.1).
     cltranscode-stored files have NO group 0002 at
     all, and the server's transcoded WADO response copies that gap.
     pynetdicom `send_c_store` then refuses the file and the whole C-MOVE
@@ -9456,12 +12263,36 @@ def _ensure_file_meta_bytes(dicom_bytes, sop_class_uid, sop_uid, ts_uid):
     )
     ts = ts_uid or "1.2.840.10008.1.2.1"
 
-    trio = b""
-    if resolved_sc:
-        trio += _ui_elem(0x0002, resolved_sc)
-    if resolved_si:
-        trio += _ui_elem(0x0003, resolved_si)
-    trio += _ui_elem(0x0010, ts)
+    # PS3.10 7.1 Table 7.1-1 marks SIX elements Type 1 in the File Meta
+    # Information: (0002,0000) Group Length, (0002,0001) Version,
+    # (0002,0002) Media Storage SOP Class UID, (0002,0003) Media Storage SOP
+    # Instance UID, (0002,0010) Transfer Syntax UID and (0002,0012)
+    # Implementation Class UID. The writer used to emit only the SOP/TS trio,
+    # so every file it repaired was a non-conformant Part 10 file.
+    body = b""
+    # (0002,0001) Version: OB, two bytes, bit 0 of the first byte set. OB is a
+    # LONG-VR: 8-byte tag+VR header, 2 reserved bytes, 4-byte length
+    # (PS3.5 7.1.2 Table 7.1-2), then the value - byte-for-byte what pydicom's
+    # own writer emits for this element.
+    body += (
+        struct.pack("<HH2sH", 0x0002, 0x0001, b"OB", 0)
+        + struct.pack("<I", 2)
+        + b"\x00\x01"
+    )
+    # (0002,0002) and (0002,0003) are Type 1 as well, so they are emitted even
+    # when no source value could be resolved: a group 0002 that omits either
+    # is non-conformant exactly like one that omits the group length. The
+    # fallback is the caller's argument and, failing that, an empty UID value -
+    # a receiver can still identify the file by the dataset, whereas a missing
+    # element is a Part 10 conformance failure.
+    body += _ui_elem(0x0002, resolved_sc or sop_class_uid or "")
+    body += _ui_elem(0x0003, resolved_si or sop_uid or "")
+    body += _ui_elem(0x0010, ts)
+    body += _ui_elem(0x0012, _BRIDGE_IMPLEMENTATION_CLASS_UID)    # (0002,0000) is the number of bytes AFTER its own value field, so it is
+    # written last and computed from the body. Encoded exactly the way pydicom
+    # writes it: UL is a SHORT-VR element in this writer's grammar (see
+    # `_walk_meta`), so 8-byte header + 4-byte value.
+    trio = struct.pack("<HH2sHI", 0x0002, 0x0000, b"UL", 4, len(body)) + body
 
     if dicom_bytes[data_start:meta_end] == trio:
         return dicom_bytes
@@ -9583,6 +12414,12 @@ def _stream_and_send_study(
     _skip_ids=None,
     _resumed=False,
     _report_lost=False,
+    _prior_completed=0,
+    _prior_failed=0,
+    _prior_total=0,
+    request_level="",
+    request_series_uid="",
+    request_sop_uid="",
     expose_rejected=False,
     qa_url="",
 ):
@@ -9624,6 +12461,10 @@ def _stream_and_send_study(
     instance UIDs that were seen and not delivered in THIS pass (PS3.4
     C.4.2.1.4.2 material); the driver reconciles the (0008,0058) tail across
     passes from the study-level list.
+
+    The returned counters describe THIS pass. `_prior_*` carries what earlier
+    passes delivered and is used only for the LIVE progress row, so the
+    poller never sees a resumed pass reset the job to 0 of N.
     """
     completed = 0
     failed = 0
@@ -9684,17 +12525,39 @@ def _stream_and_send_study(
             "bytes only, not-accepted instances fail honestly",
         )
 
-    # ONE study-level streaming GET WITHOUT ?transferSyntax=.
+    # ONE streaming GET WITHOUT ?transferSyntax=, scoped to the requested
+    # level (PS3.4 C.4.2.1.2): STUDY fetches the study, SERIES the named
+    # series, IMAGE the single instance. Without the scope a SERIES C-MOVE
+    # pushed every instance of the study to the viewer.
     accept_value = "multipart/related; type=application/dicom"
-    # The study UID goes into the path through `_quote`: it is client input, and
+    _base = service_base_url(clarus_url, qa_url, expose_rejected)
+    # Every UID goes into the path through `_quote`: they are client input, and
     # `1.2?a=b` or `../x` in one would steer the GET at a different resource.
-    url = (
-        f"{service_base_url(clarus_url, qa_url, expose_rejected)}"
-        f"/studies/{_quote(study_uid, safe='')}"
-    )
+    _study_path = f"/studies/{_quote(study_uid, safe='')}"
+    if request_level == "IMAGE" and request_series_uid and request_sop_uid:
+        url = (
+            f"{_base}{_study_path}"
+            f"/series/{_quote(request_series_uid, safe='')}"
+            f"/instances/{_quote(request_sop_uid, safe='')}"
+        )
+    elif request_level == "SERIES" and request_series_uid:
+        url = f"{_base}{_study_path}/series/{_quote(request_series_uid, safe='')}"
+    else:
+        url = f"{_base}{_study_path}"
     headers = {"Accept": accept_value}
 
-    logging.info("[C-MOVE] Streaming study %s from DICOMweb server...", study_uid)
+    logging.info(
+        "[C-MOVE] Streaming %s from DICOMweb server...",
+        (
+            f"instance {request_sop_uid} of series {request_series_uid}"
+            if request_level == "IMAGE"
+            else (
+                f"series {request_series_uid}"
+                if request_level == "SERIES"
+                else f"study {study_uid}"
+            )
+        ),
+    )
     resp = requests.get(
         url, headers=headers, timeout=http_timeout, stream=True, cert=tls
     )
@@ -9706,7 +12569,10 @@ def _stream_and_send_study(
     # backpressure is the bounded queue (4 parts ~ 20 MB, FIFO). The sender
     # loop below is unchanged; every early return must stop the reader thread.
     prefetch = PartPrefetcher(
-        _stream_multipart_instances(resp, spill_threshold=spill_threshold)
+        _stream_multipart_instances(resp, spill_threshold=spill_threshold),
+        # Closing the response is what wakes a reader parked inside
+        # `iter_content`; draining the queue only frees one blocked in `put`.
+        on_stop=resp.close,
     ).start()
 
     import os as _os
@@ -9800,12 +12666,6 @@ def _stream_and_send_study(
                 rs_err,
             )
             status = None
-            _rtmp_size = None
-        else:
-            try:
-                _rtmp_size = _os.path.getsize(_rtmp)
-            except OSError:
-                _rtmp_size = None
         finally:
             try:
                 _os.unlink(_rtmp)
@@ -9815,10 +12675,12 @@ def _stream_and_send_study(
             cstore_outbound_duration.labels(peer=ae_label(peer_ae)).observe(
                 time.perf_counter() - _t0
             )
-            if _rtmp_size is not None:
-                bytes_total.labels(direction="tx", peer=ae_label(peer_ae)).inc(
-                    _rtmp_size
-                )
+            # bytes_total is NOT incremented here: the main send loop counts
+            # `part_size` once when the peer answers 0x0000, and that is the
+            # only place allowed to - a send-time count here double-counted
+            # every refetched instance (once with the refetched size, once
+            # with the stored size) and also counted instances the peer
+            # rejected. bytes_total describes accepted traffic.
         except Exception:
             pass
         if status is None:
@@ -10015,9 +12877,6 @@ def _stream_and_send_study(
                             cstore_outbound_duration.labels(
                                 peer=ae_label(peer_ae)
                             ).observe(time.perf_counter() - _t0)
-                            bytes_total.labels(
-                                direction="tx", peer=ae_label(peer_ae)
-                            ).inc(part_size)
                         except Exception:
                             pass
                     elif decision == "refetch_main":
@@ -10052,9 +12911,29 @@ def _stream_and_send_study(
                         )
                         failed += 1
                         continue
-                    if status is None:
-                        failed += 1
-                        continue
+                    if not status or "Status" not in status:
+                        # pynetdicom 3.0.4 `send_c_store` returns an EMPTY
+                        # Dataset (not None) when the association is gone. A
+                        # falsy status or one without a Status element says
+                        # nothing about the instance: counting it failed
+                        # reported a SOP the viewer may hold, and never armed
+                        # the resume the owner of this defect exists for.
+                        logging.warning(
+                            "[DIMSE-OUT] %s:%d: association LOST after %d/%d "
+                            "C-STORE (no response). %s",
+                            getattr(assoc, "ae_title", "?"),
+                            getattr(assoc, "port", 0),
+                            completed,
+                            total if total else idx + 1,
+                            (
+                                "Resuming once."
+                                if _report_lost and not _resumed
+                                else "Viewer must re-request or resume fails."
+                            ),
+                        )
+                        prefetch.stop()
+                        resp.close()
+                        return _out(lost=True)
                 except (TypeError, ValueError) as send_err:
                     err_msg = str(send_err)
                     if "presentation context" in err_msg.lower():
@@ -10133,12 +13012,46 @@ def _stream_and_send_study(
                     if spill_path is not None:
                         _unlink_quiet(spill_path)
 
-                if status and status.Status == 0x0000:
+                if not status or "Status" not in status:
+                    # Same reading as above: a falsy status or one without a
+                    # Status element is a lost association, not a rejected
+                    # instance. Leave it UNCOUNTED (neither completed nor
+                    # failed) and hand control to the resume driver, which
+                    # re-sends it while skipping the delivered prefix - so
+                    # nothing is lost and nothing is double counted.
+                    logging.warning(
+                        "[DIMSE-OUT] %s:%d: association LOST after %d/%d "
+                        "C-STORE (no response). %s",
+                        getattr(assoc, "ae_title", "?"),
+                        getattr(assoc, "port", 0),
+                        completed,
+                        total if total else idx + 1,
+                        (
+                            "Resuming once."
+                            if _report_lost and not _resumed
+                            else "Viewer must re-request or resume fails."
+                        ),
+                    )
+                    prefetch.stop()
+                    resp.close()
+                    return _out(lost=True)
+                if status.Status == 0x0000:
                     completed += 1
                     if sent_via_refetch:
                         transcoded += 1
                     else:
                         passthrough += 1
+                    # A-M-03: the byte counter describes bytes the peer ACCEPTED.
+                    # Counting at send time recorded attempts - a resumed instance
+                    # was counted again, and the ambiguous-timeout branch counted
+                    # a send whose outcome nobody observed - under a metric name
+                    # the dashboards read as delivered traffic.
+                    try:
+                        bytes_total.labels(
+                            direction="tx", peer=ae_label(peer_ae)
+                        ).inc(part_size)
+                    except Exception:
+                        pass
                     # Bridge: track successfully sent SOPs for Storage Commitment
                     if sop_uid:
                         sent_sop_uids.append((sop_class_uid, sop_uid))
@@ -10147,7 +13060,7 @@ def _stream_and_send_study(
                     logging.warning(
                         "[C-MOVE] C-STORE failed for instance %d: status=%s",
                         idx + 1,
-                        _dimse_status_name(status.Status if status else None),
+                        _dimse_status_name(status.Status),
                     )
             except (requests.RequestException, OSError, ValueError, KeyError) as e:
                 failed += 1
@@ -10168,8 +13081,48 @@ def _stream_and_send_study(
                     exc_info=True,
                 )
 
-            # Bridge: update job progress counters
-            move_jobs.update_job_progress(job_id, completed, failed, total)
+            # Bridge: update job progress counters.
+            #
+            # The RESUMED pass reports the UNION with what pass 1 delivered,
+            # not its own zero-based counters. A resumed pass restarts
+            # `completed` at 0 because it skips the delivered prefix, so
+            # writing it verbatim told the poller "0 of N delivered" - and a
+            # poll timeout there answered 0xC000 for a study whose first pass
+            # had delivered most of it. The driver still reconciles the final
+            # numbers; this only keeps the LIVE row honest, which is what the
+            # poller reads.
+            #
+            # `completed` sums because pass 2 counts only what it added; the
+            # resumed pass already covered the full study (`total = idx + 1`
+            # is set BEFORE the skip), so `total` and `failed` must not be
+            # SUMMED with the prior pass - a re-failed instance is the same
+            # failure, not a second one, and `total + prior` double-counts
+            # the skipped prefix.
+            move_jobs.update_job_progress(
+                job_id,
+                completed + _prior_completed,
+                max(failed, _prior_failed) if _resumed else failed,
+                max(total, _prior_total) if _resumed else total,
+            )
+
+    except (requests.RequestException, OSError, ValueError, KeyError) as _stream_err:
+        # The READ failed, not a single instance: `for part, idx, part_ts in
+        # prefetch` raises the reader thread's error here (a truncated chunked
+        # body, a missing Content-Length, a socket reset mid-part). Letting it
+        # escape to the driver cost it this pass's `sent_sop_uids`, so the
+        # resume re-sent everything already delivered and a pass without a
+        # resume answered 0xC000 ("nothing delivered") for a study that had
+        # moved most of its instances. Returning `_out(lost=True)` hands the
+        # partial delivered list to the caller, which reconciles by union.
+        logging.warning(
+            "[C-MOVE] Job #%d: stream read failed after %d delivered (%s) - "
+            "reporting the partial pass so the resume can continue",
+            job_id,
+            completed,
+            _stream_err,
+        )
+        logging.debug("[C-MOVE] stream read traceback:", exc_info=True)
+        return _out(lost=True)
 
     finally:
         prefetch.stop()
@@ -10268,6 +13221,9 @@ def _execute_cmove_job(
     spill_threshold=SPILL_THRESHOLD,
     expose_rejected=False,
     qa_url="",
+    request_level="",
+    request_series_uid="",
+    request_sop_uid="",
 ):
     """Execute C-MOVE: stream study from Clarus, send instances to target SCP.
 
@@ -10295,26 +13251,38 @@ def _execute_cmove_job(
                 "[C-MOVE] Unknown Move Destination: %s",
                 move_dest_ae,
             )
-            move_jobs.finish_job(
+            if move_jobs.finish_job(
                 job_id,
                 success=False,
                 error_message=f"Unknown Move Destination: {move_dest_ae}",
-            )
-            move_jobs_counter.labels(status="failed").inc()
+            ):
+                move_jobs_counter.labels(status="failed").inc()
             return
         target_host, target_port = target
 
     assoc = None
+    gate_held = False
     try:
         # Per-peer job gate: serialize jobs to the same peer (busy exclusion).
         # No post-job cooldown: the next job starts immediately once the
         # previous one to this peer ends. Taken inside the try so the
         # finally releases it on every path, including a pre-flight raise.
-        _job_gate_enter(target_host, target_port, move_dest_ae)
+        # The wait gives up on shutdown or on cancellation of THIS job: a
+        # stopped bridge must not block its worker join on a slow peer.
+        def _give_up_gate():
+            if _shutdown_requested.is_set():
+                return True
+            try:
+                return bool(move_jobs.is_job_cancelled(job_id))
+            except Exception:
+                return False
+
+        _job_gate_enter(target_host, target_port, move_dest_ae, _give_up_gate)
+        gate_held = True
 
         # -- Pre-flight: learn each class's stored TS BEFORE the association
         # (best effort - any failure degrades to the default proposal). --
-        study_ts_by_class = _preflight_study_ts_by_class(
+        _pre = _preflight_study_ts_by_class(
             study_uid,
             clarus_url,
             http_timeout=2.0,
@@ -10323,6 +13291,7 @@ def _execute_cmove_job(
             expose_rejected=expose_rejected,
             qa_url=qa_url,
         )
+        study_ts_by_class, partial_preflight = _split_preflight(_pre)
 
         try:
             assoc, accepted_contexts_map = _associate_for_move(
@@ -10336,19 +13305,19 @@ def _execute_cmove_job(
                 acse_timeout=outbound_acse_timeout,
                 outbound_assoc_attempts=outbound_assoc_attempts,
                 study_ts_by_class=study_ts_by_class,
+                partial_preflight=partial_preflight,
             )
         except RuntimeError as e:
             logging.error("[C-MOVE] %s", e)
             logging.debug("[C-MOVE] Association traceback:", exc_info=True)
             move_jobs.record_scp_failure(move_dest_ae, host=target_host)
-            move_jobs.finish_job(job_id, success=False, error_message=str(e))
-            move_jobs_counter.labels(status="failed").inc()
+            if move_jobs.finish_job(job_id, success=False, error_message=str(e)):
+                move_jobs_counter.labels(status="failed").inc()
             return
 
         server_ts_list = _get_clarus_transfer_syntaxes(clarus_url, tls=tls)
 
-        global _suppress_pynetdicom
-        _suppress_pynetdicom = True
+        _suppress_state.suppress = True
         # -- Resume driver: at most ONE resume. The whole study is
         # re-streamed on a FRESH GET for the resumed pass (a conformant
         # continuation; PS3.7 9.1.4.2(e) / PS3.8 9.1.4 Note 2 + 9.1.5), and
@@ -10357,13 +13326,17 @@ def _execute_cmove_job(
         # delivered sets at the end (never sum regression). --
         study_sop_uids = None
         try:
-            # Authoritative study SOP list for the (0008,0058) tail ++ total.
+            # Authoritative SOP list for the (0008,0058) tail ++ total, scoped
+            # to the requested level (PS3.4 C.4.2.1.2).
             study_sop_uids = _study_sop_uids(
                 study_uid,
                 clarus_url,
                 tls=tls,
                 expose_rejected=expose_rejected,
                 qa_url=qa_url,
+                request_level=request_level,
+                request_series_uid=request_series_uid,
+                request_sop_uid=request_sop_uid,
             )
         except Exception:
             study_sop_uids = None
@@ -10371,6 +13344,11 @@ def _execute_cmove_job(
         cancelled = False
         no_common_ts = False
         resumed_lost = False
+        # Bound BEFORE the passes: the reconciliation below reads it on every
+        # path, including a pass 2 that never ran (no resume, or a resume whose
+        # re-association failed). A name that only exists inside the pass-2
+        # try is read through a default and hides exactly this kind of gap.
+        _fs2 = []
 
         # Pass 1 (initial).
         try:
@@ -10390,6 +13368,9 @@ def _execute_cmove_job(
                 _skip_ids=None,
                 _resumed=False,
                 _report_lost=True,
+                request_level=request_level,
+                request_series_uid=request_series_uid,
+                request_sop_uid=request_sop_uid,
                 expose_rejected=expose_rejected,
                 qa_url=qa_url,
             )
@@ -10399,11 +13380,36 @@ def _execute_cmove_job(
             no_common_ts = _nc1
             resumed_lost = _lost1
         except Exception:
+            # A mid-stream raise does not undo what was already delivered. The
+            # counters live in `_c1`/`_f1`/`_t1` only once the call RETURNS, so
+            # resetting them to zero here threw away the progress pass 1 had
+            # made: the job then finished reporting 0 delivered and 0 failed
+            # for a study that had, in fact, moved. Read the partial counters
+            # back off the job record and keep them so the failure propagates
+            # with an honest tally.
+            logging.error(
+                "[C-MOVE] Job #%d: pass 1 raised mid-stream - preserving the "
+                "progress counted so far",
+                job_id,
+            )
+            try:
+                # (completed_instances, total_instances, status), the same
+                # counters the 0xFF00 poll reports and the final RSP sums.
+                _c1, _t1, _ = move_jobs.get_job_progress(job_id)
+                _f1 = max(0, _t1 - _c1)
+            except Exception:
+                _c1, _f1, _t1 = 0, 0, 0
             sent_sop_uids = []
+            _fs1 = []
             cancelled = False
             no_common_ts = False
-            resumed_lost = False
-            raise
+            # Do NOT re-raise: the bare `raise` let the worker's outer handler
+            # finish the job without `set_job_failed_sops`, so the final
+            # 0xB000/0xC000 carried an EMPTY (0008,0058) even though
+            # instances were lost. Marking the pass lost routes into the
+            # reconciliation below, which builds the failed list from the
+            # study SOP set and persists it.
+            resumed_lost = True
 
         # Resume ONCE on association loss (not on cancel/shutdown/no-common).
         if resumed_lost and not cancelled and not no_common_ts:
@@ -10429,6 +13435,7 @@ def _execute_cmove_job(
                     acse_timeout=outbound_acse_timeout,
                     outbound_assoc_attempts=outbound_assoc_attempts,
                     study_ts_by_class=study_ts_by_class,
+                    partial_preflight=partial_preflight,
                 )
             except RuntimeError as e:
                 # Resume's re-association failed -> GIVE_UP (honest partial).
@@ -10458,6 +13465,12 @@ def _execute_cmove_job(
                         _skip_ids=delivered1,
                         _resumed=True,
                         _report_lost=True,
+                        _prior_completed=_c1,
+                        _prior_failed=_f1,
+                        _prior_total=_t1,
+                        request_level=request_level,
+                        request_series_uid=request_series_uid,
+                        request_sop_uid=request_sop_uid,
                         expose_rejected=expose_rejected,
                         qa_url=qa_url,
                     )
@@ -10485,29 +13498,78 @@ def _execute_cmove_job(
         delivered = {u for _c, u in sent_sop_uids if u}
         completed = len(delivered)
         _obs_total_p1 = _t1 if not no_common_ts else 0
+        # The resumed pass observed the study AGAIN on a fresh GET. Its total
+        # is the widest view the job ever got, and on a failed re-association
+        # `_t2` was never assigned - the binding stays inside the `try` that
+        # raised, so it is read through a default instead of a NameError.
+        _obs_total_p2 = (locals().get("_t2", 0) or 0) if not no_common_ts else 0
         if study_sop_uids is not None and study_sop_uids:
             study_uids_set = set(study_sop_uids)
             total = len(study_uids_set)
             ordered_uids = study_sop_uids
         else:
             # No authoritative list (degradation): total = largest pass total.
-            total = max(_obs_total_p1, completed)
+            # Pass 2 is included ONLY when it actually ran: a resumed job that
+            # gave up mid-study still saw the rest of the study on its fresh
+            # GET, and ignoring that total reported 0 failures for a job whose
+            # GIVE_UP is the one thing we know about it (PS3.4 C.4.2.1.4.2:
+            # the final status must be honest about undelivered instances).
+            total = max(_obs_total_p1, _obs_total_p2, completed)
             ordered_uids = None
         if study_sop_uids is not None and study_sop_uids:
             failed_sop_uids = [u for u in ordered_uids if u not in delivered]
         else:
-            # Degrade to the per-attempt failed sets when present, else []. If
-            # a single (non-resumed) pass ran, use its per-instance failed
-            # list (exact); otherwise list nothing conclusive (honest).
-            failed_sop_uids = sorted(_fs1) if not resumed_lost else []
-        # PS3.4 C.4.2.1.4.2: the failure count is the number of instances that
-        # were seen and NOT delivered, which is exactly the (0008,0058) list.
-        # Deriving it as `total - completed` counted every instance that never
-        # reached this pass at all as a failure, so a resumed job reported
-        # failures it never observed.
+            # Degrade to the per-attempt failed sets when present, else [].
+            #
+            # Both passes lose instances: _fs1 and _fs2 still name what each
+            # pass OBSERVED as failed, so dropping them left (0008,0058) EMPTY
+            # on a 0xB000 - PS3.4 C.4.2.1.4.2 requires the list on a Failure,
+            # Warning or Cancel final. The union may be incomplete (an
+            # unobserved tail cannot be named), but it must not be empty when
+            # the status says instances were lost.
+            #
+            # Subtracting `delivered` is what makes the union honest: each
+            # pass reports `seen in THIS pass minus delivered in THIS pass`,
+            # so an instance lost in pass 1 and delivered in pass 2 is still
+            # in _fs1, and an instance delivered in pass 1 and skipped by
+            # pass 2 is in _fs2 (a skipped instance is not in pass 2's sent
+            # list). Naming either in (0008,0058) answered 0xB000 for a
+            # complete transfer and skipped Storage Commitment.
+            observed_failed = set(_fs1) | set(_fs2)
+            # If nothing was ever OBSERVED failing the list stays empty: no UID
+            # may be invented, and the floors below still keep the status
+            # honest. An empty list here is the best available answer, not an
+            # oversight.
+            failed_sop_uids = sorted(
+                u for u in observed_failed if u and u not in delivered
+            )
+        # PS3.4 C.4.2.1.4.2: the failure count is the number of instances
+        # that were seen and NOT delivered, which is exactly the (0008,0058)
+        # list. Deriving it as `total - completed` counted every instance
+        # that never reached this pass at all as a failure, so a resumed job
+        # reported failures it never observed.
         failed = len(failed_sop_uids)
         # Ensure total never falls below the delivered count.
         total = max(total, completed)
+        # Lower bound: an instance whose SOP UID never parsed (empty UID)
+        # never entered seen_sop_uids / _fs1, so len(failed_sop_uids) can be
+        # 0 while the study still holds more instances than were delivered -
+        # which would answer 0x0000 for a study with losses. The gap between
+        # what the study holds and what was delivered is the honest floor.
+        failed = max(failed, total - completed)
+
+        # Lower bound on the failure count. With no authoritative list the
+        # failed tail cannot be named from `_fs1`/`_fs2`, so the job could
+        # claim 0 failures while `resumed_lost` says the study was cut short:
+        # at least one instance is unaccounted for, and PS3.4 C.4.2.1.4.2
+        # forbids answering 0x0000 for a study with losses.
+        if resumed_lost and not failed and not (study_sop_uids or []):
+            failed = 1
+            logging.info(
+                "[C-MOVE] Job #%d: no authoritative SOP list and the resume "
+                "failed - reporting at least one undelivered instance",
+                job_id,
+            )
 
         # 0709: persist the (0008,0058) Failed SOP Instance UID List so the
         # C-MOVE generator can attach it to the final Failed/Warning/Cancel
@@ -10517,6 +13579,17 @@ def _execute_cmove_job(
         except Exception:
             # Best-effort: the progress/status path must not fail on logging.
             logging.debug("[C-MOVE] set_job_failed_sops failed for job #%d", job_id)
+
+        # Store the RECONCILED counters before the job is finished. The last
+        # write so far came from _stream_and_send_study, which reports the
+        # current pass only: after a resume pass 2 restarts `completed` at 0, so
+        # a job that delivered 100 instances and then failed its first unsent
+        # one was stored as completed=0 and the reactor answered 0xC000 ("no
+        # SOP instances delivered") although 100 had arrived.
+        try:
+            move_jobs.update_job_progress(job_id, completed, failed, total)
+        except Exception as e:
+            logging.debug("[C-MOVE] reconciled progress write failed: %s", e)
 
         if no_common_ts:
             # No common transfer syntax: the job ends failed with zero slices
@@ -10528,22 +13601,25 @@ def _execute_cmove_job(
                 "job ends failed, 0 slices, C-MOVE-RSP is a Failure (0xC000)",
                 job_id,
             )
-            move_jobs.finish_job(
+            if move_jobs.finish_job(
                 job_id,
                 success=False,
                 error_message="No common transfer syntax between viewer and server",
-            )
-            move_jobs_counter.labels(status="failed").inc()
+            ):
+                move_jobs_counter.labels(status="failed").inc()
             return
 
         if cancelled:
             if move_jobs.is_job_cancelled(job_id):
-                move_jobs.finish_job(
+                finished = move_jobs.finish_job(
                     job_id, success=False, error_message="Cancelled by SCU"
                 )
             else:
-                move_jobs.finish_job(job_id, success=False, error_message="Shutdown")
-            move_jobs_counter.labels(status="failed").inc()
+                finished = move_jobs.finish_job(
+                    job_id, success=False, error_message="Shutdown"
+                )
+            if finished:
+                move_jobs_counter.labels(status="failed").inc()
             return
 
         # -- Storage Commitment after successful C-MOVE --
@@ -10553,7 +13629,11 @@ def _execute_cmove_job(
         # negotiated in the MAIN association (_associate_for_move requests
         # it). Viewers without SC (MicroDicom) burned ACSE timeouts when a
         # separate SC-only association was opened - skip instead of trying.
-        if failed == 0 and total > 0:
+        # A failed re-association leaves `assoc` None (released above and only
+        # re-created on success), so reading `accepted_contexts` here would
+        # raise AttributeError out of the worker and lose the honest partial
+        # result the job already earned.
+        if failed == 0 and total > 0 and assoc is not None:
             if storage_commit_after_move and sent_sop_uids:
                 sc_negotiated = any(
                     str(ctx.abstract_syntax) == StorageCommitmentPushModel
@@ -10573,6 +13653,7 @@ def _execute_cmove_job(
                             target_port,
                             sent_sop_uids,
                             bridge_ae_title,
+                            assoc=assoc,
                         )
                     except Exception as e:
                         logging.warning(
@@ -10592,12 +13673,16 @@ def _execute_cmove_job(
 
         # -- Finish job --
         job_success = failed == 0 and total > 0
-        move_jobs.finish_job(
+        if move_jobs.finish_job(
             job_id,
             success=job_success,
             error_message=f"{completed} sent, {failed} failed" if failed > 0 else None,
-        )
-        move_jobs_counter.labels(status="completed" if job_success else "failed").inc()
+        ):
+            # Count only when THIS call finished the job: the poll reactor
+            # can finish it first, and a second bump would double-count.
+            move_jobs_counter.labels(
+                status="completed" if job_success else "failed"
+            ).inc()
         logging.info(
             "[C-MOVE] Job #%d finished: %d/%d success, %d failed",
             job_id,
@@ -10624,15 +13709,23 @@ def _execute_cmove_job(
         logging.debug(
             "[C-MOVE] Download/stream traceback for job #%d:", job_id, exc_info=True
         )
-        move_jobs.finish_job(
+        if move_jobs.finish_job(
             job_id, success=False, error_message=f"Download failed: {e}"
+        ):
+            move_jobs_counter.labels(status="failed").inc()
+    except _AssocGateAborted:
+        # Bridge stopping (or this job cancelled) while the peer was busy.
+        # Not a peer failure: the job stays resumable, so leave the
+        # consecutive-failure counter alone.
+        logging.info(
+            "[C-MOVE] Job #%d abandoned while waiting for %s", job_id, move_dest_ae
         )
-        move_jobs_counter.labels(status="failed").inc()
     finally:
-        _suppress_pynetdicom = False
+        _suppress_state.suppress = False
         _release_or_abort(assoc)
         # Release the peer gate so the next job to this peer can start.
-        _job_gate_exit(target_host, target_port, move_dest_ae)
+        if gate_held:
+            _job_gate_exit(target_host, target_port, move_dest_ae)
 
 # ---------------------------------------------------------------------------
 # Bridge: C-MOVE background worker pool  -  parallel execution
@@ -10667,8 +13760,18 @@ def _cmove_worker(
         logging.info("[C-MOVE] Worker-%d started", worker_id)
 
         while not _shutdown_requested.is_set():
-            # Bridge: pick next pending job, LIMIT 1
-            job = move_jobs.pick_pending_job()
+            # Bridge: pick next pending job, LIMIT 1, skipping a peer another
+            # worker is already streaming to. Claiming a busy peer's job and
+            # handing it back parked every OTHER pending job behind it (the
+            # handback kept the row's created_at, so the next pick took the
+            # same busy peer again) and burned an UPDATE+commit twice a
+            # second for the whole transfer. Skipping at pick time leaves the
+            # row pending for the other workers to see.
+            job = move_jobs.pick_pending_job(
+                skip=lambda host, port, ae: bool(host)
+                and bool(port)
+                and _peer_is_busy(host, int(port), ae),
+            )
             if job is None:
                 # pick_pending_job() already waited via Condition
                 continue
@@ -10722,6 +13825,9 @@ def _cmove_worker(
                     tls=tls,
                     expose_rejected=job_expose_rejected,
                     qa_url=qa_url,
+                    request_level=job.get("request_level", ""),
+                    request_series_uid=job.get("request_series_uid", ""),
+                    request_sop_uid=job.get("request_sop_uid", ""),
                 )
             except Exception as e:
                 logging.error(
@@ -10730,8 +13836,8 @@ def _cmove_worker(
                     job_id,
                     e,
                 )
-                move_jobs.finish_job(job_id, success=False, error_message=str(e))
-                move_jobs_counter.labels(status="failed").inc()
+                if move_jobs.finish_job(job_id, success=False, error_message=str(e)):
+                    move_jobs_counter.labels(status="failed").inc()
             finally:
                 # Bridge: clear cancel callback after job completes
                 move_jobs.clear_job_callback(job_id)
@@ -10759,10 +13865,16 @@ def _cmove_worker(
 # ---------------------------------------------------------------------------
 # Bridge: periodic cleanup of old C-MOVE jobs
 # ---------------------------------------------------------------------------
-def _cmove_cleanup_worker(move_jobs, max_age_hours=24):
+def _cmove_cleanup_worker(move_jobs, max_age_hours=24, commit_tracker_holder=None):
     """Background thread: delete success/failed jobs older than max_age_hours.
 
-    Runs once per hour. Stops when _shutdown_requested is set.
+    Runs once per hour. Stops when _shutdown_requested is set. The same cycle
+    also expires abandoned Storage Commitment batches (R10): they can never be
+    delivered, so retaining them forever only grows `commit_jobs`.
+
+    `commit_tracker_holder` is a one-slot list, not the tracker itself: the
+    tracker is constructed after this thread starts, and re-reading the slot
+    each cycle is simpler than reordering the startup sequence around it.
     """
     max_age_seconds = max_age_hours * 3600
     logging.info(
@@ -10776,6 +13888,14 @@ def _cmove_cleanup_worker(move_jobs, max_age_hours=24):
         if _shutdown_requested.is_set():
             break
         move_jobs.cleanup_old_jobs(max_age_seconds)
+        tracker = commit_tracker_holder[0] if commit_tracker_holder else None
+        if tracker is not None:
+            try:
+                tracker.purge_abandoned()
+            except Exception as e:
+                # The retention sweep must not kill the C-MOVE cleanup that
+                # shares the cycle.
+                logging.error("[COMMIT] abandoned purge failed: %s", e)
         logging.debug("[C-MOVE] Old job cleanup completed")
 
     logging.info("[C-MOVE] Cleanup worker stopped")
@@ -10802,7 +13922,7 @@ import time
 
 from pydicom import Dataset
 from pydicom.uid import ImplicitVRLittleEndian
-from pynetdicom import AE
+from pynetdicom import AE, build_role
 from pynetdicom.sop_class import StorageCommitmentPushModel
 
 # EventTypeID (see module docstring).
@@ -10817,33 +13937,28 @@ EVENT_FAILURE = 2
 # report: it does not recognise the affected instance as the commitment one.
 WELL_KNOWN_SOP_INSTANCE_UID = "1.2.840.10008.1.20.1.1"
 
-# The pynetdicom level is saved, raised and restored around `associate()`.
-# That triple is not atomic, and two concurrent reports would interleave it:
-# the second would save the ALREADY silenced level and restore that, leaving
-# the library silenced for the life of the process.
-_LEVEL_LOCK = threading.Lock()
+# Expected chatter from pynetdicom while a Storage Commitment association is
+# negotiated: "No accepted presentation contexts" is the normal answer from an
+# SCP that does not implement the push model, and it must not spam the journal.
+#
+# It is suppressed with a per-THREAD filter on the library logger, not by
+# moving the logger's level: the level is one object shared by the whole
+# process, so silencing it also dropped every pynetdicom record of the C-STORE
+# and C-MOVE workers for as long as an association took (seconds, times the
+# retries), for no reason of theirs. A filter sees only the thread that
+# installed it, so the level never has to change and no lock is needed.
+_PN_QUIET = threading.local()
+
+def _pn_quiet_filter(record):
+    """Drop pynetdicom records from a thread that asked for silence."""
+    return not getattr(_PN_QUIET, "on", False)
 
 # PS3.4 J.3.2 / J.3.3: a Storage Commitment transaction needs the requestor to
 # receive the N-EVENT-REPORT the SCP pushes back, so the requestor must hold
 # BOTH roles. PS3.7 D.3.3.4 spells the requestor's proposal as an SCP/SCU Role
-# Selection item; pynetdicom exposes it per presentation context.
-
-def _request_scp_role(ae, abstract_syntax):
-    """Propose the SCU+SCP role for `abstract_syntax` on this association.
-
-    Returns False when the installed pynetdicom cannot express the proposal,
-    so the caller can report the resulting default-role association honestly
-    instead of assuming the report can be pushed.
-    """
-    try:
-        ae.requested_contexts[-1].requested_scp_role = True
-        return True
-    except (AttributeError, IndexError):
-        logging.debug(
-            "[N-EVENT] pynetdicom cannot propose the SCP role for %s",
-            abstract_syntax,
-        )
-        return False
+# Selection item, which is a SEPARATE negotiation primitive - it is not a
+# property of a presentation context (`PresentationContext` only carries the
+# acceptor-side scp_role/scu_role), so it must travel in `ext_neg`.
 
 def send_n_event_report(
     host,
@@ -10887,34 +14002,65 @@ def send_n_event_report(
             time.sleep(retry_delay)
 
         ae = AE(ae_title=bridge_ae_title)
+        # `connection_timeout` is the ONLY setting that bounds the raw TCP
+        # connect: pynetdicom's transport does
+        # `socket.settimeout(self.assoc.connection_timeout)` immediately
+        # before `socket.connect()`, and the AE default is None - which means
+        # blocks for the OS SYN timeout (minutes) behind a black-hole peer.
+        # `network_timeout` and `acse_timeout` cover DIMSE and ACSE only, so
+        # setting them alone left the connect unbounded (verified against the
+        # installed pynetdicom, transport.AssociationSocket.connect).
+        ae.connection_timeout = 5
         ae.network_timeout = 5
         ae.acse_timeout = 3
         ae.dimse_timeout = 30
         # PS3.7 D.3.3.4: without a role item the requestor is SCU and the
         # acceptor is SCP, so the SCP could never send the N-EVENT-REPORT that
         # carries the Storage Commitment Result (PS3.4 J.3.3.1). The bridge
-        # proposes the SCP role explicitly; a peer that declines it leaves the
-        # default roles, which the response check below reports.
+        # proposes BOTH roles; a peer that declines leaves the default roles,
+        # which the response check below reports.
         ae.add_requested_context(StorageCommitmentPushModel, ImplicitVRLittleEndian)
-        _request_scp_role(ae, StorageCommitmentPushModel)
+        sc_role = build_role(
+            StorageCommitmentPushModel, scu_role=True, scp_role=True
+        )
 
         # "No accepted presentation contexts" is normal for SCPs that
-        # do not implement the push model. Raise the pynetdicom level around
-        # associate() so that expected ERROR does not spam the journal.
+        # do not implement the push model. Quiet ONLY this thread's pynetdicom
+        # records around associate() so that expected ERROR does not spam the
+        # journal, without touching the level other threads are logging at.
         _pn_logger = logging.getLogger("pynetdicom")
-        with _LEVEL_LOCK:
-            _prev = _pn_logger.level
-            _pn_logger.setLevel(logging.CRITICAL + 1)
+        if _pn_quiet_filter not in _pn_logger.filters:
+            # Added once per process; the filter is inert outside a silenced
+            # thread, so it never filters anything another thread logs.
+            _pn_logger.addFilter(_pn_quiet_filter)
+        try:
+            _PN_QUIET.on = True
             try:
-                assoc = ae.associate(host, port, ae_title=calling_ae)
+                assoc = ae.associate(
+                    host, port, ae_title=calling_ae, ext_neg=[sc_role]
+                )
                 try:
-                    associations_total.labels(role="to", ae=ae_label(calling_ae)).inc()
+                    associations_total.labels(
+                        role="to", ae=ae_label(calling_ae)
+                    ).inc()
                 except Exception:
                     pass
             finally:
-                _pn_logger.setLevel(_prev)
+                _PN_QUIET.on = False
+        except Exception as e:
+            # A setup error (AE/role construction, a resolver failure, a
+            # socket error escaping transport) is a TRANSIENT failure like any
+            # other: this attempt has nothing to deliver, so record it and let
+            # the loop's backoff try again. Letting it escape turned a
+            # recoverable peer problem into an unreported commitment - the
+            # verdict was never sent and nothing retried it (PS3.7 D.3.3.4:
+            # the association is the transport, not the outcome).
+            assoc = None
+            last_err = f"association setup failed: {e}"
+            logging.warning("[N-EVENT] %s (tx=%s)", last_err, tx_uid)
+            continue
 
-        if not assoc.is_established:
+        if assoc is None or not assoc.is_established:
             last_err = (
                 f"SCP {calling_ae}@{host}:{port} unavailable (attempt {attempt + 1})"
             )
@@ -10922,19 +14068,35 @@ def send_n_event_report(
             _release_or_abort(assoc, timeout=2.0)
             continue
 
+        # The context alone does not prove the role: an SCP that accepts the
+        # abstract syntax but DECLINES the role item leaves the requestor as
+        # plain SCU (PS3.7 D.3.3.4), and the report would then never be
+        # accepted.
+        #
+        # `as_scp` is the ACCEPTOR's answer, not ours (pynetdicom
+        # PresentationContext.as_scp: "True if the association Acceptor can
+        # act as SCP for the current context"). The bridge is the N-EVENT
+        # requestor, i.e. the SCU of that service, so what it needs is a peer
+        # that will act as SCP - which is exactly `as_scp`. Testing `as_scu`
+        # here would check the wrong side of the association and reject a
+        # correct peer.
         sc_accepted = any(
-            str(ctx.abstract_syntax) == StorageCommitmentPushModel
+            str(ctx.abstract_syntax) == StorageCommitmentPushModel and ctx.as_scp
             for ctx in assoc.accepted_contexts
         )
         if not sc_accepted:
-            last_err = f"SCP {calling_ae} does not support push model"
+            last_err = f"SCP {calling_ae} did not grant the SCP role for storage commitment"
             logging.warning("[N-EVENT] %s", last_err)
             _release_or_abort(assoc, timeout=2.0)
             continue
 
         try:
+            # EventTypeID (0000,1002) is a COMMAND-SET element (PS3.7 Table
+            # 9.1-1); it travels as the separate `event_type` argument to
+            # send_n_event_report below, not inside the Event Information data
+            # set. Embedding a group-0000 element in the data set makes a
+            # strict SCP reject the report.
             ds = Dataset()
-            ds.EventTypeID = event_type
             ds.TransactionUID = tx_uid
 
             if success_sops:
@@ -10962,7 +14124,7 @@ def send_n_event_report(
             # constant, not the Transaction UID (which is in the dataset).
             status, _resp = assoc.send_n_event_report(
                 ds,
-                ds.EventTypeID,
+                event_type,
                 StorageCommitmentPushModel,
                 WELL_KNOWN_SOP_INSTANCE_UID,
             )
@@ -11038,6 +14200,7 @@ import functools
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -11087,6 +14250,13 @@ import argparse
 # failures.
 _SCP_FAILURES_BEFORE_REMOVE = 3
 
+# Watchdog stall threshold. The idle worker refreshes its heartbeat once per
+# pass, so this is how long a SINGLE pass (a blocked dequeue, a stuck
+# filesystem call) must run before the worker is treated as stalled. The idle
+# wait itself is bounded by next_retry_wait_sec() (5s), so a healthy loop stays
+# far below this. Named so a test can drive the branch without waiting 120s.
+_OUTBOX_STALL_SEC = 120.0
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # _parse_args - CLI: only --version and --config
@@ -11133,7 +14303,7 @@ def _populate_args(cfg):
     # [server]
     args.bridge_host = cfg.get("server", "host", default="127.0.0.1")
     args.bridge_port = cfg.get_int("server", "port", default=8104)
-    args.ae_title = cfg.get("server", "ae_title", default="CLARUS_BRIDGE")
+    args.ae_title = cfg.get("server", "ae_title", default="CLBRIDGE")
     # QA / Expose Rejected Instances AE (AIRA 57.2.1). A DIMSE association has
     # no per-query "show rejected" flag, so the standard mechanism is a second
     # AE Title whose queries go to a separately configured QA webservice
@@ -11170,8 +14340,12 @@ def _populate_args(cfg):
         "dimse", "c_find_max_responses", default=200
     )
     # c_move_workers: auto-scale - I/O-bound workers (TCP to viewer + HTTP from Clarus).
-    # max(2, cpu_count()//2). 2-2, 4-2, 8-4, 16-8. Admin can override in config.
-    _default_cmove = max(2, (os.cpu_count() or 2) // 2)
+    # min(16, max(2, cpu_count()//2)): the lower bound keeps at least one
+    # reader and one writer, the 16 ceiling keeps the pool bounded even on
+    # many-core hosts (the valid config range caps at 16; an unbounded
+    # cpu//2 gave 32 workers on 64 cores, outside the validated maximum).
+    # 2-2, 4-2, 8-4, 16-8 ... 64-16. Admin can override in config.
+    _default_cmove = min(16, max(2, (os.cpu_count() or 2) // 2))
     args.c_move_workers = cfg.get_int("dimse", "c_move_workers", default=_default_cmove)
     args.no_storage_commit = cfg.get_bool("dimse", "no_storage_commit", default=False)
     # peers_file: path to peers.conf (chmod 644, public peer list)
@@ -11306,6 +14480,19 @@ def _validate_config(cfg):
     # Server
     port = cfg.get_int("server", "port", default=8104)
     check(1 <= port <= 65535, f"server.port {port} out of range [1..65535]")
+    # The QA AE listens on its own socket, and binding a port outside 1..65535
+    # raises OverflowError - which is NOT an OSError and so escaped the bind
+    # error handling as a traceback. Range-check it here, with `server.port`,
+    # and leave 0 (the "QA AE disabled" default) alone.
+    eport = cfg.get_int("server", "expose_port", default=0)
+    check(
+        eport == 0 or 1 <= eport <= 65535,
+        f"server.expose_port {eport} out of range [0 or 1..65535]",
+    )
+    check(
+        eport != port,
+        f"server.expose_port {eport} must differ from server.port",
+    )
 
     # DICOMweb
     # 2908: clarus_url validated fail-fast (scheme, host, legacy-key removal,
@@ -11572,7 +14759,12 @@ def _check_port_available(port: int, bind_addr: str, name: str) -> None:
     """
     import socket
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # The family must match the address, not the platform default: `[server]
+    # host = ::` is a legitimate IPv6 listener choice, and binding an AF_INET
+    # socket to `::` raises, which turned a valid configuration into
+    # "[FATAL] ... Refusing to start".
+    family = socket.AF_INET6 if ":" in str(bind_addr) else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         if sys.platform == "win32":
             exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
@@ -11593,6 +14785,16 @@ def _check_port_available(port: int, bind_addr: str, name: str) -> None:
         sys.exit(1)
     finally:
         sock.close()
+
+def _qa_port_will_bind(args):
+    """True when the Expose Rejected Instances listener will actually bind.
+
+    The QA AE is constructed only under `args.expose_port AND args.qa_url`;
+    either half alone is dead config and is reported as a warning instead of
+    started. The startup port probe asks this so it can never refuse to start
+    on a port this configuration never binds.
+    """
+    return bool(args.expose_port) and bool(args.qa_url)
 
 def _check_dimse_unique(host: str, port: int, my_ae_title: str) -> None:
     """Layer 2: C-ECHO probe against the DICOMweb server via pynetdicom.
@@ -11650,9 +14852,21 @@ def _check_dimse_unique(host: str, port: int, my_ae_title: str) -> None:
                     remote_ae,
                 )
             sys.exit(1)
-    except Exception:
-        # - - - - -. -.
-        pass
+    except (ConnectionRefusedError, ConnectionResetError, TimeoutError, OSError) as e:
+        # These mean "nothing is listening on that port", which is the clean
+        # answer this probe exists to produce. Any other exception is a FAILED
+        # probe, and reporting it as clean is the optimistic default: the check
+        # would pass without ever having looked.
+        logging.debug("[STARTUP] C-ECHO probe on %s:%d: %s", host, port, e)
+    except Exception as e:
+        logging.warning(
+            "[STARTUP] C-ECHO probe on %s:%d could not complete (%s: %s) - "
+            "duplicate-instance state is UNKNOWN, continuing",
+            host,
+            port,
+            type(e).__name__,
+            e,
+        )
     finally:
         _probe_logger.setLevel(_probe_prev_level)
         try:
@@ -11745,39 +14959,74 @@ def _write_pid_file(path: str) -> None:
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
-        with open(path) as f:
-            old_pid = f.read().strip()
+        # Reading the stale file is the next thing that can fail, and it is
+        # NOT the same class as the create above: permission-denied or a file
+        # deleted between the two calls raised straight out of process start.
         try:
-            alive = _pid_is_alive(int(old_pid))
-        except ValueError:
-            alive = False
-        if alive:
-            logging.error(
-                "[FATAL] PID file %s exists and pid=%s is ALIVE. "
-                "Another instance is running. Remove %s manually if stale.",
-                path,
-                old_pid,
-                path,
-            )
-            # os._exit: immediate process termination, works on Win+*nix.
-            # sys.exit only raises SystemExit - non-daemon threads prevent exit.
-            os._exit(1)
-        else:
+            with open(path) as f:
+                old_pid = f.read().strip()
+        except OSError as e:
             logging.warning(
-                "[WARN] Stale PID file %s (pid=%s is dead). Overwriting.",
+                "[WARN] Existing PID file %s cannot be read: %s. Removing it "
+                "and continuing.",
                 path,
-                old_pid,
+                e,
             )
             try:
                 os.remove(path)
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            except OSError as e:
+            except OSError as e2:
                 logging.warning(
-                    "[WARN] Cannot rewrite stale PID file %s: %s. Continuing without it.",
+                    "[WARN] Cannot rewrite PID file %s: %s. Continuing without it.",
                     path,
-                    e,
+                    e2,
                 )
                 return
+        else:
+            try:
+                old_pid_int = int(old_pid)
+            except ValueError:
+                old_pid_int = None
+            # Our OWN pid is not a competing instance. After a crash / SIGKILL the
+            # file survives, and in a container with a stable filesystem across
+            # `docker restart` the new process gets the same pid (1 or 7 is common
+            # when /var/run is unwritable and the fallback path is used) - the
+            # liveness probe then answered "alive" for the current process and the
+            # bridge refused to start on every restart. Layers 1 and 2 already
+            # detect a live second instance, so this check only has to reject a
+            # FOREIGN live pid.
+            alive = (
+                old_pid_int is not None
+                and old_pid_int != os.getpid()
+                and _pid_is_alive(old_pid_int)
+            )
+            if alive:
+                logging.error(
+                    "[FATAL] PID file %s exists and pid=%s is ALIVE. "
+                    "Another instance is running. Remove %s manually if stale.",
+                    path,
+                    old_pid,
+                    path,
+                )
+                # os._exit: immediate process termination, works on Win+*nix.
+                # sys.exit only raises SystemExit - non-daemon threads prevent exit.
+                os._exit(1)
+            else:
+                logging.warning(
+                    "[WARN] Stale PID file %s (pid=%s is dead). Overwriting.",
+                    path,
+                    old_pid,
+                )
+                try:
+                    os.remove(path)
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except OSError as e:
+                    logging.warning(
+                        "[WARN] Cannot rewrite stale PID file %s: %s. Continuing without it.",
+                        path,
+                        e,
+                    )
+                    return
     except OSError as e:
         # PermissionError is an OSError. NOT fatal: the service must start.
         logging.warning(
@@ -11861,8 +15110,13 @@ def _start_background_services(
         max_retries=args.outbox_max_retries,
         cleanup=args.outbox_cleanup,
         retry_interval=args.outbox_retry_interval,
+        # R7: the documented RAM budget becomes a real limit. Backpressure
+        # takes the worse of the slot ratio and this byte ratio, so a queue
+        # that is 2% full by count but 400% over its memory budget still
+        # refuses.
+        max_queue_bytes=int(args.stow_queue_max_mb) * 1024 * 1024,
     )
-    recovered, undelivered = outbox.recover_stuck()
+    recovered, undelivered = outbox.recover_stuck(force=True)
     outbox_pending.set(outbox.pending_count())
     if recovered > 0:
         outbox_recovery_total.inc(recovered)
@@ -11894,6 +15148,9 @@ def _start_background_services(
             pending_gauge=forward_pending,
             undelivered_total=forward_undelivered_total,
         )
+        # Same startup sweep as the primary queue: a fresh in_progress/ item
+        # from a crashed drain worker must be visible immediately.
+        forward_outbox.recover_stuck(force=True)
         logging.info(
             "[FORWARD] secondary queue enabled -> %s (max_queue=%d, max_retries=10)",
             forward_dir,
@@ -11926,8 +15183,27 @@ def _start_background_services(
         health_checker=health_checker,
         move_jobs=move_jobs,
     )
-    http_server = ThreadingHTTPServer(
-        (args.http_print_bind, args.http_port),
+    # HTTPServer defaults to AF_INET, so an IPv6 http_bind (e.g. "::1" or
+    # "::") dies at bind time with a name-resolution error and takes the whole
+    # bridge down - a site that only has IPv6 management connectivity gets no
+    # health/metrics endpoint at all. Pick the family from the literal address;
+    # DualStack keeps "::" reachable over IPv4 too.
+    bind_host = args.http_print_bind
+    family = socket.AF_INET
+    if ":" in bind_host:
+        family = socket.AF_INET6
+    elif bind_host:
+        try:
+            family = socket.getaddrinfo(bind_host, args.http_port, 0, socket.SOCK_STREAM)[0][0]
+        except OSError:
+            family = socket.AF_INET
+
+    class _BridgeHTTPServer(ThreadingHTTPServer):
+        address_family = family
+        daemon_threads = True
+
+    http_server = _BridgeHTTPServer(
+        (bind_host, args.http_port),
         HandlerCls,
     )
     http_thread = threading.Thread(
@@ -11996,9 +15272,16 @@ def _start_background_services(
     )
 
     # Bridge: start C-MOVE cleanup worker
+    #
+    # R10: it also expires abandoned Storage Commitment batches, so the
+    # retention sweep rides this existing hourly cycle rather than adding a
+    # thread. The tracker is built later in this function, so the worker
+    # receives a holder it reads each cycle instead of the object itself.
+    cleanup_thread_tracker = [None]
     cleanup_thread = threading.Thread(
         target=_cmove_cleanup_worker,
         args=(move_jobs, 24),
+        kwargs={"commit_tracker_holder": cleanup_thread_tracker},
         name="cmove-cleanup",
         daemon=False,
     )
@@ -12109,6 +15392,12 @@ def _start_background_services(
         daemon=False,
     )
     commit_thread.start()
+    # R10: hand the tracker to the cleanup worker started earlier, which
+    # expires abandoned batches once an hour.
+    try:
+        cleanup_thread_tracker[0] = commit_tracker
+    except NameError:
+        pass
     # Expose the tracker to the /metrics scrape (pending-batch gauges). The
     # HTTP server is already serving, so the ref is attached to its handler
     # class once the tracker exists.
@@ -12183,7 +15472,7 @@ def _outbox_worker(
     batch_idle_sec=5.0,
     health_checker=None,
     tls=None,
-    bridge_ae_title="CLARUS_BRIDGE",
+    bridge_ae_title="CLBRIDGE",
 ):
     """Background worker: drains outbox, batches same-study SOPs into one STOW-RS.
 
@@ -12242,6 +15531,21 @@ def _outbox_worker(
     _batch: list = []  # (sop_uid, ds, blob_path, raw_bytes, dataset_modified)
     _batch_study: str | None = None
     _batch_bytes = 0
+    # R3: monotonic instant the FIRST item of the open batch was buffered.
+    # The idle flush only fires on a dequeue gap, so a source trickling one
+    # instance every `batch_idle_sec - 1` s keeps the batch open indefinitely;
+    # past STUCK_ITEM_TIMEOUT the reaper returns the oldest claimed item to
+    # pending, and the next dequeue sends it a SECOND time (delivered twice,
+    # mark_delivered twice, backpressure and metrics wrong).
+    _batch_started_at = 0.0
+
+    # R3: hard cap on how long ONE batch may stay open. It must stay well
+    # below the stuck-item timeout (300 s), because past that instant the
+    # reaper hands the oldest CLAIMED item back to pending while this batch
+    # still owns it - and the next dequeue sends it a second time. A quarter
+    # of the reaper window leaves three intervals of slack for one flush to
+    # finish before the item could be reclaimed, and 60 s bounds it anyway.
+    _batch_max_age_sec = min(60.0, STUCK_ITEM_TIMEOUT / 4)
 
     def _log_study_start(sop_uid, ds, study_uid):
         """First SOP of a study: log and seed per-study stats."""
@@ -12277,6 +15581,8 @@ def _outbox_worker(
         nonlocal _delivered_total, _delivered_failed, _last_summary_log
         nonlocal _queue_was_empty, _current_study
         nonlocal _pause_until
+        nonlocal _last_progress
+        nonlocal _batch_started_at
         if not _batch:
             return
         batch_study = _batch_study
@@ -12317,6 +15623,7 @@ def _outbox_worker(
             _batch = []
             _batch_study = None
             _batch_bytes = 0
+            _batch_started_at = 0.0
             with _progress_lock:
                 _last_progress = time.time()
             return
@@ -12331,6 +15638,7 @@ def _outbox_worker(
             _batch = []
             _batch_study = None
             _batch_bytes = 0
+            _batch_started_at = 0.0
             with _progress_lock:
                 _last_progress = time.time()
             outbox_pending_files.set(outbox.pending_count())
@@ -12380,7 +15688,10 @@ def _outbox_worker(
                     _study_stats[study_uid]["delivered"] += 1
                     _study_stats[study_uid]["failed"] += 1
                 retries = outbox._get_retry_count(uid)
-                if retries >= outbox.MAX_RETRIES:
+                # mark_failed already parked the item when it hit MAX_RETRIES;
+                # a second unconditional move double-decrements the pending
+                # counter and double-bumps undelivered_total.
+                if retries >= outbox.MAX_RETRIES and not outbox._is_undelivered(uid):
                     outbox.move_to_undelivered(uid)
 
         logging.info(
@@ -12391,6 +15702,7 @@ def _outbox_worker(
         _batch = []
         _batch_study = None
         _batch_bytes = 0
+        _batch_started_at = 0.0
 
         # 2908: observability - last successful STOW flush (unix time).
         if batch_ok > 0:
@@ -12447,6 +15759,49 @@ def _outbox_worker(
         # burning STOW retries (MAX_RETRIES=10 -> undelivered -> manual).
         # Reads the health checker's cached event - no HTTP on the hot path.
         if health_checker is not None and not health_checker.is_healthy():
+            if _batch:
+                # The paused batch's items are already CLAIMED (dequeue moved
+                # them to in_progress/), and only `_deliver_batch` gives them
+                # back. Pausing with a non-empty `_batch` therefore left a
+                # partially built batch owned by nobody: the stuck-item sweep
+                # later returned those files to pending/ and re-sent the very
+                # instances this batch still held - a double delivery.
+                #
+                # Hand the tail back to pending UNBURNED. The peer is known
+                # down, not rejecting: sending anyway costs a retry per item
+                # for a guaranteed failure (ten of them park the study in
+                # undelivered/), and marking them delivered would lie. A
+                # store-and-forward queue exists to survive exactly this state.
+                logging.warning(
+                    "[OUTBOX-WORKER] Server down with %d buffered item(s) - "
+                    "returning them to pending and pausing",
+                    len(_batch),
+                )
+                # `_batch` holds 5-tuples. Passing the TUPLE to `requeue` sent
+                # it into `_safe_uid`, whose string methods raised
+                # AttributeError for every item - the batch was then cleared and
+                # the claimed files sat in in_progress/ until the 300 s reaper
+                # ran, which in Storage Commitment mode can push SOPs past the
+                # CommitTracker deadline and report them not committed.
+                for _uid, _ds, _bp, _raw, _mod in list(_batch):
+                    try:
+                        outbox.requeue(_uid, "server down")
+                    except Exception as e:
+                        logging.error(
+                            "[OUTBOX-WORKER] Could not return %s to pending: %s",
+                            _uid,
+                            e,
+                        )
+                # Reset EVERY field of the batch state, not just the list.
+                # A surviving `_batch_study` made the next enqueue look like a
+                # continuation of the abandoned study, so the first instance of
+                # the NEXT study was appended to it (and flushed under the old
+                # study's stats); a surviving `_batch_bytes` skewed the size
+                # guard and the flush log by the abandoned tail's bytes.
+                _batch = []
+                _batch_study = None
+                _batch_bytes = 0
+                _batch_started_at = 0.0
             if not _was_paused:
                 _was_paused = True
                 logging.warning(
@@ -12509,12 +15864,14 @@ def _outbox_worker(
                 # P8 + retry: sleep until next_retry_at (bounded by 5s).
                 wait = outbox.next_retry_wait_sec()
                 _shutdown_requested.wait(timeout=wait)
-                # P30/P1-4: watchdog heartbeat -- worker is alive and waiting.
-                with _progress_lock:
-                    _last_progress = time.time()
+                # P30/P1-4: watchdog. Measure the age of the PREVIOUS
+                # heartbeat, then refresh it. Writing the heartbeat before
+                # measuring makes dead_sec ~0 by construction and leaves the
+                # branch below unreachable.
                 with _progress_lock:
                     dead_sec = time.time() - _last_progress
-                if dead_sec > 120 and outbox.pending_count() > 0:
+                    _last_progress = time.time()
+                if dead_sec > _OUTBOX_STALL_SEC and outbox.pending_count() > 0:
                     logging.warning(
                         "[OUTBOX-WATCHDOG] Worker stalled %.0fs with %d pending - "
                         "running recovery",
@@ -12595,6 +15952,10 @@ def _outbox_worker(
 
         # P8: raw pass-through for CAS dedup. Modified instances (raw=None)
         # are re-serialized by stow_batch_instances via dcmwrite.
+        if not _batch:
+            # R3: the batch's age is fixed by its FIRST item, not refreshed by
+            # later ones - the stuck-item reaper counts from that instant.
+            _batch_started_at = time.monotonic()
         _batch.append(
             (
                 sop_uid,
@@ -12610,8 +15971,14 @@ def _outbox_worker(
             _batch_bytes += len(raw_bytes) if raw_bytes else 0
         _batch_study = _study_uid
 
-        # Flush when count or bytes trigger fires.
-        if len(_batch) >= batch_max_sop or _batch_bytes >= batch_max_bytes:
+        # Flush when count, bytes or AGE trigger fires. The age limit is the
+        # one that protects the oldest item from the stuck-item reaper: see
+        # _batch_started_at for the double-delivery it prevents.
+        if (
+            len(_batch) >= batch_max_sop
+            or _batch_bytes >= batch_max_bytes
+            or time.monotonic() - _batch_started_at >= _batch_max_age_sec
+        ):
             _deliver_batch()
 
     if _batch:
@@ -12630,7 +15997,7 @@ def _start_outbox_workers(
     batch_idle_sec=5.0,
     health_checker=None,
     tls=None,
-    bridge_ae_title="CLARUS_BRIDGE",
+    bridge_ae_title="CLBRIDGE",
 ):
     """Start single background outbox worker thread. KISS."""
     t = threading.Thread(
@@ -12730,6 +16097,10 @@ def _forward_open_assoc(
     ae.network_timeout = network_timeout
     ae.acse_timeout = acse_timeout
     ae.dimse_timeout = dimse_timeout
+    # F12 sibling: bound the raw TCP connect. A black-hole forward
+    # destination otherwise parks this association on the OS SYN timeout
+    # (minutes), and the forward worker is the only thing draining its queue.
+    ae.connection_timeout = acse_timeout
     for sop_class, ts_uid in sorted(pairs):
         if sop_class and ts_uid:
             ae.add_requested_context(sop_class, ts_uid)
@@ -12776,6 +16147,12 @@ def _forward_process_batch(
     non-zero); False if the association could NOT be established at all, in
     which case the CALLER requeues the whole batch (no retry burn) and pauses.
 
+    `_forward_process_batch.handled` carries the UIDs this call already
+    settled (delivered / failed / requeued) before returning False for a lost
+    association. The caller requeues only the items NOT in that set: the ones
+    after the loss were never attempted on the wire, and the ones before it
+    must not be requeued twice.
+
     Per instance it READS every C-STORE-RSP: 0x0000 -> mark_delivered;
     a non-zero RSP -> mark_failed (backoff, then undelivered at max retries);
     a lost/None RSP or an unasendable context mismatch -> requeued without a
@@ -12787,7 +16164,35 @@ def _forward_process_batch(
     reproducible everywhere, and keeps the wire test's exact-order pin valid.
     """
     items = sorted(items, key=lambda item: item[0])
-    pairs = sorted({(sop, ts) for (_, sop, ts, _) in items if sop and ts})
+    self_handled = set()
+
+    # Items that lost their sop_class / stored_ts cannot be proposed over any
+    # negotiated context. They used to be silently dropped from `pairs` while
+    # staying unsent: never delivered, never failed, so the caller requeued
+    # the whole batch forever and one broken item blocked every valid one
+    # behind it. Fail them HERE (before the association) and proceed with the
+    # rest.
+    sendable = []
+    pairs = set()
+    for uid, sop_class, stored_ts, blob_path in items:
+        if sop_class and stored_ts:
+            sendable.append((uid, sop_class, stored_ts, blob_path))
+            pairs.add((sop_class, stored_ts))
+        else:
+            logging.warning(
+                "[FORWARD] SOP %s missing sop_class/stored_ts - mark_failed",
+                uid,
+            )
+            forward_failed_total.inc()
+            try:
+                forward_outbox.mark_failed(uid, "missing sop_class/stored_ts")
+            except Exception:
+                pass
+    if not sendable:
+        # Nothing sendable remained; every item was already failed above, so
+        # the batch is terminal (not retryable).
+        return True
+    pairs = sorted(pairs)
     assoc = _forward_open_assoc(
         calling_ae,
         dest_ae,
@@ -12818,7 +16223,7 @@ def _forward_process_batch(
             accepted.setdefault(str(ctx.abstract_syntax), set()).update(ts_list)
 
         delivered_any = False
-        for uid, sop_class, stored_ts, blob_path in items:
+        for uid, sop_class, stored_ts, blob_path in sendable:
             # Only send when the negotiated context actually covers this
             # sop_class and stored TS; sending stored bytes as-is over a
             # foreign/absent TS would corrupt them. A peer that cannot accept
@@ -12841,14 +16246,64 @@ def _forward_process_batch(
                     forward_outbox.mark_failed(uid, "context not covered")
                 except Exception:
                     pass
+                self_handled.add(uid)
                 continue
 
             # Size is read BEFORE the send: mark_delivered removes the blob,
             # so measuring afterwards always yields 0.
             _blob_size = _forward_blob_size(blob_path)
+            # Ship the audit trail WITH the instance. `enqueue_from_blob`
+            # copies the primary `.mods` sidecar alongside the blob, but the
+            # forward channel used to send the raw file and drop the sidecar -
+            # so the second archive stored an instance whose Modified
+            # Attributes Sequence was missing, i.e. a different record from
+            # the one this bridge keeps. When a sidecar exists the instance is
+            # re-serialized with the same `record_modification` entries the
+            # primary drain applies, and THAT byte stream is what goes on the
+            # wire.
+            _send_path = blob_path
+            _mods_extra = None
+            try:
+                _mods_json = forward_outbox.read_mods_sidecar(blob_path)
+            except Exception:
+                _mods_json = None
+            if _mods_json:
+                try:
+                    from pydicom import dcmread as _fwd_dcmread
+
+                    _fds = _fwd_dcmread(blob_path)
+                    for entry in _mods_json:
+                        record_modification(
+                            _fds,
+                            tuple(entry["tag"]),
+                            entry["old"],
+                            modifying_operator="DIMSE",
+                            modifying_system=calling_ae,
+                        )
+                    import os as _os_fwd
+                    import tempfile as _tf_fwd
+
+                    _fh = _tf_fwd.NamedTemporaryFile(
+                        suffix=".dcm", delete=False, dir=_os_fwd.path.dirname(blob_path)
+                    )
+                    _fh.close()
+                    _fds.save_as(_fh.name, enforce_file_format=True)
+                    _send_path = _fh.name
+                    _mods_extra = _fh.name
+                    _blob_size = _forward_blob_size(_send_path)
+                except Exception as mods_err:
+                    logging.warning(
+                        "[FORWARD] SOP %s: audit sidecar could not be applied "
+                        "(%s) - sending the stored blob unchanged",
+                        uid,
+                        mods_err,
+                    )
+                    _send_path = blob_path
+                    _mods_extra = None
+                    _blob_size = _forward_blob_size(blob_path)
             try:
                 _t0 = time.perf_counter()
-                status = assoc.send_c_store(blob_path)
+                status = assoc.send_c_store(_send_path)
                 try:
                     cstore_outbound_duration.labels(peer=ae_label(dest_ae)).observe(
                         time.perf_counter() - _t0
@@ -12861,17 +16316,63 @@ def _forward_process_batch(
                     uid,
                     type(fwd_err).__name__,
                 )
+                if _mods_extra:
+                    try:
+                        import os as _os_fwd2
+
+                        _os_fwd2.unlink(_mods_extra)
+                    except OSError:
+                        pass
                 try:
                     forward_outbox.requeue(
                         uid, f"send exception: {type(fwd_err).__name__}"
                     )
                 except Exception:
                     pass
+                self_handled.add(uid)
                 continue
+            finally:
+                if _mods_extra:
+                    try:
+                        import os as _os_fwd3
 
-            # READ every C-STORE-RSP.
-            if status is not None and status.Status == 0x0000:
+                        _os_fwd3.unlink(_mods_extra)
+                    except OSError:
+                        pass
+
+            # READ every C-STORE-RSP. `send_c_store` also RETURNS an EMPTY
+            # Dataset when the peer times out, aborts or sends an invalid
+            # response, so `status is not None` is not "a status arrived":
+            # reading `Status` off that empty set used to raise AttributeError,
+            # which escaped this function and killed the batch with no cost
+            # recorded for the instance that caused it.
+            try:
+                rsp_status = getattr(status, "Status", None)
+            except Exception as stat_err:
+                # A malformed Status element (wrong VR, unexpected type) is a
+                # per-instance verdict, not a batch-level crash: cost it like a
+                # rejection and keep draining the rest of the batch.
+                forward_failed_total.inc()
+                logging.warning(
+                    "[FORWARD] SOP %s: malformed C-STORE-RSP Status (%s) - "
+                    "counted as rejected",
+                    uid,
+                    stat_err,
+                )
+                try:
+                    forward_outbox.mark_failed(uid, f"malformed RSP: {stat_err}")
+                except Exception:
+                    pass
+                continue
+            # PS3.7 Annex C: a WARNING is a SUCCESS class status - the instance
+            # WAS stored. Treating 0xB000/0xB006/0xB007 as a failure marked a
+            # delivered instance failed, retried it, and eventually parked it in
+            # undelivered/ while the destination held it all along.
+            if rsp_status == 0x0000 or (
+                0xB000 <= (rsp_status or 0) <= 0xBFFF
+            ) or rsp_status in (0x0001, 0x0107):
                 forward_outbox.mark_delivered(uid)
+                self_handled.add(uid)
                 forward_delivered_total.inc()
                 try:
                     bytes_total.labels(direction="tx", peer=ae_label(dest_ae)).inc(
@@ -12880,24 +16381,49 @@ def _forward_process_batch(
                 except Exception:
                     pass
                 delivered_any = True
-                logging.debug("[FORWARD] SOP %s delivered (0x0000)", uid)
-            elif status is None:
-                # Lost/aborted association transport - requeue, no retry burn.
+                logging.debug("[FORWARD] SOP %s delivered (0x%04X)", uid, rsp_status)
+            elif rsp_status is None:
+                # No C-STORE-RSP at all: the peer dropped the association, or
+                # returned an EMPTY Dataset. When the association is GONE the
+                # remaining items in this batch were never attempted on the
+                # wire at all - charging each of them a retry burned the whole
+                # batch's budget (20 items x MAX_RETRIES) on one transport
+                # failure and parked a healthy queue in undelivered/. Hand the
+                # rest back unclaimed and let the caller pause and retry the
+                # batch on a fresh association.
+                if not getattr(assoc, "is_established", False):
+                    logging.warning(
+                        "[FORWARD] association lost before SOP %s - handing "
+                        "back the rest of the batch uncharged",
+                        uid,
+                    )
+                    self_handled.add(uid)
+                    return False
+                # Association still up: this one instance produced no answer.
+                # Requeueing it for free let a single instance that always
+                # loses its response hot-loop the channel forever: every drain
+                # picked it first again. It costs a retry exactly like a
+                # rejection, so at MAX_RETRIES the item leaves the channel and
+                # the rest of the queue drains.
+                forward_failed_total.inc()
                 logging.warning(
-                    "[FORWARD] SOP %s: no C-STORE-RSP read - requeued (no burn)",
+                    "[FORWARD] SOP %s: no C-STORE-RSP read - requeued with "
+                    "a retry burn",
                     uid,
                 )
                 try:
-                    forward_outbox.requeue(uid, "no RSP")
+                    forward_outbox.mark_failed(uid, "no RSP")
                 except Exception:
                     pass
+                self_handled.add(uid)
             else:
-                # A real non-zero RSP (0xC000/0xA7xx/etc) - a per-instance status.
-                # mark_failed bumps the retry counter and (at MAX_RETRIES) calls
+                # A real FAILURE RSP (0xA7xx/0xC000/0x0122...). mark_failed
+                # bumps the retry counter and, at MAX_RETRIES, calls
                 # move_to_undelivered internally (outbox.py semantics).
-                msg = str(getattr(status, "Status", status))
+                msg = str(rsp_status)
                 forward_failed_total.inc()
                 forward_outbox.mark_failed(uid, f"C-STORE {msg}")
+                self_handled.add(uid)
                 logging.warning("[FORWARD] SOP %s rejected: %s", uid, msg)
         if delivered_any:
             try:
@@ -12906,6 +16432,10 @@ def _forward_process_batch(
                 pass
         return True
     finally:
+        # Published for the caller's requeue path (see the docstring): the
+        # UIDs this call already settled, whether it returned True or gave up
+        # on a lost association.
+        _forward_process_batch.handled = self_handled
         try:
             assoc.release()
         except Exception:
@@ -12965,21 +16495,40 @@ def _forward_worker(
             _shutdown_requested.wait(timeout=max(0.1, wait))
             continue
 
-        assoc_ok = _forward_process_batch(
-            forward_outbox,
-            items,
-            dest_ae,
-            calling_ae,
-            host,
-            port,
-            network_timeout,
-            dimse_timeout,
-            acse_timeout,
-        )
+        # A batch that raises must not kill this loop: the thread is the only
+        # thing draining the forward queue, so losing it leaves claimed items
+        # in forward/in_progress and forwarding silently stops until restart.
+        # Treat an escape as an association-level failure (requeue, no burn).
+        handled = set()
+        try:
+            assoc_ok = _forward_process_batch(
+                forward_outbox,
+                items,
+                dest_ae,
+                calling_ae,
+                host,
+                port,
+                network_timeout,
+                dimse_timeout,
+                acse_timeout,
+            )
+            handled = set(getattr(_forward_process_batch, "handled", set()))
+        except Exception as e:
+            logging.error(
+                "[FORWARD] batch processing raised %s: %s - requeueing %d item(s)",
+                type(e).__name__,
+                e,
+                len(items),
+            )
+            assoc_ok = False
         if not assoc_ok:
-            # Association-level failure: requeue the WHOLE already-claimed
-            # batch without burning retries, then pause (destination probe).
+            # Association-level failure: requeue the items that were never
+            # settled, without burning retries, then pause (destination probe).
+            # Items already delivered or failed are skipped - requeueing them
+            # moved a DELIVERED blob back into pending/.
             for uid, _sop, _ts, _bp in items:
+                if uid in handled:
+                    continue
                 try:
                     forward_outbox.requeue(uid, "association failed")
                 except Exception:
@@ -13182,193 +16731,25 @@ def _register_handlers(
     return handlers
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# SCP AE construction: contexts + handlers + shutdown monitor
 # ---------------------------------------------------------------------------
-def main():
-    # - Windows: disable Quick Edit mode (console Mark mode) -
-    # On Windows, clicking in a console window pauses ALL output
-    # (ENABLE_QUICK_EDIT_MODE). PyInstaller .exe has no Properties dialog
-    # to disable it manually, so we do it programmatically at startup.
-    # Without this, a single accidental click freezes the bridge.
-    if sys.platform == "win32" and sys.stdout is not None:
-        try:
-            kernel32 = ctypes.windll.kernel32
-            ENABLE_QUICK_EDIT_MODE = 0x0040
-            ENABLE_EXTENDED_FLAGS = 0x0080
-            STD_INPUT_HANDLE = -10
-            handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                new_mode = (
-                    mode.value & ~ENABLE_QUICK_EDIT_MODE
-                ) | ENABLE_EXTENDED_FLAGS
-                kernel32.SetConsoleMode(handle, new_mode)
-        except Exception:
-            pass  # Not a console (redirected output, no-pty, etc.)
+def _init_dimse_ae(
+    args,
+    sop_index,
+    move_jobs,
+    sop_registry,
+    outbox,
+    health_checker,
+    commit_tracker,
+    forward_outbox,
+):
+    """Build the SCP AE(s), register contexts and handlers, start the
+    shutdown monitor and the (optional) QA AE listener.
 
-    cli = _parse_args()
-
-    # CONFIG-DISCIPLINE: config file is the sole source of settings.
-    if not os.path.exists(cli.config):
-        logging.basicConfig(level=logging.INFO)
-        logging.error("Config file not found: %s", cli.config)
-        sys.exit(1)
-
-    cfg = ConfParser(cli.config)
-
-    # Validate before populating - fail fast on bad config.
-    try:
-        _validate_config(cfg)
-    except ValueError as e:
-        logging.basicConfig(level=logging.INFO)
-        logging.error("%s", e)
-        logging.debug("Config validation traceback:", exc_info=True)
-        sys.exit(1)
-
-    args = _populate_args(cfg)
-
-    # - Resolve relative paths against config file directory -
-    # Same as nginx: all relative paths in config are relative to the
-    # config file, NOT the CWD. Makes the entire folder portable.
-    _config_dir = os.path.dirname(os.path.abspath(cli.config))
-    # peers_file and printers_yaml are read by the C-MOVE peer lookup and the
-    # print registry; resolved from the CWD they point nowhere under a service
-    # manager, and both lookups then silently return nothing.
-    _path_keys = [
-        "log_file",
-        "sop_registry",
-        "sop_index_dir",
-        "outbox_dir",
-        "peers_file",
-        "printers_yaml",
-    ]
-    for key in _path_keys:
-        val = getattr(args, key, None)
-        if val and not os.path.isabs(val):
-            setattr(args, key, os.path.join(_config_dir, val))
-
-    # The patient-id masking key lives beside the outbox: the same directory
-    # the data it labels is written to, so moving the outbox moves the
-    # correlation with it. Set before the first log line that masks an id.
-    set_mask_key_dir(os.path.join(args.outbox_dir, "forward"))
-
-    # Bridge: initialize logging before any output
-    _setup_logging(args.log_level, args.log_file)
-
-    # Startup WARN: if worst-case association retry time (attempts x
-    # outbound_acse_timeout) reaches into the C-MOVE poll budget, the reactor
-    # could hit 0xB000 before a job finishes its association attempts. The
-    # standard (PS3.8 9.1.4 Note 2) gives no retry-count guidance, so surface
-    # the risk at config load - not at 0xB000 time.
-    _retry_total = args.outbound_assoc_attempts * args.outbound_acse_timeout
-    if args.move_poll_timeout and _retry_total >= args.move_poll_timeout:
-        logging.warning(
-            "[CONFIG-WARN] dimse.outbound_assoc_attempts=%d x "
-            "outbound_acse_timeout=%d = %ds reaches into "
-            "move_poll_timeout=%ds - a wedged target could exhaust the "
-            "C-MOVE poll budget across association retries (0xB000 before "
-            "delivery). Tune the attempts/timeouts down if this bites.",
-            args.outbound_assoc_attempts,
-            args.outbound_acse_timeout,
-            _retry_total,
-            args.move_poll_timeout,
-        )
-
-    # Bridge: load SOP class registry
-    sop_registry = _load_sop_registry(args.sop_registry)
-
-    # - Duplicate-instance and port checks BEFORE any component starts -
-    # `_init_components` calls `move_jobs.recover_in_progress_jobs()`, which
-    # resets every in-progress C-MOVE job in the shared database back to
-    # pending. A second instance would therefore steal the live first
-    # instance's running jobs and only afterwards discover that the ports are
-    # taken - the first instance's workers then re-claim the same jobs and
-    # both C-STORE them. Refusing before that write is what keeps the guard
-    # free of side effects.
-    _check_port_available(args.http_port, args.http_print_bind, "metrics HTTP")
-    _check_port_available(args.bridge_port, args.bridge_host, "DIMSE")
-    _check_dimse_unique(args.bridge_host, args.bridge_port, args.ae_title)
-
-    # PID file: `/var/run/clbridge-{port}.pid` on Linux, next to the script
-    # elsewhere, falling back to the script directory when the system
-    # location is not writable. Never fatal on a write error - see
-    # `_acquire_pid_file`. Named by DIMSE port so multiple bridge instances
-    # on the same machine don't clash.
-    _pid_path = _acquire_pid_file(args.bridge_port)
-    if _pid_path:
-        set_pid_path(_pid_path)
-
-    # initialize components
-    sop_index, move_jobs, printer_registry, driver_registry = _init_components(args)
-
-    # - Startup summary (INFO: key params; DEBUG: tuning) -
-    logging.info("clbridge v%s", VERSION)
-    logging.info("[CONFIG] file: %s", cli.config)
-    logging.info(
-        "[DIMSE] %s:%d AE=%s", args.bridge_host, args.bridge_port, args.ae_title
-    )
-    logging.info("[DICOMWEB] %s", args.clarus_url)
-    logging.info("[OUTBOX] dir=%s cleanup=%s", args.outbox_dir, args.outbox_cleanup)
-    # The patient-id masking key is a SECRET that lives on this host's file
-    # system: an operator who does not know it exists cannot back it up, and
-    # restoring an outbox without it silently breaks the correlation between
-    # old and new log tokens. Named here, at startup, next to the directory
-    # it sits in.
-    logging.info(
-        "[MASK] patient-id key: %s",
-        os.path.join(args.outbox_dir, "forward", ".patient_id_mask.key"),
-    )
-    logging.info("[SOP-INDEX] dir=%s", args.sop_index_dir)
-    logging.info("[METRICS] %s:%d", args.http_print_bind, args.http_port)
-    logging.info(
-        "[COERCION] fix_patient_id=%s fix_patient_name=%s id_prefix=%s",
-        args.fix_empty_patient_id,
-        args.fix_empty_patient_name,
-        args.bridge_id_prefix,
-    )
-    # - Tuning params (DEBUG only) -
-    logging.debug(
-        "[TUNING] c_find_max=%d c_move_workers=%d http_timeout=%ds "
-        "stow_queue_size=%d max_assoc=%d",
-        args.c_find_max_responses,
-        args.c_move_workers,
-        args.http_timeout,
-        args.stow_queue_size,
-        args.max_associations,
-    )
-    mx_cstore = getattr(args, "max_concurrent_cstore", None)
-    logging.debug(
-        "[TUNING] max_concurrent_cstore=%s",
-        str(mx_cstore) if mx_cstore else "unlimited",
-    )
-    # - SOP registry info (DEBUG) -
-    logging.debug("SOP registry: %s (%d classes)", args.sop_registry, len(sop_registry))
-    mx_store = f"{args.max_store_mb} MB" if args.max_store_mb > 0 else "unlimited"
-    logging.debug("C-STORE size limit: %s", mx_store)
-
-    # start background services (HTTP server, workers, cleanup)
-    (
-        http_server,
-        http_thread,
-        cmove_thread,
-        cleanup_thread,
-        sop_cleanup_thread,
-        outbox,
-        outbox_workers,
-        health_checker,
-        commit_tracker,
-        commit_thread,
-        forward_outbox,
-        forward_worker_thread,
-    ) = _start_background_services(
-        args,
-        driver_registry,
-        printer_registry,
-        move_jobs,
-        sop_index,
-        sop_registry,
-    )
-
+    Returns (ae, expose_ae, handlers). Kept out of main() so the caller can
+    wrap it in a shutdown guard: an exception here must not leave the already
+    started background threads holding the interpreter.
+    """
     ae = AE(ae_title=args.ae_title)
     # P1 (2608): answer associations ONLY for our own AE title. pynetdicom
     # default is False - any Called AE Title would be accepted, which let a
@@ -13446,10 +16827,16 @@ def main():
             # accepts the broad IMAGE_TS_INCOMING set - local files arrive in
             # their original TS, and a sender whose context is rejected
             # reports a failed export. The SCU proposal keeps IMAGE_TS.
+            #
+            # Only supported (SCP) contexts are registered here: this AE is
+            # a pure SCP and never initiates an outgoing association (the
+            # C-MOVE / N-EVENT / forward channels build their own AEs).
+            # add_requested_context on every registry UID both lied about the
+            # role and blew the 128-context UL limit for large registries,
+            # killing AE construction outright.
             target_ae.add_supported_context(
                 sop_uid, IMAGE_TS_INCOMING if ts_list is IMAGE_TS else NON_IMAGE_TS
             )
-            target_ae.add_requested_context(sop_uid, ts_list)
         target_ae.add_supported_context(
             PatientRootQueryRetrieveInformationModelFind, ImplicitVRLittleEndian
         )
@@ -13575,6 +16962,241 @@ def main():
     # Windows: Ctrl+Break - graceful shutdown (SIGBREAK)
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _signal_handler)
+
+    return ae, expose_ae, handlers
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+def main():
+    # - Windows: disable Quick Edit mode (console Mark mode) -
+    # On Windows, clicking in a console window pauses ALL output
+    # (ENABLE_QUICK_EDIT_MODE). PyInstaller .exe has no Properties dialog
+    # to disable it manually, so we do it programmatically at startup.
+    # Without this, a single accidental click freezes the bridge.
+    if sys.platform == "win32" and sys.stdout is not None:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            ENABLE_QUICK_EDIT_MODE = 0x0040
+            ENABLE_EXTENDED_FLAGS = 0x0080
+            STD_INPUT_HANDLE = -10
+            handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                new_mode = (
+                    mode.value & ~ENABLE_QUICK_EDIT_MODE
+                ) | ENABLE_EXTENDED_FLAGS
+                kernel32.SetConsoleMode(handle, new_mode)
+        except Exception:
+            pass  # Not a console (redirected output, no-pty, etc.)
+
+    cli = _parse_args()
+
+    # CONFIG-DISCIPLINE: config file is the sole source of settings.
+    if not os.path.exists(cli.config):
+        logging.basicConfig(level=logging.INFO)
+        logging.error("Config file not found: %s", cli.config)
+        sys.exit(1)
+
+    cfg = ConfParser(cli.config)
+
+    # Validate before populating - fail fast on bad config.
+    try:
+        _validate_config(cfg)
+    except ValueError as e:
+        logging.basicConfig(level=logging.INFO)
+        logging.error("%s", e)
+        logging.debug("Config validation traceback:", exc_info=True)
+        sys.exit(1)
+
+    args = _populate_args(cfg)
+
+    # - Resolve relative paths against config file directory -
+    # Same as nginx: all relative paths in config are relative to the
+    # config file, NOT the CWD. Makes the entire folder portable.
+    _config_dir = os.path.dirname(os.path.abspath(cli.config))
+    # peers_file and printers_yaml are read by the C-MOVE peer lookup and the
+    # print registry; resolved from the CWD they point nowhere under a service
+    # manager, and both lookups then silently return nothing.
+    _path_keys = [
+        "log_file",
+        "sop_registry",
+        "sop_index_dir",
+        "outbox_dir",
+        "peers_file",
+        "printers_yaml",
+    ]
+    for key in _path_keys:
+        val = getattr(args, key, None)
+        if val and not os.path.isabs(val):
+            setattr(args, key, os.path.join(_config_dir, val))
+
+    # The patient-id masking key lives beside the outbox: the same directory
+    # the data it labels is written to, so moving the outbox moves the
+    # correlation with it. Set before the first log line that masks an id.
+    set_mask_key_dir(os.path.join(args.outbox_dir, "forward"))
+
+    # Bridge: initialize logging before any output
+    _setup_logging(args.log_level, args.log_file)
+
+    # Startup WARN: if worst-case association retry time (attempts x
+    # outbound_acse_timeout) reaches into the C-MOVE poll budget, the reactor
+    # could hit 0xB000 before a job finishes its association attempts. The
+    # standard (PS3.8 9.1.4 Note 2) gives no retry-count guidance, so surface
+    # the risk at config load - not at 0xB000 time.
+    _retry_total = args.outbound_assoc_attempts * args.outbound_acse_timeout
+    if args.move_poll_timeout and _retry_total >= args.move_poll_timeout:
+        logging.warning(
+            "[CONFIG-WARN] dimse.outbound_assoc_attempts=%d x "
+            "outbound_acse_timeout=%d = %ds reaches into "
+            "move_poll_timeout=%ds - a wedged target could exhaust the "
+            "C-MOVE poll budget across association retries (0xB000 before "
+            "delivery). Tune the attempts/timeouts down if this bites.",
+            args.outbound_assoc_attempts,
+            args.outbound_acse_timeout,
+            _retry_total,
+            args.move_poll_timeout,
+        )
+
+    # Bridge: load SOP class registry
+    sop_registry = _load_sop_registry(args.sop_registry)
+
+    # - Duplicate-instance and port checks BEFORE any component starts -
+    # `_init_components` calls `move_jobs.recover_in_progress_jobs()`, which
+    # resets every in-progress C-MOVE job in the shared database back to
+    # pending. A second instance would therefore steal the live first
+    # instance's running jobs and only afterwards discover that the ports are
+    # taken - the first instance's workers then re-claim the same jobs and
+    # both C-STORE them. Refusing before that write is what keeps the guard
+    # free of side effects.
+    _check_port_available(args.http_port, args.http_print_bind, "metrics HTTP")
+    _check_port_available(args.bridge_port, args.bridge_host, "DIMSE")
+    # The QA (expose) listener is a third bind of the same shape. Without this
+    # a second instance sharing expose_port passed every pre-check, reset the
+    # live instance's in-progress C-MOVE jobs in _init_components, and only
+    # then lost its QA-AE thread - the same ordering hazard the two checks
+    # above exist to prevent.
+    #
+    # The probe mirrors the START condition: with `qa_url` empty the QA AE is
+    # never constructed and never binds the port, so a port held by an
+    # unrelated process must not abort startup for a listener that is not
+    # going to exist.
+    if _qa_port_will_bind(args):
+        _check_port_available(args.expose_port, args.bridge_host, "DIMSE QA")
+    _check_dimse_unique(args.bridge_host, args.bridge_port, args.ae_title)
+
+    # PID file: `/var/run/clbridge-{port}.pid` on Linux, next to the script
+    # elsewhere, falling back to the script directory when the system
+    # location is not writable. Never fatal on a write error - see
+    # `_acquire_pid_file`. Named by DIMSE port so multiple bridge instances
+    # on the same machine don't clash.
+    _pid_path = _acquire_pid_file(args.bridge_port)
+    if _pid_path:
+        set_pid_path(_pid_path)
+
+    # initialize components
+    sop_index, move_jobs, printer_registry, driver_registry = _init_components(args)
+
+    # - Startup summary (INFO: key params; DEBUG: tuning) -
+    logging.info("clbridge v%s", VERSION)
+    logging.info("[CONFIG] file: %s", cli.config)
+    logging.info(
+        "[DIMSE] %s:%d AE=%s", args.bridge_host, args.bridge_port, args.ae_title
+    )
+    logging.info("[DICOMWEB] %s", args.clarus_url)
+    logging.info("[OUTBOX] dir=%s cleanup=%s", args.outbox_dir, args.outbox_cleanup)
+    # The patient-id masking key is a SECRET that lives on this host's file
+    # system: an operator who does not know it exists cannot back it up, and
+    # restoring an outbox without it silently breaks the correlation between
+    # old and new log tokens. Named here, at startup, next to the directory
+    # it sits in.
+    logging.info(
+        "[MASK] patient-id key: %s",
+        os.path.join(args.outbox_dir, "forward", ".patient_id_mask.key"),
+    )
+    logging.info("[SOP-INDEX] dir=%s", args.sop_index_dir)
+    logging.info("[METRICS] %s:%d", args.http_print_bind, args.http_port)
+    logging.info(
+        "[COERCION] fix_patient_id=%s fix_patient_name=%s id_prefix=%s",
+        args.fix_empty_patient_id,
+        args.fix_empty_patient_name,
+        args.bridge_id_prefix,
+    )
+    # - Tuning params (DEBUG only) -
+    logging.debug(
+        "[TUNING] c_find_max=%d c_move_workers=%d http_timeout=%ds "
+        "stow_queue_size=%d max_assoc=%d",
+        args.c_find_max_responses,
+        args.c_move_workers,
+        args.http_timeout,
+        args.stow_queue_size,
+        args.max_associations,
+    )
+    mx_cstore = getattr(args, "max_concurrent_cstore", None)
+    logging.debug(
+        "[TUNING] max_concurrent_cstore=%s",
+        str(mx_cstore) if mx_cstore else "unlimited",
+    )
+    # - SOP registry info (DEBUG) -
+    logging.debug("SOP registry: %s (%d classes)", args.sop_registry, len(sop_registry))
+    mx_store = f"{args.max_store_mb} MB" if args.max_store_mb > 0 else "unlimited"
+    logging.debug("C-STORE size limit: %s", mx_store)
+
+    # start background services (HTTP server, workers, cleanup)
+    #
+    # This call starts NON-daemon threads - the HTTP server, the health
+    # checker, the outbox and C-MOVE workers - and later steps can still raise
+    # (opening commit_jobs.db, creating the forward queue). If one does, main()
+    # exits with the exception while those threads keep the interpreter alive:
+    # DIMSE never listens but /health keeps answering OK, so a liveness probe
+    # never restarts the process. A failure here therefore exits HARD.
+    try:
+        (
+            http_server,
+            http_thread,
+            cmove_thread,
+            cleanup_thread,
+            sop_cleanup_thread,
+            outbox,
+            outbox_workers,
+            health_checker,
+            commit_tracker,
+            commit_thread,
+            forward_outbox,
+            forward_worker_thread,
+        ) = _start_background_services(
+            args,
+            driver_registry,
+            printer_registry,
+            move_jobs,
+            sop_index,
+            sop_registry,
+        )
+    except Exception as e:
+        logging.error("[FATAL] background services failed to start: %s", e)
+        _shutdown_requested.set()
+        os._exit(1)
+
+    try:
+        ae, expose_ae, handlers = _init_dimse_ae(
+            args,
+            sop_index,
+            move_jobs,
+            sop_registry,
+            outbox,
+            health_checker,
+            commit_tracker,
+            forward_outbox,
+        )
+    except BaseException:
+        # A failure constructing the SCP AE / registering its handlers would
+        # otherwise leave the already-started non-daemon background threads
+        # (outbox / forward / commit workers) holding the interpreter: the
+        # process hangs "alive but dead". Set the shutdown flag so the workers
+        # drain and the HTTP server closes, then re-raise.
+        _shutdown_requested.set()
+        http_server.shutdown()
+        raise
 
     logging.info("Waiting for DICOM connections...")
 

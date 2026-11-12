@@ -48,3 +48,12 @@ pub(crate) fn s3_client() -> &'static Client {
 /// connection that stops making progress at all is caught by `tcp_keepalive`,
 /// not by this total.
 pub(crate) const S3_XFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Per-request ceiling for metadata operations (HEAD / LIST / DELETE).
+///
+/// These never transfer object bytes, so a healthy round-trip is bounded by
+/// `connect_timeout` (10 s) plus server latency. 30 s leaves a factor of three
+/// over that bound before a hung metadata call fails - a stuck HEAD/LIST/
+/// DELETE must not hold a scrub/audit walk open for the full 30-minute
+/// transfer ceiling while transferring nothing.
+pub(crate) const S3_META_TIMEOUT: Duration = Duration::from_secs(30);

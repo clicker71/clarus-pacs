@@ -192,12 +192,18 @@ impl ShadowTier {
         // The FIRST row of a day CREATES that day's file: the cached day list
         // (normally rebuilt only at rollover) must see the new key, or a
         // lookup before the next rollover would miss the day entirely (caught
-        // by access_journal_smoke's U-line scenario). The list is sorted
-        // ascending and today is the newest key, so the new day belongs at the
-        // tail - O(1) check, no per-row scan.
-        if guard.sop_owner_days.last() != Some(&day) {
-            guard.sop_owner_days.push(day);
-            guard.sop_owner_days.sort_unstable();
+        // by access_journal_smoke's U-line scenario).
+        //
+        // MEMBERSHIP, not a tail comparison. The list is sorted, but `current_day`
+        // is not necessarily its newest key - a directory can already hold a
+        // LATER day (a clock that went backwards, or a backfill). In that case
+        // `last() != Some(&day)` is true on EVERY append for `current_day`, and
+        // each one pushes another copy: the list grows without bound and the
+        // binary search that reads it starts returning whichever duplicate it
+        // lands on. `binary_search` answers membership directly, so the push is
+        // a one-time event per day.
+        if let Err(pos) = guard.sop_owner_days.binary_search(&day) {
+            guard.sop_owner_days.insert(pos, day);
         }
 
         Ok(())
@@ -444,5 +450,57 @@ mod tests {
         assert!(text.contains("failed=2"), "got: {text}");
         assert!(text.contains("conflicts=1"), "got: {text}");
         assert_eq!(tier.pending_tokens(), 0, "token drained exactly once");
+    }
+
+    /// The cached day list must not grow a duplicate per append when it
+    /// already holds a LATER day than the one being written.
+    ///
+    /// The membership test used to be `last() != Some(&day)`, which is a
+    /// correct tail check only while `current_day` is the newest key. With a
+    /// later day already in the list - a clock that went backwards, or a
+    /// backfilled directory - every append for `current_day` re-appended it.
+    /// The list is what `sop_owner_study_warm` binary-searches, so duplicates
+    /// make a day lookup non-deterministic and the list unbounded.
+    #[test]
+    fn appending_the_same_day_twice_keeps_one_entry_in_the_day_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tier = ShadowTier::new(dir.path().to_path_buf());
+        let later = {
+            let mut guard = tier.inner.lock().unwrap();
+            // Seed the cache exactly as a lookup would have rebuilt it, with a
+            // day LATER than the current one present in the directory.
+            let today = *guard.index.current_day();
+            let mut later = today;
+            later[7] = later[7].saturating_add(1);
+            guard.sop_owner_days = vec![later];
+            guard.sop_owner_days_for = Some(today);
+            later
+        };
+
+        // Three appends for the SAME day: a late-arriving row per call.
+        for i in 0..3u8 {
+            let mut blake3 = [0u8; 32];
+            blake3[0] = i;
+            tier.dual_write(blake3, "CT", "1.2.840.9.9", &format!("1.2.840.9.9.{i}"))
+                .expect("dual write");
+        }
+
+        let guard = tier.inner.lock().unwrap();
+        let day = *guard.index.current_day();
+        assert_eq!(
+            guard.sop_owner_days.iter().filter(|d| **d == day).count(),
+            1,
+            "one entry per day, got {:?}",
+            guard.sop_owner_days
+        );
+        assert!(
+            guard.sop_owner_days.contains(&later),
+            "the pre-existing later day must survive"
+        );
+        assert!(
+            guard.sop_owner_days.windows(2).all(|w| w[0] < w[1]),
+            "the list must stay sorted without duplicates: {:?}",
+            guard.sop_owner_days
+        );
     }
 }

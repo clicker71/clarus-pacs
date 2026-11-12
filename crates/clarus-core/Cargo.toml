@@ -44,3 +44,18 @@ tempfile = "3"
 proptest = "1"
 # S5: fuzzymatch benchmark against the names dictionary (Priority 2).
 criterion = "0.5"
+
+[[bench]]
+name = "fuzzymatch_bench"
+harness = false
+
+[[bench]]
+name = "parse_bench"
+harness = false
+
+# The wildcard walk's worst case: a leading `*` retries at every position, so
+# any per-step work that reads the tail makes the match quadratic. This bench
+# is the durable proof that the step is O(1) per scalar.
+[[bench]]
+name = "glob_worst_case_bench"
+harness = false

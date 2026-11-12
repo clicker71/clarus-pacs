@@ -11,7 +11,12 @@ from urllib.parse import quote
 
 import httpx
 
-from clean_code.http_helpers import _qido_request, service_base_url
+from clean_code.http_helpers import (
+    QidoMalformedBodyError,
+    _http_status_to_dimse,
+    _qido_request,
+    service_base_url,
+)
 from clean_code.metrics import find_responses
 from clean_code.protocol import (
     MWL_UID,
@@ -167,14 +172,20 @@ _MASKED_LOG_KEYS = frozenset(
         "InstitutionName",
         "ReferringPhysicianName",
         "PerformingPhysicianName",
+        "NameOfPhysiciansReadingStudy",
         "RequestingPhysician",
         "AdmittingDiagnosesDescription",
         "StudyID",
     )
 )
-# The same keys by tag, for a caller that passed numeric tags.
+# The same keys by tag, for a caller that passed numeric tags. Normalised to
+# lower case because `_masked_query` lower-cases the key before the lookup:
+# a tag whose element component contains a hex letter (0008,103E, 0008,1060,
+# 0008,1080) is stored with that letter in upper case by convention, and an
+# exact comparison against the canonical spelling let the whole tag - and the
+# PHI it carries - through unmasked.
 _MASKED_LOG_TAGS = frozenset(
-    tag
+    tag.lower()
     for tag in (
         "00100010",
         "00100020",
@@ -206,7 +217,10 @@ def _masked_query(params):
     from urllib.parse import unquote
 
     parts = []
-    for key in sorted(params):
+    # The error path calls this with whatever `params` holds, and a caller may
+    # pass `default_param=None` (no default search key). Masking must never be
+    # the reason a status is not sent, so a missing map logs as empty.
+    for key in sorted(params or {}):
         bare = unquote(str(key)).strip().lower().replace(",", "")
         if bare in _MASKED_LOG_KEYS or bare in _MASKED_LOG_TAGS:
             parts.append(f"{key}=***")
@@ -280,21 +294,44 @@ def _handle_qido_search(
         if not isinstance(results, list):
             results = []
     except httpx.HTTPStatusError as exc:
-        # 31.08 honest log: a 400 here is the BRIDGE's fault (bad query,
-        # e.g. series keys on the study level) - never a "connection
-        # failure". The response body is not logged (may echo the query).
+        # Status class decides the refusal: 4xx is the BRIDGE's own bad
+        # query (e.g. series keys on the study level), 5xx is the server or
+        # a proxy failing for a reason unrelated to this query. The response
+        # body is not logged (may echo the query).
+        #
+        # R14: 429 is NOT a bad query - it is the upstream rate-limiting us,
+        # and it is TRANSIENT. `_http_status_to_dimse` already classifies it
+        # (and 5xx) as 0xA700; a bare `>= 500` check turned rate-limiting into
+        # 0xC000, which told the SCU to give up on a query that would succeed
+        # a moment later.
         logging.warning(
             "[C-FIND] QIDO HTTP %d: %s?%s",
             exc.response.status_code,
             url,
             _masked_query(params),
         )
-        yield 0xC000, None
+        dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+        yield dimse, None
+        return
+    except QidoMalformedBodyError as exc:
+        # R16: a 2xx whose body is not a DICOM JSON array is an unreadable
+        # ANSWER, not an empty result (batch-2 raised it instead of returning
+        # []). It is a ValueError, so without this clause it escaped the
+        # generator: no warning was logged, `find_responses` was never
+        # incremented, and the SCU got whatever pynettyic picked. Treat it as
+        # the transient upstream failure it is.
+        logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+        yield 0xA700, None
         return
     except httpx.HTTPError:
-        # Transport errors only: ReadError / ConnectError / Timeout.
+        # Transport errors only: ReadError / ConnectError / Timeout. A broken
+        # TCP link is TRANSIENT - answering 0xC000 told the SCU the query was
+        # permanently refused, so it would never retry. 0xA700 (Refused: Out
+        # of Resources) is the retryable refusal. HTTPStatusError above maps
+        # by status class: 4xx -> 0xC000 (this bridge's bad query), 5xx ->
+        # 0xA700 (transient upstream outage).
         logging.warning("[C-FIND] QIDO error: connection failed")
-        yield 0xC000, None
+        yield 0xA700, None
         return
 
     count = 0
@@ -344,7 +381,44 @@ def _handle_patient_root(
     expose_rejected=False,
     qa_url="",
 ):
-    """C-FIND Patient Root -> QIDO-RS studies."""
+    """C-FIND Patient Root -> QIDO-RS.
+
+    STUDY level (or level absent): GET /studies - unchanged.
+    SERIES level (31.08): two-step series search, the same routing Study
+    Root already applies - a patient-root SERIES query used to fall through
+    to the study path and relabel study rows as SERIES, so the SCU received
+    rows with no SeriesInstanceUID.
+    PATIENT level: NOT implemented - refused with 0xA900. Returning study
+    rows labelled PATIENT duplicated one patient per study, which is worse
+    than an honest refusal.
+    """
+    level = (
+        str(getattr(event.identifier, "QueryRetrieveLevel", "") or "").strip().upper()
+    )
+    if level == "SERIES":
+        yield from _handle_series_search(
+            event,
+            clarus_url,
+            verbose,
+            max_responses,
+            http_timeout,
+            tls,
+            expose_rejected=expose_rejected,
+            qa_url=qa_url,
+        )
+        return
+    if level == "PATIENT":
+        yield 0xA900, None
+        return
+    if level not in ("", "STUDY"):
+        # R5: IMAGE (and anything unrecognised) has no study-level equivalent.
+        # Falling through relabelled study rows with QueryRetrieveLevel=IMAGE
+        # and no SOPInstanceUID, which the SCU cannot use - and the server
+        # drops a return key it cannot honour, so the rows looked plausible.
+        # PS3.4 C.4.1.1.4 / PS3.7: the honest answer is Identifier Does Not
+        # Match SOP Class. Same refusal the PATIENT branch above already makes.
+        yield 0xA900, None
+        return
     yield from _handle_qido_search(
         event,
         clarus_url,
@@ -374,9 +448,9 @@ def _handle_study_root(
     STUDY level (or level absent): GET /studies - unchanged.
     SERIES level (31.08, MicroDicom series search): two-step search
     (study -> per-study series), see _handle_series_search.
-    IMAGE level is NOT implemented - out of scope, documented in the
-    report; such a query falls through to the study-level path and the
-    server answers 400 for the foreign SOPInstanceUID key (honest log).
+    IMAGE level is NOT implemented: such a query is refused with 0xA900.
+    It used to fall through to the study-level path, which relabelled study
+    rows as IMAGE with no SOPInstanceUID - rows the SCU cannot use.
     """
     level = (
         str(getattr(event.identifier, "QueryRetrieveLevel", "") or "").strip().upper()
@@ -392,6 +466,10 @@ def _handle_study_root(
             expose_rejected=expose_rejected,
             qa_url=qa_url,
         )
+        return
+    if level not in ("", "STUDY"):
+        # R5: see _handle_patient_root - IMAGE has no study-row equivalent.
+        yield 0xA900, None
         return
     yield from _handle_qido_search(
         event,
@@ -453,17 +531,31 @@ def _handle_series_search(
         if not isinstance(study_rows, list):
             study_rows = []
     except httpx.HTTPStatusError as exc:
+        # Status class decides the refusal: 4xx is this query's fault
+        # (0xC000), 5xx is the server or a proxy failing (0xA700, retryable).
+        # R14: 429 is upstream rate-limiting and is transient, so the shared
+        # classifier decides rather than a bare `>= 500` threshold.
         logging.warning(
             "[C-FIND] QIDO HTTP %d: %s?%s",
             exc.response.status_code,
             studies_url,
             _masked_query(study_params),
         )
-        yield 0xC000, None
+        dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+        yield dimse, None
+        return
+    except QidoMalformedBodyError as exc:
+        # R16: an unreadable 2xx body is a transient upstream failure, not an
+        # empty result; see the single-study handler above.
+        logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+        yield 0xA700, None
         return
     except httpx.HTTPError:
+        # A broken transport is transient: 0xA700 tells the SCU to retry,
+        # while 0xC000 would read as a permanent refusal and lose a query
+        # the network happened to interrupt.
         logging.warning("[C-FIND] QIDO error: connection failed")
-        yield 0xC000, None
+        yield 0xA700, None
         return
 
     study_by_uid = {}
@@ -487,6 +579,19 @@ def _handle_series_search(
     count = 0
     truncated = False
     for study_uid, study_row in study_by_uid.items():
+        # A C-CANCEL from the SCU, or a bridge shutdown, must stop a broad
+        # SERIES walk: each iteration can block for http_timeout and the walk
+        # otherwise has no way out. Mirror the metric bookkeeping the terminal
+        # paths do: count the rows already sent before the non-Pending yield
+        # (nothing after a non-Pending status is ever executed).
+        if getattr(event, "is_cancelled", False):
+            find_responses.labels(type="series").inc(count)
+            yield 0xFE00, None
+            return
+        if _shutdown_requested.is_set():
+            find_responses.labels(type="series").inc(count)
+            yield 0xC000, None
+            return
         if max_responses and count >= max_responses:
             truncated = True
             logging.warning(
@@ -506,17 +611,28 @@ def _handle_series_search(
             if not isinstance(series_rows, list):
                 series_rows = []
         except httpx.HTTPStatusError as exc:
+            # Status class decides the refusal: 4xx is this query's fault
+            # (0xC000), 5xx is the server or a proxy failing (0xA700).
+            # R14: 429 is transient and the shared classifier already says so.
             logging.warning(
                 "[C-FIND] QIDO HTTP %d: %s?%s",
                 exc.response.status_code,
                 series_url,
                 _masked_query(series_params),
             )
-            yield 0xC000, None
+            dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+            yield dimse, None
+            return
+        except QidoMalformedBodyError as exc:
+            # R16: same class as the single-study handler - an unreadable 2xx
+            # body is a transient upstream failure, not an empty result.
+            logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+            yield 0xA700, None
             return
         except httpx.HTTPError:
+            # Same class as step (a): a transport break is retryable.
             logging.warning("[C-FIND] QIDO error: connection failed")
-            yield 0xC000, None
+            yield 0xA700, None
             return
         for row in series_rows:
             if max_responses and count >= max_responses:

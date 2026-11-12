@@ -161,6 +161,14 @@ def _http_retry(request_func, max_retries=3, delay=2.0):
 # ---------------------------------------------------------------------------
 # Bridge: QIDO-RS with retry
 # ---------------------------------------------------------------------------
+class QidoMalformedBodyError(ValueError):
+    """A 2xx QIDO-RS answer whose body is not a DICOM JSON array.
+
+    Separate from an empty result: `[]` means the query ran and matched
+    nothing, whereas this means the answer could not be read at all.
+    """
+
+
 def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     """QIDO-RS GET with retry wrapper. Auth by nginx.
 
@@ -197,19 +205,32 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     # callers only catch httpx errors - a no-match search would surface as a
     # tooling failure instead of an empty result set. The same applies to an
     # intermediary that answers 200 with an empty or non-JSON body.
-    if resp.status_code == 204 or not resp.content:
+    # PS3.18 10.6.1: 204 is the explicit "nothing to return" answer and stays
+    # an empty result. A 200 with no body is NOT that: the server claimed to
+    # answer a query and delivered nothing readable, which is the same failure
+    # class as an HTML error page and must not read as "matched nothing".
+    if resp.status_code == 204:
         return []
+    if not resp.content:
+        raise QidoMalformedBodyError(f"{url} answered 200 with an empty body")
     try:
         body = resp.json()
     except ValueError:
-        logging.warning(
-            "[QIDO] %s answered 200 with a body that is not JSON "
-            "(%d bytes); treating it as no matches",
-            url,
-            len(resp.content),
+        # PS3.18 10.6.1: a successful QIDO-RS response is a JSON array. A 200
+        # carrying HTML/plain text is a proxy or an error page, not an empty
+        # answer - and returning `[]` made it indistinguishable from "the
+        # study has no matches", so a caller that counted on a real result got
+        # a silent, confidently wrong zero. Signal it as a failure instead.
+        raise QidoMalformedBodyError(
+            f"{url} answered 200 with a body that is not JSON ({len(resp.content)} bytes)"
         )
-        return []
-    return body if isinstance(body, list) else []
+    if not isinstance(body, list):
+        # A DICOM JSON object where the array belongs is the same class of
+        # breakage: it states nothing about matches.
+        raise QidoMalformedBodyError(
+            f"{url} answered 200 with a JSON {type(body).__name__}, expected an array"
+        )
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -538,40 +559,105 @@ def _http_status_to_dimse(http_status):
 # ---------------------------------------------------------------------------
 # Bridge: STOW-RS response parser  -  detect per-SOP failures
 # ---------------------------------------------------------------------------
+class StowBodyNotJsonObject(ValueError):
+    """A STOW-RS response body parsed to something that is not a JSON object.
+
+    PS3.18 10.5.2 makes the STOW response a DICOM JSON OBJECT (an array or a
+    bare scalar is not one). Rejecting it here turns what used to be an
+    AttributeError escaping the handler into a structured 4xx the caller can
+    act on.
+    """
+
+
+def _stow_body_dict(response_text):
+    """Parse a STOW-RS body and return the JSON object it must contain.
+
+    Returns None when the body is empty or not JSON at all (the caller treats
+    that as "no failure report"). Raises `StowBodyNotJsonObject` when the body
+    IS JSON but is not an object - a list or a scalar - because silently
+    returning [] there reported a malformed answer as a clean one.
+    """
+    try:
+        body = json.loads(response_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(body, dict):
+        raise StowBodyNotJsonObject(
+            f"STOW-RS body is {type(body).__name__}, not a JSON object"
+        )
+    return body
+
+
+def _stow_seq_value(tag, seq_item):
+    """The `Value` list of one DICOM JSON tag element, type-checked (PS3.18 J.2).
+
+    A tag element is an object with an optional `Value` array. Anything else -
+    a bare string, a list where the element should be, a `Value` that is not a
+    list - used to reach `.get`/`[0]` and raise AttributeError, which the wide
+    `except Exception` in the callers mapped to 0xC000: a PERMANENT refusal
+    for a body that is merely malformed. Corruption is transient, so it raises
+    `StowBodyNotJsonObject` and the caller answers 0xA700 (retryable) instead.
+    """
+    if not isinstance(seq_item, dict):
+        raise StowBodyNotJsonObject(
+            f"failed-SOP item({tag}) is {type(seq_item).__name__}, not an object"
+        )
+    values = seq_item.get("Value", [])
+    if values is None:
+        values = []
+    if not isinstance(values, list):
+        raise StowBodyNotJsonObject(
+            f"failed-SOP item({tag}) Value is {type(values).__name__}, not a list"
+        )
+    return values
+
+
 def _parse_stow_failures_all(response_text):
     """Parse STOW-RS JSON for ALL failed SOPs (0008,1198 Failed SOP Sequence).
 
     Server returns HTTP 202 even when individual SOPs in a batch fail.
     Returns a list of {"sop_uid": str, "reason": str}; empty when none failed.
+    Raises `StowBodyNotJsonObject` when the body is JSON but not an object, or
+    when a failed-SOP item does not follow the DICOM JSON shape.
     """
-    try:
-        body = json.loads(response_text)
-    except (json.JSONDecodeError, TypeError):
+    body = _stow_body_dict(response_text)
+    if body is None:
         return []
 
     failed_seq = body.get("00081198")
-    if not failed_seq:
+    if not isinstance(failed_seq, dict):
         return []
 
     items = failed_seq.get("Value", [])
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise StowBodyNotJsonObject(
+            f"00081198 Value is {type(items).__name__}, not a list"
+        )
     if not items:
         return []
 
     failures = []
+    seq_items = []
     for item in items:
+        if not isinstance(item, dict):
+            raise StowBodyNotJsonObject(
+                f"00081198 item is {type(item).__name__}, not an object"
+            )
+        seq_items.append(item)
+
+    for item in seq_items:
         # 00081197 = Failure Reason (US, numeric code)
-        failure_code_tag = item.get("00081197", {})
-        codes = failure_code_tag.get("Value", [])
+        codes = _stow_seq_value("00081197", item.get("00081197", {}))
         failure_code = codes[0] if codes else "?"
 
         # 00000902 = Error Comment (LO, human-readable)
-        error_comment_tag = item.get("00000902", {})
-        comments = error_comment_tag.get("Value", [])
+        comments = _stow_seq_value("00000902", item.get("00000902", {}))
         error_comment = comments[0] if comments else "Unknown reason"
 
         # 00081155 = Referenced SOP Instance UID (PS3.18 sec.10.5.2.1)
-        ref_sop_tag = item.get("00081155", {})
-        ref_sops = ref_sop_tag.get("Value", [])
+        ref_sops = _stow_seq_value("00081155", item.get("00081155", {}))
         ref_sop = ref_sops[0] if ref_sops else "?"
 
         failures.append(
@@ -641,9 +727,18 @@ def stow_single_instance(
     if raw_bytes is not None:
         dicom_bytes = raw_bytes
     else:
-        buf = io.BytesIO()
-        dcmwrite(buf, dataset, enforce_file_format=True)
-        dicom_bytes = buf.getvalue()
+        # R4: an instance that cannot be re-serialized (an invalid value for
+        # its VR) is a verdict about THIS instance, not a crash. Letting
+        # dcmwrite raise here escaped before the function returned its
+        # promised three-tuple, and the caller's broad handler then answered
+        # for the whole request.
+        try:
+            buf = io.BytesIO()
+            dcmwrite(buf, dataset, enforce_file_format=True)
+            dicom_bytes = buf.getvalue()
+        except Exception as e:
+            logging.error("[STOW-RS] could not serialize the instance: %s", e)
+            return (0xC000, None, f"Serialize error: {e}")
 
     boundary = f"BOUNDARY_{uuid.uuid4().hex[:16]}"
     body = (
@@ -700,8 +795,15 @@ def stow_single_instance(
         sop_uid = str(getattr(dataset, "SOPInstanceUID", "?"))
 
         if resp.status_code in (200, 201, 202):
-            # Bridge: parse STOW-RS JSON for per-SOP failures
-            rejection = _parse_stow_failures(resp.text, sop_uid)
+            # Bridge: parse STOW-RS JSON for per-SOP failures. A body that is
+            # not a DICOM JSON object is the server answering the wrong thing:
+            # report it as a rejected instance rather than letting the parse
+            # exception escape the C-STORE handler.
+            try:
+                rejection = _parse_stow_failures(resp.text, sop_uid)
+            except StowBodyNotJsonObject as e:
+                logging.error("[STOW-RS] malformed response body: %s", e)
+                return (0xA700, resp.status_code, str(e))
             if rejection:
                 logging.error(
                     "[STOW-RS] Server rejected SOP %s: %s - check clarus-server logs",
@@ -732,6 +834,15 @@ def stow_single_instance(
         logging.warning("-> STOW-RS: TOTAL TIMEOUT after %.0fs", total_timeout)
         stow_requests.labels(status="error").inc()
         return (0xA700, None, "Total timeout")
+    except httpx.TransportError as e:
+        # ReadError / WriteError / RemoteProtocolError: the TCP link broke
+        # mid-request. This is TRANSIENT (retryable), not a permanent verdict:
+        # answering 0xC000 told the modality the instance was refused and must
+        # never be re-sent, so a single blip lost data. 0xA700 (Out of
+        # Resources) is the retryable refusal.
+        logging.warning("-> STOW-RS: TRANSPORT ERROR (%s)", e)
+        stow_requests.labels(status="error").inc()
+        return (0xA700, None, str(e))
     except Exception as e:
         logging.warning("-> STOW-RS: ERROR (%s)", e)
         logging.debug("-> STOW-RS: Full traceback follows:", exc_info=True)
@@ -768,12 +879,29 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
     stow_url = f"{base}/studies"
 
     body = bytearray()
+    pre_failed = []
     for sop_uid, ds, raw_bytes in payloads:
         if raw_bytes is None:
-            _ensure_stow_ts(ds)
-            buf = io.BytesIO()
-            dcmwrite(buf, ds, enforce_file_format=True)
-            dicom_bytes = buf.getvalue()
+            # R4: re-serialization is per-SOP work and can raise on ONE bad
+            # instance (an invalid value for its VR). Outside this guard that
+            # exception escaped before the function returned the `(results,
+            # retry_after)` tuple it promises, so the whole batch had no
+            # outcome and the retry re-sent every other SOP with it. A failed
+            # part is reported as 0xC000 (this instance is unwritable) and the
+            # rest of the batch still goes.
+            try:
+                _ensure_stow_ts(ds)
+                buf = io.BytesIO()
+                dcmwrite(buf, ds, enforce_file_format=True)
+                dicom_bytes = buf.getvalue()
+            except Exception as e:
+                logging.error(
+                    "[STOW-RS] could not serialize SOP %s for the batch: %s",
+                    sop_uid,
+                    e,
+                )
+                pre_failed.append((sop_uid, 0xC000, None, f"Serialize error: {e}"))
+                continue
         else:
             dicom_bytes = raw_bytes
         body += b"--" + boundary.encode("ascii") + b"\r\n"
@@ -781,6 +909,15 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
         body += dicom_bytes
         body += b"\r\n"
     body += b"--" + boundary.encode("ascii") + b"--\r\n"
+
+    failed_uids = {entry[0] for entry in pre_failed}
+    live_payloads = [
+        (uid, ds, raw) for uid, ds, raw in payloads if uid not in failed_uids
+    ]
+    if not live_payloads:
+        # Every part was unwritable: nothing to POST, and the caller still gets
+        # the promised tuple with the per-SOP verdicts.
+        return pre_failed, None
 
     headers = {
         "Content-Type": (
@@ -812,9 +949,22 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
 
         if resp.status_code in (200, 201, 202):
             # Per-SOP outcome: server may reject a subset (0008,1198) in a 2xx.
-            failed = _parse_stow_failures_all(resp.text)
+            try:
+                failed = _parse_stow_failures_all(resp.text)
+            except StowBodyNotJsonObject as e:
+                # PS3.18 10.5.2: the response must be a DICOM JSON object. A
+                # list or scalar body states nothing about the batch, so it is
+                # a server-side reject, not a clean answer - and it must be
+                # returned in the SAME `(results, retryafter)` shape as every
+                # other outcome, or the caller unpacks two values from a
+                # three-tuple and dies with ValueError.
+                logging.error("[STOW-RS] malformed batch response body: %s", e)
+                return pre_failed + [
+                    (uid, 0xA700, resp.status_code, f"Malformed response: {e}")
+                    for uid, _ds, _raw in live_payloads
+                ], None
             failed_by_uid = {f["sop_uid"]: f["reason"] for f in failed}
-            sent = {uid for uid, _ds, _raw in payloads}
+            sent = {uid for uid, _ds, _raw in live_payloads}
             # PS3.18 10.5: a rejection the server reported for a SOP the client
             # did not send means the two sides disagree about the batch. Marking
             # every sent SOP as delivered would claim a success nobody stated,
@@ -826,12 +976,12 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     "whole batch retried",
                     len(unmatched),
                 )
-                return [
+                return pre_failed + [
                     (uid, 0xA700, resp.status_code, "Unmatched failure response")
-                    for uid in sent
+                    for uid, _ds, _raw in live_payloads
                 ], None
-            results = []
-            for sop_uid, ds, raw_bytes in payloads:
+            results = list(pre_failed)
+            for sop_uid, ds, raw_bytes in live_payloads:
                 if sop_uid in failed_by_uid:
                     results.append(
                         (sop_uid, 0xA700, resp.status_code, failed_by_uid[sop_uid])
@@ -843,7 +993,7 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     "[STOW-RS] Batch: %d/%d SOPs rejected by server - "
                     "will re-send individually on retry",
                     len(failed),
-                    len(payloads),
+                    len(live_payloads),
                 )
             return results, None
 
@@ -858,26 +1008,44 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 backoff,
             )
             msg = f"Disk full - retry after {backoff}s"
-            return [(uid, 0xA700, 507, msg) for uid, _, _ in payloads], backoff
+            return pre_failed + [
+                (uid, 0xA700, 507, msg) for uid, _, _ in live_payloads
+            ], backoff
 
         # non-2xx  -  whole batch shares one outcome.
         dimse_status, _, msg = _http_status_to_dimse(resp.status_code)
         return (
-            [(uid, dimse_status, resp.status_code, msg) for uid, _, _ in payloads],
+            pre_failed
+            + [
+                (uid, dimse_status, resp.status_code, msg)
+                for uid, _, _ in live_payloads
+            ],
             None,
         )
     except httpx.ConnectError:
         logging.warning("-> STOW-RS: CONNECTION REFUSED")
         stow_requests.labels(status="error").inc()
-        return [
-            (uid, 0xA700, None, "Connection refused") for uid, _, _ in payloads
+        return pre_failed + [
+            (uid, 0xA700, None, "Connection refused") for uid, _, _ in live_payloads
         ], None
     except httpx.TimeoutException:
         logging.warning("-> STOW-RS: TOTAL TIMEOUT after %.0fs", total_timeout)
         stow_requests.labels(status="error").inc()
-        return [(uid, 0xA700, None, "Total timeout") for uid, _, _ in payloads], None
+        return pre_failed + [
+            (uid, 0xA700, None, "Total timeout") for uid, _, _ in live_payloads
+        ], None
+    except httpx.TransportError as e:
+        # Transient mid-request transport break (Read/Write/RemoteProtocol):
+        # retryable, so 0xA700 per SOP, not the permanent 0xC000.
+        logging.warning("-> STOW-RS: TRANSPORT ERROR (%s)", e)
+        stow_requests.labels(status="error").inc()
+        return pre_failed + [
+            (uid, 0xA700, None, str(e)) for uid, _, _ in live_payloads
+        ], None
     except Exception as e:
         logging.warning("-> STOW-RS: ERROR (%s)", e)
         logging.debug("-> STOW-RS: Full traceback follows:", exc_info=True)
         stow_requests.labels(status="error").inc()
-        return [(uid, 0xC000, None, str(e)) for uid, _, _ in payloads], None
+        return pre_failed + [
+            (uid, 0xC000, None, str(e)) for uid, _, _ in live_payloads
+        ], None

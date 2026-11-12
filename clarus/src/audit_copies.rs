@@ -63,7 +63,15 @@ pub fn build_audit_copies_snapshot(manifest_dir: &Path) -> std::io::Result<Audit
             continue;
         };
         let study_uid = fname.trim_end_matches(suffix).to_string();
-        let text = std::fs::read_to_string(entry.path())?;
+        // A sidecar can be removed between `read_dir` and this read: the erase
+        // worker lifts it as soon as its last line drains, and that is a normal
+        // race rather than a failure. Failing the whole walk over it would make
+        // an unrelated concurrent erase look like a broken audit.
+        let text = match std::fs::read_to_string(entry.path()) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
         // Both sidecar files of one study merge into ONE study entry.
         let study = match studies.iter_mut().find(|s| s.study_uid == study_uid) {
             Some(s) => s,

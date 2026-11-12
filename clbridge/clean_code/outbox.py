@@ -2,7 +2,8 @@
 
 """Outbox Queue  -  filesystem-backed reliable DICOM persistence + delivery.
 
-nginx-way: directories = queue state. Atomic os.rename = state transition.
+nginx-way: directories = queue state. os.rename = state transition; enqueue
+publishes with os.replace (retried - see replace_with_retry).
 No SQLite. No WAL. No busy_timeout. No _write_lock.
 
 Layout:
@@ -17,7 +18,13 @@ Layout:
 
 Guarantees:
   - Atomic claim: os.rename(pending/x.*, in_progress/x.*)  -  only ONE worker succeeds
-  - Crash-safe: recover_stuck() moves in_progress/* back to pending/ on startup
+  - Restart-safe, NOT power-loss-safe: recover_stuck() moves in_progress/*
+    back to pending/ on startup, so a crash or restart loses nothing that
+    reached the filesystem. Writes are flushed to the OS page cache, not
+    fsynced: an unclean power loss can lose an item already answered 0x0000.
+    That window is closed by the HOST (UPS / battery-backed write cache), not
+    by this process - fsync per instance would cost a disk round-trip per
+    C-STORE and still not survive a failing disk.
   - Idempotent: enqueue checks if {uid}.dcm already exists in any dir -> skip
   - No duplicate delivery: exactly one in_progress/ at a time
 
@@ -42,12 +49,21 @@ from clean_code.metrics import (
     outbox_enqueue_latency_seconds,
     outbox_pending,
 )
+from clean_code.utils import LockStripes, replace_with_retry
 
 # How often the worker checks for stuck items (crashed during delivery).
 STUCK_ITEM_CHECK_INTERVAL = 60.0  # seconds
 
 # Items stuck in in_progress/ longer than this -> recovered.
 STUCK_ITEM_TIMEOUT = 300.0  # 5 minutes
+
+# A pending/ blob without its .meta is adopted as an orphan (crash between the
+# blob write and the ready-marker) only after this long. enqueue writes .dcm
+# first and .meta LAST, and the sweep runs on a 60 s timer while enqueue() is
+# in flight, so anything younger than one sweep interval may still be being
+# written. 60 s covers a large instance on slow storage and keeps the timer
+# and the grace period aligned.
+ENQUEUE_PUBLISH_GRACE_SEC = 60.0
 
 
 def _ensure_file_meta(dataset):
@@ -103,9 +119,15 @@ class OutboxQueue:
         retry_interval=0,
         pending_gauge=None,
         undelivered_total=None,
+        max_queue_bytes=0,
     ):
         self._dir = outbox_dir
         self.max_queue = max_queue
+        # R7: byte budget for the pending/ blobs, 0 = no byte limit. The slot
+        # count alone let a dead server plus store_forward pile up 20000 items
+        # of 0.5-50 MB (up to 10 GB) against a configured 500 MB: the memory
+        # budget was a documented knob the enqueue path never consulted.
+        self.max_queue_bytes = max_queue_bytes
         self.MAX_RETRIES = max_retries
         self.cleanup = cleanup
         self.retry_interval = retry_interval
@@ -131,9 +153,24 @@ class OutboxQueue:
         # In-memory pending counter (avoids os.listdir on hot C-STORE path).
         self._pending_count = 0
         self._pending_lock = threading.Lock()
-
+        # One guard per SOP Instance UID: two reactor threads receiving the
+        # same instance publish to the same `<uid>.dcm`. Unique temp names stop
+        # the writers from sharing a file; this serialises them so they do not
+        # all contend for the destination rename at once (the rename itself is
+        # retried inside `replace_with_retry`). Striped rather than one lock
+        # per UID: a per-UID dict grows for every instance the bridge ever
+        # receives and is never pruned.
+        self._publish_guards = LockStripes()
+        # `dequeue` sorts the pending/ .meta listing by mtime; the sorted list
+        # is reused until something claims the queue empty or publishes a new
+        # item (see dequeue's comment). None = must re-read the directory.
+        self._pending_meta_cache = None
         # Sync from what's already on disk (survives restart).
         self._sync_pending_count()
+
+    def _publish_guard_for(self, sop_uid):
+        """The guard serialising publishers of `sop_uid`."""
+        return self._publish_guards.for_key(sop_uid)
 
     def _set_pending_gauge(self):
         """Push the in-memory pending count to this queue's Prometheus gauge.
@@ -149,7 +186,40 @@ class OutboxQueue:
     # -- path helpers --------------------------------------------------
 
     def _safe_uid(self, sop_uid):
-        return sop_uid.replace("\x00", "_").replace("/", "_").replace("\\", "_")
+        """File-name form of a SOP Instance UID, injective over its input.
+
+        A UID is digits and dots, so nothing needs escaping in the normal case.
+        The three bytes that cannot appear in a path (`\\x00`, `/`, `\\`) are
+        percent-escaped rather than replaced with `_`: collapsing them all to
+        one character made two different UIDs name one file, and the second
+        instance then published over the first. `%` itself is escaped first so
+        the mapping cannot be spoofed into producing an escape sequence.
+        """
+        return (
+            sop_uid.replace("%", "%25")
+            .replace("\x00", "%00")
+            .replace("/", "%2F")
+            .replace("\\", "%5C")
+        )
+
+    @staticmethod
+    def _unsafe_uid(name):
+        """Inverse of `_safe_uid`, applied ONLY to a UID read back from a
+        filename (never to a UID already held in memory).
+
+        `dequeue` and `recover_stuck` derive the UID from `name[:-4]` /
+        `name[:-5]`, which is the ESCAPED form; passing it back through
+        `_safe_uid` escaped it a second time (`%2F` -> `%252F`) and the item
+        was skipped forever. Unescape in the REVERSE order of `_safe_uid`,
+        so `%25` is decoded LAST (a literal `%` in the UID must not turn the
+        two characters `%25` into a `%` before the other escapes run).
+        """
+        return (
+            name.replace("%5C", "\\")
+            .replace("%2F", "/")
+            .replace("%00", "\x00")
+            .replace("%25", "%")
+        )
 
     def _dcm_path(self, dir_, sop_uid):
         return os.path.join(dir_, f"{self._safe_uid(sop_uid)}.dcm")
@@ -160,18 +230,51 @@ class OutboxQueue:
     def _mods_path(self, dir_, sop_uid):
         return os.path.join(dir_, f"{self._safe_uid(sop_uid)}.mods")
 
+    def _is_undelivered(self, sop_uid):
+        """True when the SOP is already parked in undelivered/.
+
+        `move_to_undelivered` is not idempotent from the caller's point of
+        view: it moves whatever it finds and counts it. A failure path that
+        reaches it after `mark_failed` has already parked the same item would
+        move nothing but still bump `undelivered_total`, so callers check here
+        first.
+        """
+        return os.path.isfile(self._dcm_path(self._undelivered, sop_uid))
+
     # -- atomic file write ---------------------------------------------
+
+    @staticmethod
+    def _tmp_path(path):
+        """A temporary path that only THIS write operation can own.
+
+        The whole queue is keyed by SOP Instance UID, so two reactor threads
+        receiving the same instance write the SAME final path. A shared
+        `<path>.tmp` made them interleave into one file and both `os.replace`
+        it; the dedup `isfile` check above is check-then-act and cannot
+        serialise them. PID plus thread id is unique among the writers that
+        can race here without leaving a lock or a file handle behind.
+        """
+        return f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
 
     @staticmethod
     def _atomic_write(path, data, binary=False):
         """Write data atomically: tmp -> flush -> os.replace."""
-        tmp = path + ".tmp"
+        tmp = OutboxQueue._tmp_path(path)
         mode = "wb" if binary else "w"
         encoding = None if binary else "utf-8"
-        with open(tmp, mode, encoding=encoding) as f:
-            f.write(data)
-            f.flush()
-        os.replace(tmp, path)
+        try:
+            with open(tmp, mode, encoding=encoding) as f:
+                f.write(data)
+                f.flush()
+            replace_with_retry(tmp, path)
+        except Exception:
+            # A failed write must not leave its temp file behind: the next
+            # attempt would pile another one next to it.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     # -- modifications sidecar -----------------------------------------
 
@@ -235,44 +338,71 @@ class OutboxQueue:
             logging.error("[OUTBOX] Dataset has no SOPInstanceUID - cannot enqueue")
             return False
 
-        # Check if already in any queue directory (dedup).
-        for d in [self._pending, self._in_progress, self._done]:
-            if os.path.isfile(self._dcm_path(d, sop_uid)):
-                logging.info(
-                    "[OUTBOX] SOP %s already in queue - duplicate, 0x0000", sop_uid
-                )
-                return "duplicate"
-
         dcm_path = self._dcm_path(self._pending, sop_uid)
 
-        # Step 1: Write DICOM blob (atomic).
-        _ensure_file_meta(dataset)
-        try:
-            tmp = dcm_path + ".tmp"
-            dcmwrite(tmp, dataset, enforce_file_format=True)
-            os.replace(tmp, dcm_path)
-        except Exception as e:
-            logging.error("[OUTBOX] Failed to write blob for %s: %s", sop_uid, e)
+        # Dedup and publish are one critical section per SOP Instance UID:
+        # the `isfile` scan is check-then-act, so it is only a decision when
+        # nothing else can create the file between the scan and the write.
+        guard = self._publish_guard_for(sop_uid)
+        with guard:
+            for d in [self._pending, self._in_progress, self._done]:
+                if os.path.isfile(self._dcm_path(d, sop_uid)):
+                    logging.info(
+                        "[OUTBOX] SOP %s already in queue - duplicate, 0x0000",
+                        sop_uid,
+                    )
+                    return "duplicate"
+
+            # Step 1: Write DICOM blob (atomic).
+            _ensure_file_meta(dataset)
+            tmp = self._tmp_path(dcm_path)
             try:
-                os.unlink(dcm_path + ".tmp")
-            except OSError:
-                pass
-            return False
+                dcmwrite(tmp, dataset, enforce_file_format=True)
+                replace_with_retry(tmp, dcm_path)
+            except Exception as e:
+                logging.error("[OUTBOX] Failed to write blob for %s: %s", sop_uid, e)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return False
 
-        # Step 2: Write modifications sidecar (best-effort, BEFORE .meta).
-        if modifications:
-            self._write_mods_sidecar(sop_uid, modifications)
+            # Step 2: Write modifications sidecar (best-effort, BEFORE .meta).
+            if modifications:
+                self._write_mods_sidecar(sop_uid, modifications)
 
-        # Step 3: Write metadata (LAST  -  signals "this item is ready").
-        now = time.time()
-        meta = {
-            "created_at": now,
-            "retry_count": 0,
-            "next_retry_at": now,
-            "last_error": None,
-        }
-        meta_path = self._meta_path(self._pending, sop_uid)
-        self._atomic_write(meta_path, json.dumps(meta))
+            # Step 3: Write metadata (LAST  -  signals "this item is ready").
+            now = time.time()
+            meta = {
+                "created_at": now,
+                "retry_count": 0,
+                "next_retry_at": now,
+                "last_error": None,
+            }
+            meta_path = self._meta_path(self._pending, sop_uid)
+            try:
+                self._atomic_write(meta_path, json.dumps(meta))
+                # A published item must be visible to the very next dequeue.
+                self._pending_meta_cache = None
+            except Exception as e:
+                # `.meta` is what makes an item VISIBLE to the queue (the
+                # pending walk trusts "no .meta = interrupted earlier, clean
+                # up"). Leaving the blob behind on a failed write produced an
+                # orphan that the next sweep would delete out from under a
+                # caller that had already been told the enqueue failed. Undo
+                # the blob so enqueue either succeeds whole or leaves nothing.
+                logging.error(
+                    "[OUTBOX] Failed to write .meta for %s: %s - removing the "
+                    "orphan blob",
+                    sop_uid,
+                    e,
+                )
+                for orphan in (dcm_path, self._mods_path(self._pending, sop_uid)):
+                    try:
+                        os.unlink(orphan)
+                    except OSError:
+                        pass
+                return False
 
         with self._pending_lock:
             self._pending_count += 1
@@ -317,13 +447,13 @@ class OutboxQueue:
         except OSError:
             pass
         try:
-            tmp = dst + ".tmp"
+            tmp = self._tmp_path(dst)
             shutil.copyfile(src, tmp)
-            os.replace(tmp, dst)
+            replace_with_retry(tmp, dst)
             return True
         except OSError:
             try:
-                os.unlink(dst + ".tmp")
+                os.unlink(tmp)
             except OSError:
                 pass
             return False
@@ -409,6 +539,8 @@ class OutboxQueue:
         }
         meta_path = self._meta_path(self._pending, sop_uid)
         self._atomic_write(meta_path, json.dumps(meta))
+        # A published item must be visible to the very next dequeue.
+        self._pending_meta_cache = None
 
         with self._pending_lock:
             self._pending_count += 1
@@ -416,6 +548,29 @@ class OutboxQueue:
 
         logging.debug("[OUTBOX] Forward-enqueued SOP %s", sop_uid)
         return True
+
+    def _list_pending_names(self):
+        """`os.listdir` of pending/, or [] when the directory is unreadable."""
+        try:
+            return os.listdir(self._pending)
+        except OSError:
+            return []
+
+    def _scan_pending_metas(self, names):
+        """`[(mtime, name)]` for every `.meta` in `names`, oldest first."""
+        # Only the .meta NAMES are sorted here, so a busy queue costs one stat
+        # per item instead of a full JSON re-read.
+        metas = []
+        for name in names:
+            if not name.endswith(".meta"):
+                continue
+            meta_path = os.path.join(self._pending, name)
+            try:
+                metas.append((os.path.getmtime(meta_path), name))
+            except OSError:
+                continue
+        metas.sort()
+        return metas
 
     def dequeue(self):
         """Atomically claim the oldest ready SOP.
@@ -430,16 +585,33 @@ class OutboxQueue:
         now = time.time()
         sop_uid = None
 
-        try:
-            names = os.listdir(self._pending)
-        except OSError:
-            return (None, None, None, None)
+        # OLDEST FIRST. `os.listdir` returns directory order, which is neither
+        # creation order nor stable across filesystems, so the queue could
+        # deliver a newer instance before an older one waiting on the same
+        # study - and a backlog drained in arrival order is the whole point of
+        # a queue. The sort key is the mtime of the .meta, which `enqueue`
+        # writes LAST and nothing rewrites: it is the publish time, exactly the
+        # ordering the queue means.
+        #
+        # The listing is CACHED and only re-read when nothing in it was
+        # claimable. Dequeue runs once per delivered item, and re-listing a
+        # backlog of `max_queue` (20000) entries with a stat per entry turned
+        # a drain into O(n^2) filesystem calls - hours of stat traffic on
+        # NTFS after a crash. The cache is dropped wholesale on every enqueue
+        # (an item must become visible at once) and whenever the cached rows
+        # yield nothing, so a newly ready retry is still found on the next
+        # call.
+        metas = self._pending_meta_cache
+        if metas is None:
+            metas = self._scan_pending_metas(self._list_pending_names())
+            self._pending_meta_cache = metas
 
-        # Find first ready item.
-        for name in names:
-            if not name.endswith(".meta"):
-                continue
-            uid = name[:-5]  # strip .meta
+        # Find the first READY item in age order.
+        for _mtime, name in metas:
+            # `name` is the ESCAPED form on disk; unescape before any path
+            # helper re-escapes it, or `1.2%2F3.meta` would be looked up as
+            # `1.2%252F3.meta` and skipped on every pass.
+            uid = self._unsafe_uid(name[:-5])  # strip .meta
             meta_path = self._meta_path(self._pending, uid)
 
             try:
@@ -462,6 +634,18 @@ class OutboxQueue:
                 if os.path.isfile(mods):
                     os.rename(mods, self._mods_path(self._in_progress, uid))
                 os.rename(meta_path, self._meta_path(self._in_progress, uid))
+                # `rename` preserves the mtime the blob got when it was
+                # ENQUEUED, but `recover_stuck` reads that mtime as "how long
+                # has this been in progress". An item that waited in pending/
+                # longer than STUCK_ITEM_TIMEOUT (a backlog after an incident,
+                # parking, a 507 pause) therefore reads as stuck the instant it
+                # is claimed, the sweep puts it back, and the same instance is
+                # delivered twice while `_pending_count` drops by two.
+                claimed = self._dcm_path(self._in_progress, uid)
+                try:
+                    os.utime(claimed, None)
+                except OSError:
+                    pass
                 sop_uid = uid
                 break
             except OSError:
@@ -469,6 +653,10 @@ class OutboxQueue:
                 continue
 
         if sop_uid is None:
+            # Nothing in the cached listing was claimable: a new item or a
+            # newly ready retry may have appeared since it was taken, so the
+            # next call re-reads the directory.
+            self._pending_meta_cache = None
             return (None, None, None, None)
 
         # Read DICOM from claimed file.
@@ -493,7 +681,14 @@ class OutboxQueue:
             logging.error("[OUTBOX] Failed to read blob %s: %s", blob_path, e)
             self.mark_failed(sop_uid, f"Blob read error: {e}")
             retries = self._get_retry_count(sop_uid)
-            if retries >= self.MAX_RETRIES:
+            # mark_failed ALREADY parks the item once it hits MAX_RETRIES
+            # (outbox.py mark_failed -> move_to_undelivered). Calling it again
+            # here moved an item that was no longer in pending/ or
+            # in_progress/ and, worse, could move a SECOND time on a
+            # concurrent path, producing two undelivered entries and a double
+            # `undelivered_total` bump for one failure. Only act when the
+            # failed item is still present somewhere movable.
+            if retries >= self.MAX_RETRIES and not self._is_undelivered(sop_uid):
                 self.move_to_undelivered(sop_uid)
             return (None, None, None, None)
 
@@ -501,6 +696,16 @@ class OutboxQueue:
 
     def mark_delivered(self, sop_uid):
         """Mark SOP as successfully delivered."""
+        # A previous delivery attempt may have exhausted its retries and left
+        # undelivered/{uid}.dcm behind. If a LATER attempt of the SAME SOP
+        # succeeds, that stale marker must go: delivered() checks undelivered/
+        # FIRST, so the saved instance would otherwise keep reading as a
+        # Storage Commitment failure forever.
+        try:
+            os.unlink(self._dcm_path(self._undelivered, sop_uid))
+        except OSError:
+            pass
+
         # Find which dir the SOP is in (normally in_progress/, but allow pending/ for test flexibility).
         dir_ = self._in_progress
         if not os.path.isfile(self._dcm_path(dir_, sop_uid)):
@@ -584,11 +789,11 @@ class OutboxQueue:
         }
 
         # Atomic update of .meta.
-        tmp = meta_path + ".tmp"
+        tmp = self._tmp_path(meta_path)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f)
             f.flush()
-        os.replace(tmp, meta_path)
+        replace_with_retry(tmp, meta_path)
 
         # If in in_progress/, move back to pending/.
         if dir_ == self._in_progress:
@@ -685,13 +890,30 @@ class OutboxQueue:
                 "[OUTBOX] Failed to move %s to undelivered: %s", sop_uid, e
             )
 
-        # Clean up .meta and .mods.
+        # Carry the audit sidecars WITH the blob. `.mods` is the record of what
+        # the bridge changed (Modified Attributes Sequence material) and `.meta`
+        # is why the item gave up - deleting them on the way to `undelivered/`
+        # destroyed the trail exactly where an operator needs it to decide what
+        # to do with a saved instance. The forward path already carries both.
+        moved_sidecars = set()
         for dir_ in [self._pending, self._in_progress]:
-            for p in [self._meta_path(dir_, sop_uid), self._mods_path(dir_, sop_uid)]:
+            for src_sidecar, dst_sidecar in (
+                (self._meta_path(dir_, sop_uid), self._meta_path(self._undelivered, sop_uid)),
+                (self._mods_path(dir_, sop_uid), self._mods_path(self._undelivered, sop_uid)),
+            ):
+                if dst_sidecar in moved_sidecars:
+                    continue
+                if not os.path.isfile(src_sidecar):
+                    continue
                 try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+                    shutil.move(src_sidecar, dst_sidecar)
+                    moved_sidecars.add(dst_sidecar)
+                except OSError as e:
+                    logging.warning(
+                        "[OUTBOX] Could not carry sidecar %s to undelivered: %s",
+                        src_sidecar,
+                        e,
+                    )
 
         with self._pending_lock:
             self._pending_count = max(0, self._pending_count - 1)
@@ -703,15 +925,22 @@ class OutboxQueue:
 
     # -- recovery ------------------------------------------------------
 
-    def recover_stuck(self):
+    def recover_stuck(self, force=False):
         """Move stuck in_progress/ items back to pending/. Called at startup and periodically.
 
         Two categories:
           1. in_progress/ files with mtime older than STUCK_ITEM_TIMEOUT -> back to pending/
           2. pending/ items with retry_count >= MAX_RETRIES -> move to undelivered/
+
+        `force=True` is the startup sweep: a crash + fast restart leaves the
+        dead worker's in_progress/ items with a FRESH mtime, so the normal
+        cutoff would hide them from `_sync_pending_count` and `delivered()`
+        until the next periodic sweep (up to 300 s later) - long enough for a
+        commitment tracker to answer "not committed" for a delivered SOP.
+        Force treats every in_progress item as stuck (cutoff = now).
         """
         now = time.time()
-        cutoff = now - STUCK_ITEM_TIMEOUT
+        cutoff = now if force else now - STUCK_ITEM_TIMEOUT
         recovered = 0
         undelivered_count = 0
 
@@ -720,13 +949,16 @@ class OutboxQueue:
             for name in os.listdir(self._in_progress):
                 if not name.endswith(".dcm"):
                     continue
-                uid = name[:-4]
+                # `name` is the ESCAPED form; unescape so the rename paths
+                # below (re-escaped by _safe_uid) name the same file.
+                uid = self._unsafe_uid(name[:-4])
+                safe_uid = self._safe_uid(uid)
                 dcm_path = os.path.join(self._in_progress, name)
                 try:
                     if os.path.getmtime(dcm_path) < cutoff:
                         for ext in [".dcm", ".meta", ".mods"]:
-                            src = os.path.join(self._in_progress, uid + ext)
-                            dst = os.path.join(self._pending, uid + ext)
+                            src = os.path.join(self._in_progress, safe_uid + ext)
+                            dst = os.path.join(self._pending, safe_uid + ext)
                             if os.path.isfile(src):
                                 os.rename(src, dst)
                         recovered += 1
@@ -737,13 +969,30 @@ class OutboxQueue:
 
         # Category 1b: orphan .dcm files in pending/ without .meta (crashed before metadata write).
         # Create a .meta so dequeue() can find them.
+        #
+        # A blob whose .meta is missing is only an orphan once it has stopped
+        # being written. The sweep also runs on a timer while enqueue() is in
+        # flight, and enqueue writes .dcm first and .meta LAST - adopting a
+        # blob that is still being written publishes a half-written instance as
+        # ready. Earlier than ENQUEUE_PUBLISH_GRACE_SEC, it is not ours to adopt.
+        orphan_cutoff = now - ENQUEUE_PUBLISH_GRACE_SEC
         try:
             for name in os.listdir(self._pending):
                 if not name.endswith(".dcm"):
                     continue
-                uid = name[:-4]
+                # `name` is the ESCAPED form; unescape before `_meta_path`
+                # re-escapes it - the same double-escape as dequeue. A UID
+                # with % or / would otherwise adopt a .meta under a name no
+                # read path can ever match.
+                uid = self._unsafe_uid(name[:-4])
                 meta_path = self._meta_path(self._pending, uid)
                 if not os.path.isfile(meta_path):
+                    dcm_path = os.path.join(self._pending, name)
+                    try:
+                        if os.path.getmtime(dcm_path) > orphan_cutoff:
+                            continue
+                    except OSError:
+                        continue
                     now_ts = time.time()
                     meta = {
                         "created_at": now_ts,
@@ -767,7 +1016,9 @@ class OutboxQueue:
             for name in os.listdir(self._pending):
                 if not name.endswith(".meta"):
                     continue
-                uid = name[:-5]
+                # `name` is the ESCAPED form; unescape before `_dcm_path`
+                # re-escapes it (the same double-escape as `dequeue`).
+                uid = self._unsafe_uid(name[:-5])
                 meta_path = os.path.join(self._pending, name)
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
@@ -799,8 +1050,57 @@ class OutboxQueue:
         with self._pending_lock:
             return self._pending_count
 
+    def pending_bytes(self):
+        """Bytes currently held in pending/ (O(n) walk, size of each blob).
+
+        R7: a walk, not a counter. `enqueue` runs once per instance, not in a
+        loop, and the blob count it walks is bounded by `max_queue`, so the
+        scan is cheap; a byte counter would have to be kept in step with
+        every path that writes, moves or deletes a blob (deliver, requeue,
+        undelivered, recovery), which is where drift comes from.
+
+        R7b: the walk runs on EVERY admitted C-STORE (the admission gate
+        calls it per instance), and each blob in it costs a `getsize` stat.
+        With a dead server and store_forward the pending/ directory holds up
+        to `max_queue` blobs, so thousands of stats per C-STORE, multiplied
+        by the concurrent handlers, collapse throughput exactly when the
+        backlog is worst. A 1 s TTL cache keeps the same walk but not per
+        instance: the backpressure ratio only needs to move on the order of
+        a second, not per blob.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_pending_bytes_cache", None)
+        if cached is not None and now - cached[0] < 1.0:
+            return cached[1]
+        total = 0
+        try:
+            names = os.listdir(self._pending)
+        except OSError:
+            return 0
+        for name in names:
+            if not name.endswith(".dcm"):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(self._pending, name))
+            except OSError:
+                continue
+        self._pending_bytes_cache = (now, total)
+        return total
+
+    def _over_byte_budget(self, incoming_bytes):
+        """True when accepting `incoming_bytes` would exceed the byte budget.
+
+        Checked BEFORE the blob is published: refusing afterwards would mean
+        writing the bytes that caused the overflow and then deleting them.
+        """
+        if not self.max_queue_bytes:
+            return False
+        return self.pending_bytes() + max(0, incoming_bytes) > self.max_queue_bytes
+
     def _sync_pending_count(self):
         """Recalculate pending count from FS (startup / recovery only)."""
+        # The directory was just swept: the cached listing is stale.
+        self._pending_meta_cache = None
         try:
             count = sum(1 for n in os.listdir(self._pending) if n.endswith(".dcm"))
         except OSError:

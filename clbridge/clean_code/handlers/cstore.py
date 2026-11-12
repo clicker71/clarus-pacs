@@ -14,6 +14,11 @@ import struct
 import threading
 import time
 
+from pydicom.datadict import keyword_dict, keyword_for_tag
+from pydicom.dataset import Dataset
+from pydicom.multival import MultiValue
+from pydicom.tag import BaseTag, Tag
+
 from clean_code.assoc_tracker import record_cstore
 from clean_code.http_helpers import stow_single_instance
 from clean_code.metrics import (
@@ -55,7 +60,7 @@ def set_max_concurrent_cstore(n: int) -> None:
 # ---------------------------------------------------------------------------
 # PROD-HARDENING: Unified backpressure  -  single function for outbox
 # ---------------------------------------------------------------------------
-def _check_backpressure(pending, max_queue):
+def _check_backpressure(pending, max_queue, pending_bytes=0, max_queue_bytes=0):
     """Unified adaptive backpressure with hysteresis.
 
     Returns DIMSE status:
@@ -67,9 +72,19 @@ def _check_backpressure(pending, max_queue):
     Args:
         pending: Current queue depth (integer count).
         max_queue: Maximum queue capacity (integer count).
+        pending_bytes: Bytes currently held by the queue (0 = not measured).
+        max_queue_bytes: Byte budget (0 = no byte limit).
+
+    The fill ratio is the WORSE of the slot ratio and the byte ratio. Slots
+    alone let `advanced.stow_queue_max_mb` be a documented knob that nothing
+    read: 20000 slots of 0.5-50 MB is up to 10 GB against a configured 500 MB
+    budget, and a queue that is 2% full by count can be far past its memory
+    budget.
     """
     max_q = max_queue if max_queue > 0 else 5000
     ratio = pending / max_q if max_q > 0 else 0.0
+    if max_queue_bytes > 0 and pending_bytes > 0:
+        ratio = max(ratio, pending_bytes / max_queue_bytes)
 
     if ratio >= 0.95:
         logging.critical(
@@ -160,9 +175,20 @@ class _AdmissionController:
                     return status, reason or "server degraded"
 
         if self._outbox is not None:
+            # The byte budget is optional: a queue that cannot report its
+            # pending bytes (or has no budget configured) is judged on slots
+            # alone, exactly as before.
+            _pending_bytes = 0
+            try:
+                if getattr(self._outbox, "max_queue_bytes", 0):
+                    _pending_bytes = self._outbox.pending_bytes()
+            except Exception:
+                _pending_bytes = 0
             bp = _check_backpressure(
                 self._outbox.pending_count(),
                 self._outbox.max_queue,
+                pending_bytes=_pending_bytes,
+                max_queue_bytes=getattr(self._outbox, "max_queue_bytes", 0),
             )
             if bp != 0x0000:
                 return bp, "queue backpressure"
@@ -206,6 +232,14 @@ def _fix_cp1251_krakozyabry(ds):
             charset_conversions.labels(from_encoding="utf8").inc()
             return ds
 
+    # Every TEXT-valued element is a candidate, not just five named fields.
+    # Setting ISO_IR 192 for the whole dataset while repairing only PatientName
+    # and friends relabelled the remaining cp1251 bytes (ReferringPhysicianName,
+    # PerformingPhysicianName, OperatorsName, comments, ...) as UTF-8, which
+    # turns readable Cyrillic into replacement characters downstream. The walk
+    # below visits all of them (PS3.5 Table 6.2-1 text VRs).
+    _TEXT_VRS = frozenset({"PN", "LO", "SH", "ST", "LT", "UT", "UC", "DA", "TM"})
+
     fields_to_fix = [
         "PatientName",
         "PatientID",
@@ -241,28 +275,40 @@ def _fix_cp1251_krakozyabry(ds):
             and all(ch in _CYRILLIC_BLOCK for ch in text)
         )
 
-    fixed_any = False
-    for field in fields_to_fix:
-        if field not in ds:
-            continue
-        element = ds.data_element(field)
-        if element is None:
-            continue
-        value = element.value
-        if not isinstance(value, (str, bytes)):
-            try:
-                value = str(value)
-            except Exception:
-                continue
-        if not value:
-            continue
+    def _cp1251_fix_one(value):
+        """Repair one text value. Returns (new_value, examined).
 
+        `examined` is False when the value could not be tested at all; the
+        caller then keeps the dataset's original charset, because relabelling
+        UTF-8 over a field nobody checked is exactly the mislabel this repair
+        must not create.
+        """
         try:
-            raw_bytes = value.encode("latin-1")
-            fixed = raw_bytes.decode("cp1251", errors="replace")
-        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            raw_bytes = str(value).encode("latin-1")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            # Not representable byte-for-byte, so it was never cp1251-as-
+            # latin-1; it is already something else and is left alone.
             malformed_tags.inc()
-            continue
+            return value, False
+        except Exception:
+            malformed_tags.inc()
+            return value, False
+
+        # R6: a value whose Latin-1 bytes decode STRICTLY as UTF-8 is text
+        # that reached us through a missing SpecificCharacterSet: pydicom
+        # read the UTF-8 bytes as Latin-1, so `str(value)` looks like
+        # mojibake but its byte content is valid UTF-8. Re-decoding those
+        # bytes as cp1251 turned "Петров" into permanent garbage and then
+        # relabelled the dataset ISO_IR 192. The strict probe runs FIRST and
+        # returns on success; only a strict-decode failure falls through to
+        # the cp1251 repair (genuine cp1251 Cyrillic is almost never valid
+        # UTF-8).
+        try:
+            return raw_bytes.decode("utf-8"), True
+        except UnicodeDecodeError:
+            pass
+
+        fixed = raw_bytes.decode("cp1251", errors="replace")
 
         # Only accept the fix if the result contains >=3 consecutive Cyrillic
         # characters OR is a short all-Cyrillic name (1-4 chars, no long run).
@@ -271,43 +317,206 @@ def _fix_cp1251_krakozyabry(ds):
             and not _has_cyrillic_run(fixed, 3)
             and not _is_all_cyrillic(fixed)
         ):
-            continue
+            return value, True
+        return fixed, True
 
-        if fixed != value:
-            element.value = fixed
-            fixed_any = True
-            if field == "PatientName":
-                logging.debug(
-                    "  [CP1251] Fixed %s: %s -> %s",
-                    field,
-                    mask_patient_name(str(value)),
-                    mask_patient_name(str(fixed)),
-                )
-            elif field == "PatientID":
-                # A modality's PatientID is the real identifier, not the
-                # bridge's AUTOPAT_ placeholder: it goes through the keyed
-                # token like every other log line that carries one.
-                logging.debug(
-                    "  [CP1251] Fixed %s: %s -> %s",
-                    field,
-                    mask_patient_id(str(value)),
-                    mask_patient_id(str(fixed)),
-                )
-            else:
-                logging.debug(
-                    "  [CP1251] Fixed %s: %.40s → %.40s",
-                    field,
-                    str(value)[:40],
-                    str(fixed)[:40],
-                )
+    fixed_any = False
+    # Set when some text element was NOT examined or its repair was uncertain:
+    # the dataset then keeps its original charset instead of being relabelled
+    # UTF-8 over a mixture of encodings.
+    uncertain = False
+    # id(element) -> (element, value BEFORE any repair), so a partial repair can
+    # be undone whole (`_repair_dataset` writes into `element.value` as it
+    # walks, and the decision to keep the original charset is only made at the
+    # top).
+    #
+    # Keyed by the ELEMENT IDENTITY, not by tag: the SAME tag appears in every
+    # item of a sequence (two SR Content Items each carry a TextValue, two
+    # nested items each carry a CodeMeaning). Keying by tag kept only the
+    # first item's original and then wrote it into EVERY element with that
+    # tag on undo - silently replacing one item's clinical text with
+    # another's.
+    #
+    # `id()` rather than the element itself: pydicom's DataElement defines no
+    # `__hash__`, so it cannot be a dict key. The element is stored beside its
+    # original, which also keeps the object alive for the life of the map.
+    _uncertain_replaced = {}
+
+    # Built from the walk so a tag added to the dataset later is not silently
+    # missed: the five historical names stay FIRST (their log lines are
+    # field-specific), then every other text-valued element.
+    #
+    # PS3.5 SpecificCharacterSet (0008,0005) applies to the WHOLE data set,
+    # including every nested Sequence item: (0040,A730) Content Sequence and
+    # any other SQ carries text elements in the same source encoding. Relabelling
+    # the top level to ISO_IR 192 while repairing only top-level elements left
+    # every nested PN/LO/ST as cp1251 bytes declared UTF-8. The walk therefore
+    # descends into sequences (`_top_level=False` below).
+    def _repair_dataset(ds_obj, top_level):
+        """Repair one dataset level. Returns (fixed_any, uncertain)."""
+        fixed_here = False
+        uncertain_here = False
+        _walk_tags = []
+        for elem in ds_obj:
+            # A sequence ELEMENT is a DataElement whose VR is 'SQ' and whose
+            # .value is the Sequence - it is NOT itself a Sequence instance.
+            # Testing `isinstance(elem, Sequence)` therefore never matched, so
+            # the descent below never ran and nested text was never repaired.
+            if elem.VR == "SQ":
+                continue
+            if elem.VR in _TEXT_VRS or (
+                top_level and elem.keyword in fields_to_fix
+            ):
+                _walk_tags.append(elem.tag)
+        _ordered_tags = []
+        if top_level:
+            for field in fields_to_fix:
+                tag = keyword_dict.get(field)
+                if tag is not None:
+                    _ordered_tags.append(Tag(tag))
+        for tag in _walk_tags:
+            if tag not in _ordered_tags:
+                _ordered_tags.append(tag)
+
+        for _tag in _ordered_tags:
+            # `keyword_dict` yields a Tag and the walk yields a Tag: normalise
+            # once so the dataset lookup and the element access agree on the
+            # key. (`pydicom.tag.Tag` is a FACTORY function, so `isinstance`
+            # has to test the concrete `BaseTag` class.)
+            tag = _tag if isinstance(_tag, BaseTag) else Tag(_tag)
+            # The keyword only drives the LOG wording; an unknown/private tag
+            # has none and falls into the redacted branch.
+            field = keyword_for_tag(tag)
+            if tag not in ds_obj:
+                continue
+            element = ds_obj[tag]
+            if element is None:
+                continue
+            if element.VR not in _TEXT_VRS:
+                # A keyword listed above whose VR is not text (PatientID is
+                # LO, so this is only reachable for a non-conformant file):
+                # leave it and mark the walk partial.
+                uncertain_here = True
+                continue
+            value = element.value
+            if isinstance(value, (list, tuple, MultiValue)):
+                # A multi-valued text element is repaired value by value; if
+                # any component cannot be examined the element is uncertain.
+                new_values = []
+                for part in value:
+                    fixed_part, ok = _cp1251_fix_one(part)
+                    if not ok:
+                        uncertain_here = True
+                    new_values.append(fixed_part)
+                    if fixed_part != part:
+                        fixed_here = True
+                        if id(element) not in _uncertain_replaced:
+                            _uncertain_replaced[id(element)] = (element, list(value))
+                element.value = new_values
+                continue
+            if not isinstance(value, (str, bytes)):
+                try:
+                    value = str(value)
+                except Exception:
+                    uncertain_here = True
+                    continue
+            if not value:
+                continue
+            fixed, ok = _cp1251_fix_one(value)
+            if not ok:
+                uncertain_here = True
+                continue
+            if fixed != value:
+                if id(element) not in _uncertain_replaced:
+                    _uncertain_replaced[id(element)] = (element, value)
+                element.value = fixed
+                fixed_here = True
+                if field == "PatientName":
+                    logging.debug(
+                        "  [CP1251] Fixed %s: %s -> %s",
+                        field,
+                        mask_patient_name(str(value)),
+                        mask_patient_name(str(fixed)),
+                    )
+                elif field == "PatientID":
+                    # A modality's PatientID is the real identifier, not the
+                    # bridge's AUTOPAT_ placeholder: it goes through the keyed
+                    # token like every other log line that carries one.
+                    logging.debug(
+                        "  [CP1251] Fixed %s: %s -> %s",
+                        field,
+                        mask_patient_id(str(value)),
+                        mask_patient_id(str(fixed)),
+                    )
+                else:
+                    # Free text a site fills with names and addresses, and on a
+                    # cp1251-fixed instance exactly as identifying as
+                    # PatientName. Neither masker applies (not a PN, not a keyed
+                    # ID), so the value is NOT logged at all: the tag and the
+                    # length are enough to confirm the repair happened.
+                    logging.debug(
+                        "  [CP1251] Fixed %s: value redacted (%d -> %d chars)",
+                        field,
+                        len(str(value)),
+                        len(str(fixed)),
+                    )
+
+        # Descend into every sequence at this level, including sequences
+        # nested inside items of other sequences.
+        for elem in ds_obj:
+            if elem.VR != "SQ":
+                continue
+            for item in elem.value or []:
+                if not isinstance(item, Dataset):
+                    # A non-Dataset item cannot carry tagged text elements;
+                    # it is not an encoding question, so it is not "uncertain".
+                    continue
+                sub_fixed, sub_uncertain = _repair_dataset(item, False)
+                fixed_here = fixed_here or sub_fixed
+                uncertain_here = uncertain_here or sub_uncertain
+        return fixed_here, uncertain_here
+
+    fixed_any, uncertain = _repair_dataset(ds, True)
+    fixed_any = bool(fixed_any)
+    uncertain = bool(uncertain)
 
     if fixed_any:
-        ds.SpecificCharacterSet = "ISO_IR 192"
-        charset_conversions.labels(from_encoding="cp1251").inc()
-        logging.info(
-            "  [CP1251] Detected and fixed cp1251 mojibake in %s",
-            mask_patient_name(str(ds.get("PatientName", "unknown"))),
-        )
+        if uncertain:
+            # Some text element could not be examined, so the dataset is not
+            # uniformly repairable. Relabelling UTF-8 would declare a charset
+            # the unexamined element does not honour; but KEEPING the repaired
+            # values under the original charset is just as wrong in the other
+            # direction - PS3.5 (0008,0005) applies to the whole data set, so a
+            # Cyrillic string left under ISO_IR 100 is written out as Latin-1
+            # bytes (or raises) and the text is corrupted on the wire. Neither
+            # half-label is acceptable, so the whole repair is undone: value
+            # and charset stay exactly as received, mutually consistent.
+            #
+            # The recorded ELEMENTS are restored directly, so each one gets its
+            # OWN original back and no walking is needed (nor would a walk
+            # help: `ds[tag]` reaches only the top level, and matching by tag
+            # is exactly the swap this undo must not make).
+            for _element, _orig in list(_uncertain_replaced.values()):
+                try:
+                    _element.value = _orig
+                except Exception:
+                    pass
+            # Nothing was changed after the undo, so the caller must not treat
+            # this instance as repaired (the metric below records the no-op).
+            fixed_any = False
+            logging.warning(
+                "  [CP1251] Repaired text elements but could not examine every "
+                "text value - reverting the repair so the charset and the "
+                "bytes stay consistent",
+            )
+            charset_conversions.labels(from_encoding="latin1").inc()
+        else:
+            ds.SpecificCharacterSet = "ISO_IR 192"
+            charset_conversions.labels(from_encoding="cp1251").inc()
+            logging.info(
+                "  [CP1251] Detected and fixed cp1251 mojibake in %s",
+                mask_patient_name(str(ds.get("PatientName", "unknown"))),
+            )
     else:
         charset_conversions.labels(from_encoding="latin1").inc()
 
@@ -334,7 +543,7 @@ def handle_c_store(
     bridge_name_prefix="Anonymous^",
     tls=None,
     forward_outbox=None,
-    bridge_ae_title="CLARUS_BRIDGE",
+    bridge_ae_title="CLBRIDGE",
 ):
     """Handle C-STORE: validate, enqueue to OutboxQueue, return immediately.
 
@@ -355,7 +564,13 @@ def handle_c_store(
     # Backpressure: if all slots busy -> 0xA700 Out of Resources
     # Modality will retry  -  this is standard DICOM behavior (PS3.7 sec.C.4).
     # Like nginx worker_connections: accept only what you can process.
-    if not _cstore_semaphore.acquire(blocking=False):
+    # R17: bind the semaphore to a LOCAL before the acquire and release that
+    # same object in the finally. A reloaded [advanced] max_concurrent_cstore
+    # replaces the module global, and a handler still holding the OLD
+    # semaphore then released the NEW one - raising its counter above the
+    # configured limit for the rest of the process.
+    sem = _cstore_semaphore
+    if not sem.acquire(blocking=False):
         logging.warning(
             "[C-STORE] Backpressure: all %d slots busy - rejecting with 0xA700",
             _MAX_CONCURRENT_CSTORE,
@@ -407,6 +622,15 @@ def handle_c_store(
         # Bridge: detect malformed tags  -  missing SOPInstanceUID
         if not sop_uid:
             malformed_tags.inc()
+            # SOPInstanceUID (0008,0018) is Type 1 for every Storage SOP
+            # Class (PS3.4 B.2 / PS3.3 C.12.1.1.2). Enqueueing an instance
+            # without it produced an empty outbox key: the row read as a
+            # perpetual "duplicate", the blob was never persisted, and the
+            # modality still got 0x0000 for an instance nobody stored.
+            # 0xA900 "Data Set Does Not Match SOP Class" (PS3.4 Table B.2-1)
+            # is the honest refusal.
+            logging.warning("[C-STORE] Missing SOPInstanceUID - rejecting 0xA900")
+            return 0xA900
 
         # Bridge: C-STORE size limit guard. The size is measured in both
         # branches: with a limit it gates the store, without one it feeds the
@@ -452,7 +676,9 @@ def handle_c_store(
             assoc_id = 0
         patient_id_raw = str(getattr(ds, "PatientID", "?"))
         modality = str(getattr(ds, "Modality", "??"))
-        is_new_study = record_cstore(assoc_id, study_uid, patient_id_raw, modality)
+        # The tracker is told the modality only: it summarises per-study
+        # counts, and PatientID has no reader there.
+        is_new_study = record_cstore(assoc_id, study_uid, modality)
         if is_new_study:
             logging.info(
                 "[C-STORE] Receiving: study=%s patient=%s modality=%s",
@@ -505,10 +731,13 @@ def handle_c_store(
                     display_new = (
                         mask_patient_name(new) if tag == (0x0010, 0x0010) else new
                     )
+                    # The log needs a readable placeholder for an empty old
+                    # value; the audit tuple that travelled with this line
+                    # carries the raw empty string, never "(empty)".
                     logging.debug(
                         "Coerced %s: '%s' -> '%s' (audit trail deferred to worker)",
                         tag,
-                        old,
+                        old or "(empty)",
                         display_new,
                     )
         except ValueError as e:
@@ -550,7 +779,15 @@ def handle_c_store(
                 try:
                     # Blob is already atomically on disk in the primary outbox;
                     # hardlink (EXDEV fallback copy) it into forward/pending.
+                    #
+                    # The drain worker can claim the item (pending/ ->
+                    # in_progress/) between the enqueue returning and this
+                    # hook running, so pending/ alone is not where the blob has
+                    # to be. A hardlink to either name is safe: mark_delivered
+                    # only unlinks the name the PRIMARY owns.
                     primary_blob = outbox._dcm_path(outbox._pending, sop_uid)
+                    if not os.path.isfile(primary_blob):
+                        primary_blob = outbox._dcm_path(outbox._in_progress, sop_uid)
                     _ = forward_outbox.enqueue_from_blob(
                         primary_blob,
                         sop_uid,
@@ -593,7 +830,7 @@ def handle_c_store(
 
         return status
     finally:
-        _cstore_semaphore.release()
+        sem.release()
 
 
 # ---------------------------------------------------------------------------

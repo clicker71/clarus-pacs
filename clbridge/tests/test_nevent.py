@@ -189,7 +189,11 @@ class TestSendNEventReport:
         # from, so the caller must supply it (no default).
         mock_ae_cls.assert_called_with(ae_title="TEST_BRIDGE")
         sent = assoc.send_n_event_report.call_args[0][0]
-        assert sent.EventTypeID == 2
+        # EventTypeID (0000,1002) is a command-set element: it travels as the
+        # separate `event_type` argument, NOT inside the Event Information
+        # data set.
+        assert assoc.send_n_event_report.call_args[0][1] == 2
+        assert "EventTypeID" not in sent, "EventTypeID is a command-set element"
         assert sent.TransactionUID == "TX9"
         ref = list(sent.ReferencedSOPSequence)
         assert len(ref) == 1
@@ -220,7 +224,9 @@ class TestSendNEventReport:
                 bridge_ae_title="TEST_BRIDGE",
             )
         sent = assoc.send_n_event_report.call_args[0][0]
-        assert sent.EventTypeID == 1
+        # EventTypeID travels in the command set, not the data set.
+        assert assoc.send_n_event_report.call_args[0][1] == 1
+        assert "EventTypeID" not in sent, "EventTypeID is a command-set element"
         assert not hasattr(sent, "FailedSOPSequence")
 
     def test_bridge_ae_title_is_required(self):

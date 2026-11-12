@@ -51,6 +51,7 @@ class AbstractPrintDriver(ABC):
         printer_host: str,
         printer_port: int,
         calling_aet: str,
+        called_aet: str | None = None,
     ) -> PrintResult:
         """Execute a DICOM Print job.
 
@@ -62,6 +63,8 @@ class AbstractPrintDriver(ABC):
             printer_host: IP/hostname of the DICOM printer (Print SCP).
             printer_port: TCP port of the DICOM printer.
             calling_aet: AE Title to use when calling the printer (SCU).
+            called_aet: The PRINTER's AE Title (PS3.8 9.3.2.1). Defaults to
+                `calling_aet` only for a peer that accepts any Called AE.
 
         Returns:
             PrintResult with job status, counts, and error details.

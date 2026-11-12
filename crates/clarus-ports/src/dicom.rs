@@ -129,6 +129,16 @@ pub struct InstanceMeta {
     pub sop_class_uid: Option<String>,
     pub instance_number: Option<i32>,
     pub transfer_syntax_uid: Option<String>, // (0002,0010) TransferSyntaxUID
+    /// Byte offset of the (7FE0,0010) PIXEL DATA element's TAG, from the start
+    /// of the file - the seam where header attributes may still be inserted.
+    ///
+    /// A caller that must add a missing patient identifier to the stored blob
+    /// has to write it BEFORE PixelData: the metadata reader stops at the pixel
+    /// data, so anything appended to the tail is invisible to WADO-RS
+    /// `/metadata`. The position comes from the parse walk, not from a byte
+    /// search, so pixel data whose bytes happen to look like the tag cannot
+    /// move it. `None` when the file has no PixelData before EOF.
+    pub pixel_data_offset: Option<u64>,
     /// Number of rows in the image (0028,0010). `None` for non-image SOPs.
     pub rows: Option<u16>,
     /// Number of columns in the image (0028,0011). `None` for non-image SOPs.

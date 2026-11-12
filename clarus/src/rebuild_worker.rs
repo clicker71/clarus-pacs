@@ -253,6 +253,15 @@ fn walk_fs(
     errors
 }
 
+/// Whether a listed object is too large to materialise during a rebuild.
+///
+/// A zero cap disables the check, matching STOW's reading of the same key: an
+/// operator who set it to 0 asked for no ceiling.
+#[cfg(feature = "s3")]
+fn exceeds_rebuild_cap(size: u64, max_bytes: u64) -> bool {
+    max_bytes > 0 && size > max_bytes
+}
+
 /// Walk the S3 source (LIST-by-prefix + GET each object), rebuild each valid
 /// instance. Returns the number of hard errors. `s3_key()` produces the
 /// unified `{prefix}{xx}/{yy}/{hash}.dcm` key.
@@ -286,6 +295,25 @@ fn walk_s3(
     let mut errors = 0u64;
     for obj in objects {
         if !obj.key.ends_with(".dcm") {
+            continue;
+        }
+        // LIST already reports the size, so an object the hot path would have
+        // refused is refused here too - before it is materialised. The cap is
+        // the same `max_instance_size_mb` STOW applies; without this check a
+        // 12.5 GB WSI object was GET in full and then decoded, which is an OOM
+        // partway through a rebuild rather than one skipped object.
+        let max_bytes = state
+            .config
+            .max_instance_size_mb
+            .saturating_mul(1024 * 1024);
+        if exceeds_rebuild_cap(obj.size, max_bytes) {
+            acc.skipped += 1;
+            crate::clog_warn!(
+                key = %obj.key,
+                size = obj.size,
+                max = max_bytes,
+                "rebuild: S3 object exceeds max_instance_size_mb; skipped"
+            );
             continue;
         }
         let data = match s3.get_object(&obj.key) {
@@ -653,6 +681,24 @@ mod tests {
         assert_eq!(hex_nibble(b'F'), Some(15));
         assert_eq!(hex_nibble(b'g'), None);
         assert_eq!(hex_nibble(b':'), None);
+    }
+
+    /// An object larger than the instance cap is skipped on its REPORTED size,
+    /// before any GET.
+    ///
+    /// The hot path already refuses such an instance; a rebuild that
+    /// materialised it first turned one oversized object into an OOM partway
+    /// through the pass, with no record of which object caused it.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn an_object_over_the_instance_cap_is_skipped_before_the_get() {
+        let cap = 4096 * 1024 * 1024u64;
+        assert!(exceeds_rebuild_cap(cap + 1, cap));
+        assert!(exceeds_rebuild_cap(12_500_000_000, cap));
+        assert!(!exceeds_rebuild_cap(cap, cap), "the boundary is inclusive");
+        assert!(!exceeds_rebuild_cap(1024, cap));
+        // A zero cap means "no ceiling", the same reading STOW gives it.
+        assert!(!exceeds_rebuild_cap(u64::MAX, 0));
     }
 
     #[test]

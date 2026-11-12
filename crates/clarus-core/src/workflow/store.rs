@@ -128,11 +128,12 @@ impl WorkflowStore {
     }
 
     /// Insert a new SPS record, failing when the UID is already present.
+    ///
+    /// The install is an atomic create-if-absent, so two concurrent inserts of
+    /// one UID cannot both pass an existence test and then both publish.
     pub fn insert_sps(&self, rec: &SpsRecord) -> Result<(), WorkflowStoreError> {
-        if self.find_sps(&rec.sps_uid)?.is_some() {
-            return Err(WorkflowStoreError::Duplicate(rec.sps_uid.clone()));
-        }
-        self.put_sps(rec)
+        let bytes = rec.encode().map_err(WorkflowStoreError::Sps)?;
+        write_if_absent(&self.sps_path(&rec.sps_uid), &bytes)
     }
 
     /// Delete one SPS record. `true` when a file was removed.
@@ -188,10 +189,8 @@ impl WorkflowStore {
     /// N-CREATE duplicate path (PS3.4 F.7.2.1: N-CREATE on an existing SOP
     /// Instance is refused).
     pub fn insert_mpps(&self, rec: &MppsRecord) -> Result<(), WorkflowStoreError> {
-        if self.find_mpps(&rec.mpps_uid)?.is_some() {
-            return Err(WorkflowStoreError::Duplicate(rec.mpps_uid.clone()));
-        }
-        self.put_mpps(rec)
+        let bytes = rec.encode().map_err(WorkflowStoreError::Mpps)?;
+        write_if_absent(&self.mpps_path(&rec.mpps_uid), &bytes)
     }
 
     /// Delete one MPPS record. `true` when a file was removed.
@@ -211,22 +210,42 @@ impl WorkflowStore {
     }
 }
 
-/// Sanitise a record key before it becomes a file stem.
+/// Encode a record key as a file stem, injectively.
 ///
-/// A DICOM UID is `[0-9.]` and the router has already validated the path
-/// segment, but the store repeats the check: a key with a separator or `..`
-/// would let one record address a file outside the store, and a store is the
-/// wrong place to trust its caller.
+/// A DICOM UID is `[0-9.]`, but an SPS identifier may also be a site's TEXTUAL
+/// step id, and the router has already validated only the path segment. Two
+/// requirements follow:
+///
+/// - nothing may address a file outside the store, so separators and `..` are
+///   not allowed through;
+/// - the mapping must be INJECTIVE. The previous `[^0-9.] -> '_'` rule sent both
+///   `"SPS-A"` and `"SPS-B"` to `_____`, so two different steps shared one file
+///   and `put_sps` overwrote one with the other.
+///
+/// Printable ASCII that is safe in a filename passes through unchanged, so a
+/// normal UID keeps its exact stem. Everything else is percent-encoded as
+/// `%XX`, and `%` itself is encoded first, which makes the map reversible and
+/// therefore collision-free for distinct inputs.
 fn safe_stem(uid: &str) -> String {
-    uid.chars()
-        .map(|c| {
-            if c.is_ascii_digit() || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let mut out = String::with_capacity(uid.len());
+    let bytes = uid.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let passthrough = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_');
+        // `.` passes through UNCHANGED so every existing DICOM-UID file keeps
+        // its current name - re-encoding it would rename the whole store for a
+        // conformance fix. The one case that must not survive is a `..` run,
+        // which would address a parent directory; the SECOND dot of such a run
+        // is encoded, which leaves a normal UID (`1.2.840...`) untouched.
+        let dot_ok = b == b'.' && bytes.get(i.wrapping_sub(1)) != Some(&b'.');
+        if passthrough || dot_ok {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+            out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
+        }
+    }
+    out
 }
 
 /// Write bytes to `path` atomically via a `.tmp` sibling + rename.
@@ -257,6 +276,47 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> {
             Err(WorkflowStoreError::Io(e))
         }
     }
+}
+
+/// Write bytes to `path` only if nothing occupies it, atomically.
+///
+/// `hard_link` is the affordable create-if-absent: it fails with
+/// `AlreadyExists` in the kernel, so two concurrent inserts cannot both observe
+/// "absent" and both publish - the loser is told `Duplicate` instead of silently
+/// overwriting. Same primitive `WorkItemStore::write_if_absent` and the
+/// commitment store use.
+fn write_if_absent(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp);
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Err(WorkflowStoreError::Duplicate(stem_of(path)))
+        }
+        Err(e) => Err(WorkflowStoreError::Io(e)),
+    }
+}
+
+/// The stem of a record path, for the `Duplicate` payload.
+fn stem_of(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Remove a file, reporting whether it existed.
@@ -355,6 +415,91 @@ mod tests {
             s.insert_sps(&rec),
             Err(WorkflowStoreError::Duplicate(_))
         ));
+    }
+
+    /// C7: two different textual SPS identifiers must not share a file.
+    ///
+    /// `sps_uid` also carries a site's textual step id. The old stem rule
+    /// mapped every non-digit character to `_`, so `"SPS-A"` and `"SPS-B"` both
+    /// became `_____`: one insert silently overwrote the other and a scan
+    /// returned one record where two were stored.
+    #[test]
+    fn textual_sps_ids_do_not_collide_on_one_file() {
+        let s = store();
+        s.insert_sps(&sps("SPS-A")).expect("insert A");
+        s.insert_sps(&sps("SPS-B")).expect("insert B");
+
+        assert_eq!(
+            s.find_sps("SPS-A").expect("find A").map(|r| r.sps_uid),
+            Some("SPS-A".to_string()),
+            "A must still be readable"
+        );
+        assert_eq!(
+            s.find_sps("SPS-B").expect("find B").map(|r| r.sps_uid),
+            Some("SPS-B".to_string()),
+            "B must not have overwritten A"
+        );
+        assert_eq!(s.all_sps().expect("scan").len(), 2, "both records stored");
+
+        // The stem is still a safe filename: no separator can escape the store.
+        let stem = safe_stem("../../etc/passwd");
+        assert!(!stem.contains('/'), "no path separator: {stem}");
+        assert!(!stem.contains('\\'), "no path separator: {stem}");
+        assert!(!stem.contains(".."), "no traversal: {stem}");
+    }
+
+    /// C8: the SPS install is create-if-absent, so an occupied path is refused
+    /// rather than replaced.
+    ///
+    /// A `find()`-then-`put()` pair let two concurrent inserts of one UID both
+    /// pass the test and both publish. Driving the install directly reproduces
+    /// the state a racing winner leaves behind; the old path overwrote it.
+    #[test]
+    fn an_sps_install_onto_an_occupied_path_is_refused() {
+        let s = store();
+        let winner = sps("SPS-X");
+        let bytes = winner.encode().expect("encode");
+        write_if_absent(&s.sps_path("SPS-X"), &bytes).expect("winner installs");
+
+        let mut loser = sps("SPS-X");
+        loser.station_aet = "MR99".to_string();
+        let loser_bytes = loser.encode().expect("encode");
+        assert!(
+            matches!(
+                write_if_absent(&s.sps_path("SPS-X"), &loser_bytes),
+                Err(WorkflowStoreError::Duplicate(_))
+            ),
+            "an occupied path must be refused"
+        );
+
+        let back = s.find_sps("SPS-X").expect("find").expect("present");
+        assert_eq!(
+            back.station_aet, "CT01",
+            "the winner must not have been replaced"
+        );
+    }
+
+    /// C8: the MPPS install has the same guarantee as SPS (the duplicate path
+    /// is covered by `mpps_duplicate_insert_conflicts`; this pins the case a
+    /// racing winner produces, where the path is already occupied).
+    #[test]
+    fn an_mpps_install_onto_an_occupied_path_is_refused() {
+        let s = store();
+        let winner = mpps("1.2.9", "IN PROGRESS");
+        let bytes = winner.encode().expect("encode");
+        write_if_absent(&s.mpps_path("1.2.9"), &bytes).expect("winner installs");
+
+        let loser = mpps("1.2.9", "COMPLETED");
+        let loser_bytes = loser.encode().expect("encode");
+        assert!(
+            matches!(
+                write_if_absent(&s.mpps_path("1.2.9"), &loser_bytes),
+                Err(WorkflowStoreError::Duplicate(_))
+            ),
+            "an occupied path must be refused"
+        );
+        let back = s.find_mpps("1.2.9").expect("find").expect("present");
+        assert_eq!(back.status, "IN PROGRESS", "the winner must survive");
     }
 
     #[test]

@@ -77,7 +77,7 @@ def record_modification(
         Item:
           AttributeModificationDateTime (0400,0562)
           ModifyingSystem (0400,0563)
-          ModifyingOperator (0400,0566)  -  who made the change (Type 2)
+          SourceOfPreviousValues (0400,0564)  -  Type 2, may be empty
           ReasonForModification (0400,0565)
           ModifiedAttributesSequence (0400,0550)
             Item: the actual changed tag with its OLD value
@@ -114,17 +114,27 @@ def record_modification(
     attr_item.ReasonForTheAttributeModification = (
         reason  # (0400,0565) Type 1  -  CID 7050: COERCE
     )
-    # (0400,0566) ModifyingOperator  -  who (Type 2). Not in pydicom data dict
-    # (pydicom doesn't know this private-ish tag), so use add_new() to avoid
-    # "Camel case attribute" warnings.
-    attr_item.add_new((0x0400, 0x0566), "PN", modifying_operator or "DIMSE")
+    # (0400,0566) ModifyingOperator is NOT a standard attribute: the Attribute
+    # Modification macro's "who" is (0400,0562) DateTime, (0400,0563) Modifying
+    # System and (0400,0564) Source of Previous Values (PS3.3 C.12.1.1.9.1),
+    # and (0400,0566) is absent from the PS3.6 registry (verified against the
+    # installed pydicom 3.0.2 dictionary). Group 0400 is even, so it cannot
+    # carry a private element either (PS3.5 7.8.1). Writing it produced a tag
+    # no reader can resolve, so the operator travels in ModifyingSystem above.
 
     # -- ModifiedAttributesSequence (0400,0550)  -  WHAT was changed --
     # Type 1. Single Item containing the modified tag with its OLD value.
     # Preserve VR from original element, fallback to LO (Long String).
     vr = ds[tag].VR if tag in ds else "LO"
     mod_attr = Dataset()
-    mod_attr[tag] = DataElement(tag, vr, old_value or "")
+    # PS3.3 C.12.1.1.9.1: the item holds the PREVIOUS value. `old_value or ""`
+    # replaced every falsy previous value - 0, 0.0, False - with an empty
+    # string, so an audit entry for a changed numeric attribute recorded "no
+    # previous value" instead of the zero it really held. Only None (no value
+    # at all) becomes empty.
+    mod_attr[tag] = DataElement(
+        tag, vr, "" if old_value is None else old_value
+    )
     mod_seq = Sequence()
     mod_seq.append(mod_attr)
     attr_item.ModifiedAttributesSequence = mod_seq
@@ -178,13 +188,14 @@ def sanitize_dataset(
     # PatientID (0010,0020)  -  Type 2
     pid = ds.get((0x0010, 0x0020))
     if not pid or not pid.value:
-        # Two values with different jobs: the log tuple needs a readable
-        # placeholder, while the audit entry records what the attribute
-        # ACTUALLY held - the empty string for an absent or empty Type 2 field
-        # (PS3.3 C.2.2). Recording "(empty)" in the Modified Attributes
-        # Sequence would state a value the attribute never had.
+        # Two consumers with different jobs: the audit entry records what the
+        # attribute ACTUALLY held - the empty string for an absent or empty
+        # Type 2 field (PS3.3 C.2.2) - so the tuple carries `old`, never a
+        # placeholder. The "(empty)" substitution belongs to the LOG line in
+        # cstore.py, which needs a readable placeholder the audit must not
+        # record. Recording "(empty)" in the Modified Attributes Sequence
+        # would state a value the attribute never had.
         old = str(pid.value) if (pid and pid.value) else ""
-        logged = old or "(empty)"
         if fix_patient_id:
             if study_uid:
                 new_id = generate_patient_id_from_study(study_uid, id_prefix)
@@ -195,7 +206,7 @@ def sanitize_dataset(
                 record_modification(
                     ds, (0x0010, 0x0020), old, modifying_system=modifying_system
                 )
-            modifications.append(((0x0010, 0x0020), logged, new_id))
+            modifications.append(((0x0010, 0x0020), old, new_id))
         else:
             raise ValueError("PatientID is empty and fix_patient_id is disabled")
 
@@ -203,7 +214,6 @@ def sanitize_dataset(
     pname = ds.get((0x0010, 0x0010))
     if not pname or not pname.value:
         old = str(pname.value) if (pname and pname.value) else ""
-        logged = old or "(empty)"
         if fix_patient_name:
             if study_uid:
                 new_name = generate_patient_name_from_study(study_uid, name_prefix)
@@ -214,7 +224,7 @@ def sanitize_dataset(
                 record_modification(
                     ds, (0x0010, 0x0010), old, modifying_system=modifying_system
                 )
-            modifications.append(((0x0010, 0x0010), logged, new_name))
+            modifications.append(((0x0010, 0x0010), old, new_name))
         else:
             raise ValueError("PatientName is empty and fix_patient_name is disabled")
 

@@ -320,20 +320,28 @@ pub fn search(
 
     // The response bound: a client `limit` is CLAMPED to `mwl_max_responses`
     // (the hard ceiling), and an absent `limit` takes `mwl_default_limit`
-    // (0 = unlimited), which the ceiling then clamps as well.
+    // (0 = unlimited, i.e. the ceiling), which the ceiling then clamps as well.
     //
     // `limit=0` asks for no results, not for no bound. Reading it as
     // "unlimited" inverted the request: a client that wanted an empty answer
     // got the LARGEST answer the server would ever send. The ceiling is the
     // zero the request already asked for, so it is also the clamp.
+    //
+    // The default path must ALWAYS produce `Some`, never `None`: `None` reaches
+    // the writer as "unbounded", which skips `mwl_max_responses` for every
+    // client that simply omits `limit` - the common case - and turns the DoS
+    // bound into dead config. `mwl_max_responses` is range-checked to 1..=10000
+    // at load (`[workflow]` refusal test), so it is never 0 and `min` can only
+    // narrow: no client limit is ever widened past the ceiling.
     let ceiling = state.config.workflow.mwl_max_responses;
-    let effective_limit = match query.limit {
-        Some(l) => Some(l.min(ceiling)),
-        None => match state.config.workflow.mwl_default_limit {
-            0 => None,
-            d => Some(d.min(ceiling)),
-        },
+    let default_limit = match state.config.workflow.mwl_default_limit {
+        0 => ceiling,
+        d => d.min(ceiling),
     };
+    let effective_limit = Some(match query.limit {
+        Some(l) => l.min(ceiling),
+        None => default_limit,
+    });
     query.limit = effective_limit;
 
     let store = workflow_store(state);

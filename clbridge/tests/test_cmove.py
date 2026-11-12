@@ -45,9 +45,51 @@ class TestParseCMoveRq:
         ds.StudyInstanceUID = "1.2.3.4.5.6"
         ds.MoveDestination = "DEST_AET"
         event = FakeEvent(ds)
-        study_uids, dest = _parse_c_move_rq(event)
+        study_uids, dest, level, series_uid, sop_uid = _parse_c_move_rq(event)
         assert study_uids == ["1.2.3.4.5.6"]
         assert dest == "DEST_AET"
+        # Absent QueryRetrieveLevel means STUDY scope (the historical meaning).
+        assert level == ""
+        assert series_uid == ""
+        assert sop_uid == ""
+
+    def test_series_level_carries_the_series_scope(self):
+        """PS3.4 C.4.2.1.2: a SERIES-level C-MOVE names SeriesInstanceUID."""
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.StudyInstanceUID = "1.2.3"
+        ds.SeriesInstanceUID = "1.2.3.4"
+        ds.MoveDestination = "DEST_AET"
+        _study, _dest, level, series_uid, sop_uid = _parse_c_move_rq(FakeEvent(ds))
+        assert (level, series_uid, sop_uid) == ("SERIES", "1.2.3.4", "")
+
+    def test_image_level_carries_series_and_instance(self):
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "IMAGE"
+        ds.StudyInstanceUID = "1.2.3"
+        ds.SeriesInstanceUID = "1.2.3.4"
+        ds.SOPInstanceUID = "1.2.3.4.5"
+        ds.MoveDestination = "DEST_AET"
+        _study, _dest, level, series_uid, sop_uid = _parse_c_move_rq(FakeEvent(ds))
+        assert (level, series_uid, sop_uid) == ("IMAGE", "1.2.3.4", "1.2.3.4.5")
+
+    def test_series_level_without_a_series_uid_is_refused(self):
+        """Refuse rather than fall back to whole-study retrieval: the SCU
+        would receive data it never asked for."""
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.StudyInstanceUID = "1.2.3"
+        ds.MoveDestination = "DEST_AET"
+        with pytest.raises(ValueError, match="SeriesInstanceUID"):
+            _parse_c_move_rq(FakeEvent(ds))
+
+    def test_an_unknown_level_is_refused(self):
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "PATIENT"
+        ds.StudyInstanceUID = "1.2.3"
+        ds.MoveDestination = "DEST_AET"
+        with pytest.raises(ValueError, match="QueryRetrieveLevel"):
+            _parse_c_move_rq(FakeEvent(ds))
 
 
 # ---------------------------------------------------------------------------

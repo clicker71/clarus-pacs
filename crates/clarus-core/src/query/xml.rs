@@ -33,6 +33,25 @@ struct Sink<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamOverflow;
 
+/// A DA/TM stored value that has no fixed-width rendering.
+///
+/// DA is exactly 8 digits `YYYYMMDD` and TM exactly 6 `HHMMSS` (PS3.5 6.2),
+/// so a wider integer describes no representable date or time. This is a
+/// malformed stored attribute, not a buffer problem - hence its own type
+/// rather than a reuse of [`StreamOverflow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnrepresentableDate;
+
+/// The writer stack returns [`StreamOverflow`] for the whole document, so a
+/// malformed DA/TM travels through it: the document is refused as a whole,
+/// which is the only outcome that neither drops the element silently nor
+/// emits a wrong one.
+impl From<UnrepresentableDate> for StreamOverflow {
+    fn from(_: UnrepresentableDate) -> Self {
+        StreamOverflow
+    }
+}
+
 impl<'a> Sink<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
         Sink { buf, len: 0 }
@@ -82,6 +101,57 @@ fn push_dec(out: &mut Sink<'_>, mut v: u64) -> Result<(), StreamOverflow> {
         }
     }
     out.extend(&buf[i..])
+}
+
+/// Write a `YYYYMMDD` integer as zero-padded 8 decimal ASCII digits into
+/// `buf` (allocation-free).
+///
+/// Values wider than 8 digits have no DA rendering: the quotient loop below
+/// stops as soon as the remaining value reaches zero, so an over-wide input
+/// laid down its LOW digits and produced a different, plausible-looking date.
+fn push_date8(buf: &mut [u8; 8], v: u64) -> Result<(), UnrepresentableDate> {
+    if v > 99_999_999 {
+        return Err(UnrepresentableDate);
+    }
+    for b in buf.iter_mut() {
+        *b = b'0';
+    }
+    let mut rem = v;
+    let mut i = 8;
+    while i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (rem % 10) as u8;
+        rem /= 10;
+        if rem == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Write a `HHMMSS` integer as zero-padded 6 decimal ASCII digits into
+/// `buf` (allocation-free).
+///
+/// Same over-wide rule as [`push_date8`]: 6 digits is the whole TM width
+/// (PS3.5 6.2), and truncating to the low digits would silently rename a time.
+fn push_hms6(buf: &mut [u8; 6], v: u64) -> Result<(), UnrepresentableDate> {
+    if v > 999_999 {
+        return Err(UnrepresentableDate);
+    }
+    for b in buf.iter_mut() {
+        *b = b'0';
+    }
+    let mut rem = v;
+    let mut i = 6;
+    while i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (rem % 10) as u8;
+        rem /= 10;
+        if rem == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 // -- XML escaping ----------------------------------------------------------
@@ -195,12 +265,40 @@ fn write_person_name(out: &mut Sink<'_>, raw: &str) -> Result<(), StreamOverflow
 /// `UInt` as a bare number, `Bytes`/`Array` are omitted (not part of the
 /// study/series/instance QIDO subset). PN-typed attributes use `PersonName`
 /// decomposition; all other VRs use a `<Value number="N">` element.
+///
+/// Fallible beyond a full buffer: a DA/TM `UInt` that exceeds its fixed width
+/// yields [`UnrepresentableDate`], and the element is NOT emitted - a partial
+/// `<DicomAttribute>` would be malformed XML.
 fn write_attr_elem(
     out: &mut Sink<'_>,
     tag: u32,
     value: &AttrValue,
     vr: &str,
 ) -> Result<(), StreamOverflow> {
+    // Render the fixed-width DA/TM body BEFORE opening the element so a value
+    // that has no rendering fails with nothing written.
+    let fixed: Option<([u8; 8], usize)> = match (value, vr) {
+        (AttrValue::UInt(u), "DA") => {
+            let mut dbuf = [0u8; 8];
+            match push_date8(&mut dbuf, *u) {
+                Ok(()) => Some((dbuf, 8)),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        (AttrValue::UInt(u), "TM") => {
+            let mut tbuf = [0u8; 6];
+            match push_hms6(&mut tbuf, *u) {
+                Ok(()) => {
+                    let mut fixed = [0u8; 8];
+                    fixed[..6].copy_from_slice(&tbuf);
+                    Some((fixed, 6))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        _ => None,
+    };
+
     out.extend(b"<DicomAttribute tag=\"")?;
     push_hex8(out, tag)?;
     out.extend(b"\" vr=\"")?;
@@ -219,7 +317,15 @@ fn write_attr_elem(
         }
         AttrValue::UInt(u) => {
             out.extend(b"<Value number=\"1\">")?;
-            push_dec(out, *u)?;
+            // DA/TM are canonical fixed-width strings on the wire (DA 8-digit
+            // YYYYMMDD, TM 6-digit HHMMSS, PS3.5 6.2). A bare decimal render
+            // drops leading zeros (a UInt-stored `083000` would emit `83000`),
+            // which breaks the fixed-width contract the JSON writer honours.
+            if let Some((buf, len)) = fixed {
+                out.extend(&buf[..len])?;
+            } else {
+                push_dec(out, *u)?;
+            }
             out.extend(b"</Value>")?;
         }
         // Bytes (encapsulated) and Array (multi-valued) are not in the
@@ -858,6 +964,29 @@ mod tests {
     }
 
     #[test]
+    fn a_da_or_tm_uint_renders_zero_padded() {
+        // DA/TM are fixed-width on the wire; a UInt-stored value without
+        // zero-padding would drop leading zeros (PS3.5 6.2).
+        let mut buf = [0u8; 256];
+        let n = {
+            let mut out = Sink::new(&mut buf);
+            write_attr_elem(&mut out, 0x0008_0020, &AttrValue::UInt(60802), "DA").expect("fits");
+            out.len
+        };
+        let got = String::from_utf8(buf[..n].to_vec()).unwrap();
+        assert!(got.contains("<Value number=\"1\">00060802</Value>"));
+
+        let mut buf = [0u8; 256];
+        let n = {
+            let mut out = Sink::new(&mut buf);
+            write_attr_elem(&mut out, 0x0008_0030, &AttrValue::UInt(83000), "TM").expect("fits");
+            out.len
+        };
+        let got = String::from_utf8(buf[..n].to_vec()).unwrap();
+        assert!(got.contains("<Value number=\"1\">083000</Value>"));
+    }
+
+    #[test]
     fn study_attrs_emit_derived_counts_and_modalities() {
         let mut s = study(vec![(0x0008_0020, AttrValue::UInt(20260802))]);
         s.series_count = 2;
@@ -883,6 +1012,62 @@ mod tests {
         let pos_1206 = got.find("tag=\"00201206\"").expect("00201206 present");
         let pos_1208 = got.find("tag=\"00201208\"").expect("00201208 present");
         assert!(pos_m < pos_1206 && pos_1206 < pos_1208);
+    }
+
+    /// A DA/TM value that does not fit the fixed width has no rendering at
+    /// all: the quotient loop stops when the remaining value reaches zero, so
+    /// an over-wide input laid down its LOW digits (`100_000_000` became
+    /// `"00000000"`) - a DIFFERENT, plausible date. Refusing is the only
+    /// honest answer.
+    #[test]
+    fn a_date_at_the_width_still_renders_fixed_width() {
+        let mut b = [0u8; 8];
+        assert!(push_date8(&mut b, 99_999_999).is_ok());
+        assert_eq!(&b, b"99999999");
+        // The leading-zero behaviour the function exists for survives.
+        let mut b = [0u8; 8];
+        assert!(push_date8(&mut b, 83_000).is_ok());
+        assert_eq!(&b, b"00083000");
+        let mut b = [0u8; 8];
+        assert!(push_date8(&mut b, 463_000).is_ok());
+        assert_eq!(&b, b"00463000");
+    }
+
+    #[test]
+    fn a_date_above_the_width_is_refused() {
+        let mut b = [0u8; 8];
+        assert_eq!(push_date8(&mut b, 100_000_000), Err(UnrepresentableDate));
+        // Nothing is written on refusal; the caller must not emit the buffer.
+        assert_eq!(&b, b"\0\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn a_time_at_the_width_still_renders_fixed_width() {
+        let mut b = [0u8; 6];
+        assert!(push_hms6(&mut b, 235_959).is_ok());
+        assert_eq!(&b, b"235959");
+        let mut b = [0u8; 6];
+        assert!(push_hms6(&mut b, 83_000).is_ok());
+        assert_eq!(&b, b"083000");
+    }
+
+    #[test]
+    fn a_time_above_the_width_is_refused() {
+        let mut b = [0u8; 6];
+        assert_eq!(push_hms6(&mut b, 1_000_000), Err(UnrepresentableDate));
+        assert_eq!(&b, b"\0\0\0\0\0\0");
+    }
+
+    /// The caller must not emit a DA it could not render: a silent skip is
+    /// the same lie as a truncated render.
+    #[test]
+    fn an_unrenderable_date_fails_the_study_write() {
+        let s = study(vec![(0x0008_0020, AttrValue::UInt(100_000_000))]);
+        let mut buf = [0u8; 1024];
+        assert!(
+            write_study_attrs(&mut buf, &s, None, None).is_err(),
+            "a DA outside the YYYYMMDD width must fail the write, not emit digits"
+        );
     }
 
     #[test]

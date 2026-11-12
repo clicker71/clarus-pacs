@@ -19,7 +19,7 @@ import time
 
 from pydicom import Dataset
 from pydicom.uid import ImplicitVRLittleEndian
-from pynetdicom import AE
+from pynetdicom import AE, build_role
 from pynetdicom.sop_class import StorageCommitmentPushModel
 
 from clean_code.handlers.cmove import _release_or_abort
@@ -43,34 +43,29 @@ EVENT_FAILURE = 2
 # report: it does not recognise the affected instance as the commitment one.
 WELL_KNOWN_SOP_INSTANCE_UID = "1.2.840.10008.1.20.1.1"
 
-# The pynetdicom level is saved, raised and restored around `associate()`.
-# That triple is not atomic, and two concurrent reports would interleave it:
-# the second would save the ALREADY silenced level and restore that, leaving
-# the library silenced for the life of the process.
-_LEVEL_LOCK = threading.Lock()
+# Expected chatter from pynetdicom while a Storage Commitment association is
+# negotiated: "No accepted presentation contexts" is the normal answer from an
+# SCP that does not implement the push model, and it must not spam the journal.
+#
+# It is suppressed with a per-THREAD filter on the library logger, not by
+# moving the logger's level: the level is one object shared by the whole
+# process, so silencing it also dropped every pynetdicom record of the C-STORE
+# and C-MOVE workers for as long as an association took (seconds, times the
+# retries), for no reason of theirs. A filter sees only the thread that
+# installed it, so the level never has to change and no lock is needed.
+_PN_QUIET = threading.local()
+
+
+def _pn_quiet_filter(record):
+    """Drop pynetdicom records from a thread that asked for silence."""
+    return not getattr(_PN_QUIET, "on", False)
 
 # PS3.4 J.3.2 / J.3.3: a Storage Commitment transaction needs the requestor to
 # receive the N-EVENT-REPORT the SCP pushes back, so the requestor must hold
 # BOTH roles. PS3.7 D.3.3.4 spells the requestor's proposal as an SCP/SCU Role
-# Selection item; pynetdicom exposes it per presentation context.
-
-
-def _request_scp_role(ae, abstract_syntax):
-    """Propose the SCU+SCP role for `abstract_syntax` on this association.
-
-    Returns False when the installed pynetdicom cannot express the proposal,
-    so the caller can report the resulting default-role association honestly
-    instead of assuming the report can be pushed.
-    """
-    try:
-        ae.requested_contexts[-1].requested_scp_role = True
-        return True
-    except (AttributeError, IndexError):
-        logging.debug(
-            "[N-EVENT] pynetdicom cannot propose the SCP role for %s",
-            abstract_syntax,
-        )
-        return False
+# Selection item, which is a SEPARATE negotiation primitive - it is not a
+# property of a presentation context (`PresentationContext` only carries the
+# acceptor-side scp_role/scu_role), so it must travel in `ext_neg`.
 
 
 def send_n_event_report(
@@ -115,34 +110,65 @@ def send_n_event_report(
             time.sleep(retry_delay)
 
         ae = AE(ae_title=bridge_ae_title)
+        # `connection_timeout` is the ONLY setting that bounds the raw TCP
+        # connect: pynetdicom's transport does
+        # `socket.settimeout(self.assoc.connection_timeout)` immediately
+        # before `socket.connect()`, and the AE default is None - which means
+        # blocks for the OS SYN timeout (minutes) behind a black-hole peer.
+        # `network_timeout` and `acse_timeout` cover DIMSE and ACSE only, so
+        # setting them alone left the connect unbounded (verified against the
+        # installed pynetdicom, transport.AssociationSocket.connect).
+        ae.connection_timeout = 5
         ae.network_timeout = 5
         ae.acse_timeout = 3
         ae.dimse_timeout = 30
         # PS3.7 D.3.3.4: without a role item the requestor is SCU and the
         # acceptor is SCP, so the SCP could never send the N-EVENT-REPORT that
         # carries the Storage Commitment Result (PS3.4 J.3.3.1). The bridge
-        # proposes the SCP role explicitly; a peer that declines it leaves the
-        # default roles, which the response check below reports.
+        # proposes BOTH roles; a peer that declines leaves the default roles,
+        # which the response check below reports.
         ae.add_requested_context(StorageCommitmentPushModel, ImplicitVRLittleEndian)
-        _request_scp_role(ae, StorageCommitmentPushModel)
+        sc_role = build_role(
+            StorageCommitmentPushModel, scu_role=True, scp_role=True
+        )
 
         # "No accepted presentation contexts" is normal for SCPs that
-        # do not implement the push model. Raise the pynetdicom level around
-        # associate() so that expected ERROR does not spam the journal.
+        # do not implement the push model. Quiet ONLY this thread's pynetdicom
+        # records around associate() so that expected ERROR does not spam the
+        # journal, without touching the level other threads are logging at.
         _pn_logger = logging.getLogger("pynetdicom")
-        with _LEVEL_LOCK:
-            _prev = _pn_logger.level
-            _pn_logger.setLevel(logging.CRITICAL + 1)
+        if _pn_quiet_filter not in _pn_logger.filters:
+            # Added once per process; the filter is inert outside a silenced
+            # thread, so it never filters anything another thread logs.
+            _pn_logger.addFilter(_pn_quiet_filter)
+        try:
+            _PN_QUIET.on = True
             try:
-                assoc = ae.associate(host, port, ae_title=calling_ae)
+                assoc = ae.associate(
+                    host, port, ae_title=calling_ae, ext_neg=[sc_role]
+                )
                 try:
-                    associations_total.labels(role="to", ae=ae_label(calling_ae)).inc()
+                    associations_total.labels(
+                        role="to", ae=ae_label(calling_ae)
+                    ).inc()
                 except Exception:
                     pass
             finally:
-                _pn_logger.setLevel(_prev)
+                _PN_QUIET.on = False
+        except Exception as e:
+            # A setup error (AE/role construction, a resolver failure, a
+            # socket error escaping transport) is a TRANSIENT failure like any
+            # other: this attempt has nothing to deliver, so record it and let
+            # the loop's backoff try again. Letting it escape turned a
+            # recoverable peer problem into an unreported commitment - the
+            # verdict was never sent and nothing retried it (PS3.7 D.3.3.4:
+            # the association is the transport, not the outcome).
+            assoc = None
+            last_err = f"association setup failed: {e}"
+            logging.warning("[N-EVENT] %s (tx=%s)", last_err, tx_uid)
+            continue
 
-        if not assoc.is_established:
+        if assoc is None or not assoc.is_established:
             last_err = (
                 f"SCP {calling_ae}@{host}:{port} unavailable (attempt {attempt + 1})"
             )
@@ -150,19 +176,35 @@ def send_n_event_report(
             _release_or_abort(assoc, timeout=2.0)
             continue
 
+        # The context alone does not prove the role: an SCP that accepts the
+        # abstract syntax but DECLINES the role item leaves the requestor as
+        # plain SCU (PS3.7 D.3.3.4), and the report would then never be
+        # accepted.
+        #
+        # `as_scp` is the ACCEPTOR's answer, not ours (pynetdicom
+        # PresentationContext.as_scp: "True if the association Acceptor can
+        # act as SCP for the current context"). The bridge is the N-EVENT
+        # requestor, i.e. the SCU of that service, so what it needs is a peer
+        # that will act as SCP - which is exactly `as_scp`. Testing `as_scu`
+        # here would check the wrong side of the association and reject a
+        # correct peer.
         sc_accepted = any(
-            str(ctx.abstract_syntax) == StorageCommitmentPushModel
+            str(ctx.abstract_syntax) == StorageCommitmentPushModel and ctx.as_scp
             for ctx in assoc.accepted_contexts
         )
         if not sc_accepted:
-            last_err = f"SCP {calling_ae} does not support push model"
+            last_err = f"SCP {calling_ae} did not grant the SCP role for storage commitment"
             logging.warning("[N-EVENT] %s", last_err)
             _release_or_abort(assoc, timeout=2.0)
             continue
 
         try:
+            # EventTypeID (0000,1002) is a COMMAND-SET element (PS3.7 Table
+            # 9.1-1); it travels as the separate `event_type` argument to
+            # send_n_event_report below, not inside the Event Information data
+            # set. Embedding a group-0000 element in the data set makes a
+            # strict SCP reject the report.
             ds = Dataset()
-            ds.EventTypeID = event_type
             ds.TransactionUID = tx_uid
 
             if success_sops:
@@ -190,7 +232,7 @@ def send_n_event_report(
             # constant, not the Transaction UID (which is in the dataset).
             status, _resp = assoc.send_n_event_report(
                 ds,
-                ds.EventTypeID,
+                event_type,
                 StorageCommitmentPushModel,
                 WELL_KNOWN_SOP_INSTANCE_UID,
             )

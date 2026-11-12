@@ -158,13 +158,13 @@ preload_days = 1
     # Everything the fixture creates is inside the guard below: a server that
     # never becomes ready raises out of _wait_http, and without the guard the
     # child process and the temp directory survive the failed start.
-    _wait_http(base, proc, log_path)
-
+    #
     # In-process bridge AE serving the MWL model, translating to the live
     # Clarus HTTP server at `base`. `_handle_mwl` takes the full DICOMweb
     # base URL (scheme + host + /dicomweb), not a host/port pair - see
     # clean_code/handlers/cfind.py:360 and the production call at cfind.py:101.
     dicomweb_url = f"{base}/dicomweb"
+    ae = None
 
     def _on_cfind(event):
         yield from _handle_mwl(
@@ -174,11 +174,12 @@ preload_days = 1
             max_responses=50,
         )
 
-    ae = AE()
-    ae.add_supported_context(ModalityWorklistInformationFind)
-    handlers = [(evt.EVT_C_FIND, _on_cfind)]
-
     try:
+        _wait_http(base, proc, log_path)
+
+        ae = AE()
+        ae.add_supported_context(ModalityWorklistInformationFind)
+        handlers = [(evt.EVT_C_FIND, _on_cfind)]
         ae.start_server(("127.0.0.1", dsp_port), block=False, evt_handlers=handlers)
 
         # Give the AE time to bind.
@@ -191,10 +192,13 @@ preload_days = 1
 
         yield {"http": base, "dsp": ("127.0.0.1", dsp_port), "tmp": tmp}
     finally:
-        try:
-            ae.shutdown()
-        except Exception:
-            pass
+        # `ae` is created inside the guard, so a failed _wait_http leaves it
+        # None - the teardown must still stop the server and drop the temp dir.
+        if ae is not None:
+            try:
+                ae.shutdown()
+            except Exception:
+                pass
         proc.terminate()
         try:
             proc.wait(timeout=10)
@@ -298,11 +302,21 @@ def test_mwl_cfind_through_bridge_returns_scheduled(stack):
     try:
         responses = assoc.send_c_find(ds, ModalityWorklistInformationFind)
         matches = []
+        statuses = []
         for status, identifier in responses:
+            statuses.append(0x0000 if status is None else int(status.Status))
             if status and identifier:
                 matches.append(identifier)
 
         assert matches, "MWL SCU received no workitem matches"
+        # PS3.4 Table C.4.1-1: the answer ENDS with a terminal status, and
+        # "Success" is the only one that means the list was complete. A bridge
+        # that answered a valid Pending and then failed (0xA700, 0xC000) used
+        # to pass every assertion below, because the final status was ignored.
+        assert statuses, "the SCU received no C-FIND response at all"
+        assert statuses[-1] == 0x0000, (
+            f"{statuses[:5]}..., terminal {statuses[-1]:#06x})"
+        )
         # The nested station key IS the filter: the bridge reads it out of
         # (0040,0100) and sends ?ScheduledStationNameCodeSequence.CodeValue=
         # STATION01, so the OTHERSTATION workitem must be filtered out by the

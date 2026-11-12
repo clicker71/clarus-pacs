@@ -94,26 +94,37 @@ class TestHandleQidoSearch:
         assert hasattr(gen, "__iter__")
 
     def test_handle_qido_search_with_no_results(self):
-        """Error handling when QIDO connection fails."""
+        """An answer with no matches completes with 0x0000 and no rows.
+
+        The test used a real 127.0.0.1:8024 URL and then accepted "0x0000,
+        0xB000 or 0xC000" - three different meanings - because what it saw
+        depended on whether a live server happened to be listening. That is
+        not a test of the no-results path. The origin is now stubbed to answer
+        an EMPTY result set, which is the case the name promises: the handler
+        must report a complete (0x0000) answer, not a failure.
+        """
+        from unittest.mock import patch
+
         ds = Dataset()
         ds.PatientName = "NonExistent*"
         event = FakeEvent(ds)
-        gen = _handle_qido_search(
-            event,
-            "http://127.0.0.1:8024/dicomweb",
-            False,
-            50,
-            30,
-            {"PatientName": "*"},
-            "study",
+        with patch("clean_code.handlers.cfind._qido_request", return_value=[]):
+            results = list(
+                _handle_qido_search(
+                    event,
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                    {"PatientName": "*"},
+                    "study",
+                )
+            )
+        statuses = [status for status, _ in results]
+        assert statuses == [0x0000], (
+            "an empty result set is a COMPLETE answer, not a failure: "
+            f"{statuses}"
         )
-        # First yield should be error status
-        results = list(gen)
-        assert len(results) >= 1
-        status, _ = results[0]
-        # Should be an error status (0xC000 on connection failure,
-        # or 0x0000/0xB000 on unreachable server depending on QIDO behavior)
-        assert status in (0x0000, 0xB000, 0xC000)
 
 
 class TestQidoLimitAsksForOneExtra:
@@ -256,3 +267,323 @@ class TestSeriesSearchKeepsTheStudyCap:
         assert statuses[-1] == 0x0000, (
             "a full walk of a short study list is a complete answer: " f"{statuses}"
         )
+
+
+class TestPatientRootLevelRouting:
+    """Patient Root honours QueryRetrieveLevel: SERIES routes to the two-step
+    series search (rows carry SeriesInstanceUID), PATIENT is refused 0xA900
+    rather than relabelling study rows and duplicating a patient."""
+
+    def test_series_level_returns_rows_with_a_series_instance_uid(self):
+        from unittest.mock import patch
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.Modality = "CT"
+
+        study_rows = [{"0020000D": {"Value": ["1.2.3"]}}]
+        series_rows = [
+            {
+                "0020000E": {"Value": ["1.2.3.4"]},
+                "00080060": {"Value": ["CT"]},
+            }
+        ]
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            if url.endswith("/studies"):
+                return study_rows
+            if "/series" in url:
+                return series_rows
+            return []
+
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_patient_root(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
+            )
+
+        rows = [row for status, row in results if status == 0xFF00]
+        assert rows, "a SERIES query on Patient Root must return series rows"
+        for row in rows:
+            assert "SeriesInstanceUID" in row, (
+                f"a series row must carry SeriesInstanceUID: {row}"
+            )
+
+    def test_patient_level_is_refused(self):
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "PATIENT"
+        results = list(
+            _handle_patient_root(
+                FakeEvent(ds),
+                "http://127.0.0.1:8024/dicomweb",
+                False,
+                50,
+                30,
+            )
+        )
+        assert results == [(0xA900, None)], (
+            "PATIENT level must be refused rather than duplicating a patient "
+            f"once per study: {results}"
+        )
+
+
+class TestSeriesWalkHonoursCancelAndShutdown:
+    """A broad SERIES walk can block per study; C-CANCEL and shutdown must
+    stop it mid-walk with the standard codes and no further QIDO request."""
+
+    def _study_rows(self):
+        return [
+            {"0020000D": {"Value": ["1.2.3"]}},
+            {"0020000D": {"Value": ["1.2.4"]}},
+        ]
+
+    def test_cancel_between_studies_yields_fe00(self):
+        from unittest.mock import patch
+
+        from clean_code.handlers.cfind import _handle_series_search
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.Modality = "CT"
+        event = FakeEvent(ds)
+        series_requests = []
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            if url.endswith("/studies"):
+                return self._study_rows()
+            if "/series" in url:
+                series_requests.append(url)
+                # The SCU cancels after the first study's series were asked.
+                event.is_cancelled = True
+                return [{"0020000E": {"Value": ["1.2.3.4"]}}]
+            return []
+
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_series_search(
+                    event,
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
+            )
+
+        statuses = [status for status, _ in results]
+        assert 0xFE00 in statuses, f"a cancel must yield 0xFE00: {statuses}"
+        assert len(series_requests) == 1, (
+            "no further QIDO request after the cancel: " f"{series_requests}"
+        )
+
+    def test_shutdown_before_the_first_study_yields_c000(self):
+        from unittest.mock import patch
+
+        from clean_code.handlers.cfind import _handle_series_search
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.Modality = "CT"
+        event = FakeEvent(ds)
+
+        class _Set:
+            def is_set(self):
+                return True
+
+        series_requests = []
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            if url.endswith("/studies"):
+                return self._study_rows()
+            series_requests.append(url)
+            return []
+
+        with patch(
+            "clean_code.handlers.cfind._shutdown_requested", _Set()
+        ), patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_series_search(
+                    event,
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
+            )
+
+        statuses = [status for status, _ in results]
+        assert 0xC000 in statuses, f"a shutdown must yield 0xC000: {statuses}"
+        assert series_requests == [], (
+            "no series QIDO request must go out during shutdown: "
+            f"{series_requests}"
+        )
+
+
+class TestHttpStatusClassMapping:
+    """A 5xx from the server or a proxy is Out of Resources (0xA700,
+    retryable); a 4xx is this bridge's own bad query (0xC000, permanent).
+    PS3.7 status classes, one test per QIDO path per class."""
+
+    @staticmethod
+    def _status_error(status_code):
+        import httpx
+
+        request = httpx.Request("GET", "http://qido.test")
+        response = httpx.Response(status_code, request=request)
+        return httpx.HTTPStatusError(
+            f"{status_code} status", request=request, response=response
+        )
+
+    def test_study_503_is_out_of_resources(self):
+        from unittest.mock import patch
+
+        ds = Dataset()
+        ds.PatientName = "*"
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            raise self._status_error(503)
+
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_qido_search(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                    {"PatientName": "*"},
+                    "study",
+                )
+            )
+        assert results == [(0xA700, None)], f"a 503 must be retryable: {results}"
+
+    def test_study_400_is_cannot_understand(self):
+        from unittest.mock import patch
+
+        ds = Dataset()
+        ds.PatientName = "*"
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            raise self._status_error(400)
+
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_qido_search(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                    {"PatientName": "*"},
+                    "study",
+                )
+            )
+        assert results == [(0xC000, None)], f"a 400 is our bad query: {results}"
+
+    def test_series_studies_step_503_is_out_of_resources(self):
+        from unittest.mock import patch
+
+        from clean_code.handlers.cfind import _handle_series_search
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.Modality = "CT"
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            if url.endswith("/studies"):
+                raise self._status_error(503)
+            return []
+
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_series_search(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
+            )
+        assert results == [(0xA700, None)], f"a 503 must be retryable: {results}"
+
+    def test_series_studies_step_400_is_cannot_understand(self):
+        from unittest.mock import patch
+
+        from clean_code.handlers.cfind import _handle_series_search
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.Modality = "CT"
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            if url.endswith("/studies"):
+                raise self._status_error(400)
+            return []
+
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_series_search(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
+            )
+        assert results == [(0xC000, None)], f"a 400 is our bad query: {results}"
+
+    def test_patient_root_series_step_503_is_out_of_resources(self):
+        from unittest.mock import patch
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.Modality = "CT"
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            if url.endswith("/studies"):
+                return [{"0020000D": {"Value": ["1.2.3"]}}]
+            if "/series" in url:
+                raise self._status_error(503)
+            return []
+
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_patient_root(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
+            )
+        assert results == [(0xA700, None)], f"a 503 must be retryable: {results}"
+
+    def test_patient_root_series_step_400_is_cannot_understand(self):
+        from unittest.mock import patch
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "SERIES"
+        ds.Modality = "CT"
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            if url.endswith("/studies"):
+                return [{"0020000D": {"Value": ["1.2.3"]}}]
+            if "/series" in url:
+                raise self._status_error(400)
+            return []
+
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_patient_root(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
+            )
+        assert results == [(0xC000, None)], f"a 400 is our bad query: {results}"

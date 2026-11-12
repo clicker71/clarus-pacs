@@ -332,6 +332,16 @@ pub struct ManifestBatch {
     /// The key is the UID, so a study flushed twice within one request (its
     /// instances straddle the guard) still yields ONE entry.
     flushed_studies: std::collections::HashMap<String, FlushedStudy>,
+    /// SOP Instance UIDs whose study manifest a mid-request flush could not
+    /// write.
+    ///
+    /// They must survive [`Self::clear`] for the same reason as
+    /// `flushed_studies`: the failed instance was already counted as accepted
+    /// when it entered the batch, and the response is built from the
+    /// accumulator AFTER the last flush. Reporting it here lets the caller move
+    /// it into FailedSOPSequence (reason 272) instead of claiming a store the
+    /// archive cannot serve back.
+    manifest_failed: Vec<String>,
 }
 
 /// The study-level facts kept for a study a mid-request flush already wrote.
@@ -356,6 +366,14 @@ impl ManifestBatch {
         self.studies.clear();
         self.instances = 0;
         self.bytes = 0;
+    }
+
+    /// Take the UIDs of instances a mid-request flush could not commit.
+    ///
+    /// Draining rather than borrowing keeps a second flush from reporting the
+    /// same instance twice - the caller records each one exactly once.
+    pub fn take_manifest_failed(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.manifest_failed)
     }
 
     /// Study UIDs accepted into this request, flushed or still pending.
@@ -727,7 +745,10 @@ fn batch_add(
         // would have reached by flushing once at the end: the manifests are
         // committed AND synced here (the end-of-request sync would no longer
         // see them), and the studies stay listed for the follow-up work.
-        commit_manifests(state, batch);
+        // Instances the flush could not commit stay on the batch so the
+        // response reports them as failed.
+        let uncommitted = commit_manifests(state, batch);
+        batch.manifest_failed.extend(uncommitted);
         sync_batch_manifests(state, batch);
         carry_flushed_facts(batch);
         batch.clear();
@@ -777,11 +798,20 @@ fn batch_add(
 /// `write_study_manifest_full` (it re-reads + merges prior instances under the
 /// existing per-study coordinator lease, so parallel requests to the same
 /// study still converge). The RAM study index is refreshed once per study via
-/// `on_study_committed` after the single write. Manifest-write errors stay
-/// best-effort (shadow-tier degraded) exactly as before P1 - they never fail
-/// the accepted instances' response entries.
-pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) {
+/// Write one study manifest per study in the batch, returning the instance
+/// UIDs whose manifest could not be written.
+///
+/// The response is built FROM the returned list - a study whose manifest write
+/// failed is reported as `FailedSOPSequence` with reason 272 rather than
+/// silently kept as `Stored`. The instance bytes are in the CAS either way, but
+/// an instance no manifest names is not retrievable by any QIDO/WADO route, so
+/// telling the client "stored" would be a claim the archive cannot honour.
+///
+/// The shadow-tier scanner is NOT told about a study that failed: its index
+/// would then advertise instances no manifest backs.
+pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) -> Vec<String> {
     let manifest_dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
+    let mut failed: Vec<String> = Vec::new();
     for (study_uid, study) in &batch.studies {
         // Rebuild fresh attrs so `write_study_manifest_full` stamps the final
         // merged counts (RAM-only) after merging all accumulated series.
@@ -796,12 +826,20 @@ pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) {
             crate::clog_warn!(
                 error = %e,
                 study_uid = %study_uid,
-                "B-tree study manifest write failed (shadow tier degraded, client unaffected)"
+                "B-tree study manifest write failed: instances of this study are reported failed"
+            );
+            failed.extend(
+                study
+                    .series
+                    .iter()
+                    .flat_map(|series| series.instances.iter())
+                    .map(|instance| instance.sop_instance_uid.clone()),
             );
         } else {
             state.study_scanner.on_study_committed(study_uid, &attrs);
         }
     }
+    failed
 }
 
 /// Apply the rejection notes a committed batch carried.
@@ -1240,7 +1278,31 @@ fn ingest_tempfile(
     // actually truncated (the rare Weasis CRLF-framed part) do the written
     // bytes differ from the stored bytes, and we recompute over the truncated
     // file to keep digest == bytes. SHA-256 stays the manifest key.
-    let blake3 = if file_size != size {
+    // FR-001b: write the generated patient identity INTO the blob, before
+    // PixelData, and BEFORE the content hash and the insert decision. The
+    // order matters twice over: the CAS key must describe the bytes actually
+    // served, and a repeated upload of the SAME coerced file must hash to the
+    // same key it did the first time - if the splice ran after the decision,
+    // the second upload would be compared against a stored blob that carries
+    // the elements and be misfiled as an update.
+    //
+    // SKIPPED when the hidden-PHI sanitizer will run: that path excises the
+    // original (0400,0550)/(0400,0561) ranges BY OFFSET into the incoming
+    // bytes, so shifting them here would excise the wrong span. It splices
+    // instead, on the sanitized buffer, where the offsets are already resolved.
+    let will_sanitize = sanitize_hidden_phi(&meta, &coerce);
+    if !will_sanitize && embeddable_transfer_syntax(&meta) {
+        let patient_bytes = coerced_patient_elements(&coerce, &meta);
+        if !patient_bytes.is_empty() {
+            splice_patient_elements_in_file(temp_path, &patient_bytes, &meta, &sop_instance_uid)?;
+        }
+    }
+
+    // The caller's folded digest was computed over the bytes AS RECEIVED, so
+    // any splice or truncation invalidates it: re-hash the final file. The
+    // common case (a conformant, non-coerced instance) still reuses the folded
+    // digest and never re-reads the blob.
+    let blake3 = if file_size != size || !coerce.generated.is_empty() {
         blake3_of_file(temp_path).map_err(|e| {
             let _ = std::fs::remove_file(temp_path);
             stow_error_with_sop(
@@ -1253,6 +1315,9 @@ fn ingest_tempfile(
     } else {
         folded_blake3
     };
+    let file_size = std::fs::metadata(temp_path)
+        .map(|m| m.len())
+        .unwrap_or(file_size);
 
     // 2808 update-in-place: decide BEFORE any CAS materialization, exactly
     // like the bytes path (one blob per outcome, no orphan-on-idempotent).
@@ -1694,18 +1759,544 @@ fn sanitize_hidden_phi(meta: &InstanceMeta, coerce: &CoerceReport) -> bool {
     coerce.any && meta.hidden_identifying_attrs
 }
 
-/// Can a (0400,0561) element be appended to this instance's bytes?
+/// Can an Explicit VR LE element be written into this instance's header?
 ///
-/// Only for Explicit VR Little Endian, uncompressed - the syntax the embed is
-/// encoded in. Every other syntax would be corrupted by the tail: Implicit VR
-/// LE reads the VR pair as part of the length, Big Endian byte-swaps every
-/// length, and a deflated dataset ends at its zlib stream so raw bytes after it
-/// are not part of the dataset at all. An absent syntax means the parser found
-/// none, and guessing is worse than not embedding.
+/// Explicit VR Little Endian uncompressed (1.2.840.10008.1.2.1) and every
+/// ENCAPSULATED syntax (JPEG baseline/extended/lossless, JPEG-LS, JPEG 2000,
+/// RLE, HTJ2K). The encapsulated ones keep all of their NON-pixel elements in
+/// Explicit VR LE - only the pixel data is wrapped in items - so a header
+/// attribute written that way is exactly what a reader expects. This is what
+/// makes the Weasis/RLE flow work: an RLE instance with an empty PatientID can
+/// still carry the generated one.
+///
+/// Implicit VR LE (1.2.840.10008.1.2) and deflated explicit VR
+/// (1.2.840.10008.1.2.1.99) are refused. Under Implicit VR the VR pair this
+/// writer emits would be read as part of the length, shifting every following
+/// element; after a deflate stream the raw bytes are not part of the dataset at
+/// all. Big/little endian explicit (1.2.840.10008.1.2.2) is refused for the
+/// same length problem. An absent syntax means the parser found none, and
+/// guessing is worse than not embedding.
 fn embeddable_transfer_syntax(meta: &InstanceMeta) -> bool {
-    // Explicit VR Little Endian, uncompressed: the only syntax the embed is
-    // byte-compatible with.
-    meta.transfer_syntax_uid.as_deref() == Some("1.2.840.10008.1.2.1")
+    let Some(ts) = meta.transfer_syntax_uid.as_deref() else {
+        return false;
+    };
+    matches!(
+        ts,
+        // Explicit VR Little Endian, uncompressed.
+        "1.2.840.10008.1.2.1"
+            // Explicit VR Big Endian is NOT listed: every length would need
+            // byte-swapping, which this writer does not do.
+            | "1.2.840.10008.1.2.4.50" // JPEG Baseline
+            | "1.2.840.10008.1.2.4.51" // JPEG Extended
+            | "1.2.840.10008.1.2.4.57" // JPEG Lossless (14)
+            | "1.2.840.10008.1.2.4.70" // JPEG Lossless (14, SV1)
+            | "1.2.840.10008.1.2.4.80" // JPEG-LS Lossless
+            | "1.2.840.10008.1.2.4.81" // JPEG-LS Near-Lossless
+            | "1.2.840.10008.1.2.4.90" // JPEG 2000 Lossless
+            | "1.2.840.10008.1.2.4.91" // JPEG 2000
+            | "1.2.840.10008.1.2.4.92" // JPEG 2000 Part 2 Multi-component Lossless
+            | "1.2.840.10008.1.2.4.93" // JPEG 2000 Part 2 Multi-component
+            | "1.2.840.10008.1.2.5" // RLE Lossless
+            | "1.2.840.10008.1.2.4.201" // HTJ2K Lossless
+            | "1.2.840.10008.1.2.4.202" // HTJ2K Lossless RPCL
+            | "1.2.840.10008.1.2.4.203" // HTJ2K
+    )
+}
+
+/// The generated-patient elements this instance must carry, or empty when the
+/// coercion generated no patient identity.
+///
+/// FR-001 fills an empty PatientID/PatientName in the MANIFEST. Writing the
+/// value ONLY there left the stored blob without `(0010,0020)`/`(0010,0010)`,
+/// so QIDO found the instance and WADO-RS `/metadata` - which reads the blob -
+/// did not: the bridge (FR-001a) writes the generated value into the dataset
+/// AND records the COERCE audit, and this server had lost the first half.
+fn coerced_patient_elements(coerce: &CoerceReport, meta: &InstanceMeta) -> Vec<u8> {
+    let patient_coerced = coerce
+        .generated
+        .iter()
+        .any(|&(g, e)| (g, e) == (0x0010, 0x0010) || (g, e) == (0x0010, 0x0020));
+    if !patient_coerced {
+        return Vec::new();
+    }
+    crate::validation::build_coerced_patient_elements(&meta.patient_name, &meta.patient_id)
+}
+
+/// Splice `elements` into the dataset header, immediately before PixelData.
+///
+/// Position comes from the parse walk (`InstanceMeta::pixel_data_offset`), never
+/// from a byte search: pixel data whose bytes happen to spell the tag must not
+/// move the seam. A file with no PixelData has no header worth splicing (the
+/// attributes would land after the last element of an empty dataset), so the
+/// bytes are returned unchanged.
+///
+/// The transfer syntax rule is the SAME one the audit embed follows
+/// ([`embeddable_transfer_syntax`], explicit VR only): under Implicit VR LE the
+/// VR pair this writes would be read as part of the length, and Big Endian
+/// byte-swaps every length, so either insertion corrupts the dataset. Those
+/// instances keep the manifest-only coercion (audit-log change), which is what
+/// they had before.
+fn splice_before_pixel_data(src: &[u8], elements: &[u8], offset: Option<u64>) -> Vec<u8> {
+    if elements.is_empty() {
+        return src.to_vec();
+    }
+    let Some(at) = offset.map(|o| o as usize).filter(|&o| o <= src.len()) else {
+        return src.to_vec();
+    };
+    let mut out = Vec::with_capacity(src.len() + elements.len());
+    out.extend_from_slice(&src[..at]);
+    out.extend_from_slice(elements);
+    out.extend_from_slice(&src[at..]);
+    out
+}
+
+/// Removes a scratch file when it goes out of scope.///
+/// The spill file holds the pixel-data tail of a possibly multi-gigabyte
+/// instance. Every early return in the splice would otherwise leak it, and a
+/// STOW that fails to embed would quietly fill the volume it was trying to
+/// write to.
+struct RemoveOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+/// Splice `elements` in front of PixelData in the file at `temp_path`.
+///
+/// Rewrites the temp file in place (write the prefix, the elements, then the
+/// rest streamed through a fixed buffer) so a multi-gigabyte instance is never
+/// held in memory: only the header prefix and a 64 KiB window are ever resident.
+fn splice_patient_elements_in_file(
+    temp_path: &Path,
+    elements: &[u8],
+    meta: &InstanceMeta,
+    sop_instance_uid: &str,
+) -> Result<(), StowError> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    // The metadata parse reads only `max_part_header` bytes, so a header larger
+    // than that window reports no PixelData offset. Re-parse a wider window
+    // rather than give up: the coercion is a rare path, and losing the patient
+    // identity from the blob is the bug being fixed.
+    let at: u64 = match meta.pixel_data_offset {
+        Some(at) => at,
+        None => match pixel_data_offset_from_file(temp_path) {
+            Some(at) => at,
+            None => {
+                crate::clog_warn!(
+                    sop_instance_uid,
+                    "coerced patient elements not written: no PixelData found in the file"
+                );
+                return Ok(());
+            }
+        },
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp_path)
+        .map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to reopen the part for the patient embed: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+    let len = file.metadata().map(|m| m.len()).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to stat the part for the patient embed: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    if at > len {
+        return Ok(());
+    }
+    // Move the pixel-data tail aside into a scratch file, then rewrite the
+    // original as header + elements + tail. The scratch file keeps the peak
+    // memory at one buffer regardless of instance size. It lives beside the
+    // part (same volume, so no cross-device copy) and is removed on every
+    // exit path by the guard below.
+    let spill_path = temp_path.with_extension("pixspill");
+    // Read+write, not `File::create`: the spill is written with the tail and
+    // then READ BACK to restore it, and a write-only handle cannot be read.
+    let mut tail = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&spill_path)
+        .map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to open the spill file for the patient embed: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+    let _spill_guard = RemoveOnDrop(&spill_path);
+    file.seek(SeekFrom::Start(at)).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to seek the pixel data: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    std::io::copy(&mut (&mut file).take(len - at), &mut tail).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to spill the pixel data: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    tail.seek(SeekFrom::Start(0)).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to rewind the spill file: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    // Truncate at the seam and write elements + tail.
+    file.set_len(at).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to truncate at the pixel data: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    file.seek(SeekFrom::Start(at)).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to seek the insertion point: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    file.write_all(elements).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to write the patient elements: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    std::io::copy(&mut tail, &mut file).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to restore the pixel data: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    file.flush().map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to flush the patient embed: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    Ok(())
+}
+
+/// The common update path: derive everything from the TEMP FILE on disk.///
+/// A corrected instance is a re-sent whole object - for a whole-slide study
+/// that is gigabytes. Reading it back into memory to hash it, append the audit
+/// embed and scan for frames allocated the entire instance for the duration of
+/// the write; when hidden-PHI excision ran it allocated a second copy. The temp
+/// file already holds the incoming bytes, so this variant:
+///
+/// 1. appends the (0400,0561) embed to that file (when the transfer syntax can
+///    carry it),
+/// 2. hashes it with `blake3_of_file`,
+/// 3. builds the frame table with `frame_records_from_file_capped` (header
+///    streaming, not a read-back), and
+/// 4. renames it into CAS under the new key.
+///
+/// The hidden-PHI case still needs the original bytes twice (the alibi blob and
+/// the sanitized blob), so it delegates to [`materialize_update`] with the file
+/// read into memory - the documented exception rather than the common path.
+#[allow(clippy::too_many_arguments)]
+fn materialize_update_from_file(
+    state: &AppState,
+    meta: &InstanceMeta,
+    temp_path: &Path,
+    old_attrs: &[(u16, u16, String)],
+    coerce: &CoerceReport,
+    modifier: &str,
+    sop_class_uid: String,
+    sop_instance_uid: String,
+    study_instance_uid: String,
+    series_instance_uid: String,
+    patient_id: String,
+    old_blake3: [u8; 32],
+    old_tier: u8,
+) -> Result<InstanceOutcome, StowError> {
+    // Hidden-PHI excision rewrites the bytes, so it needs them in memory (and
+    // keeps the original as a second alibi blob). Hand off to the shared core.
+    if sanitize_hidden_phi(meta, coerce) {
+        let original = std::fs::read(temp_path).map_err(|e| {
+            let _ = std::fs::remove_file(temp_path);
+            stow_error_with_sop(
+                500,
+                format!("Failed to read part for update: {e}"),
+                Some(sop_class_uid.as_str()),
+                &sop_instance_uid,
+            )
+        })?;
+        let _ = std::fs::remove_file(temp_path);
+        return materialize_update(
+            state,
+            meta,
+            original,
+            old_attrs,
+            coerce,
+            modifier,
+            sop_class_uid,
+            sop_instance_uid,
+            study_instance_uid,
+            series_instance_uid,
+            patient_id,
+            old_blake3,
+            old_tier,
+        );
+    }
+
+    // CORRECT items: one per changed StudyManifestAttrs tag (fixed order), then
+    // COERCE items for fields generated during THIS ingest (old value = "").
+    let mut items: Vec<crate::validation::OriginalAttributeItem> = Vec::new();
+    if let Some(item) = correct_item(old_attrs, 0x0010, 0x0010, &meta.patient_name) {
+        items.push(item);
+    }
+    if let Some(item) = correct_item(old_attrs, 0x0010, 0x0020, &meta.patient_id) {
+        items.push(item);
+    }
+    if let Some(item) = correct_item(
+        old_attrs,
+        0x0010,
+        0x0030,
+        meta.patient_birth_date.as_deref().unwrap_or(""),
+    ) {
+        items.push(item);
+    }
+    if let Some(item) = correct_item(
+        old_attrs,
+        0x0010,
+        0x0040,
+        meta.patient_sex.as_deref().unwrap_or(""),
+    ) {
+        items.push(item);
+    }
+    for &(g, e) in &coerce.generated {
+        items.push(crate::validation::OriginalAttributeItem {
+            group: g,
+            element: e,
+            old_value: String::new(),
+            reason: "COERCE",
+        });
+    }
+
+    let changed_attrs = items.len();
+    // The embed is Explicit VR Little Endian by construction, so appending it
+    // to a dataset in another transfer syntax would write bytes that dataset
+    // cannot describe - the change then lives in the audit log only and the
+    // blob keeps its original bytes. Same rule as the in-memory core.
+    let can_embed = changed_attrs > 0 && embeddable_transfer_syntax(meta);
+    if changed_attrs > 0 && !can_embed {
+        crate::clog_warn!(
+            sop_instance_uid = %sop_instance_uid,
+            study_uid = %study_instance_uid,
+            transfer_syntax = meta.transfer_syntax_uid.as_deref().unwrap_or(""),
+            changed_attrs = changed_attrs,
+            "attribute change recorded in the audit log only: the instance's \
+             transfer syntax cannot carry an explicit-VR attribute sequence"
+        );
+    }
+    if can_embed {
+        let audit_bytes = crate::validation::build_original_attributes_sequence(
+            &items,
+            modifier,
+            &state.config.resolved_modifying_system(),
+        );
+        // FR-001b: the generated PatientID/PatientName must reach the BLOB, not
+        // only the manifest - QIDO read the manifest and WADO-RS /metadata read
+        // the blob, so the two disagreed. They go BEFORE PixelData (the metadata
+        // walk stops there); the audit embed stays on the tail.
+        let patient_bytes = coerced_patient_elements(coerce, meta);
+        if !patient_bytes.is_empty() {
+            splice_patient_elements_in_file(temp_path, &patient_bytes, meta, &sop_instance_uid)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(temp_path)
+            .map_err(|e| {
+                let _ = std::fs::remove_file(temp_path);
+                stow_error_with_sop(
+                    500,
+                    format!("Failed to open part for the attribute embed: {e}"),
+                    Some(sop_class_uid.as_str()),
+                    &sop_instance_uid,
+                )
+            })?;
+        if let Err(e) = std::io::Write::write_all(&mut file, &audit_bytes) {
+            let _ = std::fs::remove_file(temp_path);
+            return Err(stow_error_with_sop(
+                500,
+                format!("Failed to append the attribute embed: {e}"),
+                Some(sop_class_uid.as_str()),
+                &sop_instance_uid,
+            ));
+        }
+    }
+
+    let new_blake3 = blake3_of_file(temp_path).map_err(|e| {
+        let _ = std::fs::remove_file(temp_path);
+        stow_error_with_sop(
+            500,
+            format!("Failed to hash the updated part: {e}"),
+            Some(sop_class_uid.as_str()),
+            &sop_instance_uid,
+        )
+    })?;
+    let file_size = std::fs::metadata(temp_path).map(|m| m.len()).map_err(|e| {
+        let _ = std::fs::remove_file(temp_path);
+        stow_error_with_sop(
+            500,
+            format!("Failed to stat the updated part: {e}"),
+            Some(sop_class_uid.as_str()),
+            &sop_instance_uid,
+        )
+    })?;
+    // F5 (0310): the frame cap applies to EVERY accepted blob. The cap is
+    // enforced BEFORE the CAS rename so an over-cap update leaves no residue.
+    let frame_table =
+        frame_records_from_file_capped(temp_path, state.config.max_frames_per_instance)
+            .map_err(|e| too_many_frames_error(&sop_class_uid, &sop_instance_uid, e))?;
+    rename_temp_to_cas(
+        state,
+        temp_path,
+        &new_blake3,
+        &sop_class_uid,
+        &sop_instance_uid,
+    )?;
+
+    commit_updated_manifest(
+        state,
+        meta,
+        new_blake3,
+        file_size,
+        frame_table,
+        old_blake3,
+        old_tier,
+        sop_class_uid,
+        sop_instance_uid,
+        study_instance_uid,
+        series_instance_uid,
+        patient_id,
+        changed_attrs,
+    )
+}
+
+/// Re-point the manifest at a replacement blob after the bytes are durable.
+///
+/// Shared by both update paths so the manifest/attribute/orphan bookkeeping
+/// cannot differ between them. On a manifest write failure the correction is
+/// reported as a per-SOP failure and NO orphan is queued: the manifest still
+/// serves the old blob, so reclaiming it would delete the bytes in use.
+#[allow(clippy::too_many_arguments)]
+fn commit_updated_manifest(
+    state: &AppState,
+    meta: &InstanceMeta,
+    new_blake3: [u8; 32],
+    file_size: u64,
+    frame_table: Vec<clarus_core::manifest::FrameRecord>,
+    old_blake3: [u8; 32],
+    old_tier: u8,
+    sop_class_uid: String,
+    sop_instance_uid: String,
+    study_instance_uid: String,
+    series_instance_uid: String,
+    patient_id: String,
+    changed_attrs: usize,
+) -> Result<InstanceOutcome, StowError> {
+    let manifest_dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
+    let mut attrs = study_attrs_from_meta(meta);
+    let series = vec![instance_series_model(
+        meta,
+        new_blake3,
+        file_size,
+        frame_table,
+    )];
+    match clarus_core::stow::write_study_manifest_update(&manifest_dir, &mut attrs, &series) {
+        Ok(_) => {
+            state
+                .study_scanner
+                .on_study_committed(&study_instance_uid, &attrs);
+        }
+        Err(e) => {
+            crate::clog_warn!(
+                error = %e,
+                sop_instance_uid = %sop_instance_uid,
+                study_uid = %study_instance_uid,
+                "study manifest update failed: the correction was not applied"
+            );
+            return Ok(InstanceOutcome::Failed {
+                sop_class_uid: Some(sop_class_uid),
+                sop_instance_uid: Some(sop_instance_uid),
+                reason: format!(
+                    "Study manifest update failed, so the replacement was not committed: {e}"
+                ),
+            });
+        }
+    }
+
+    // Orphan accounting (P1): remember the REPLACED blob in a per-study
+    // sidecar so the erase worker reclaims it when the study is erased. No
+    // deletion on the hot path (the old blob stays in CAS until erase).
+    let old_hex = clarus_adapters::hex_encode(&old_blake3);
+    match append_sidecar_line(
+        &manifest_dir,
+        &study_instance_uid,
+        ".orphans",
+        &old_hex,
+        old_tier,
+    ) {
+        Ok(true) => {
+            crate::metrics::ORPHANS_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            crate::clog_warn!(
+                error = %e,
+                study_uid = %study_instance_uid,
+                "orphan sidecar append failed (old blob stays until manual reclaim, client unaffected)"
+            );
+        }
+    }
+
+    crate::clog_info!(
+        sop_instance_uid = %sop_instance_uid,
+        changed_attrs = changed_attrs,
+        "Instance updated (bytes replaced)"
+    );
+
+    Ok(InstanceOutcome::Updated {
+        sop_class_uid,
+        sop_instance_uid,
+        study_instance_uid,
+        series_instance_uid,
+        patient_id,
+        changed_attrs,
+        bytes_replaced: true,
+    })
 }
 
 /// The shared 2808 update core: materialize ONE canonical blob (original
@@ -1804,6 +2395,12 @@ fn materialize_update(
             modifier,
             &state.config.resolved_modifying_system(),
         );
+        // FR-001b: splice the generated patient elements BEFORE PixelData, then
+        // append the audit sequence. Doing it in this order keeps the patient
+        // attributes inside the header the metadata reader walks, while the
+        // (0400,0561) audit stays on the tail where it is already written.
+        let patient_bytes = coerced_patient_elements(coerce, meta);
+        owned = splice_before_pixel_data(&owned, &patient_bytes, meta.pixel_data_offset);
         owned.extend_from_slice(&audit_bytes);
     }
     let new_blake3 = crate::shadow::blake3_of(&owned);
@@ -1879,68 +2476,21 @@ fn materialize_update(
     // study attrs are RE-STAMPED from the corrected incoming values. The
     // frame table is rebuilt from `owned` - the exact bytes just written to
     // CAS - so the offsets match the blob the serve path will open.
-    let mut attrs = study_attrs_from_meta(meta);
-    let series = vec![instance_series_model(
+    commit_updated_manifest(
+        state,
         meta,
         new_blake3,
         file_size,
         frame_table,
-    )];
-    match clarus_core::stow::write_study_manifest_update(&manifest_dir, &mut attrs, &series) {
-        Ok(_) => {
-            state
-                .study_scanner
-                .on_study_committed(&study_instance_uid, &attrs);
-        }
-        Err(e) => {
-            crate::clog_warn!(
-                error = %e,
-                study_uid = %study_instance_uid,
-                "B-tree study manifest update failed (shadow tier degraded, client unaffected)"
-            );
-        }
-    }
-
-    // Orphan accounting (P1): remember the REPLACED blob in a per-study
-    // sidecar so the erase worker reclaims it when the study is erased. No
-    // deletion on the hot path (the old blob stays in CAS until erase).
-    let old_hex = clarus_adapters::hex_encode(&old_blake3);
-    match append_sidecar_line(
-        &manifest_dir,
-        &study_instance_uid,
-        ".orphans",
-        &old_hex,
+        old_blake3,
         old_tier,
-    ) {
-        Ok(true) => {
-            // The ONE owner-approved hot-path gauge touch (ap101 statement).
-            crate::metrics::ORPHANS_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(false) => {}
-        Err(e) => {
-            crate::clog_warn!(
-                error = %e,
-                study_uid = %study_instance_uid,
-                "orphan sidecar append failed (old blob stays until manual reclaim, client unaffected)"
-            );
-        }
-    }
-
-    crate::clog_info!(
-        sop_instance_uid = %sop_instance_uid,
-        changed_attrs = changed_attrs,
-        "Instance updated (bytes replaced)"
-    );
-
-    Ok(InstanceOutcome::Updated {
         sop_class_uid,
         sop_instance_uid,
         study_instance_uid,
         series_instance_uid,
         patient_id,
         changed_attrs,
-        bytes_replaced: true,
-    })
+    )
 }
 
 /// Multipart mapping: the decision ran BEFORE the rename, so the rename /
@@ -1980,6 +2530,20 @@ fn map_insert_tempfile(
                     stow_error_with_sop(500, format!("CAS read for sanitize: {e}"), Some(&sc), &si)
                 })?;
                 let sanitized = excise_original_attrs(&original, &meta.original_attrs_ranges);
+                // FR-001b on the hidden-PHI path: the patient elements are
+                // spliced HERE because the excision above resolved the ranges
+                // against the incoming bytes; the offset is still the incoming
+                // PixelData position, which the excision never moves (the
+                // excised spans all precede it).
+                let sanitized = if embeddable_transfer_syntax(meta) {
+                    splice_before_pixel_data(
+                        &sanitized,
+                        &coerced_patient_elements(coerce, meta),
+                        meta.pixel_data_offset,
+                    )
+                } else {
+                    sanitized
+                };
                 let s_blake3 = crate::shadow::blake3_of(&sanitized);
                 write_cas_dedup(state, &s_blake3, &sanitized, Some(&sc), &si)?;
                 let manifest_dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
@@ -2090,20 +2654,24 @@ fn map_insert_tempfile(
             old_blake3,
             old_tier,
         } => {
-            let original = std::fs::read(temp_path).map_err(|e| {
-                let _ = std::fs::remove_file(temp_path);
-                stow_error_with_sop(
-                    500,
-                    format!("Failed to read part for update: {e}"),
-                    Some(sc.as_str()),
-                    &si,
-                )
-            })?;
-            let _ = std::fs::remove_file(temp_path);
-            materialize_update(
+            // N1: the part is NOT read back into memory here.
+            //
+            // The previous version did `std::fs::read(temp_path)` before hashing
+            // and frame-scanning, so a corrected multi-GB whole-slide instance
+            // (a client re-sending a WSI it already stored) allocated the whole
+            // thing once, and twice when hidden-PHI excision ran on a copy. The
+            // temp file is already on disk with the incoming bytes; the update
+            // core now appends the audit embed to THAT file and derives the
+            // hash, the frame table and the CAS target from it.
+            //
+            // The hidden-PHI path still needs the original bytes in memory (it
+            // writes TWO CAS blobs: the alibi original and the sanitized one),
+            // so it keeps reading the file - that is the documented exception,
+            // not the common path.
+            materialize_update_from_file(
                 state,
                 meta,
-                original,
+                temp_path,
                 &old_attrs,
                 coerce,
                 modifier,
@@ -2240,6 +2808,33 @@ fn read_dicom_header(path: &Path, max_header: usize) -> Result<Vec<u8>, DicomErr
     Ok(buf)
 }
 
+/// Locate PixelData in a file whose header exceeded the STOW parse window.
+///
+/// The parser is not asked to walk a whole multi-gigabyte file for one offset:
+/// it is handed progressively larger PREFIXES until the pixel tag appears. The
+/// offset it reports is already relative to the file start, and the size keeps
+/// doubling only while the header genuinely has not ended, so a normal instance
+/// answers on the first or second probe. Bounded at 64 MiB - a header larger
+/// than that is not a header, and refusing is better than an unbounded read.
+fn pixel_data_offset_from_file(path: &Path) -> Option<u64> {
+    use clarus_ports::dicom::DicomParser;
+    let len = std::fs::metadata(path).ok()?.len() as usize;
+    let mut window = 8 * 1024 * 1024usize;
+    loop {
+        let probe = window.min(len);
+        let header = read_dicom_header(path, probe).ok()?;
+        if let Ok(meta) = clarus_adapters::dicom_rs::DicomRsParser.extract_metadata(&header)
+            && let Some(at) = meta.pixel_data_offset
+        {
+            return Some(at);
+        }
+        if probe == len || window >= 64 * 1024 * 1024 {
+            return None;
+        }
+        window *= 2;
+    }
+}
+
 /// Counts how many times the STOW path falls back to a FULL file re-read to
 /// compute the content hash (`blake3_of_file`). The folded `CasWrite` digest
 /// means the common case must keep this at ZERO for the request that just
@@ -2356,9 +2951,82 @@ fn generate_study_uid_without_patient(meta: &InstanceMeta) -> String {
 
 // -- Hex / ENOSPC helpers ------------------------------------------------
 
-/// Detect ENOSPC (disk full) from an I/O error's raw OS error code.
+/// Detect a full volume.
+///
+/// `ErrorKind::StorageFull` (stable since 1.83) is the standard's canonical
+/// classification and already covers both platforms: unix maps `ENOSPC` to it,
+/// and Windows maps `ERROR_HANDLE_DISK_FULL` (39) and `ERROR_DISK_FULL` (112) to
+/// it while leaving 28 (`ERROR_OUT_OF_PAPER`) as `Uncategorized`. So one arm
+/// replaces the previous per-platform raw-code table, and the two-number pairing
+/// that produced a false 507 for "the printer is out of paper" can no longer be
+/// written down.
+///
+/// The direction is one-way: an error constructed FROM the kind reports
+/// `raw_os_error() == None`, so a raw code is never recovered here.
 fn is_enospc(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(28) | Some(39) | Some(112))
+    err.kind() == std::io::ErrorKind::StorageFull
+}
+
+#[cfg(test)]
+mod enospc_tests {
+    use std::io::{Error, ErrorKind};
+
+    /// The kind of an error built from a raw OS code is what decides.
+    fn kind_of(code: i32) -> ErrorKind {
+        Error::from_raw_os_error(code).kind()
+    }
+
+    /// 28 (`ENOSPC`) is the one unix disk-full code, and the two numbers that
+    /// share its shape on this platform are not.
+    ///
+    /// 39 is `ENOTEMPTY` on Linux and `EDESTADDRREQ` on macOS: under the old
+    /// un-scoped `Some(28) | Some(39) | Some(112)` match it became a 507 "disk
+    /// full" with `Retry-After: 60`.
+    #[cfg(unix)]
+    #[test]
+    fn enospc_is_detected_and_look_alikes_are_not() {
+        assert!(super::is_enospc(&Error::from_raw_os_error(28)));
+        assert_eq!(kind_of(28), ErrorKind::StorageFull, "ENOSPC");
+        assert!(
+            !super::is_enospc(&Error::from_raw_os_error(39)),
+            "39 is ENOTEMPTY/EDESTADDRREQ on unix, never a full disk"
+        );
+        assert!(
+            !super::is_enospc(&Error::from_raw_os_error(112)),
+            "112 is undefined on unix"
+        );
+        assert!(!super::is_enospc(&Error::from(ErrorKind::Other)));
+    }
+
+    /// Windows raises BOTH 39 and 112 for a full volume, and 28 there means the
+    /// printer is out of paper.
+    ///
+    /// The defect on this platform was never a missed disk-full: the old code
+    /// caught 39 and 112. It was that 28 was read as disk-full, so a paper-out
+    /// answered 507 with `Retry-After: 60`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_disk_full_codes_are_detected_and_paper_out_is_not() {
+        assert!(
+            super::is_enospc(&Error::from_raw_os_error(39)),
+            "39 is ERROR_HANDLE_DISK_FULL"
+        );
+        assert!(
+            super::is_enospc(&Error::from_raw_os_error(112)),
+            "112 is ERROR_DISK_FULL"
+        );
+        assert_eq!(kind_of(39), ErrorKind::StorageFull);
+        assert_eq!(kind_of(112), ErrorKind::StorageFull);
+        assert!(
+            !super::is_enospc(&Error::from_raw_os_error(28)),
+            "28 is ERROR_OUT_OF_PAPER on Windows, never a full disk"
+        );
+        assert!(
+            !super::is_enospc(&Error::from_raw_os_error(145)),
+            "145 is ERROR_DIR_NOT_EMPTY"
+        );
+        assert!(!super::is_enospc(&Error::from(ErrorKind::Other)));
+    }
 }
 
 #[cfg(test)]
@@ -3058,6 +3726,47 @@ mod iocm_anyclass_tests {
             "a disabled AnyClass feature must not hide a diagnostic image"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mid-request flush that could not write the manifest must hand the
+    /// affected UIDs to the response builder exactly once.
+    ///
+    /// `clear()` wipes the pending write set, so a UID parked on the batch is
+    /// the ONLY remaining evidence that the instance is not retrievable. Two
+    /// flushes in one request must not report the same instance twice, hence
+    /// the drain semantics.
+    #[test]
+    fn a_flush_reports_its_manifest_failures_once() {
+        let mut batch = super::ManifestBatch::default();
+        batch.manifest_failed.push("1.2.3.4.5.6.7.1".to_string());
+        batch.manifest_failed.push("1.2.3.4.5.6.7.2".to_string());
+
+        let first = batch.take_manifest_failed();
+        assert_eq!(
+            first,
+            vec!["1.2.3.4.5.6.7.1".to_string(), "1.2.3.4.5.6.7.2".to_string()],
+            "every instance the flush could not commit is reported"
+        );
+        assert!(
+            batch.take_manifest_failed().is_empty(),
+            "a UID is never reported by two flushes of the same request"
+        );
+    }
+
+    /// `clear()` must keep the manifest failures: it runs AFTER the flush that
+    /// recorded them, and before the end-of-request response is built.
+    #[test]
+    fn clearing_a_batch_keeps_the_manifest_failures() {
+        let mut batch = super::ManifestBatch::default();
+        batch.manifest_failed.push("1.2.3.4.5.6.7.1".to_string());
+
+        batch.clear();
+
+        assert_eq!(
+            batch.take_manifest_failed(),
+            vec!["1.2.3.4.5.6.7.1".to_string()],
+            "an instance the archive cannot serve back stays reported as failed"
+        );
     }
 
     /// Positive half: with `anyclass_enable = true` the hide applies, and it

@@ -140,14 +140,30 @@ impl StudyQidoIndex {
     /// mutations the merge exists to preserve. The watermark is taken from
     /// this index, which is where the stamps came from.
     pub fn replace_with_full(&self, other: &StudyQidoIndex) {
+        // Compatibility entry point for callers that hold no separate
+        // watermark: the swap-time generation is the conservative choice (it
+        // keeps every entry stamped since the build was constructed, at the
+        // cost of also keeping entries the build already saw - which is a
+        // stale read, never a lost write).
+        let start_gen = self.generation();
+        self.replace_with_full_from(other, start_gen);
+    }
+
+    /// Replace this index with a build whose scan BEGAN at `start_gen`.
+    ///
+    /// The watermark has to be taken when the scan starts, not when it lands.
+    /// A mutation committed while the scan was running is stamped BEFORE the
+    /// scan could have seen it on disk; comparing it against a generation read
+    /// at swap time made it look "already in the snapshot" and the merge
+    /// dropped it - the study stayed missing from QIDO until the next rebuild.
+    pub fn replace_with_full_from(&self, other: &StudyQidoIndex, start_gen: u64) {
         let built = other.snapshot();
         let mut st = self.state.write().expect("study index write");
-        // Entries stamped at or after this point were written while the build
-        // was in flight, so the built snapshot cannot contain them.
-        let live_gen = st.generation;
+        // Entries stamped at or after the point the build STARTED were written
+        // while it was in flight, so the built snapshot cannot contain them.
         let mut merged = (*built).clone();
         for (uid, entry_generation) in st.entry_gen.iter() {
-            if *entry_generation >= live_gen {
+            if *entry_generation >= start_gen {
                 match st.by_uid.get(uid) {
                     Some(qido) => {
                         merged.insert(uid.clone(), Arc::clone(qido));
@@ -254,9 +270,18 @@ impl StudyQidoIndex {
     /// were corrupt (undecodable) and therefore skipped during the build. The
     /// server feeds this into the `MANIFEST_CORRUPT` degradation signal.
     pub fn build_and_swap(&self, manifests_dir: &Path) -> u64 {
+        // The watermark belongs to the START of the scan: a commit stamped
+        // after this point may not be on disk yet, and the merge has to keep
+        // the live entry rather than the snapshot's older view.
+        let start_gen = self.generation();
         let (built, corrupt) = Self::build_with_corrupt(manifests_dir);
-        self.replace_with_full(&built);
+        self.replace_with_full_from(&built, start_gen);
         corrupt
+    }
+
+    /// The current mutation generation (the watermark a build records).
+    pub fn generation(&self) -> u64 {
+        self.state.read().expect("study index read").generation
     }
 }
 
@@ -314,6 +339,14 @@ mod tests {
             study_description: Some("D".to_string()),
             ..Default::default()
         }
+    }
+
+    /// Serialize with the cache's own tests: `write_study_manifest_full`
+    /// installs cache entries, so a test asserting the cache's exact size
+    /// (manifest_cache module) would otherwise count the entries these tests
+    /// create while running in parallel.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::manifest_cache::test_sync::lock()
     }
 
     #[test]
@@ -406,6 +439,7 @@ mod tests {
 
     #[test]
     fn build_and_swap_on_shared_handle() {
+        let _g = serial();
         // Two handles share one Arc state; the builder swap is visible to the
         // reader handle (the lazy-build wiring).
         let reader = StudyQidoIndex::new();
@@ -459,6 +493,7 @@ mod tests {
     /// swap silently discards the mutations it exists to preserve.
     #[test]
     fn the_watermark_is_this_indexs_own_counter() {
+        let _g = serial();
         let manifests = tempfile::tempdir().expect("temp");
         let manifests = manifests.path().to_path_buf();
         let _ =
@@ -482,6 +517,115 @@ mod tests {
         assert!(
             live.get("1.2.41").is_some(),
             "the builder's own entry stays"
+        );
+    }
+
+    /// The build watermark is taken when the scan STARTS.
+    ///
+    /// A commit stamped after the scan began may not be on disk yet, so the
+    /// snapshot cannot contain it and the merge has to keep the live entry.
+    /// Reading the generation at swap time instead compared the commit
+    /// against a counter that had already advanced past it, concluded the
+    /// snapshot covered it, and dropped the study - invisible to QIDO until
+    /// the next rebuild.
+    ///
+    /// Driven through `build_and_swap`, which is the production entry point:
+    /// the commit is injected from the builder's own handle (the same handle
+    /// the server's lazy builder mutates), which is what marks it as "during
+    /// the build".
+    #[test]
+    fn a_commit_during_the_build_survives_the_swap() {
+        let _g = serial();
+        let manifests = tempfile::tempdir().expect("temp");
+        let manifests = manifests.path().to_path_buf();
+        let _ =
+            write_study_manifest_full(&manifests, &mut attrs_for("1.2.50", "ha", 20260150), &[]);
+
+        let live = StudyQidoIndex::new();
+        // MORE THAN ONE mutation before the scan, so the counter is well past
+        // the start watermark. A commit during the build is then stamped
+        // strictly BETWEEN the two, which is the only window where a
+        // swap-time watermark can differ from the start one.
+        live.upsert("1.2.49", &attrs_for("1.2.49", "pre", 20260149));
+        live.upsert("1.2.48", &attrs_for("1.2.48", "pre", 20260148));
+        // The build starts here: this is the watermark the merge must use.
+        let start_gen = live.generation();
+        let (built, _) = StudyQidoIndex::build_with_corrupt(&manifests);
+        // The commit lands while the scan is running.
+        live.upsert("1.2.51", &attrs_for("1.2.51", "ko", 20260151));
+        assert!(
+            live.generation() > start_gen,
+            "the commit moved the counter past the build's watermark"
+        );
+        // And the swap happens after it.
+        live.replace_with_full_from(&built, start_gen);
+        assert!(
+            live.get("1.2.51").is_some(),
+            "a commit made during the build is not overwritten by the snapshot"
+        );
+        assert!(
+            live.get("1.2.50").is_some(),
+            "and the scan's own result is present"
+        );
+    }
+
+    /// The merge compares against the watermark it was GIVEN.
+    ///
+    /// This is the discriminating half: the fixture stamps an entry at a
+    /// generation the caller then hands over as the watermark. An
+    /// implementation that reads the live counter instead of the argument sees
+    /// a smaller number (`>=` is then false) and drops the entry, so the two
+    /// readings cannot both pass this test.
+    #[test]
+    fn the_merge_uses_the_watermark_it_was_given() {
+        let _g = serial();
+        let manifests = tempfile::tempdir().expect("temp");
+        let manifests = manifests.path().to_path_buf();
+        let _ =
+            write_study_manifest_full(&manifests, &mut attrs_for("1.2.70", "ha", 20260170), &[]);
+
+        let live = StudyQidoIndex::new();
+        live.upsert("1.2.71", &attrs_for("1.2.71", "ko", 20260171));
+        // The entry is stamped at generation 1; the caller names 5 as the
+        // watermark, so the entry is older than the build and the snapshot
+        // should own the key - the snapshot does not have it, so the entry
+        // must be DROPPED.
+        let (built, _) = StudyQidoIndex::build_with_corrupt(&manifests);
+        live.replace_with_full_from(&built, 5);
+        assert!(
+            live.get("1.2.71").is_none(),
+            "an entry older than the given watermark is not merged back"
+        );
+
+        // The same entry with a watermark of 1 IS merged back.
+        let live2 = StudyQidoIndex::new();
+        live2.upsert("1.2.71", &attrs_for("1.2.71", "ko", 20260171));
+        live2.replace_with_full_from(&built, 1);
+        assert!(
+            live2.get("1.2.71").is_some(),
+            "an entry at the watermark is in flight and survives"
+        );
+    }
+
+    /// An erase during the build must remove the study, not be resurrected.
+    #[test]
+    fn a_removal_during_the_build_is_not_resurrected() {
+        let _g = serial();
+        let manifests = tempfile::tempdir().expect("temp");
+        let manifests = manifests.path().to_path_buf();
+        let _ =
+            write_study_manifest_full(&manifests, &mut attrs_for("1.2.60", "ha", 20260160), &[]);
+
+        let live = StudyQidoIndex::new();
+        live.upsert("1.2.60", &attrs_for("1.2.60", "ha", 20260160));
+        let start_gen = live.generation();
+        let (built, _) = StudyQidoIndex::build_with_corrupt(&manifests);
+        live.remove("1.2.60");
+        live.replace_with_full_from(&built, start_gen);
+
+        assert!(
+            live.get("1.2.60").is_none(),
+            "a study erased during the build stays erased"
         );
     }
 }

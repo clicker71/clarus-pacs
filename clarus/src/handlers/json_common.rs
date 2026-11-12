@@ -366,6 +366,66 @@ pub fn form_decode_str(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Decode one DICOMweb QUERY-parameter value: `%XX` only, `+` stays `+`.
+///
+/// PS3.18 8.3.1 lists `+` in `qp-special`, so it is a legal LITERAL character
+/// in a query value and not the form-urlencoded space escape. Decoding it to a
+/// space (`form_decode_str`, the WHATWG application/x-www-form-urlencoded rule)
+/// corrupts every value that carries a plus - a PatientID of `A+B`, a signed
+/// expression in a DT match - and the server then searches for a string the
+/// requester never sent. A space travels as `%20`.
+pub fn form_decode_query_str(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex_val(bytes[i + 1]);
+                let lo = hex_val(bytes[i + 2]);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Encode one DICOMweb QUERY-parameter value: everything outside the RFC 3986
+/// unreserved set becomes `%XX`, spaces included.
+///
+/// The counterpart of `form_decode_query_str`: a space must travel as `%20`
+/// (never `+`), because PS3.18 8.3.1 makes `+` a literal `qp-special`
+/// character. Encoding it as `+` would decode back as a literal plus on any
+/// conformant reader, so the pair would not round-trip.
+pub fn form_encode_query_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -544,13 +604,35 @@ impl<'a> JsonObjParser<'a> {
                 }
                 0x80..=0xFF => {
                     // Multi-byte UTF-8: decode ONE scalar from the current
-                    // offset. `from_utf8` over the whole remainder would fail
-                    // on any later byte and, when it succeeded, made the walk
-                    // quadratic in the string length.
-                    let s = std::str::from_utf8(&self.bytes[self.pos..]).ok()?;
+                    // offset.
+                    //
+                    // The width comes from the LEAD byte, so only that slice is
+                    // validated. Decoding `&self.bytes[self.pos..]` - the whole
+                    // remainder - is O(remaining) per non-ASCII byte, which
+                    // makes a string of N Cyrillic/CJK characters O(N^2): a few
+                    // MB of either held a worker thread for minutes. JSON is an
+                    // untrusted body, so that was a cheap CPU DoS.
+                    //
+                    // RFC 3629 Table 3-7: 110xxxxx = 2 bytes, 1110xxxx = 3,
+                    // 11110xxx = 4. Anything else (0x80..=0xBF continuation,
+                    // 0xF8..=0xFF) is not a legal lead and must be refused
+                    // here, before `from_utf8` could report it as a lone
+                    // continuation.
+                    let width = match b {
+                        0xC0..=0xDF => 2,
+                        0xE0..=0xEF => 3,
+                        0xF0..=0xF7 => 4,
+                        _ => return None,
+                    };
+                    let end = self.pos.checked_add(width)?;
+                    let slice = self.bytes.get(self.pos..end)?;
+                    // `from_utf8` on exactly one scalar's worth of bytes is
+                    // O(1) and still rejects overlongs, surrogates and
+                    // out-of-range values (RFC 3629).
+                    let s = std::str::from_utf8(slice).ok()?;
                     let ch = s.chars().next()?;
                     out.push(ch);
-                    self.pos += ch.len_utf8();
+                    self.pos = end;
                 }
                 _ => {
                     // A raw ASCII byte. Bytes below 0x80 are their own UTF-8
@@ -890,8 +972,80 @@ mod tests {
         );
     }
 
-    // category C: error-body writers are byte-exact with the serde-era
-    // `serde_json::to_vec(&json!({...}))` responses (captured 19.08 - compact,
+    /// A long non-ASCII string must decode in TIME proportional to its length.
+    ///
+    /// The decoder used to call `from_utf8` on the whole remaining slice for
+    /// every non-ASCII byte, re-validating the tail each time: O(N^2). A JSON
+    /// body is untrusted input, so a few MB of Cyrillic or CJK text pinned a
+    /// worker for minutes. The width now comes from the lead byte and only that
+    /// slice is validated, which is O(N).
+    ///
+    /// The assertion is a TIME bound on the whole parse, with a wide margin:
+    /// the quadratic form needs many seconds for this input, the linear one
+    /// milliseconds. A wall-clock bound can flake on a loaded machine, so the
+    /// limit sits far above the linear cost and far below the quadratic one.
+    #[test]
+    fn parse_json_decodes_a_long_non_ascii_string_in_linear_time() {
+        // 200k two-byte scalars (U+0410-U+042F, Cyrillic capitals) = ~400 KB.
+        let mut unit = String::with_capacity(2);
+        unit.push('\u{0410}');
+        // Alternate to defeat any run-length shortcut and stay two-byte wide.
+        let text: String = std::iter::repeat_n(unit.as_str(), 200_000).collect();
+        assert_eq!(text.len(), 400_000);
+        let body = format!("{{\"msg\":\"{text}\"}}");
+
+        let started = std::time::Instant::now();
+        let parsed = parse_json(body.as_bytes()).expect("long Cyrillic body parses");
+        let elapsed = started.elapsed();
+
+        match parsed {
+            JsonVal::Obj(pairs) => {
+                let msg = pairs.iter().find(|(k, _)| k == "msg").expect("msg key");
+                assert_eq!(msg.1, JsonVal::Str(text.clone()));
+            }
+            other => panic!("expected an object, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "decoding 400 KB took {elapsed:?}: the per-byte re-validation is back"
+        );
+    }
+
+    /// A lone continuation byte and an illegal lead are both refused.
+    ///
+    /// Taking the width from the lead byte put the rejection ON the width
+    /// match, so the error cases must be pinned here: 0x80 alone is a
+    /// continuation, 0xF8 is a 5-byte lead neither RFC 3629 nor this parser
+    /// accepts, and a 2-byte lead whose tail is truncated must fail rather than
+    /// silently consume the following bytes.
+    #[test]
+    fn parse_json_refuses_malformed_utf8_in_a_string() {
+        // 0x80 (lone continuation) inside an otherwise valid string.
+        let mut body = br#"{"msg":""#.to_vec();
+        body.push(0x80);
+        body.extend_from_slice(br#""}"#);
+        assert!(parse_json(&body).is_none(), "lone continuation");
+
+        // 0xF8 is a 5-byte lead: illegal in UTF-8.
+        let mut body = br#"{"msg":""#.to_vec();
+        body.push(0xF8);
+        body.extend_from_slice(br#""}"#);
+        assert!(parse_json(&body).is_none(), "5-byte lead");
+
+        // A 2-byte lead with no room for its tail.
+        let mut body = br#"{"msg":""#.to_vec();
+        body.push(0xD0);
+        body.extend_from_slice(br#""}"#);
+        assert!(parse_json(&body).is_none(), "truncated sequence");
+
+        // Overlong encoding of '/' (0xC0 0xAF) must be refused.
+        let mut body = br#"{"msg":""#.to_vec();
+        body.extend_from_slice(&[0xC0, 0xAF]);
+        body.extend_from_slice(br#""}"#);
+        assert!(parse_json(&body).is_none(), "overlong");
+    }
+
+    // category C: error-body writers are byte-exact with the serde-era    // `serde_json::to_vec(&json!({...}))` responses (captured 19.08 - compact,
     // alphabetical key order, values escaped via push_json_str = Family A).
     #[test]
     fn err_json_matches_serde_render() {

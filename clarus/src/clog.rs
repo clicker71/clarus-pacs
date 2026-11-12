@@ -94,6 +94,12 @@ const INFO_WHITELIST: &[&str] = &[
     // INFO line was visible in a developer's debug run and invisible in
     // production, which is the only place the expiry matters.
     "COMMITMENT_RETENTION",
+    // MWL/MPPS retention sweep summary and the UPS retention lines. Same
+    // release-only trap as above: these run on background threads, so a bare
+    // INFO line reached no production log - exactly where a deletion has to
+    // leave a trace.
+    "WORKFLOW_RETENTION",
+    "UPS_RETENTION",
 ];
 
 fn whitelisted(tag: &str) -> bool {

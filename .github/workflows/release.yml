@@ -107,8 +107,19 @@ jobs:
       packages: write
     env:
       IMG_TAG: ${{ github.ref_name }}
+      # `latest` must only ever point at a real release tag. workflow_dispatch
+      # can be started from a branch, where github.ref_name is the branch name;
+      # pointing latest at that would silently publish an unreleased build as
+      # current. Empty on non-tag refs -> only the version tag is pushed.
+      EXTRA_TAG: ${{ github.ref_type == 'tag' && 'latest' || '' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Refuse to publish `latest` from a non-tag ref
+        if: github.ref_type != 'tag'
+        run: |
+          echo "::error::This workflow only publishes images for release tags; refusing to move 'latest' from ref '${{ github.ref_name }}'." >&2
+          exit 1
 
       - uses: actions/download-artifact@v4
         with:
@@ -140,7 +151,10 @@ jobs:
           ENTRYPOINT ["/clarus", "--config", "/clarus.conf"]
           EOF
           TAG="${IMG_TAG#v}"
-          docker buildx build --provenance=false --push -t ghcr.io/clicker71/clarus-pacs/clarus:"${TAG}" -f ctx/Dockerfile.clarus ctx
+          docker buildx build --provenance=false --push \
+            -t ghcr.io/clicker71/clarus-pacs/clarus:"${TAG}" \
+            ${EXTRA_TAG:+-t ghcr.io/clicker71/clarus-pacs/clarus:${EXTRA_TAG}} \
+            -f ctx/Dockerfile.clarus ctx
 
       - name: Build & push clbridge (python:slim)
         run: |
@@ -153,7 +167,10 @@ jobs:
           ENTRYPOINT ["python", "clbridge.py"]
           EOF
           TAG="${IMG_TAG#v}"
-          docker buildx build --provenance=false --push -t ghcr.io/clicker71/clarus-pacs/clbridge:"${TAG}" -f ctx/Dockerfile.clbridge ctx
+          docker buildx build --provenance=false --push \
+            -t ghcr.io/clicker71/clarus-pacs/clbridge:"${TAG}" \
+            ${EXTRA_TAG:+-t ghcr.io/clicker71/clarus-pacs/clbridge:${EXTRA_TAG}} \
+            -f ctx/Dockerfile.clbridge ctx
 
   release:
     name: Publish GitHub Release

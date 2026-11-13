@@ -955,3 +955,45 @@ their failures, not to sandbox their privileges.**
   it rather than mis-read an array. Readers in `params.py` take the first
   element for their scalar helpers, so no example script's behaviour
   changes.
+
+---
+
+## 15. Privacy: what never crosses the ABI
+
+The work directory is the ONLY channel between clinfer and a processor:
+clinfer builds it, the processor reads it, and what that channel carries
+is exactly the manifest and the raw frame bytes listed in section 3 -
+nothing else.
+
+The ABI never carries patient-identity attributes:
+
+- no `PatientName` (0010,0010), `PatientID` (0010,0020),
+  `PatientBirthDate` (0010,0030), `PatientSex` (0010,0040) or
+  `PatientAge` (0010,1010) - not in the manifest, not in any frame file;
+- no DICOM object of any kind: the processor sees raw pixel bytes and a
+  JSON document, never a file it could re-tag or re-file under another
+  identity;
+- no person-name parameter: a (0040,A123) PNAME content item in the
+  requester's parameter list is dropped with a stderr warning that names
+  the parameter and never its value (section 3.1.2).
+
+What the ABI does carry, deliberately and minimally:
+
+- `study.uid` - the Study Instance UID, a pseudonymous identifier the
+  processor needs to trace a result to its input;
+- `study.description` (0008,1030), `study.modalities` (0008,0061) and
+  `study.body_part` (0018,0015) - study-level clinical context, not
+  patient identity;
+- the requester's processing parameters (0074,1210), flattened as
+  described in section 3.1.2.
+
+Two fields are free text authored by the site, not by clinfer, and the
+site is responsible for what it puts in them: `study.description` and the
+`TEXT` parameter values. The contract itself adds no patient identity to
+either.
+
+clinfer does copy `PatientName` and `PatientID` into the objects it writes
+back - the SR, SEG and RTSTRUCT - so a result is filed under the right
+patient. That happens inside clinfer's DICOM writer, after the processor
+has already run: those attributes never cross the ABI in either
+direction.

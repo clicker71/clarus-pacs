@@ -175,9 +175,9 @@ class TestWatchdogStallBranch:
             assert outbox.idle_passes >= 3, (
                 "the idle branch barely ran (%d passes)" % outbox.idle_passes
             )
-            assert outbox.recoveries == 0, (
-                "watchdog fired although no pass exceeded the threshold"
-            )
+            assert (
+                outbox.recoveries == 0
+            ), "watchdog fired although no pass exceeded the threshold"
         finally:
             try:
                 outbox.close()

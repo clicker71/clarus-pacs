@@ -550,9 +550,7 @@ def _preflight_study_ts_by_class(
                 f"{base}/studies/{_quote(study_uid, safe='')}"
                 f"/series/{_quote(suid, safe='')}/instances"
             )
-            inst_rows = _qido_request(
-                inst_url, {}, http_timeout, limit=None, tls=tls
-            )
+            inst_rows = _qido_request(inst_url, {}, http_timeout, limit=None, tls=tls)
             if not isinstance(inst_rows, list) or not inst_rows:
                 missed += 1
                 continue
@@ -783,9 +781,7 @@ def _study_sop_uids(
             f"/series/{_quote(suid, safe='')}/instances"
         )
         try:
-            inst_rows = _qido_request(
-                inst_url, {}, http_timeout, limit=None, tls=tls
-            )
+            inst_rows = _qido_request(inst_url, {}, http_timeout, limit=None, tls=tls)
         except Exception:
             return None
         if not isinstance(inst_rows, list):
@@ -1912,9 +1908,7 @@ def _associate_for_move(
         if sop_registry is not None and partial_preflight:
             known = set(class_uids)
             missing = sorted(
-                uid
-                for uid in _proposed_ts_per_class(sop_registry)
-                if uid not in known
+                uid for uid in _proposed_ts_per_class(sop_registry) if uid not in known
             )
             if missing:
                 logging.info(
@@ -1999,7 +1993,9 @@ def _associate_for_move(
     # proposed keep their stored syntaxes as far as the budget allows.
     survivors = set(proposals)
     flat = [
-        tok for cls_uid, toks in per_class_optional.items() if cls_uid in survivors
+        tok
+        for cls_uid, toks in per_class_optional.items()
+        if cls_uid in survivors
         for tok in toks
     ]
     kept_tokens = set(_trim_optional_ts(len(survivors), True, flat))
@@ -2428,7 +2424,9 @@ def _ensure_file_meta_bytes(dicom_bytes, sop_class_uid, sop_uid, ts_uid):
     body += _ui_elem(0x0002, resolved_sc or sop_class_uid or "")
     body += _ui_elem(0x0003, resolved_si or sop_uid or "")
     body += _ui_elem(0x0010, ts)
-    body += _ui_elem(0x0012, _BRIDGE_IMPLEMENTATION_CLASS_UID)    # (0002,0000) is the number of bytes AFTER its own value field, so it is
+    body += _ui_elem(
+        0x0012, _BRIDGE_IMPLEMENTATION_CLASS_UID
+    )  # (0002,0000) is the number of bytes AFTER its own value field, so it is
     # written last and computed from the body. Encoded exactly the way pydicom
     # writes it: UL is a SHORT-VR element in this writer's grammar (see
     # `_walk_meta`), so 8-byte header + 4-byte value.
@@ -3191,9 +3189,9 @@ def _stream_and_send_study(
                     # a send whose outcome nobody observed - under a metric name
                     # the dashboards read as delivered traffic.
                     try:
-                        bytes_total.labels(
-                            direction="tx", peer=ae_label(peer_ae)
-                        ).inc(part_size)
+                        bytes_total.labels(direction="tx", peer=ae_label(peer_ae)).inc(
+                            part_size
+                        )
                     except Exception:
                         pass
                     # Bridge: track successfully sent SOPs for Storage Commitment

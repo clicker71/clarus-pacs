@@ -50,6 +50,12 @@ def _sop_item(sop_class, sop_uid):
 
 
 def _failed_item(sop_class, sop_uid, reason):
+    """One FailedSOPSequence item with FailureReason (0008,1197) US.
+
+    PS3.18 F.2.3 Table F.2.3-1 maps US to the JSON Data Type "Number": only
+    IS, DS, SV and UV may be written as a string. The caller passes the DIMSE
+    code as an int, so the fixture emits the conformant numeric form.
+    """
     item = _sop_item(sop_class, sop_uid)
     item["00081197"] = {"vr": "US", "Value": [reason]}
     return item
@@ -179,7 +185,7 @@ def test_commit_maps_committed_and_failed_verdicts():
         origin.script(
             body=_verdict_body(
                 committed=[(SOP_CLASS, SOP_A)],
-                failed=[(SOP_CLASS, SOP_B, "0112")],
+                failed=[(SOP_CLASS, SOP_B, 0x0112)],
             )
         )
         committed, failed, sentinel = _stc_commit_request(
@@ -192,8 +198,35 @@ def test_commit_maps_committed_and_failed_verdicts():
         origin.close()
 
 
-def test_commit_reads_failure_reason_as_a_string():
-    """DICOM JSON renders numeric VRs as strings; 0110/0213 map too."""
+def test_commit_reads_failure_reason_as_a_number():
+    """PS3.18 F.2.3: a US value is a JSON Number, and 0110/0213 map too.
+
+    This is the shape a conformant origin sends - {"vr":"US","Value":[274]}
+    for 0x0112. A parser written against the old string fixture would treat
+    every real verdict as an unknown reason and report 0x0110.
+    """
+    origin = _Origin()
+    try:
+        origin.script(
+            body=_verdict_body(
+                committed=[],
+                failed=[
+                    (SOP_CLASS, SOP_A, 0x0110),
+                    (SOP_CLASS, SOP_B, 0x0213),
+                ],
+            )
+        )
+        _c, failed, _s = _stc_commit_request(origin.url, "1.2.3", [])
+        assert (SOP_CLASS, SOP_A, 0x0110) in failed
+        assert (SOP_CLASS, SOP_B, 0x0213) in failed
+    finally:
+        origin.close()
+
+
+def test_a_string_failure_reason_is_also_understood():
+    """Lenient input: US as a JSON String is NON-conformant (F.2.3 allows a
+    string only for IS/DS/SV/UV), but a peer that sends it is still read
+    rather than reported as an unknown reason."""
     origin = _Origin()
     try:
         origin.script(
@@ -282,7 +315,7 @@ def test_a_409_replays_the_stored_verdict_over_one_get():
             get_status=200,
             body=_verdict_body(
                 committed=[(SOP_CLASS, SOP_A)],
-                failed=[(SOP_CLASS, SOP_B, "0112")],
+                failed=[(SOP_CLASS, SOP_B, 0x0112)],
             ),
         )
         committed, failed, sentinel = _stc_commit_request(
@@ -350,7 +383,7 @@ def test_a_straggler_at_the_deadline_is_reported_with_the_origin_verdict():
         origin.script(
             body=_verdict_body(
                 committed=[(SOP_CLASS, SOP_A)],
-                failed=[(SOP_CLASS, SOP_B, "0112")],
+                failed=[(SOP_CLASS, SOP_B, 0x0112)],
             )
         )
         events = []
@@ -449,7 +482,9 @@ def _naction_event(sop_list):
         ref.append(item)
     ds.ReferencedSOPSequence = ref
 
-    Req = type("Req", (), {"ae_title": "TEST_SCU", "address": "10.0.0.5", "port": 11112})
+    Req = type(
+        "Req", (), {"ae_title": "TEST_SCU", "address": "10.0.0.5", "port": 11112}
+    )
     Assoc = type("Assoc", (), {"requestor": Req()})
 
     class _Event:
@@ -471,7 +506,7 @@ def test_true_mode_answers_a_status_only_rsp_and_probes_nothing():
     try:
         origin.script(
             body=_verdict_body(
-                committed=[(SOP_CLASS, SOP_A)], failed=[(SOP_CLASS, SOP_B, "0112")]
+                committed=[(SOP_CLASS, SOP_A)], failed=[(SOP_CLASS, SOP_B, 0x0112)]
             )
         )
         events = []

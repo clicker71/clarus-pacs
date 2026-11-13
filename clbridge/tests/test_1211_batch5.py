@@ -165,9 +165,9 @@ def test_a_reregistration_during_abandonment_keeps_its_row(tmp_path):
     restarted = _tracker(_Db(path))
     try:
         revived = restarted._jobs["1.2.3.12"]
-        assert revived.abandoned is False, (
-            "the parked abandoned row overwrote the new request's row"
-        )
+        assert (
+            revived.abandoned is False
+        ), "the parked abandoned row overwrote the new request's row"
         assert revived.frozen_verdict is None
         assert revived.report_attempts == 0
     finally:
@@ -202,18 +202,14 @@ def test_a_reloaded_abandoned_job_is_not_ticked(tmp_path):
         revived = restarted._abandoned["1.2.3.13"]
         assert revived.abandoned is True
         assert revived.report_attempts >= MAX_REPORT_ATTEMPTS
-        assert "1.2.3.13" not in restarted._jobs, (
-            "R10: an abandoned batch must not rejoin the working set"
-        )
+        assert (
+            "1.2.3.13" not in restarted._jobs
+        ), "R10: an abandoned batch must not rejoin the working set"
 
         restarted._resolve = lambda j: (reports.append(j.tx_uid), True)[1]
         restarted._tick()
-        assert reports == [], (
-            "an abandoned batch must not be resolved again on restart"
-        )
-        assert "1.2.3.13" in restarted._abandoned, (
-            "the row stays for inspection"
-        )
+        assert reports == [], "an abandoned batch must not be resolved again on restart"
+        assert "1.2.3.13" in restarted._abandoned, "the row stays for inspection"
     finally:
         restarted.close()
 
@@ -221,9 +217,9 @@ def test_a_reloaded_abandoned_job_is_not_ticked(tmp_path):
     # once it is old enough.
     purged = _tracker(_Db(path))
     try:
-        assert purged.purge_abandoned(max_age_sec=3600.0) == 0, (
-            "a fresh abandonment is not expired yet"
-        )
+        assert (
+            purged.purge_abandoned(max_age_sec=3600.0) == 0
+        ), "a fresh abandonment is not expired yet"
         assert "1.2.3.13" in purged._abandoned
         assert purged.purge_abandoned(max_age_sec=-1.0) == 1
         assert purged._abandoned == {}
@@ -247,9 +243,9 @@ def test_the_tick_skips_abandoned_jobs_in_both_trackers():
         tick = tick.split("\n    # ---- lifecycle", 1)[0]
 
         listed = tick.split("jobs = ", 1)[1].split("\n", 1)[0]
-        assert "self._jobs.values()" in listed, (
-            f"{rel}: _tick must iterate the working set, not the abandoned list"
-        )
+        assert (
+            "self._jobs.values()" in listed
+        ), f"{rel}: _tick must iterate the working set, not the abandoned list"
 
         lines = tick.splitlines()
         for i, line in enumerate(lines):
@@ -279,8 +275,7 @@ def test_the_tick_skips_abandoned_jobs_in_both_trackers():
                 "removes the job, not after the lock was released"
             )
             assert "_park_undelivered(job)" in body, (
-                f"{rel}: the abandoned row must be written in the same locked "
-                "step"
+                f"{rel}: the abandoned row must be written in the same locked " "step"
             )
             break
         else:

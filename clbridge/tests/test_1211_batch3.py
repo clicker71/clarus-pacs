@@ -33,12 +33,12 @@ def test_the_down_server_path_resets_every_batch_field():
         "if not _was_paused"
     )[0]
     for field in ("_batch", "_batch_study", "_batch_bytes"):
-        assert f"{field} = " in down_branch, (
-            f"{field} is not reset on the down-server path"
-        )
-    assert "_batch.clear()" not in down_branch, (
-        "clearing the list leaves the study and the byte count stale"
-    )
+        assert (
+            f"{field} = " in down_branch
+        ), f"{field} is not reset on the down-server path"
+    assert (
+        "_batch.clear()" not in down_branch
+    ), "clearing the list leaves the study and the byte count stale"
 
 
 # ---------------------------------------------------------------------------
@@ -66,20 +66,21 @@ class TestRegistryNonBooleanAccept:
 
         with caplog.at_level(logging.ERROR):
             registry = self._load(tmp_path, value)
-        assert registry == _BUILTIN_SOP_CLASSES(), (
-            f"accept: {value} was coerced instead of refused"
-        )
-        assert any("non-boolean accept" in r.message for r in caplog.records), (
-            "the operator must be told which UID and which value"
-        )
+        assert (
+            registry == _BUILTIN_SOP_CLASSES()
+        ), f"accept: {value} was coerced instead of refused"
+        assert any(
+            "non-boolean accept" in r.message for r in caplog.records
+        ), "the operator must be told which UID and which value"
 
     def test_the_literals_still_work(self, tmp_path):
-        assert self._load(tmp_path, "true")["1.2.840.10008.5.1.4.1.1.2"][
-            "accept"
-        ] is True
-        assert self._load(tmp_path, "false")["1.2.840.10008.5.1.4.1.1.2"][
-            "accept"
-        ] is False
+        assert (
+            self._load(tmp_path, "true")["1.2.840.10008.5.1.4.1.1.2"]["accept"] is True
+        )
+        assert (
+            self._load(tmp_path, "false")["1.2.840.10008.5.1.4.1.1.2"]["accept"]
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -177,14 +178,21 @@ def test_an_association_setup_error_is_retried(monkeypatch):
     monkeypatch.setattr(nv.time, "sleep", lambda *a: None)
 
     ok = nv.send_n_event_report(
-        "10.0.0.5", 11112, "MODALITY", "1.2.3", 1,
-        [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.1")], [],
-        bridge_ae_title="BRIDGE", max_retries=2, retry_delay=0.0,
+        "10.0.0.5",
+        11112,
+        "MODALITY",
+        "1.2.3",
+        1,
+        [("1.2.840.10008.5.1.4.1.1.2", "1.2.3.1")],
+        [],
+        bridge_ae_title="BRIDGE",
+        max_retries=2,
+        retry_delay=0.0,
     )
     assert ok is False, "the report genuinely never arrived"
-    assert len(attempts) == 3, (
-        f"the setup error must retry (max_retries+1 = 3), got {len(attempts)}"
-    )
+    assert (
+        len(attempts) == 3
+    ), f"the setup error must retry (max_retries+1 = 3), got {len(attempts)}"
 
 
 # ---------------------------------------------------------------------------
@@ -220,17 +228,17 @@ def test_a_midstream_raise_in_pass_one_preserves_the_counters():
     src = inspect.getsource(cm._execute_cmove_job)
     code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
     # The pass-1 handler must READ the progress back before continuing.
-    assert "get_job_progress(job_id)" in code, (
-        "the mid-stream handler must recover the counters from the job record"
-    )
+    assert (
+        "get_job_progress(job_id)" in code
+    ), "the mid-stream handler must recover the counters from the job record"
     # Anchor on the CODE that only the guarded handler contains (the comment
     # wording is stripped above, and comments are not behaviour).
     anchor = code.index("move_jobs.get_job_progress(job_id)")
     handler = code[anchor : code.index("if resumed_lost", anchor)]
     assert "raise" not in handler, "the failure must NOT re-raise out of the worker"
-    assert "resumed_lost = True" in handler, (
-        "the loss must route into the reconciliation, not out of the worker"
-    )
+    assert (
+        "resumed_lost = True" in handler
+    ), "the loss must route into the reconciliation, not out of the worker"
     assert "_c1, _f1, _t1 = 0, 0, 0" in handler, "the fallback must still exist"
     assert "sent_sop_uids = []" in handler
 
@@ -249,9 +257,9 @@ def test_pick_pending_job_takes_the_condition_before_selecting(tmp_path):
     code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
     # The select must happen INSIDE the `with self._cond:` block, before wait.
     cond_block = code.split("with self._cond:")[1].split("row = rows[0]")[0]
-    assert "_select_pending()" in cond_block, (
-        "the SELECT must run under the condition lock, or insert's notify is lost"
-    )
+    assert (
+        "_select_pending()" in cond_block
+    ), "the SELECT must run under the condition lock, or insert's notify is lost"
     assert "_cond.wait(" in cond_block
 
 
@@ -308,8 +316,10 @@ def test_a_blob_read_failure_parks_the_item_exactly_once(tmp_path, monkeypatch):
     ds.file_meta.TransferSyntaxUID = ImplicitVRLittleEndian
     assert q.enqueue(ds) is True
 
-    counter = q._undelivered_total if q._undelivered_total is not None else (
-        m.outbox_undelivered_total
+    counter = (
+        q._undelivered_total
+        if q._undelivered_total is not None
+        else (m.outbox_undelivered_total)
     )
     before = counter._value.get()
 
@@ -420,15 +430,15 @@ class TestCharsetUncertainBranch:
                 "a reverted repair must restore the ORIGINAL bytes, not leave "
                 f"the repaired Cyrillic under Latin-1 (got {value!r})"
             )
-            assert all(ord(ch) < 256 for ch in value), (
-                "Cyrillic under ISO_IR 100 is corrupted on write"
-            )
+            assert all(
+                ord(ch) < 256 for ch in value
+            ), "Cyrillic under ISO_IR 100 is corrupted on write"
         else:
             assert charset == "ISO_IR 192"
             assert value == "Тест"
-        assert any("reverting the repair" in r.message for r in caplog.records), (
-            "the revert must be reported, not silent"
-        )
+        assert any(
+            "reverting the repair" in r.message for r in caplog.records
+        ), "the revert must be reported, not silent"
 
     def test_a_fully_examinable_dataset_is_still_repaired(self):
         from clean_code.handlers import cstore as cs

@@ -122,8 +122,7 @@ class TestHandleQidoSearch:
             )
         statuses = [status for status, _ in results]
         assert statuses == [0x0000], (
-            "an empty result set is a COMPLETE answer, not a failure: "
-            f"{statuses}"
+            "an empty result set is a COMPLETE answer, not a failure: " f"{statuses}"
         )
 
 
@@ -310,26 +309,144 @@ class TestPatientRootLevelRouting:
         rows = [row for status, row in results if status == 0xFF00]
         assert rows, "a SERIES query on Patient Root must return series rows"
         for row in rows:
-            assert "SeriesInstanceUID" in row, (
-                f"a series row must carry SeriesInstanceUID: {row}"
-            )
+            assert (
+                "SeriesInstanceUID" in row
+            ), f"a series row must carry SeriesInstanceUID: {row}"
 
-    def test_patient_level_is_refused(self):
+    def test_patient_level_returns_one_row_per_patient(self):
+        """PS3.4 C.6.1.1.2 Table C.6-1: PATIENT is the root level of the model
+        this SCP announces, so it must answer. Two studies of one patient
+        fold into ONE row; the row carries the level's own attributes and
+        echoes QueryRetrieveLevel=PATIENT.
+
+        Refusing with 0xA900 - the previous behaviour - made an announced
+        model's root level unavailable.
+        """
+        from unittest.mock import patch
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            assert url.endswith("/studies"), url
+            return [
+                {
+                    "00100010": {"vr": "PN", "Value": [{"Alphabetic": "Doe^Jane"}]},
+                    "00100020": {"vr": "LO", "Value": ["PT-1"]},
+                    "00100030": {"vr": "DA", "Value": ["19800229"]},
+                    "00100040": {"vr": "CS", "Value": ["F"]},
+                    "0020000D": {"vr": "UI", "Value": ["2.25.1111"]},
+                    "00080020": {"vr": "DA", "Value": ["20260101"]},
+                },
+                {
+                    "00100010": {"vr": "PN", "Value": [{"Alphabetic": "Doe^Jane"}]},
+                    "00100020": {"vr": "LO", "Value": ["PT-1"]},
+                    "00100030": {"vr": "DA", "Value": ["19800229"]},
+                    "00100040": {"vr": "CS", "Value": ["F"]},
+                    "0020000D": {"vr": "UI", "Value": ["2.25.2222"]},
+                    "00080020": {"vr": "DA", "Value": ["20260202"]},
+                },
+            ]
+
         ds = Dataset()
         ds.QueryRetrieveLevel = "PATIENT"
-        results = list(
-            _handle_patient_root(
-                FakeEvent(ds),
-                "http://127.0.0.1:8024/dicomweb",
-                False,
-                50,
-                30,
+        ds.PatientID = "PT-1"
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_patient_root(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
             )
-        )
-        assert results == [(0xA900, None)], (
-            "PATIENT level must be refused rather than duplicating a patient "
-            f"once per study: {results}"
-        )
+
+        rows = [row for status, row in results if status == 0xFF00]
+        assert (
+            len(rows) == 1
+        ), f"two studies of one patient must fold into one row: {rows}"
+        row = rows[0]
+        assert str(row.QueryRetrieveLevel) == "PATIENT"
+        assert str(row.PatientID) == "PT-1"
+        assert "Doe^Jane" in str(row.PatientName)
+        assert str(row.PatientBirthDate) == "19800229"
+        assert str(row.PatientSex) == "F"
+        # Table C.6-1 is the patient level's whole vocabulary: a study
+        # attribute here would tell the SCU the level is really STUDY.
+        assert "StudyInstanceUID" not in row
+        assert "StudyDate" not in row
+        assert results[-1] == (0x0000, None), results[-1]
+
+    def test_patient_level_keeps_anonymous_studies_apart(self):
+        """A study with no PatientID identifies nobody, so it cannot be
+        merged with another anonymous study - each is its own row. (PS3.4
+        C.6.1.1.2 note: Patient ID is the grouping key; without it there is
+        no group.)"""
+        from unittest.mock import patch
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            return [
+                {
+                    "00100010": {"vr": "PN", "Value": [{"Alphabetic": "Anon^One"}]},
+                    "0020000D": {"vr": "UI", "Value": ["2.25.secure"]},
+                },
+                {
+                    "00100010": {"vr": "PN", "Value": [{"Alphabetic": "Anon^Two"}]},
+                    "0020000D": {"vr": "UI", "Value": ["2.25.nopeer"]},
+                },
+            ]
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "PATIENT"
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_patient_root(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    50,
+                    30,
+                )
+            )
+
+        rows = [row for status, row in results if status == 0xFF00]
+        assert (
+            len(rows) == 2
+        ), f"studies without a PatientID must not collapse into one patient: {rows}"
+
+    def test_patient_level_caps_on_patient_count(self):
+        """max_responses bounds PATIENT rows: 0xB001 must mean 'more patients
+        exist', so the study set behind the fold is never silently cut."""
+        from unittest.mock import patch
+
+        def fake_qido(url, params, timeout, limit=None, tls=None):
+            # Two studies for PT-1, one for PT-2, one for PT-3.
+            out = []
+            for pat in ("PT-1", "PT-1", "PT-2", "PT-3"):
+                out.append(
+                    {
+                        "00100010": {"vr": "PN", "Value": [{"Alphabetic": "X^Y"}]},
+                        "00100020": {"vr": "LO", "Value": [pat]},
+                        "0020000D": {"vr": "UI", "Value": [f"2.25.{pat}.{len(out)}"]},
+                    }
+                )
+            assert limit is None, "the fold needs the whole study set"
+            return out
+
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "PATIENT"
+        with patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+            results = list(
+                _handle_patient_root(
+                    FakeEvent(ds),
+                    "http://127.0.0.1:8024/dicomweb",
+                    False,
+                    2,
+                    30,
+                )
+            )
+
+        rows = [row for status, row in results if status == 0xFF00]
+        assert len(rows) == 2, f"the cap applies to patients, not studies: {rows}"
+        assert results[-1] == (0xB001, None), results[-1]
 
 
 class TestSeriesWalkHonoursCancelAndShutdown:
@@ -402,9 +519,9 @@ class TestSeriesWalkHonoursCancelAndShutdown:
             series_requests.append(url)
             return []
 
-        with patch(
-            "clean_code.handlers.cfind._shutdown_requested", _Set()
-        ), patch("clean_code.handlers.cfind._qido_request", side_effect=fake_qido):
+        with patch("clean_code.handlers.cfind._shutdown_requested", _Set()), patch(
+            "clean_code.handlers.cfind._qido_request", side_effect=fake_qido
+        ):
             results = list(
                 _handle_series_search(
                     event,
@@ -418,8 +535,7 @@ class TestSeriesWalkHonoursCancelAndShutdown:
         statuses = [status for status, _ in results]
         assert 0xC000 in statuses, f"a shutdown must yield 0xC000: {statuses}"
         assert series_requests == [], (
-            "no series QIDO request must go out during shutdown: "
-            f"{series_requests}"
+            "no series QIDO request must go out during shutdown: " f"{series_requests}"
         )
 
 

@@ -87,8 +87,7 @@ def test_the_deferred_tuple_records_the_empty_string():
         f"{olds[(0x0010, 0x0020)]!r}"
     )
     assert olds[(0x0010, 0x0010)] == "", (
-        "PatientName old value must be the empty string: "
-        f"{olds[(0x0010, 0x0010)]!r}"
+        "PatientName old value must be the empty string: " f"{olds[(0x0010, 0x0010)]!r}"
     )
 
 

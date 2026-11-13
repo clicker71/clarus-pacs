@@ -898,8 +898,14 @@ class OutboxQueue:
         moved_sidecars = set()
         for dir_ in [self._pending, self._in_progress]:
             for src_sidecar, dst_sidecar in (
-                (self._meta_path(dir_, sop_uid), self._meta_path(self._undelivered, sop_uid)),
-                (self._mods_path(dir_, sop_uid), self._mods_path(self._undelivered, sop_uid)),
+                (
+                    self._meta_path(dir_, sop_uid),
+                    self._meta_path(self._undelivered, sop_uid),
+                ),
+                (
+                    self._mods_path(dir_, sop_uid),
+                    self._mods_path(self._undelivered, sop_uid),
+                ),
             ):
                 if dst_sidecar in moved_sidecars:
                     continue

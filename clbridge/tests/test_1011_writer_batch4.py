@@ -12,6 +12,7 @@ Items already correct in the tree are pinned so they cannot regress.
 import inspect
 import logging
 import os
+import re
 import threading
 from unittest.mock import MagicMock
 
@@ -150,9 +151,9 @@ class TestAM01HostNormalisation:
         """Pins the CHECK, not just the helper: handle_c_move must not answer
         0xA801 when peers.conf names the caller's own machine differently."""
         src = inspect.getsource(cm.handle_c_move)
-        assert "_normalize_host(target_host) != _normalize_host(calling_ip)" in src, (
-            "the C-MOVE guard still compares the raw strings"
-        )
+        assert (
+            "_normalize_host(target_host) != _normalize_host(calling_ip)" in src
+        ), "the C-MOVE guard still compares the raw strings"
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +200,7 @@ class TestAM02PortProbeFamily:
         """A second instance sharing expose_port passed every pre-check and
         only then reset the live instance's in-progress C-MOVE jobs."""
         src = inspect.getsource(main_mod.main)
-        idx_check = src.find('_check_port_available(args.expose_port')
+        idx_check = src.find("_check_port_available(args.expose_port")
         idx_init = src.find("_init_components(args)")
         assert idx_check != -1, "expose_port is not probed at all"
         assert idx_init != -1
@@ -244,8 +245,10 @@ class TestAC01NoneCStoreRsp:
                 code = codes.pop(0)
                 return None if code is None else _status(code)
 
-        body = b"".join(_part_bytes(_body(200 * 1024, sop_uid=f"2.25.999000111222333{i}"))
-                        for i in range(5))
+        body = b"".join(
+            _part_bytes(_body(200 * 1024, sop_uid=f"2.25.999000111222333{i}"))
+            for i in range(5)
+        )
         _FakeClarus.body = body + _final()
         httpd = HTTPServer(("127.0.0.1", 0), _FakeClarus)
         port = httpd.server_address[1]
@@ -313,8 +316,10 @@ class TestAC02EmptyDatasetRsp:
                     return Dataset()  # empty, no Status element
                 return _status(code)
 
-        body = b"".join(_part_bytes(_body(200 * 1024, sop_uid=f"2.25.999000111222333{i}"))
-                        for i in range(5))
+        body = b"".join(
+            _part_bytes(_body(200 * 1024, sop_uid=f"2.25.999000111222333{i}"))
+            for i in range(5)
+        )
         _FakeClarus.body = body + _final()
         httpd = HTTPServer(("127.0.0.1", 0), _FakeClarus)
         port = httpd.server_address[1]
@@ -353,12 +358,13 @@ class TestAM03BytesTotal:
         again while the metric name reads as delivered traffic."""
         src = inspect.getsource(cm._stream_and_send_study)
         success_at = src.find("completed += 1")
-        bytes_at = src.find('bytes_total.labels(\n                            direction="tx"')
+        bytes_match = re.search(r'bytes_total\.labels\([^\n]*direction="tx"', src)
         send_at = src.find("status = assoc.send_c_store(_tmp_path)")
         assert success_at != -1 and send_at != -1
-        assert bytes_at > success_at, (
-            "bytes_total must be incremented on the success branch, not at send time"
-        )
+        assert bytes_match is not None
+        assert (
+            bytes_match.start() > success_at
+        ), "bytes_total must be incremented on the success branch, not at send time"
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +432,9 @@ class TestAm03PeersReload:
 
         from tests.test_db_move_jobs import _TestDb
 
-        return MoveJobManager(shared_db=_TestDb(str(tmp_path / "move_jobs.db")), max_workers=1)
+        return MoveJobManager(
+            shared_db=_TestDb(str(tmp_path / "move_jobs.db")), max_workers=1
+        )
 
     def test_an_empty_file_keeps_the_existing_peers(self, tmp_path):
         """A truncated or empty peers.conf parses to zero peers; treating that
@@ -446,9 +454,9 @@ class TestAm03PeersReload:
             mgr.lazyload_peers_interval = 0
             mgr.reload_peers_from_file(str(peers))
 
-            assert mgr.lookup_scp(rows[0][0]) is not None, (
-                "an empty peers.conf deleted every peer"
-            )
+            assert (
+                mgr.lookup_scp(rows[0][0]) is not None
+            ), "an empty peers.conf deleted every peer"
         finally:
             mgr.close()
 
@@ -507,13 +515,13 @@ class TestAm04DimseProbe:
 # ---------------------------------------------------------------------------
 class TestAm05JsonNull:
     def test_null_returns_none(self):
-        assert proto._json_first_value({"0020000D": {"Value": [None]}}, "0020000D") is None
+        assert (
+            proto._json_first_value({"0020000D": {"Value": [None]}}, "0020000D") is None
+        )
 
     def test_a_real_value_is_unchanged(self):
         assert (
-            proto._json_first_value(
-                {"0020000D": {"Value": ["1.2.3"]}}, "0020000D"
-            )
+            proto._json_first_value({"0020000D": {"Value": ["1.2.3"]}}, "0020000D")
             == "1.2.3"
         )
 
@@ -553,9 +561,9 @@ class TestB01ForwardEmptyRsp:
         times out or aborts; `status.Status` then raised AttributeError, which
         escaped _forward_process_batch and killed the forward thread."""
         src = inspect.getsource(main_mod._forward_process_batch)
-        assert 'getattr(status, "Status", None)' in src, (
-            "the C-STORE-RSP status is not read defensively"
-        )
+        assert (
+            'getattr(status, "Status", None)' in src
+        ), "the C-STORE-RSP status is not read defensively"
         assert "status.Status ==" not in src
 
     def test_the_worker_loop_guards_the_batch_call(self):
@@ -574,9 +582,9 @@ class TestB01ForwardEmptyRsp:
 class TestB02PidOwnPid:
     def test_own_pid_is_not_treated_as_foreign(self):
         src = inspect.getsource(main_mod._write_pid_file)
-        assert "old_pid_int != os.getpid()" in src, (
-            "the liveness check does not exclude the current process"
-        )
+        assert (
+            "old_pid_int != os.getpid()" in src
+        ), "the liveness check does not exclude the current process"
 
 
 # ---------------------------------------------------------------------------
@@ -591,9 +599,9 @@ class TestB03StartupFailure:
         idx_try = src.rfind("try:", 0, idx_start)
         assert idx_start != -1
         assert idx_try != -1, "_start_background_services is not inside a try"
-        assert "os._exit(1)" in src[idx_try:], (
-            "the guarded startup does not exit non-zero"
-        )
+        assert (
+            "os._exit(1)" in src[idx_try:]
+        ), "the guarded startup does not exit non-zero"
 
 
 # ---------------------------------------------------------------------------
@@ -617,9 +625,9 @@ class TestB04ForgetFailure:
         finally:
             tracker.close()
 
-        assert tracker.pending_count() == 0, (
-            "a store failure aborted the tick and left batches behind"
-        )
+        assert (
+            tracker.pending_count() == 0
+        ), "a store failure aborted the tick and left batches behind"
 
 
 # ---------------------------------------------------------------------------
@@ -721,9 +729,9 @@ class TestB09ReconciledProgress:
         # The LAST finish_job in this function is the terminal one.
         idx_finish = src.rfind("finish_job(")
         assert idx_write != -1, "the reconciled counters are never stored"
-        assert idx_write < idx_finish, (
-            "the reconciled counters are stored after the job is finished"
-        )
+        assert (
+            idx_write < idx_finish
+        ), "the reconciled counters are stored after the job is finished"
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +754,9 @@ class TestReplaceWithRetry:
 
     def test_the_budget_is_finite_and_the_error_surfaces(self, monkeypatch):
         monkeypatch.setattr(
-            utils.os, "replace", lambda s, d: (_ for _ in ()).throw(PermissionError(13, "x"))
+            utils.os,
+            "replace",
+            lambda s, d: (_ for _ in ()).throw(PermissionError(13, "x")),
         )
         monkeypatch.setattr(utils.time, "sleep", lambda *a: None)
         with pytest.raises(PermissionError):

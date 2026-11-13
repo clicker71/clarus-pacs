@@ -162,9 +162,9 @@ class TestJsonToDataset:
         ds = _json_to_dataset(study_json, {"PatientName"})
 
         assert str(ds.SpecificCharacterSet) == "ISO_IR 192"
-        assert "00080005" not in QIDO_KEY_TO_TAG, (
-            "mapping 0008,0005 lets the server charset overwrite the forced UTF-8"
-        )
+        assert (
+            "00080005" not in QIDO_KEY_TO_TAG
+        ), "mapping 0008,0005 lets the server charset overwrite the forced UTF-8"
         assert "?" not in str(ds.PatientName)
 
         # The declaration is only useful if the value ENCODES: with the wrong
@@ -175,9 +175,9 @@ class TestJsonToDataset:
         ds.file_meta.MediaStorageSOPInstanceUID = "1.2.3.4.5"
         buf = io.BytesIO()
         dcmwrite(buf, ds, enforce_file_format=True)
-        assert "Петров^Иван".encode("utf-8") in buf.getvalue(), (
-            "the Cyrillic name was not encoded as UTF-8 on the wire"
-        )
+        assert (
+            "Петров^Иван".encode("utf-8") in buf.getvalue()
+        ), "the Cyrillic name was not encoded as UTF-8 on the wire"
 
 
 class TestJsonToDatasetSeries:
@@ -222,6 +222,7 @@ class TestJsonToDatasetSeries:
         ds = _json_to_dataset_series(series_json, set(), None)
         assert str(ds.SpecificCharacterSet) == "ISO_IR 192"
         assert "00080005" not in QIDO_SERIES_KEY_TO_TAG
+
     def test_no_study_json_no_identity(self):
         series_json = {"0020000E": {"Value": ["2.25.5555666677778888"]}}
         ds = _json_to_dataset_series(series_json, set(), None)

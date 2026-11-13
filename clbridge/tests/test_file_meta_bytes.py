@@ -113,9 +113,9 @@ def test_ensure_ts_only_meta_emits_canonical_trio():
     assert values[0x0010].rstrip(b"\x00") == TS.encode("ascii")
     assert values[0x0012], "(0002,0012) Implementation Class UID is Type 1"
     # (0002,0000) counts the bytes that follow its own value field.
-    assert struct.unpack("<I", values[0x0000])[0] == meta_end - 132 - 12, (
-        "the group length must cover exactly the rest of group 0002"
-    )
+    assert (
+        struct.unpack("<I", values[0x0000])[0] == meta_end - 132 - 12
+    ), "the group length must cover exactly the rest of group 0002"
     # Every value length is even and the pad is INSIDE the length. The UL
     # group length and the UI UIDs use the 8-byte SHORT header; the OB
     # version element uses the 12-byte LONG one (2 reserved bytes + 4-byte

@@ -463,7 +463,15 @@ class TestOutboxSkipOnError:
     """P0-1: Outbox skip-on-error — один плохой SOP не блокирует очередь."""
 
     def test_max_retries_moves_to_undelivered(self, outbox):
-        """После MAX_RETRIES неудач → SOP перемещается в undelivered, очередь идёт дальше."""
+        """После MAX_RETRIES неудач SOP паркуется в undelivered/ сам по себе.
+
+        `mark_failed` calls `move_to_undelivered` when the counter reaches
+        MAX_RETRIES, so the exhausted item leaves pending/ on its own and the
+        healthy one behind it is the only candidate left. The assertion is
+        therefore about the good SOP being delivered AND the bad one being
+        parked by `mark_failed` alone - no manual move, and no branch that
+        would also accept None.
+        """
         sop_good = "1.2.840.10008.5.1.4.1.1.2.good"
         sop_bad = "1.2.840.10008.5.1.4.1.1.2.bad"
 
@@ -474,34 +482,34 @@ class TestOutboxSkipOnError:
         outbox.enqueue(ds_bad)
         assert outbox.pending_count() == 2
 
-        blob_bad = outbox._dcm_path(outbox._pending, sop_bad)
-
         # Симулируем исчерпание retries для bad SOP
         for i in range(outbox.MAX_RETRIES + 1):
             outbox.mark_failed(sop_bad, f"Error #{i}")
 
-        # После mark_failed, dequeue должен вернуть good (bad отфильтрован WHERE retry_count < MAX_RETRIES)
+        # mark_failed parks the item itself: no manual move_to_undelivered.
+        parked = outbox._dcm_path(outbox._undelivered, sop_bad)
+        assert os.path.isfile(parked), "MAX_RETRIES must park the blob"
+
+        # dequeue must hand out the good SOP, exactly.
         uid, ds_out, bp, raw = outbox.dequeue()
-        # Может вернуть good, или None если bad ещё не перемещён
-        if uid == sop_good:
-            # Good dequeued — отлично
-            assert ds_out.PatientName == "Test^Patient"
-        elif uid is None:
-            # dequeue ждёт на Condition — это нормально для теста
-            pass
-        else:
-            # Если вернулся bad (его retry_count был сброшен?) — перемещаем
-            assert uid == sop_bad
+        assert uid == sop_good, f"the parked SOP must not be handed out, got {uid}"
+        assert ds_out.PatientName == "Test^Patient"
 
-        # Перемещаем bad в undelivered вручную (worker делает это автоматически)
-        if os.path.isfile(blob_bad):
-            outbox.move_to_undelivered(sop_bad)
+        # The bad item is not in pending/ any more (the filesystem is the
+        # authority here - the counter is a gauge, not a claim record).
+        assert not os.path.isfile(outbox._dcm_path(outbox._pending, sop_bad))
+        # Nothing else is claimable.
+        assert outbox.dequeue()[0] is None
 
-        # Теперь good должен быть доступен (если ещё не доставлен)
-        assert outbox.pending_count() == 1  # только good остался
+    def test_an_exhausted_item_never_comes_back_out_of_the_queue(self, outbox):
+        """After MAX_RETRIES the SOP is parked and cannot be dequeued again.
 
-    def test_dequeue_skips_max_retries(self, outbox):
-        """dequeue() пропускает SOP с retry_count >= MAX_RETRIES."""
+        This pins the PARKING path (`mark_failed` -> `move_to_undelivered`),
+        which is what actually keeps an exhausted item out of the queue; the
+        retry_count predicate in `dequeue` is covered separately by
+        test_dequeue_skips_an_exhausted_pending_item, which needs a pending
+        item that `mark_failed` never saw.
+        """
         sop_good = "1.2.840.10008.5.1.4.1.1.2.g2"
         sop_bad = "1.2.840.10008.5.1.4.1.1.2.b2"
 
@@ -514,9 +522,54 @@ class TestOutboxSkipOnError:
         for i in range(outbox.MAX_RETRIES):
             outbox.mark_failed(sop_bad, f"Error #{i}")
 
-        # dequeue ДОЛЖЕН вернуть good (не bad)
+        # The exhausted blob is in undelivered/, so it is not a candidate.
+        assert os.path.isfile(outbox._dcm_path(outbox._undelivered, sop_bad))
+
         uid, ds_out, bp, raw = outbox.dequeue()
         assert uid == sop_good, f"Expected good SOP, got {uid}"
+        assert ds_out.PatientName == "Test^Patient"
+
+    def test_dequeue_skips_an_exhausted_pending_item(self, outbox):
+        """dequeue() must not hand out a pending item whose .meta is exhausted.
+
+        `mark_failed` parks an item itself, so the retry_count predicate is
+        only reachable through the RECOVERY path: a `.meta` written by a
+        previous run (or restored from a backup) can carry
+        `retry_count >= MAX_RETRIES` while the blob is still in pending/.
+
+        The exhausted item is made the OLDEST of the two, because dequeue
+        claims oldest-first: it is then the FIRST candidate the scan reaches.
+        Without the predicate the scan claims it and returns it, whatever the
+        healthy item behind it would have done - which is what makes the
+        assertion about the filter rather than about the ordering.
+        """
+        import json
+        import os as _os
+
+        sop_good = "1.2.840.10008.5.1.4.1.1.2.g3"
+        sop_bad = "1.2.840.10008.5.1.4.1.1.2.b3"
+
+        # Enqueue the BAD one first so its .meta is the older publish.
+        outbox.enqueue(_make_dataset(sop_bad))
+        outbox.enqueue(_make_dataset(sop_good))
+
+        # Rewrite the bad item's .meta as an exhausted record, leaving the
+        # blob where it is (the crashed-run / restored-backup shape).
+        meta_path = outbox._meta_path(outbox._pending, sop_bad)
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["retry_count"] = outbox.MAX_RETRIES
+        meta["next_retry_at"] = 0  # ready by time, so only the count blocks it
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        # The .meta mtime is the dequeue sort key: keep the exhausted item
+        # unambiguously first.
+        _t = _os.path.getmtime(meta_path) - 10
+        _os.utime(meta_path, (_t, _t))
+        outbox._pending_meta_cache = None
+
+        uid, ds_out, bp, raw = outbox.dequeue()
+        assert uid == sop_good, f"an exhausted pending item must be skipped, got {uid}"
         assert ds_out.PatientName == "Test^Patient"
 
     def test_dequeue_does_not_block_on_failure(self, outbox):

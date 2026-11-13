@@ -73,7 +73,9 @@ def test_a_byte_per_window_head_answers_408(monkeypatch):
     h.send_response = lambda *a, **k: None
     h.send_header = lambda *a, **k: None
     h.end_headers = lambda: None
-    h.wfile = type("W", (), {"write": lambda *a, **k: None, "flush": lambda *a, **k: None})()
+    h.wfile = type(
+        "W", (), {"write": lambda *a, **k: None, "flush": lambda *a, **k: None}
+    )()
 
     h.handle_one_request()
 
@@ -98,7 +100,9 @@ def test_a_multi_valued_series_uid_never_becomes_a_python_list_string():
     # Bypass the single-value check: the wire CAN carry several values for a
     # Type 1 single-value key, and that is the shape the fix must survive.
     event.identifier._dict[0x0020000E] = DataElement(
-        0x0020000E, "UI", __import__("pydicom").multival.MultiValue(str, ["1.2.3.4", "1.2.3.5"])
+        0x0020000E,
+        "UI",
+        __import__("pydicom").multival.MultiValue(str, ["1.2.3.4", "1.2.3.5"]),
     )
     _study, _dest, level, series_uid, _sop = _parse_c_move_rq(event)
 
@@ -140,6 +144,7 @@ def test_an_ambiguous_container_uid_is_refused():
         assert "SeriesInstanceUID" in str(exc), exc
     else:  # pragma: no cover - the assertion below reports it
         raise AssertionError("an ambiguous container was accepted into the URL")
+
 
 # ---------------------------------------------------------------------------
 # R3 - a stream-read failure keeps the delivered prefix
@@ -254,9 +259,7 @@ def test_a_complete_preflight_does_not_add_the_whole_registry(monkeypatch):
             self.contexts.append((sop, ts))
 
         def associate(self, *a, **k):
-            return type(
-                "A", (), {"is_established": True, "accepted_contexts": []}
-            )()
+            return type("A", (), {"is_established": True, "accepted_contexts": []})()
 
     monkeypatch.setattr(cm, "AE", _AE)
 
@@ -284,9 +287,9 @@ def test_a_complete_preflight_does_not_add_the_whole_registry(monkeypatch):
         f"got {len(proposed)} classes"
     )
     ts_for_ct = {ts for sop, ts in built["ae"].contexts if sop == CT}
-    assert "1.2.840.10008.1.2.4.70" in ts_for_ct, (
-        "the study's stored syntax must survive the budget trim"
-    )
+    assert (
+        "1.2.840.10008.1.2.4.70" in ts_for_ct
+    ), "the study's stored syntax must survive the budget trim"
 
 
 def test_a_partial_preflight_still_fills_in_the_registry(monkeypatch):
@@ -305,9 +308,7 @@ def test_a_partial_preflight_still_fills_in_the_registry(monkeypatch):
             self.contexts.append((sop, ts))
 
         def associate(self, *a, **k):
-            return type(
-                "A", (), {"is_established": True, "accepted_contexts": []}
-            )()
+            return type("A", (), {"is_established": True, "accepted_contexts": []})()
 
     monkeypatch.setattr(cm, "AE", _AE)
     registry = {CT: {"accept": True}, "1.2.840.10008.5.1.4.1.1.4": {"accept": True}}
@@ -377,9 +378,9 @@ def test_utf8_text_without_a_charset_is_left_readable():
 
     _fix_cp1251_krakozyabry(ds)
 
-    assert str(ds.PatientName) == name, (
-        "valid UTF-8 must be recovered, not re-decoded as cp1251"
-    )
+    assert (
+        str(ds.PatientName) == name
+    ), "valid UTF-8 must be recovered, not re-decoded as cp1251"
 
 
 def test_real_cp1251_text_is_still_repaired():
@@ -425,9 +426,11 @@ def test_a_falsy_old_value_is_recorded_verbatim():
         ds = Dataset()
         ds.add_new((0x0028, 0x0002), "US", 1)
         record_modification(ds, (0x0028, 0x0002), old, modifying_system="B")
-        recorded = ds.OriginalAttributesSequence[0].ModifiedAttributesSequence[0][
-            (0x0028, 0x0002)
-        ].value
+        recorded = (
+            ds.OriginalAttributesSequence[0]
+            .ModifiedAttributesSequence[0][(0x0028, 0x0002)]
+            .value
+        )
         assert recorded == old, (old, recorded)
 
 
@@ -515,9 +518,9 @@ def test_a_mistyped_entry_keeps_the_disabled_class_disabled(tmp_path):
         encoding="utf-8",
     )
     registry = _load_sop_registry(str(path))
-    assert _is_sop_accepted(registry, "1.2.840.10008.5.1.4.1.1.2") is False, (
-        "one mistyped entry must not re-enable a class the operator switched off"
-    )
+    assert (
+        _is_sop_accepted(registry, "1.2.840.10008.5.1.4.1.1.2") is False
+    ), "one mistyped entry must not re-enable a class the operator switched off"
 
 
 # ---------------------------------------------------------------------------
@@ -631,9 +634,9 @@ def test_a_reloaded_semaphore_is_not_over_released():
         # Releasing the NEW one would raise its counter above the limit.
         before = new_sem._value
         old_sem.release()
-        assert new_sem._value == before, (
-            "the release must reach the semaphore that was acquired"
-        )
+        assert (
+            new_sem._value == before
+        ), "the release must reach the semaphore that was acquired"
     finally:
         cstore._cstore_semaphore = original
         cstore._MAX_CONCURRENT_CSTORE = original_max
@@ -708,9 +711,9 @@ def test_the_mwl_e2e_test_asserts_a_terminal_success():
     path = os.path.join(os.path.dirname(__file__), "test_mwl_e2e.py")
     with open(path, encoding="utf-8") as f:
         src = f.read()
-    assert "statuses[-1] == 0x0000" in src, (
-        "the e2e MWL test must require a terminal Success status"
-    )
+    assert (
+        "statuses[-1] == 0x0000" in src
+    ), "the e2e MWL test must require a terminal Success status"
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +726,8 @@ def test_the_file_meta_group_carries_every_mandatory_element():
         struct.pack("<HH", 0x0008, 0x0016)
         + b"UI"
         + struct.pack("<H", 26)
-        + CT.encode("ascii") + b"\x00"
+        + CT.encode("ascii")
+        + b"\x00"
     )
     out = _ensure_file_meta_bytes(b"\x00" * 128 + b"DICM" + body, "", "", MR)
     _, elems, _meta_end = _walk_meta(out)

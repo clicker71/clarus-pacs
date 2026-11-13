@@ -365,8 +365,7 @@ class CommitTracker:
             try:
                 with self._db.locked() as conn:
                     cur = conn.execute(
-                        "DELETE FROM commit_jobs"
-                        " WHERE tx_uid = ? AND abandoned = 1",
+                        "DELETE FROM commit_jobs" " WHERE tx_uid = ? AND abandoned = 1",
                         (tx,),
                     )
                     conn.commit()
@@ -414,9 +413,11 @@ class CommitTracker:
                     # report was sent but its response was lost must re-send
                     # the SAME result, not a freshly computed one that may
                     # differ for the same transaction.
-                    json.dumps(_verdict_to_json(job.frozen_verdict))
-                    if job.frozen_verdict is not None
-                    else None,
+                    (
+                        json.dumps(_verdict_to_json(job.frozen_verdict))
+                        if job.frozen_verdict is not None
+                        else None
+                    ),
                     1 if job.abandoned else 0,
                     float(getattr(job, "abandoned_at", 0.0)),
                 ),

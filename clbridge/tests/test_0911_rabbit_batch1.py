@@ -67,7 +67,11 @@ class _TestDb:
 
 
 def _noop_counter():
-    return type("C", (), {"labels": lambda *a, **k: type("L", (), {"inc": lambda *a, **k: None})()})()
+    return type(
+        "C",
+        (),
+        {"labels": lambda *a, **k: type("L", (), {"inc": lambda *a, **k: None})()},
+    )()
 
 
 def _counter(name):
@@ -282,9 +286,7 @@ class TestClassB:
         mock_assoc = MagicMock()
         mock_assoc.is_established = True
         ctx = MagicMock()
-        type(ctx).abstract_syntax = property(
-            lambda self: "1.2.840.10008.1.20.1"
-        )
+        type(ctx).abstract_syntax = property(lambda self: "1.2.840.10008.1.20.1")
         mock_assoc.accepted_contexts = [ctx]
         mock_assoc.send_n_action.return_value = (MagicMock(Status=0x0000), None)
 
@@ -386,9 +388,9 @@ class TestClassD:
                 assert next(gen) == ("127.0.0.1", 11112)
                 flag["c"] = True
                 list(gen)
-            assert m.is_job_cancelled(1) is True, (
-                "cancel path must latch the callback, not clear it"
-            )
+            assert (
+                m.is_job_cancelled(1) is True
+            ), "cancel path must latch the callback, not clear it"
         finally:
             m.close()
             db.close()
@@ -439,6 +441,7 @@ class TestClassE:
     def test_cache_evict_uses_pop_not_del(self):
         """E2: eviction must use pop(key, None), not `del`, so two workers
         evicting the same expired key cannot raise KeyError."""
+
         class SpyDict(dict):
             used_del = False
 

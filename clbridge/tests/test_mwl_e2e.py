@@ -314,9 +314,9 @@ def test_mwl_cfind_through_bridge_returns_scheduled(stack):
         # that answered a valid Pending and then failed (0xA700, 0xC000) used
         # to pass every assertion below, because the final status was ignored.
         assert statuses, "the SCU received no C-FIND response at all"
-        assert statuses[-1] == 0x0000, (
-            f"{statuses[:5]}..., terminal {statuses[-1]:#06x})"
-        )
+        assert (
+            statuses[-1] == 0x0000
+        ), f"{statuses[:5]}..., terminal {statuses[-1]:#06x})"
         # The nested station key IS the filter: the bridge reads it out of
         # (0040,0100) and sends ?ScheduledStationNameCodeSequence.CodeValue=
         # STATION01, so the OTHERSTATION workitem must be filtered out by the

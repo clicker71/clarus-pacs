@@ -81,9 +81,9 @@ class TestBase64Validation:
         import clean_code.http_server as hs
 
         src = inspect.getsource(hs.BridgeHTTPHandler.do_POST)
-        assert "validate=True" in src, (
-            "the /print handler must reject malformed base64 before the driver"
-        )
+        assert (
+            "validate=True" in src
+        ), "the /print handler must reject malformed base64 before the driver"
         # And the strict form really does refuse what the lenient form accepts
         # (length-correct, padding-correct, two bad characters in the middle).
         junk = "QUJD" * 4 + "!!" + "REVG"
@@ -213,9 +213,7 @@ class TestMigrationCrashSafe:
             " host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 104,"
             " last_seen INTEGER NOT NULL, consecutive_failures INTEGER DEFAULT 0)"
         )
-        conn.execute(
-            "INSERT INTO scp_targets VALUES ('AE1','10.0.0.1',104,1,0)"
-        )
+        conn.execute("INSERT INTO scp_targets VALUES ('AE1','10.0.0.1',104,1,0)")
         conn.commit()
         conn.close()
 
@@ -258,9 +256,7 @@ class TestMigrationCrashSafe:
             " last_seen INTEGER NOT NULL, consecutive_failures INTEGER DEFAULT 0,"
             " PRIMARY KEY (ae_title, host))"
         )
-        conn.execute(
-            "INSERT INTO scp_targets_v2 VALUES ('AE1','10.0.0.1',104,1,0)"
-        )
+        conn.execute("INSERT INTO scp_targets_v2 VALUES ('AE1','10.0.0.1',104,1,0)")
         conn.commit()
         _migrate_scp_targets(conn)
         cols = {r[1] for r in conn.execute("PRAGMA table_info('scp_targets')")}
@@ -269,9 +265,7 @@ class TestMigrationCrashSafe:
         assert ("AE1", "10.0.0.1") in rows, rows
         # And running it again on the migrated schema is a no-op.
         _migrate_scp_targets(conn)
-        assert (
-            conn.execute("SELECT COUNT(*) FROM scp_targets").fetchone()[0] == 1
-        )
+        assert conn.execute("SELECT COUNT(*) FROM scp_targets").fetchone()[0] == 1
         conn.close()
 
 
@@ -301,6 +295,8 @@ def test_the_charset_repair_descends_into_sequence_items():
         f"be relabelled UTF-8: {fixed_nested!r}"
     )
     assert str(result.SpecificCharacterSet) == "ISO_IR 192"
+
+
 class TestStaleTickDoesNotClobberTheRow:
     def test_the_shrink_write_is_guarded_by_identity(self):
         """`_tick` walks a SNAPSHOT of `_jobs`, so a re-registration during a
@@ -365,10 +361,8 @@ def test_study_sop_uids_uses_the_instance_list_not_series_metadata():
     src = inspect.getsource(cm._study_sop_uids)
     # Strip comments: the explanatory note NAMES the old resource, and a
     # substring scan over raw text would fail on the comment.
-    code = "\n".join(
-        line.split("#", 1)[0] for line in src.splitlines()
-    )
+    code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
     assert "/instances" in code, "the instance list is the cheap source"
-    assert "/metadata" not in code, (
-        "the study SOP list must not render instance metadata any more"
-    )
+    assert (
+        "/metadata" not in code
+    ), "the study SOP list must not render instance metadata any more"

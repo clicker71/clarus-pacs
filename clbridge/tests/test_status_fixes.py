@@ -134,7 +134,10 @@ def test_zero_delivered_failure_is_c000_with_error_comment(move_jobs, monkeypatc
     status, identifier = _drain_final(gen)
     assert status == 0xC000, hex(status)
     assert identifier is not None
-    assert (0x0000, 0x0902) not in identifier, (
+    assert (
+        0x0000,
+        0x0902,
+    ) not in identifier, (
         "Error Comment is a command-set element, not a data-set element"
     )
 

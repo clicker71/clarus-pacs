@@ -53,7 +53,9 @@ def test_a_trickling_head_answers_408(monkeypatch):
     h.send_response = lambda *a, **k: None
     h.send_header = lambda *a, **k: None
     h.end_headers = lambda: None
-    h.wfile = type("W", (), {"write": lambda *a, **k: None, "flush": lambda *a, **k: None})()
+    h.wfile = type(
+        "W", (), {"write": lambda *a, **k: None, "flush": lambda *a, **k: None}
+    )()
 
     h.handle_one_request()
     assert 408 in h.errors, h.errors
@@ -81,9 +83,9 @@ def test_a_broken_health_check_zeros_the_gauge(monkeypatch):
     h.log_message = lambda *a, **k: None
     h.do_GET()
 
-    assert hs.server_health._value.get() == 0, (
-        "a raising checker must not keep reporting the last good value"
-    )
+    assert (
+        hs.server_health._value.get() == 0
+    ), "a raising checker must not keep reporting the last good value"
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +139,9 @@ def test_a_failed_delete_keeps_the_abandoned_entry(tmp_path):
 
     tracker._db = _Boom()
     assert tracker.purge_abandoned(max_age_sec=-1.0) == 0
-    assert "1.2.3.92" in tracker._abandoned, (
-        "a failed DELETE must leave the entry for the next sweep"
-    )
+    assert (
+        "1.2.3.92" in tracker._abandoned
+    ), "a failed DELETE must leave the entry for the next sweep"
     tracker.close()
 
 
@@ -221,9 +223,9 @@ def test_an_inline_comment_on_a_uid_line_does_not_reopen_the_previous_class(tmp_
         encoding="utf-8",
     )
     registry = _parse_simple_yaml(str(path))["sop_classes"]
-    assert _is_sop_accepted(registry, "1.2.840.10008.5.1.4.1.1.2") is False, (
-        "the MR class's `accept: true` must not land on the previous UID"
-    )
+    assert (
+        _is_sop_accepted(registry, "1.2.840.10008.5.1.4.1.1.2") is False
+    ), "the MR class's `accept: true` must not land on the previous UID"
     assert _is_sop_accepted(registry, "1.2.840.10008.5.1.4.1.1.4") is True
 
 
@@ -343,9 +345,9 @@ def test_a_failed_instance_counts_undelivered_once(tmp_path, monkeypatch):
         t.join(timeout=10)
 
     assert q._is_undelivered(uid)
-    assert counter._value.get() - before == 1, (
-        "the undelivered counter must rise once, not twice"
-    )
+    assert (
+        counter._value.get() - before == 1
+    ), "the undelivered counter must rise once, not twice"
 
 
 # ---------------------------------------------------------------------------
@@ -527,22 +529,29 @@ def test_the_move_association_bounds_the_tcp_connect(monkeypatch):
     cm._associate_for_move("DEST", "BRIDGE", {MR: {"accept": True}}, "10.0.0.1", 11112)
     assert made, "no AE was constructed"
     t = made[0]._timeouts
-    for key in ("network_timeout", "acse_timeout", "dimse_timeout", "connection_timeout"):
+    for key in (
+        "network_timeout",
+        "acse_timeout",
+        "dimse_timeout",
+        "connection_timeout",
+    ):
         assert key in t, f"AE missing {key}"
-    assert t["connection_timeout"] == t["acse_timeout"], (
-        "the connect bound must match the ACSE timeout"
-    )
+    assert (
+        t["connection_timeout"] == t["acse_timeout"]
+    ), "the connect bound must match the ACSE timeout"
 
 
 def test_the_commit_fallback_bounds_the_tcp_connect(monkeypatch):
     import clean_code.handlers.cmove as cm
 
     made = _fake_ae_capture(monkeypatch, cm)
-    cm._send_storage_commitment("DEST", "10.0.0.1", 11112, [(MR, "1.2.3")], "BRIDGE", assoc=None)
-    assert made, "no AE was constructed for the fallback association"
-    assert made[0]._timeouts.get("connection_timeout") == 5, (
-        "the fallback connect must be bounded to 5s, symmetric with nevent.py"
+    cm._send_storage_commitment(
+        "DEST", "10.0.0.1", 11112, [(MR, "1.2.3")], "BRIDGE", assoc=None
     )
+    assert made, "no AE was constructed for the fallback association"
+    assert (
+        made[0]._timeouts.get("connection_timeout") == 5
+    ), "the fallback connect must be bounded to 5s, symmetric with nevent.py"
 
 
 def test_the_forward_association_bounds_the_tcp_connect(monkeypatch):
@@ -654,7 +663,7 @@ def test_a_midstream_raise_still_names_the_failed_sops(monkeypatch):
         sop_registry={MR: {"accept": True}},
     )
 
-    assert ops.get("failed_sops") == sop_all, (
-        "the final (0008,0058) must name the undelivered instances"
-    )
+    assert (
+        ops.get("failed_sops") == sop_all
+    ), "the final (0008,0058) must name the undelivered instances"
     assert ops["finished"][1] is False, "a study with losses must not finish as success"

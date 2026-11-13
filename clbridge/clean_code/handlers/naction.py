@@ -113,9 +113,7 @@ def _register_commit(
             # Persistence failed, so the commitment cannot be honoured later.
             # Answer Failure (0x0110) instead of acknowledging a request whose
             # N-EVENT-REPORT would never be pushed (PS3.4 J.3.3.1).
-            logging.error(
-                "[N-ACTION] tx=%s could not be registered: %s", tx_uid, e
-            )
+            logging.error("[N-ACTION] tx=%s could not be registered: %s", tx_uid, e)
             return False
         return True
 

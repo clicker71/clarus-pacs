@@ -121,7 +121,9 @@ def _load_sop_registry(yaml_path="sop_classes.yaml"):
         # is the same silent-wrong-answer failure as a missing key, so such an
         # entry is dropped rather than corrected - never the whole file.
         mistyped = sorted(
-            uid for uid, entry in registry.items() if not isinstance(entry["accept"], bool)
+            uid
+            for uid, entry in registry.items()
+            if not isinstance(entry["accept"], bool)
         )
         if mistyped:
             for uid in mistyped:

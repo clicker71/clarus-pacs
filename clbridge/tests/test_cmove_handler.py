@@ -320,7 +320,10 @@ class TestCMoveSelfLoopGuards:
         status, identifier = results[-1]
         assert status == 0xC000, f"zero-delivered job -> Failure, got {hex(status)}"
         assert identifier is not None
-        assert (0x0000, 0x0902) not in identifier, (
+        assert (
+            0x0000,
+            0x0902,
+        ) not in identifier, (
             "Error Comment is a command-set element, not a data-set element"
         )
         assert move_jobs.pick_pending_job(timeout=0) is None
@@ -410,7 +413,9 @@ class TestCMoveRspPolicy:
         assert list(gen) == [0]
         assert calls == [], f"reactor issued HTTP: {calls}"
 
-    def test_failure_partial_yields_expected_total_then_warning_0008_0058(self, move_jobs):
+    def test_failure_partial_yields_expected_total_then_warning_0008_0058(
+        self, move_jobs
+    ):
         """Job finished failed with completed<total -> yield the expected
         total (keeps the dialog open), then 0xB000 with (0008,0058) Failed
         SOP Instance UID List (PS3.4 C.4.2.1.4.2)."""
@@ -462,7 +467,10 @@ class TestCMoveRspPolicy:
         status, identifier = pulled[1]
         assert status == 0xC000, hex(status)
         assert identifier is not None
-        assert (0x0000, 0x0902) not in identifier, (
+        assert (
+            0x0000,
+            0x0902,
+        ) not in identifier, (
             "Error Comment is a command-set element, not a data-set element"
         )
 

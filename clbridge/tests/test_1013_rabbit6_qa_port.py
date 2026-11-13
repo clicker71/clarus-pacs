@@ -25,7 +25,9 @@ def _args(**kw):
 
 class TestB3QaPortWillBind:
     def test_both_set_means_it_binds(self):
-        assert main_mod._qa_port_will_bind(_args(expose_port=11113, qa_url="http://x/qa"))
+        assert main_mod._qa_port_will_bind(
+            _args(expose_port=11113, qa_url="http://x/qa")
+        )
 
     def test_port_without_url_does_not_bind(self):
         """The regression: this configuration starts no QA listener, so the
@@ -33,7 +35,9 @@ class TestB3QaPortWillBind:
         assert not main_mod._qa_port_will_bind(_args(expose_port=11113, qa_url=""))
 
     def test_url_without_port_does_not_bind(self):
-        assert not main_mod._qa_port_will_bind(_args(expose_port=None, qa_url="http://x/qa"))
+        assert not main_mod._qa_port_will_bind(
+            _args(expose_port=None, qa_url="http://x/qa")
+        )
 
     def test_neither_set_does_not_bind(self):
         assert not main_mod._qa_port_will_bind(_args())
@@ -43,9 +47,9 @@ class TestB3QaPortWillBind:
         `if args.expose_port and args.qa_url`, so the predicate must be that
         exact conjunction."""
         src = inspect.getsource(main_mod._init_dimse_ae)
-        assert "if args.expose_port and args.qa_url:" in src, (
-            "the AE start condition changed - update _qa_port_will_bind"
-        )
+        assert (
+            "if args.expose_port and args.qa_url:" in src
+        ), "the AE start condition changed - update _qa_port_will_bind"
 
 
 class TestB3ProbeCallSite:
@@ -62,8 +66,7 @@ class TestB3ProbeCallSite:
             if name != "_check_port_available":
                 return False
             return any(
-                isinstance(a, ast.Constant) and a.value == "DIMSE QA"
-                for a in node.args
+                isinstance(a, ast.Constant) and a.value == "DIMSE QA" for a in node.args
             )
 
         guarded = False
@@ -75,9 +78,9 @@ class TestB3ProbeCallSite:
                 continue
             if any(_is_qa_probe(n) for n in ast.walk(node)):
                 guarded = True
-        assert guarded, (
-            "the 'DIMSE QA' port probe is not inside a _qa_port_will_bind branch"
-        )
+        assert (
+            guarded
+        ), "the 'DIMSE QA' port probe is not inside a _qa_port_will_bind branch"
 
     def test_the_probe_still_precedes_component_initialisation(self):
         """The existing ordering guarantee (a second instance must not reset

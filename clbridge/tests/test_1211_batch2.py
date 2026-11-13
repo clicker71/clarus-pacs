@@ -37,9 +37,9 @@ class TestMalformedStowBatchBody:
         )
         assert retryafter is None
         assert [r[0] for r in results] == ["1.2.3.1", "1.2.3.2"]
-        assert all(r[1] == 0xA700 for r in results), (
-            "a body the server could not express as DICOM JSON is a reject"
-        )
+        assert all(
+            r[1] == 0xA700 for r in results
+        ), "a body the server could not express as DICOM JSON is a reject"
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +71,9 @@ def test_undelivered_items_keep_their_sidecars(tmp_path):
     names = {p.name for p in undelivered.iterdir()}
     stem = next(n for n in names if not n.endswith(".meta"))
     assert stem.endswith(".dcm"), names
-    assert stem[:-4] + ".meta" in names, (
-        "the give-up record must travel with the blob: " + repr(names)
-    )
+    assert (
+        stem[:-4] + ".meta" in names
+    ), "the give-up record must travel with the blob: " + repr(names)
     assert not (tmp_path / "in_progress" / stem).exists()
     assert not (tmp_path / "in_progress" / (stem[:-4] + ".meta")).exists()
 
@@ -98,9 +98,10 @@ class TestSopRegistryRefusal:
             registry = _load_sop_registry(str(path))
 
         assert registry == _BUILTIN_SOP_CLASSES()
-        assert "1.2.840.10008.5.1.4.1.1.2" not in registry or registry[
-            "1.2.840.10008.5.1.4.1.1.2"
-        ].get("accept") is not None
+        assert (
+            "1.2.840.10008.5.1.4.1.1.2" not in registry
+            or registry["1.2.840.10008.5.1.4.1.1.2"].get("accept") is not None
+        )
         assert any(
             "without `accept`" in r.message for r in caplog.records
         ), "the operator must be told which UID and which file"
@@ -133,9 +134,9 @@ class TestForwardWarningIsDelivered:
         import clean_code.main as m
 
         src = inspect.getsource(m._forward_process_batch)
-        assert "0xB000" in src and "0xBFFF" in src, (
-            "the deliverable set must include the WARNING class"
-        )
+        assert (
+            "0xB000" in src and "0xBFFF" in src
+        ), "the deliverable set must include the WARNING class"
         code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
         assert "mark_delivered(uid)" in code
 
@@ -172,9 +173,12 @@ def test_a_down_server_returns_the_batch_to_pending_without_a_retry_burn():
     src = inspect.getsource(m._outbox_worker)
     code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
     assert "requeue(" in code, "the buffered tail goes back to pending/"
-    assert "_deliver_batch()" not in code.split("not health_checker.is_healthy()")[1].split(
-        "elif _was_paused"
-    )[0], "a down server must not be sent to at all"
+    assert (
+        "_deliver_batch()"
+        not in code.split("not health_checker.is_healthy()")[1].split(
+            "elif _was_paused"
+        )[0]
+    ), "a down server must not be sent to at all"
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +193,12 @@ def test_a_partial_preflight_does_not_narrow_the_proposal_to_learned_classes():
 
     src = inspect.getsource(cm._associate_for_move)
     code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
-    assert "_proposed_ts_per_class(sop_registry)" in code, (
-        "the registry must still fill in the classes the pre-flight missed"
-    )
-    assert "protected" in code, (
-        "a class the pre-flight SAW must not be dropped by the budget trim"
-    )
+    assert (
+        "_proposed_ts_per_class(sop_registry)" in code
+    ), "the registry must still fill in the classes the pre-flight missed"
+    assert (
+        "protected" in code
+    ), "a class the pre-flight SAW must not be dropped by the budget trim"
 
 
 # ---------------------------------------------------------------------------

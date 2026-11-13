@@ -22,6 +22,7 @@ Rule A replaces the 31.08 fallback-first scenarios (6-11 of the old file) and
 the probes_timeout observability (removed with the probe itself).
 """
 
+import io
 import json
 import logging
 import socket
@@ -31,6 +32,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from clean_code.handlers.cmove import _execute_cmove_job
+from pydicom import dcmread
 from pydicom.uid import (
     ExplicitVRLittleEndian,
     ImplicitVRLittleEndian,
@@ -43,6 +45,12 @@ from pynetdicom import AE, evt
 EVRLE = ExplicitVRLittleEndian
 IVRLE = ImplicitVRLittleEndian
 JPG = JPEGBaseline8Bit
+
+# Transfer syntaxes whose Pixel Data is encapsulated (PS3.5 A.4). EVRLE/IVRLE
+# carry native Pixel Data with an explicit length, so the fixture must encode
+# the two forms differently - that distinction is the whole point of the
+# passthrough assertions.
+_COMPRESSED_TS = frozenset({JPEGBaseline8Bit, JPEGLosslessSV1, JPEGLSLossless})
 
 CT = "1.2.840.10008.5.1.4.1.1.2"
 MR = "1.2.840.10008.5.1.4.1.1.4"
@@ -60,6 +68,54 @@ def _ui(value):
     return v + b"\x00" if len(v) % 2 else v
 
 
+# A deterministic "compressed" bit stream: a SOI marker, filler that is NOT
+# plain grey, and the EOI marker. Nothing in the bridge decodes it, so its
+# only job is to be recognisable byte-for-byte after the round trip - which is
+# what proves the stored payload survived instead of being re-encoded.
+_COMPRESSED_FRAME = b"\xff\xd8" + bytes(range(0x20, 0x20 + 62)) + b"\xff\xd9"
+
+
+def _fragment(sop_uid, ts):
+    """`_COMPRESSED_FRAME` with the SOP UID folded in, so two instances of the
+    same study cannot be confused."""
+    tail = sop_uid.encode("ascii")
+    body = _COMPRESSED_FRAME + tail
+    return body + b"\x00" if len(body) % 2 else body
+
+
+def _encapsulated_pixel_data(fragment):
+    """PS3.5 A.4 encapsulated (7FE0,0010) OB, undefined length.
+
+    Layout: an empty Basic Offset Table Item (FFFE,E000 with length 0), one
+    Fragment Item (FFFE,E000) carrying the encoded bit stream, then the
+    Sequence Delimitation Item (FFFE,E0DD) with length 0. The Value Length of
+    the element itself is the Undefined Length sentinel.
+    """
+    bot = struct.pack("<HHI", 0xFFFE, 0xE000, 0)  # empty basic offset table
+    item = struct.pack("<HHI", 0xFFFE, 0xE000, len(fragment)) + fragment
+    delim = struct.pack("<HHI", 0xFFFE, 0xE0DD, 0)
+    return (
+        struct.pack("<HH", 0x7FE0, 0x0010)
+        + b"OB"
+        + b"\x00\x00"
+        + struct.pack("<I", 0xFFFFFFFF)
+        + bot
+        + item
+        + delim
+    )
+
+
+def _native_pixel_data(payload):
+    """PS3.5 A.4 native (7FE0,0010) OW, defined length."""
+    return (
+        struct.pack("<HH", 0x7FE0, 0x0010)
+        + b"OW"
+        + b"\x00\x00"
+        + struct.pack("<I", len(payload))
+        + payload
+    )
+
+
 def _meta_trio_bytes(sc, si, ts):
     out = b""
     for elem, value in ((0x0002, sc), (0x0003, si), (0x0010, ts)):
@@ -69,7 +125,13 @@ def _meta_trio_bytes(sc, si, ts):
 
 
 def _img_bytes(sop_uid, ts):
-    """CT instance with canonical trio meta, stored under `ts`."""
+    """CT instance with canonical trio meta, stored under `ts`.
+
+    A compressed transfer syntax REQUIRES encapsulated Pixel Data (PS3.5 A.4:
+    VR OB, Undefined Length, fragment Items). A defined-length OW blob under a
+    compressed TS is not encapsulated at all, so a test built on one could
+    never show that the compressed bytes survived delivery.
+    """
     d = b""
     for group, elem, value in (
         (0x0008, 0x0016, CT),
@@ -90,13 +152,10 @@ def _img_bytes(sop_uid, ts):
         + struct.pack("<H", 2)
         + struct.pack("<H", 4)
     )
-    d += (
-        struct.pack("<HH", 0x7FE0, 0x0010)
-        + b"OW"
-        + b"\x00\x00"
-        + struct.pack("<I", 4)
-        + b"\xaa" * 4
-    )
+    if ts in _COMPRESSED_TS:
+        d += _encapsulated_pixel_data(_fragment(sop_uid, ts))
+    else:
+        d += _native_pixel_data(b"\xaa" * 4)
     return b"\x00" * 128 + b"DICM" + _meta_trio_bytes(CT, sop_uid, ts) + d
 
 
@@ -118,6 +177,37 @@ def _free_port():
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def _pixel_data_fragment(ds):
+    """The first encapsulated Fragment Item payload of (7FE0,0010).
+
+    pydicom hands an encapsulated element back as the raw Item stream (Basic
+    Offset Table Item, the Fragment Items, then the Sequence Delimitation
+    Item). Returning the first fragment's payload lets a test compare the
+    bytes that arrived against the bytes that were sent - the only way to show
+    the stored compressed stream survived instead of being re-encoded.
+
+    A native (defined-length) element yields its value bytes unchanged.
+    """
+    try:
+        element = ds[0x7FE0, 0x0010]
+    except KeyError:
+        return b""
+    value = element.value
+    stream = bytes((value[1] if isinstance(value, tuple) else value) or b"")
+    if len(stream) < 8 or stream[:4] != b"\xfe\xff\x00\xe0":
+        # Native format: no Item stream to walk.
+        return stream
+    # Walk the Item stream: the first Item with a non-zero length is the
+    # fragment (PS3.5 7.5: items carry no VR, 8-byte header).
+    pos = 0
+    while pos + 8 <= len(stream):
+        _group, _elem, length = struct.unpack_from("<HHI", stream, pos)
+        if length:
+            return stream[pos + 8 : pos + 8 + length]
+        pos += 8
+    return b""
 
 
 class _FakeClarus(BaseHTTPRequestHandler):
@@ -229,6 +319,7 @@ class _StorageScp:
                 str(getattr(ds, "SOPClassUID", "")),
                 str(getattr(ds, "SOPInstanceUID", "")),
                 str(getattr(ds.file_meta, "TransferSyntaxUID", "")),
+                _pixel_data_fragment(ds),
             )
         )
         return 0x0000
@@ -350,6 +441,62 @@ def test_stored_ts_accepted_by_main_association():
     finally:
         scp.shutdown()
         server.shutdown()
+
+
+def test_the_compressed_fixture_is_encapsulated_not_native():
+    """PS3.5 A.4: a compressed transfer syntax REQUIRES encapsulated Pixel Data.
+
+    The fixture is the evidence in every compressed-wire test above, so its
+    framing is itself asserted here: VR OB, Undefined Length, an Item stream
+    that starts with a Basic Offset Table Item, one Fragment Item carrying the
+    encoded bit stream and a Sequence Delimitation Item. A defined-length OW
+    blob under a compressed TS would mean those tests only proved that the
+    transfer-syntax UID survived.
+    """
+    for ts in (JPG, JPEGLosslessSV1, JPEGLSLossless):
+        raw = _img_bytes(SOP_CT, ts)
+        # Locate the Pixel Data element with pydicom rather than a byte scan:
+        # the tag bytes also occur inside the SOP UID text and inside the
+        # fragment itself. `file_offset` is where its header starts.
+        parsed = dcmread(io.BytesIO(raw))
+        # file_tell is the offset of the element's VALUE (the Item stream);
+        # the 12-byte long-VR header starts immediately before it.
+        pos = parsed[(0x7FE0, 0x0010)].file_tell - 12
+        assert pos > 0, ts
+        vr = raw[pos + 4 : pos + 6]
+        assert vr == b"OB", (ts, vr)
+        length = struct.unpack_from("<I", raw, pos + 8)[0]
+        assert length == 0xFFFFFFFF, (ts, hex(length))
+
+        stream = raw[parsed[(0x7FE0, 0x0010)].file_tell :]
+        # Item stream: Basic Offset Table Item (empty), Fragment Item, then the
+        # Sequence Delimitation Item. Each Item header is 8 bytes (PS3.5 7.5:
+        # no VR), so the fragment payload starts at 16 and the delimiter
+        # follows it at 16 + frag_len.
+        group, elem, bot_len = struct.unpack_from("<HHI", stream, 0)
+        assert (group, elem, bot_len) == (0xFFFE, 0xE000, 0), (ts, group, elem, bot_len)
+        group, elem, frag_len = struct.unpack_from("<HHI", stream, 8)
+        assert (group, elem) == (0xFFFE, 0xE000), (ts, group, elem)
+        assert frag_len > 0, ts
+        fragment = stream[16 : 16 + frag_len]
+        assert fragment == _fragment(
+            SOP_CT, ts
+        ), "the fragment payload must be the encoded bytes"
+        delim_at = 16 + frag_len
+        group, elem, delim_len = struct.unpack_from("<HHI", stream, delim_at)
+        assert (group, elem, delim_len) == (0xFFFE, 0xE0DD, 0), (
+            ts,
+            group,
+            elem,
+            delim_len,
+        )
+        assert len(stream) == delim_at + 8, (ts, len(stream), delim_at + 8)
+
+    # The native path keeps the explicit-length OW form (A.4).
+    native = _img_bytes(SOP_CT, EVRLE)
+    pos = native.find(struct.pack("<HH", 0x7FE0, 0x0010))
+    assert native[pos + 4 : pos + 6] == b"OW"
+    assert struct.unpack_from("<I", native, pos + 8)[0] == 4
 
 
 def test_stored_rejected_refetch_single_instance_evrle():
@@ -515,6 +662,12 @@ def test_native_only_scp_accepts_fallback_passthrough_470():
         assert inst_gets == [], inst_gets
         assert len(scp.received) == 1
         assert scp.received[0][2] == JPEGLosslessSV1
+        # PS3.5 A.4: the encapsulated fragment on the wire is byte-identical
+        # to the one that was stored - the compressed stream was not decoded
+        # and re-encoded on the way through.
+        assert scp.received[0][3] == _fragment(
+            SOP_CT, JPEGLosslessSV1
+        ), "the stored compressed fragment must arrive unchanged"
         joined = "\n".join(records)
         # Accepted on the main (a 4.70 context was proposed and accepted) -
         # passthrough on the ONE association.
@@ -542,6 +695,9 @@ def test_main_covers_stored_ts_no_fallback_association():
         assert inst_gets == [], inst_gets
         assert len(scp.received) == 1
         assert scp.received[0][2] == JPEGLSLossless
+        assert scp.received[0][3] == _fragment(
+            SOP_CT, JPEGLSLossless
+        ), "4.80 rides the main context; its fragment must be untouched"
         joined = "\n".join(records)
         # Exactly ONE association (main); no refetch.
         assert joined.count("Requesting Association") == 1, joined

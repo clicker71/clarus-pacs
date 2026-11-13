@@ -426,9 +426,10 @@ def _stc_map_verdict(payload, sop_list, tx_uid):
     """Map a Commit/Check 200 body onto (committed, failed, None).
 
     Committed SOPs come from ReferencedSOPSequence (0008,1199); failed ones
-    from FailedSOPSequence (0008,1198) with FailureReason (0008,1197) read as
-    a STRING (DICOM JSON renders numeric VRs as strings). A SOP absent from
-    BOTH sequences is a protocol defect of the origin and is reported as
+    from FailedSOPSequence (0008,1198) with FailureReason (0008,1197). PS3.18
+    F.2.3 maps US to a JSON Number, so the reason arrives as an integer and
+    `_stc_reason` resolves it to a DIMSE code. A SOP absent from BOTH
+    sequences is a protocol defect of the origin and is reported as
     failed 0x0110 - the bridge reports, it does not guess.
     """
     committed = []
@@ -500,11 +501,29 @@ def _stc_key(pair):
 
 
 def _stc_reason(item):
-    """FailureReason as a DIMSE code; anything unenumerated is 0x0110."""
+    """Failure Reason (0008,1197) as a DIMSE code; unenumerated -> 0x0110.
+
+    PS3.18 F.2.3 Table F.2.3-1 maps US to the JSON Data Type "Number", so a
+    conformant origin writes 0x0112 as the bare number 274. `_stc_single`
+    stringifies it, so the DECIMAL text has to be resolved to the same code as
+    the hex text - a map lookup keyed only on "0112" reported every numeric
+    verdict as 0x0110. A JSON String is still accepted (lenient input): that
+    form is non-conformant for US but harmless to read.
+    """
     raw = _stc_single(item, _STC_FAILURE_REASON)
     if raw is None:
         return _STC_PROCESSING_FAILURE
-    return _STC_REASON_MAP.get(str(raw).strip(), _STC_PROCESSING_FAILURE)
+    text = str(raw).strip()
+    if text in _STC_REASON_MAP:
+        return _STC_REASON_MAP[text]
+    try:
+        # Decimal form of the same code (274 == 0x0112).
+        code = int(text, 10)
+    except (TypeError, ValueError):
+        return _STC_PROCESSING_FAILURE
+    if 0 <= code <= 0xFFFF:
+        return code
+    return _STC_PROCESSING_FAILURE
 
 
 # ---------------------------------------------------------------------------
@@ -959,10 +978,14 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 # other outcome, or the caller unpacks two values from a
                 # three-tuple and dies with ValueError.
                 logging.error("[STOW-RS] malformed batch response body: %s", e)
-                return pre_failed + [
-                    (uid, 0xA700, resp.status_code, f"Malformed response: {e}")
-                    for uid, _ds, _raw in live_payloads
-                ], None
+                return (
+                    pre_failed
+                    + [
+                        (uid, 0xA700, resp.status_code, f"Malformed response: {e}")
+                        for uid, _ds, _raw in live_payloads
+                    ],
+                    None,
+                )
             failed_by_uid = {f["sop_uid"]: f["reason"] for f in failed}
             sent = {uid for uid, _ds, _raw in live_payloads}
             # PS3.18 10.5: a rejection the server reported for a SOP the client
@@ -976,10 +999,14 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     "whole batch retried",
                     len(unmatched),
                 )
-                return pre_failed + [
-                    (uid, 0xA700, resp.status_code, "Unmatched failure response")
-                    for uid, _ds, _raw in live_payloads
-                ], None
+                return (
+                    pre_failed
+                    + [
+                        (uid, 0xA700, resp.status_code, "Unmatched failure response")
+                        for uid, _ds, _raw in live_payloads
+                    ],
+                    None,
+                )
             results = list(pre_failed)
             for sop_uid, ds, raw_bytes in live_payloads:
                 if sop_uid in failed_by_uid:
@@ -1008,9 +1035,10 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 backoff,
             )
             msg = f"Disk full - retry after {backoff}s"
-            return pre_failed + [
-                (uid, 0xA700, 507, msg) for uid, _, _ in live_payloads
-            ], backoff
+            return (
+                pre_failed + [(uid, 0xA700, 507, msg) for uid, _, _ in live_payloads],
+                backoff,
+            )
 
         # non-2xx  -  whole batch shares one outcome.
         dimse_status, _, msg = _http_status_to_dimse(resp.status_code)
@@ -1025,27 +1053,35 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
     except httpx.ConnectError:
         logging.warning("-> STOW-RS: CONNECTION REFUSED")
         stow_requests.labels(status="error").inc()
-        return pre_failed + [
-            (uid, 0xA700, None, "Connection refused") for uid, _, _ in live_payloads
-        ], None
+        return (
+            pre_failed
+            + [
+                (uid, 0xA700, None, "Connection refused") for uid, _, _ in live_payloads
+            ],
+            None,
+        )
     except httpx.TimeoutException:
         logging.warning("-> STOW-RS: TOTAL TIMEOUT after %.0fs", total_timeout)
         stow_requests.labels(status="error").inc()
-        return pre_failed + [
-            (uid, 0xA700, None, "Total timeout") for uid, _, _ in live_payloads
-        ], None
+        return (
+            pre_failed
+            + [(uid, 0xA700, None, "Total timeout") for uid, _, _ in live_payloads],
+            None,
+        )
     except httpx.TransportError as e:
         # Transient mid-request transport break (Read/Write/RemoteProtocol):
         # retryable, so 0xA700 per SOP, not the permanent 0xC000.
         logging.warning("-> STOW-RS: TRANSPORT ERROR (%s)", e)
         stow_requests.labels(status="error").inc()
-        return pre_failed + [
-            (uid, 0xA700, None, str(e)) for uid, _, _ in live_payloads
-        ], None
+        return (
+            pre_failed + [(uid, 0xA700, None, str(e)) for uid, _, _ in live_payloads],
+            None,
+        )
     except Exception as e:
         logging.warning("-> STOW-RS: ERROR (%s)", e)
         logging.debug("-> STOW-RS: Full traceback follows:", exc_info=True)
         stow_requests.labels(status="error").inc()
-        return pre_failed + [
-            (uid, 0xC000, None, str(e)) for uid, _, _ in live_payloads
-        ], None
+        return (
+            pre_failed + [(uid, 0xC000, None, str(e)) for uid, _, _ in live_payloads],
+            None,
+        )

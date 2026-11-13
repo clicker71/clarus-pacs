@@ -653,6 +653,28 @@ def _json_to_dataset(json_obj, request_keywords):
     return _json_map_to_dataset(json_obj, QIDO_KEY_TO_TAG)
 
 
+# PS3.4 C.6.1.1.2 Table C.6-1 (standard/ps3.4/patient-root-levels-C.6-1.json)
+# fixes exactly these attributes at the Patient level of the Patient Root
+# model. PatientName is the level's Type R key; the rest are optional, and
+# QIDO_KEY_TO_TAG already maps all four, so no new tag knowledge is needed -
+# the table only decides WHICH of the study row's attributes survive the fold.
+PATIENT_LEVEL_KEYS = ("00100010", "00100020", "00100030", "00100040")
+
+
+def _json_to_dataset_patient(json_obj):
+    """QIDO-RS study JSON -> a Patient-level Dataset (PS3.4 Table C.6-1).
+
+    Patient level is served from the study query: the origin's study row
+    carries the patient attributes, so the fold is a projection, not a
+    separate lookup. Keys outside Table C.6-1 are dropped - a Patient-level
+    row that also carried StudyDate or StudyInstanceUID would tell the SCU
+    the level is actually a study level with a relabelled (0008,0052).
+    """
+    return _json_map_to_dataset(
+        json_obj, {k: QIDO_KEY_TO_TAG[k] for k in PATIENT_LEVEL_KEYS}
+    )
+
+
 def _json_first_value(json_obj, key):
     """First DICOMweb JSON Value entry for `key` ('' when absent).
 

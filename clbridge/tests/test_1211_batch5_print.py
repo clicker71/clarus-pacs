@@ -60,6 +60,7 @@ def _print_with(monkeypatch, film_session, images=None):
 
 # ---------------------------------------------------------------------------
 
+
 # ---------------------------------------------------------------------------
 # R4 - 0x0116 "Attribute Value Out of Range" is a WARNING
 # ---------------------------------------------------------------------------
@@ -81,9 +82,9 @@ def test_r4_0116_is_not_read_as_a_failure(monkeypatch):
     assoc.send_n_create = _warn
     result, assoc, _created = _run_print(monkeypatch, assoc=assoc)
     assert result.status == 0x0000
-    assert result.film_boxes_printed == 1, (
-        "0x0116 is a warning: the Film Session was created"
-    )
+    assert (
+        result.film_boxes_printed == 1
+    ), "0x0116 is a warning: the Film Session was created"
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +128,9 @@ def test_r6_more_images_than_cells_is_not_a_successful_print(monkeypatch):
     assert result.status != 0x0000, "an incomplete film is not success"
     assert result.film_boxes_printed == 0
     assert [idx for idx, _reason in result.failed_images] == [1]
-    assert not [c for c in assoc.calls if c[0] == "n_action"], (
-        "the refusal must come BEFORE the print action"
-    )
+    assert not [
+        c for c in assoc.calls if c[0] == "n_action"
+    ], "the refusal must come BEFORE the print action"
 
 
 def test_r6_a_film_that_exactly_fits_is_printed(monkeypatch):

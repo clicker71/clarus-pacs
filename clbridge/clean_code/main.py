@@ -1100,7 +1100,9 @@ def _start_background_services(
         family = socket.AF_INET6
     elif bind_host:
         try:
-            family = socket.getaddrinfo(bind_host, args.http_port, 0, socket.SOCK_STREAM)[0][0]
+            family = socket.getaddrinfo(
+                bind_host, args.http_port, 0, socket.SOCK_STREAM
+            )[0][0]
         except OSError:
             family = socket.AF_INET
 
@@ -2289,9 +2291,11 @@ def _forward_process_batch(
             # WAS stored. Treating 0xB000/0xB006/0xB007 as a failure marked a
             # delivered instance failed, retried it, and eventually parked it in
             # undelivered/ while the destination held it all along.
-            if rsp_status == 0x0000 or (
-                0xB000 <= (rsp_status or 0) <= 0xBFFF
-            ) or rsp_status in (0x0001, 0x0107):
+            if (
+                rsp_status == 0x0000
+                or (0xB000 <= (rsp_status or 0) <= 0xBFFF)
+                or rsp_status in (0x0001, 0x0107)
+            ):
                 forward_outbox.mark_delivered(uid)
                 self_handled.add(uid)
                 forward_delivered_total.inc()

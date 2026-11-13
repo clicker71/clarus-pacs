@@ -244,9 +244,9 @@ class TestNeventLevelLock:
         retries. Suppression must be scoped to the reporting thread."""
         import clean_code.nevent as nevent
 
-        assert not hasattr(nevent, "_LEVEL_LOCK"), (
-            "the level window is gone: suppression is a per-thread filter now"
-        )
+        assert not hasattr(
+            nevent, "_LEVEL_LOCK"
+        ), "the level window is gone: suppression is a per-thread filter now"
         source = open(os.path.join(CLEAN_CODE, "nevent.py"), encoding="utf-8").read()
         tree = ast.parse(source)
         fn = next(
@@ -337,6 +337,6 @@ class TestNeventLevelLock:
         assert (
             pn.level == original
         ), f"the pynetdicom level stayed at {pn.level} instead of {original}"
-        assert getattr(nevent._PN_QUIET, "on", False) is False, (
-            "the suppression flag must be reset when the association returns"
-        )
+        assert (
+            getattr(nevent._PN_QUIET, "on", False) is False
+        ), "the suppression flag must be reset when the association returns"

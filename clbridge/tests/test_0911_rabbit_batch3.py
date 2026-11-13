@@ -183,7 +183,9 @@ class TestP2MwlKeysAreTags:
 
         params = _build_mwl_params(ds)
         assert params == {"00100020": "PID12345", "00080060": "CT"}, params
-        assert not [k for k in params if "_" in k], "snake_case key reached the log path"
+        assert not [
+            k for k in params if "_" in k
+        ], "snake_case key reached the log path"
         masked = cf._masked_query(params)
         assert "PID12345" not in masked, masked
 
@@ -224,9 +226,9 @@ class TestM3DequeueRefreshesMtime:
 
         q.recover_stuck()
 
-        assert os.path.isfile(q._dcm_path(q._in_progress, uid)), (
-            "the sweep reclaimed an item that had just been claimed"
-        )
+        assert os.path.isfile(
+            q._dcm_path(q._in_progress, uid)
+        ), "the sweep reclaimed an item that had just been claimed"
         assert not os.path.isfile(q._dcm_path(q._pending, uid))
 
 
@@ -324,7 +326,9 @@ class TestM6BuiltinSopClasses:
 # M7 - an unusable port is a configuration error, not a first-request failure
 # ---------------------------------------------------------------------------
 class TestM7UrlPort:
-    @pytest.mark.parametrize("url", ["http://host:abc/dicomweb", "http://host:99999/dicomweb"])
+    @pytest.mark.parametrize(
+        "url", ["http://host:abc/dicomweb", "http://host:99999/dicomweb"]
+    )
     def test_an_invalid_port_is_rejected_at_load(self, url, tmp_path):
         from clean_code.config import ConfParser, validate_clarus_url
 
@@ -338,7 +342,9 @@ class TestM7UrlPort:
         from clean_code.config import ConfParser, validate_clarus_url
 
         cfg = tmp_path / "clbridge.conf"
-        cfg.write_text("[dicomweb]\nclarus_url = http://host:8024/dicomweb\n", encoding="utf-8")
+        cfg.write_text(
+            "[dicomweb]\nclarus_url = http://host:8024/dicomweb\n", encoding="utf-8"
+        )
         url, _cert, _key = validate_clarus_url(ConfParser(str(cfg)))
         assert url == "http://host:8024/dicomweb", url
 
@@ -362,9 +368,9 @@ class TestM8OrphanGrace:
         half-written instance as ready."""
         q, uid = self._queue_with_orphan(tmp_path, age=0)
         q.recover_stuck()
-        assert not os.path.isfile(q._meta_path(q._pending, uid)), (
-            "a blob that may still be being written was published"
-        )
+        assert not os.path.isfile(
+            q._meta_path(q._pending, uid)
+        ), "a blob that may still be being written was published"
 
     def test_an_old_orphan_is_adopted(self, tmp_path):
         """The crashed-enqueue case the sweep exists for still works."""
@@ -447,9 +453,9 @@ class TestM10ForwardAfterClaim:
         from clean_code.handlers import cstore
 
         src = inspect.getsource(cstore.handle_c_store)
-        assert "outbox._in_progress" in src, (
-            "the forward hook does not fall back to in_progress/"
-        )
+        assert (
+            "outbox._in_progress" in src
+        ), "the forward hook does not fall back to in_progress/"
 
     def test_a_blob_moved_to_in_progress_is_still_mirrored(self, tmp_path):
         """Behavioural form of the same contract, using the real API."""

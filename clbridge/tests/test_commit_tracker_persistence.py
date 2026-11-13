@@ -210,9 +210,9 @@ def test_a_failed_persist_keeps_the_earlier_job_in_the_working_set(tmp_path):
     with pytest.raises(RuntimeError):
         tracker.register("1.2.3.90", "MODALITY", "10.0.0.5", 104, second_sops)
 
-    assert "1.2.3.90" not in tracker._jobs, (
-        "a batch whose persist failed must not become visible to _tick"
-    )
+    assert (
+        "1.2.3.90" not in tracker._jobs
+    ), "a batch whose persist failed must not become visible to _tick"
     surviving = tracker._jobs["1.2.3.9"]
     assert surviving is original, "the earlier job must survive the failed persist"
     assert surviving.sops == first_sops
@@ -247,9 +247,9 @@ def test_a_second_naction_for_an_active_transaction_uid_is_refused(tmp_path):
         row = conn.execute(
             "SELECT sops FROM commit_jobs WHERE tx_uid = ?", (tx,)
         ).fetchone()
-    assert json.loads(row[0]) == [list(s) for s in first_sops], (
-        "the refused duplicate must not have overwritten the first batch's row"
-    )
+    assert json.loads(row[0]) == [
+        list(s) for s in first_sops
+    ], "the refused duplicate must not have overwritten the first batch's row"
     tracker.close()
 
 
@@ -319,16 +319,16 @@ def test_an_abandoned_batch_stays_abandoned_across_a_restart(tmp_path):
     # pending) and in the inspection list instead.
     restarted = _tracker(_Db(path))
     try:
-        assert tx not in restarted._jobs, (
-            "an abandoned batch must not rejoin the working set"
-        )
+        assert (
+            tx not in restarted._jobs
+        ), "an abandoned batch must not rejoin the working set"
         assert restarted.pending_count() == 0
         revived = restarted._abandoned.get(tx)
         assert revived is not None, "the row is kept for inspection"
         assert revived.abandoned is True
-        assert revived.report_attempts >= MAX_REPORT_ATTEMPTS, (
-            "a reloaded abandoned batch must not get a fresh report budget"
-        )
+        assert (
+            revived.report_attempts >= MAX_REPORT_ATTEMPTS
+        ), "a reloaded abandoned batch must not get a fresh report budget"
     finally:
         restarted.close()
 

@@ -51,6 +51,7 @@ def _preflight_study_ts_by_class(*args, **kwargs):
     value, _partial = _preflight_raw(*args, **kwargs)
     return value
 
+
 EVRLE = ExplicitVRLittleEndian
 IVRLE = ImplicitVRLittleEndian
 TS_470 = JPEGLosslessSV1  # "1.2.840.10008.1.2.4.70"

@@ -41,7 +41,12 @@ def _inst_row(sop):
 
 
 def _class_ts_row(ts=TS_470):
-    return [{"00080016": {"vr": "UI", "Value": [CT]}, "00020010": {"vr": "UI", "Value": [ts]}}]
+    return [
+        {
+            "00080016": {"vr": "UI", "Value": [CT]},
+            "00020010": {"vr": "UI", "Value": [ts]},
+        }
+    ]
 
 
 def test_a_partial_preflight_walk_is_not_cached(monkeypatch):
@@ -61,7 +66,9 @@ def test_a_partial_preflight_walk_is_not_cached(monkeypatch):
     monkeypatch.setattr(
         cm,
         "_qido_request",
-        lambda url, *a, **k: series if url.endswith("/series") else [_inst_row("1.2.3")],
+        lambda url, *a, **k: (
+            series if url.endswith("/series") else [_inst_row("1.2.3")]
+        ),
     )
 
     n = {"i": 0}
@@ -90,7 +97,9 @@ def test_a_complete_preflight_walk_is_cached(monkeypatch):
     monkeypatch.setattr(
         cm,
         "_qido_request",
-        lambda url, *a, **k: series if url.endswith("/series") else [_inst_row("1.2.3")],
+        lambda url, *a, **k: (
+            series if url.endswith("/series") else [_inst_row("1.2.3")]
+        ),
     )
     monkeypatch.setattr(cm.requests, "get", lambda url, **k: _Resp(_class_ts_row()))
     cm._preflight_study_ts_by_class("2.25.10", "http://x/dicomweb")
@@ -122,9 +131,9 @@ def test_refetch_does_not_increment_bytes_at_send_time():
         hash_at = line.find("#")
         code_lines.append(line if hash_at < 0 else line[:hash_at])
     code = "\n".join(code_lines)
-    assert "cstore_outbound_duration" in code, (
-        "the duration observe must stay - only the bytes increment goes"
-    )
+    assert (
+        "cstore_outbound_duration" in code
+    ), "the duration observe must stay - only the bytes increment goes"
     assert "bytes_total" not in code, (
         "the refetch path must not increment bytes_total: the success branch "
         f"of the main loop already counts it. Found in:\n{code}"

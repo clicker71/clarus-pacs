@@ -1278,6 +1278,26 @@ def _json_to_dataset(json_obj, request_keywords):
     """QIDO-RS study JSON -> pydicom Dataset (13/13 QIDO attributes)."""
     return _json_map_to_dataset(json_obj, QIDO_KEY_TO_TAG)
 
+# PS3.4 C.6.1.1.2 Table C.6-1 (standard/ps3.4/patient-root-levels-C.6-1.json)
+# fixes exactly these attributes at the Patient level of the Patient Root
+# model. PatientName is the level's Type R key; the rest are optional, and
+# QIDO_KEY_TO_TAG already maps all four, so no new tag knowledge is needed -
+# the table only decides WHICH of the study row's attributes survive the fold.
+PATIENT_LEVEL_KEYS = ("00100010", "00100020", "00100030", "00100040")
+
+def _json_to_dataset_patient(json_obj):
+    """QIDO-RS study JSON -> a Patient-level Dataset (PS3.4 Table C.6-1).
+
+    Patient level is served from the study query: the origin's study row
+    carries the patient attributes, so the fold is a projection, not a
+    separate lookup. Keys outside Table C.6-1 are dropped - a Patient-level
+    row that also carried StudyDate or StudyInstanceUID would tell the SCU
+    the level is actually a study level with a relabelled (0008,0052).
+    """
+    return _json_map_to_dataset(
+        json_obj, {k: QIDO_KEY_TO_TAG[k] for k in PATIENT_LEVEL_KEYS}
+    )
+
 def _json_first_value(json_obj, key):
     """First DICOMweb JSON Value entry for `key` ('' when absent).
 
@@ -1728,7 +1748,9 @@ def _load_sop_registry(yaml_path="sop_classes.yaml"):
         # is the same silent-wrong-answer failure as a missing key, so such an
         # entry is dropped rather than corrected - never the whole file.
         mistyped = sorted(
-            uid for uid, entry in registry.items() if not isinstance(entry["accept"], bool)
+            uid
+            for uid, entry in registry.items()
+            if not isinstance(entry["accept"], bool)
         )
         if mistyped:
             for uid in mistyped:
@@ -2855,9 +2877,7 @@ def record_modification(
     # string, so an audit entry for a changed numeric attribute recorded "no
     # previous value" instead of the zero it really held. Only None (no value
     # at all) becomes empty.
-    mod_attr[tag] = DataElement(
-        tag, vr, "" if old_value is None else old_value
-    )
+    mod_attr[tag] = DataElement(tag, vr, "" if old_value is None else old_value)
     mod_seq = Sequence()
     mod_seq.append(mod_attr)
     attr_item.ModifiedAttributesSequence = mod_seq
@@ -3456,8 +3476,7 @@ class CommitTracker:
             try:
                 with self._db.locked() as conn:
                     cur = conn.execute(
-                        "DELETE FROM commit_jobs"
-                        " WHERE tx_uid = ? AND abandoned = 1",
+                        "DELETE FROM commit_jobs" " WHERE tx_uid = ? AND abandoned = 1",
                         (tx,),
                     )
                     conn.commit()
@@ -3505,9 +3524,11 @@ class CommitTracker:
                     # report was sent but its response was lost must re-send
                     # the SAME result, not a freshly computed one that may
                     # differ for the same transaction.
-                    json.dumps(_verdict_to_json(job.frozen_verdict))
-                    if job.frozen_verdict is not None
-                    else None,
+                    (
+                        json.dumps(_verdict_to_json(job.frozen_verdict))
+                        if job.frozen_verdict is not None
+                        else None
+                    ),
                     1 if job.abandoned else 0,
                     float(getattr(job, "abandoned_at", 0.0)),
                 ),
@@ -4298,9 +4319,10 @@ def _stc_map_verdict(payload, sop_list, tx_uid):
     """Map a Commit/Check 200 body onto (committed, failed, None).
 
     Committed SOPs come from ReferencedSOPSequence (0008,1199); failed ones
-    from FailedSOPSequence (0008,1198) with FailureReason (0008,1197) read as
-    a STRING (DICOM JSON renders numeric VRs as strings). A SOP absent from
-    BOTH sequences is a protocol defect of the origin and is reported as
+    from FailedSOPSequence (0008,1198) with FailureReason (0008,1197). PS3.18
+    F.2.3 maps US to a JSON Number, so the reason arrives as an integer and
+    `_stc_reason` resolves it to a DIMSE code. A SOP absent from BOTH
+    sequences is a protocol defect of the origin and is reported as
     failed 0x0110 - the bridge reports, it does not guess.
     """
     committed = []
@@ -4367,11 +4389,29 @@ def _stc_key(pair):
     return (str(pair[0]), str(pair[1]))
 
 def _stc_reason(item):
-    """FailureReason as a DIMSE code; anything unenumerated is 0x0110."""
+    """Failure Reason (0008,1197) as a DIMSE code; unenumerated -> 0x0110.
+
+    PS3.18 F.2.3 Table F.2.3-1 maps US to the JSON Data Type "Number", so a
+    conformant origin writes 0x0112 as the bare number 274. `_stc_single`
+    stringifies it, so the DECIMAL text has to be resolved to the same code as
+    the hex text - a map lookup keyed only on "0112" reported every numeric
+    verdict as 0x0110. A JSON String is still accepted (lenient input): that
+    form is non-conformant for US but harmless to read.
+    """
     raw = _stc_single(item, _STC_FAILURE_REASON)
     if raw is None:
         return _STC_PROCESSING_FAILURE
-    return _STC_REASON_MAP.get(str(raw).strip(), _STC_PROCESSING_FAILURE)
+    text = str(raw).strip()
+    if text in _STC_REASON_MAP:
+        return _STC_REASON_MAP[text]
+    try:
+        # Decimal form of the same code (274 == 0x0112).
+        code = int(text, 10)
+    except (TypeError, ValueError):
+        return _STC_PROCESSING_FAILURE
+    if 0 <= code <= 0xFFFF:
+        return code
+    return _STC_PROCESSING_FAILURE
 
 # ---------------------------------------------------------------------------
 # Bridge: HTTP status -> DIMSE status mapping
@@ -4817,10 +4857,14 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 # other outcome, or the caller unpacks two values from a
                 # three-tuple and dies with ValueError.
                 logging.error("[STOW-RS] malformed batch response body: %s", e)
-                return pre_failed + [
-                    (uid, 0xA700, resp.status_code, f"Malformed response: {e}")
-                    for uid, _ds, _raw in live_payloads
-                ], None
+                return (
+                    pre_failed
+                    + [
+                        (uid, 0xA700, resp.status_code, f"Malformed response: {e}")
+                        for uid, _ds, _raw in live_payloads
+                    ],
+                    None,
+                )
             failed_by_uid = {f["sop_uid"]: f["reason"] for f in failed}
             sent = {uid for uid, _ds, _raw in live_payloads}
             # PS3.18 10.5: a rejection the server reported for a SOP the client
@@ -4834,10 +4878,14 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     "whole batch retried",
                     len(unmatched),
                 )
-                return pre_failed + [
-                    (uid, 0xA700, resp.status_code, "Unmatched failure response")
-                    for uid, _ds, _raw in live_payloads
-                ], None
+                return (
+                    pre_failed
+                    + [
+                        (uid, 0xA700, resp.status_code, "Unmatched failure response")
+                        for uid, _ds, _raw in live_payloads
+                    ],
+                    None,
+                )
             results = list(pre_failed)
             for sop_uid, ds, raw_bytes in live_payloads:
                 if sop_uid in failed_by_uid:
@@ -4866,9 +4914,10 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 backoff,
             )
             msg = f"Disk full - retry after {backoff}s"
-            return pre_failed + [
-                (uid, 0xA700, 507, msg) for uid, _, _ in live_payloads
-            ], backoff
+            return (
+                pre_failed + [(uid, 0xA700, 507, msg) for uid, _, _ in live_payloads],
+                backoff,
+            )
 
         # non-2xx  -  whole batch shares one outcome.
         dimse_status, _, msg = _http_status_to_dimse(resp.status_code)
@@ -4883,30 +4932,38 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
     except httpx.ConnectError:
         logging.warning("-> STOW-RS: CONNECTION REFUSED")
         stow_requests.labels(status="error").inc()
-        return pre_failed + [
-            (uid, 0xA700, None, "Connection refused") for uid, _, _ in live_payloads
-        ], None
+        return (
+            pre_failed
+            + [
+                (uid, 0xA700, None, "Connection refused") for uid, _, _ in live_payloads
+            ],
+            None,
+        )
     except httpx.TimeoutException:
         logging.warning("-> STOW-RS: TOTAL TIMEOUT after %.0fs", total_timeout)
         stow_requests.labels(status="error").inc()
-        return pre_failed + [
-            (uid, 0xA700, None, "Total timeout") for uid, _, _ in live_payloads
-        ], None
+        return (
+            pre_failed
+            + [(uid, 0xA700, None, "Total timeout") for uid, _, _ in live_payloads],
+            None,
+        )
     except httpx.TransportError as e:
         # Transient mid-request transport break (Read/Write/RemoteProtocol):
         # retryable, so 0xA700 per SOP, not the permanent 0xC000.
         logging.warning("-> STOW-RS: TRANSPORT ERROR (%s)", e)
         stow_requests.labels(status="error").inc()
-        return pre_failed + [
-            (uid, 0xA700, None, str(e)) for uid, _, _ in live_payloads
-        ], None
+        return (
+            pre_failed + [(uid, 0xA700, None, str(e)) for uid, _, _ in live_payloads],
+            None,
+        )
     except Exception as e:
         logging.warning("-> STOW-RS: ERROR (%s)", e)
         logging.debug("-> STOW-RS: Full traceback follows:", exc_info=True)
         stow_requests.labels(status="error").inc()
-        return pre_failed + [
-            (uid, 0xC000, None, str(e)) for uid, _, _ in live_payloads
-        ], None
+        return (
+            pre_failed + [(uid, 0xC000, None, str(e)) for uid, _, _ in live_payloads],
+            None,
+        )
 
 # ---------------------------------------------------------------------------
 # Bridge: http_server
@@ -4934,7 +4991,7 @@ from pydicom.datadict import dictionary_VR, keyword_dict
 # rewrites this line when it assembles clbridge.py; in the source tree the
 # value is the placeholder, which is also the honest answer for a bundle cut
 # outside a repository.
-BUNDLE_STAMP = "e10f1134"
+BUNDLE_STAMP = "7ed2af53"
 
 # Per-socket-operation deadline for a request. A print job is a JSON body with
 # base64 images on a LAN, so 30 s is far beyond any legitimate transfer while
@@ -5056,8 +5113,10 @@ def _print_attr_value(vr, value):
     through untouched and pydicom's own converter applies the VR's rules;
     everything else keeps the historical string form.
     """
-    if vr in _NUMERIC_VRS and isinstance(value, (int, float)) and not isinstance(
-        value, bool
+    if (
+        vr in _NUMERIC_VRS
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
     ):
         return value
     return str(value)
@@ -5159,7 +5218,7 @@ class BridgeHTTPHandler(BaseHTTPRequestHandler):
     # Dependencies injected via make_bridge_handler() factory  -  NO lazy imports in do_GET!
     driver_registry = {}
     printer_registry = {}
-    bridge_ae_title = "CLBRIDGE"    # BR-P31: cached references to avoid per-request imports (P2.10 bottleneck fix)
+    bridge_ae_title = "CLBRIDGE"  # BR-P31: cached references to avoid per-request imports (P2.10 bottleneck fix)
     _outbox_ref = None  # OutboxQueue  -  reliable persistence queue
     _health_checker_ref = None  # HealthChecker  -  real server health status
     _commit_tracker_ref = None  # CommitTracker  -  Storage Commitment batches
@@ -6115,9 +6174,7 @@ class MoveJobManager:
                 rows = self._select_pending()
                 if skip is not None:
                     rows = [
-                        r
-                        for r in rows
-                        if not skip(r[4] or "", r[5] or 0, r[2] or "")
+                        r for r in rows if not skip(r[4] or "", r[5] or 0, r[2] or "")
                     ]
                 if not rows:
                     if not self._cond.wait(timeout=timeout):
@@ -7463,8 +7520,14 @@ class OutboxQueue:
         moved_sidecars = set()
         for dir_ in [self._pending, self._in_progress]:
             for src_sidecar, dst_sidecar in (
-                (self._meta_path(dir_, sop_uid), self._meta_path(self._undelivered, sop_uid)),
-                (self._mods_path(dir_, sop_uid), self._mods_path(self._undelivered, sop_uid)),
+                (
+                    self._meta_path(dir_, sop_uid),
+                    self._meta_path(self._undelivered, sop_uid),
+                ),
+                (
+                    self._mods_path(dir_, sop_uid),
+                    self._mods_path(self._undelivered, sop_uid),
+                ),
             ):
                 if dst_sidecar in moved_sidecars:
                     continue
@@ -8510,6 +8573,123 @@ def _handle_qido_search(
     else:
         yield 0x0000, None
 
+def _handle_patient_level(
+    event,
+    clarus_url,
+    verbose,
+    max_responses,
+    http_timeout=30,
+    tls=None,
+    expose_rejected=False,
+    qa_url="",
+):
+    """C-FIND Patient Root at PATIENT level: study QIDO, folded per patient.
+
+    PS3.4 C.6.1.1.2 Table C.6-1: PATIENT is the ROOT level of the model this
+    SCP announces, and Patient's Name (0010,0010) is the one Type R attribute
+    there. The bridge has no patient index of its own, so the level is served
+    from the same study QIDO the STUDY level uses (PS3.18 10.6: a study
+    result carries the patient attributes), folded onto one row per
+    PatientID.
+
+    Folding rules, in the order they matter:
+      - Matching keys still go to the server: the study query is built by
+        `_handle_qido_search`'s own parameter mapping, so a PatientName or
+        PatientID filter narrows the study set exactly as at STUDY level.
+      - A row keeps only the attributes Table C.6-1 defines at this level.
+        PatientName is required; the optional ones are returned when the
+        origin supplied a value (the shared converter already drops
+        empty values, so an absent tag means the origin had nothing).
+      - One row per PatientID, first-seen order: the study rows arrive
+        ordered by the origin, and re-sorting would make the response
+        unstable across servers.
+      - A study with NO PatientID cannot be identified as belonging to any
+        other, so each such study is its own row. Collapsing them would
+        assert that every anonymous study is one patient (PS3.4 C.6.1.1.2
+        note: Patient ID is the grouping key; without it there is no group).
+
+    max_responses caps the PATIENT rows (not the study rows that produced
+    them): the caller asked for patients, and 0xB001 must mean "more
+    patients exist". A study set big enough to be ambiguous is therefore
+    fetched whole - the patient count is only known after the fold, so a
+    study-level limit could hide patients behind a silent early cut.
+    """
+    ds = event.identifier
+    request_keywords = _extract_request_keywords(ds)
+    logging.info(
+        "[C-FIND] patient keywords: %s",
+        ", ".join(sorted(request_keywords)) if request_keywords else "(none)",
+    )
+    params = _build_qido_params(ds) or {}
+    base = service_base_url(clarus_url, qa_url, expose_rejected)
+    try:
+        study_rows = _qido_request(
+            f"{base}/studies",
+            params,
+            http_timeout,
+            limit=None,
+            tls=tls,
+        )
+        if not isinstance(study_rows, list):
+            study_rows = []
+    except httpx.HTTPStatusError as exc:
+        # Same classifier as the other handlers: 4xx is this query's fault,
+        # 5xx and 429 are upstream conditions the SCU should retry.
+        logging.warning(
+            "[C-FIND] QIDO HTTP %d: %s?%s",
+            exc.response.status_code,
+            f"{base}/studies",
+            _masked_query(params),
+        )
+        dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+        yield dimse, None
+        return
+    except QidoMalformedBodyError as exc:
+        logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+        yield 0xA700, None
+        return
+    except httpx.HTTPError:
+        logging.warning("[C-FIND] QIDO error: connection failed")
+        yield 0xA700, None
+        return
+
+    count = 0
+    truncated = False
+    seen = set()
+    for study_row in study_rows:
+        if getattr(event, "is_cancelled", False):
+            find_responses.labels(type="patient").inc(count)
+            yield 0xFE00, None
+            return
+        if _shutdown_requested.is_set():
+            find_responses.labels(type="patient").inc(count)
+            yield 0xC000, None
+            return
+        patient_id = _json_first_value(study_row, "00100020") or ""
+        # An empty PatientID identifies nobody, so it never merges: give each
+        # such study a key of its own instead of a shared "" bucket.
+        group_key = patient_id if patient_id else object()
+        if group_key in seen:
+            continue
+        seen.add(group_key)
+        if max_responses and count >= max_responses:
+            truncated = True
+            logging.warning(
+                "[C-FIND] Response limit reached (%d). Patients truncated.",
+                max_responses,
+            )
+            break
+        row_ds = _json_to_dataset_patient(study_row)
+        _stamp_cfind_response(event, row_ds)
+        yield 0xFF00, row_ds
+        count += 1
+
+    find_responses.labels(type="patient").inc(count)
+    if truncated:
+        yield 0xB001, None
+    else:
+        yield 0x0000, None
+
 def _handle_patient_root(
     event,
     clarus_url,
@@ -8522,14 +8702,13 @@ def _handle_patient_root(
 ):
     """C-FIND Patient Root -> QIDO-RS.
 
+    PATIENT level: one row per patient, folded from the study query
+    (_handle_patient_level) - see PS3.4 C.6.1.1.2 Table C.6-1.
     STUDY level (or level absent): GET /studies - unchanged.
     SERIES level (31.08): two-step series search, the same routing Study
     Root already applies - a patient-root SERIES query used to fall through
     to the study path and relabel study rows as SERIES, so the SCU received
     rows with no SeriesInstanceUID.
-    PATIENT level: NOT implemented - refused with 0xA900. Returning study
-    rows labelled PATIENT duplicated one patient per study, which is worse
-    than an honest refusal.
     """
     level = (
         str(getattr(event.identifier, "QueryRetrieveLevel", "") or "").strip().upper()
@@ -8547,7 +8726,16 @@ def _handle_patient_root(
         )
         return
     if level == "PATIENT":
-        yield 0xA900, None
+        yield from _handle_patient_level(
+            event,
+            clarus_url,
+            verbose,
+            max_responses,
+            http_timeout,
+            tls,
+            expose_rejected=expose_rejected,
+            qa_url=qa_url,
+        )
         return
     if level not in ("", "STUDY"):
         # R5: IMAGE (and anything unrecognised) has no study-level equivalent.
@@ -9163,9 +9351,7 @@ def _fix_cp1251_krakozyabry(ds):
             # the descent below never ran and nested text was never repaired.
             if elem.VR == "SQ":
                 continue
-            if elem.VR in _TEXT_VRS or (
-                top_level and elem.keyword in fields_to_fix
-            ):
+            if elem.VR in _TEXT_VRS or (top_level and elem.keyword in fields_to_fix):
                 _walk_tags.append(elem.tag)
         _ordered_tags = []
         if top_level:
@@ -9746,9 +9932,7 @@ def _register_commit(
             # Persistence failed, so the commitment cannot be honoured later.
             # Answer Failure (0x0110) instead of acknowledging a request whose
             # N-EVENT-REPORT would never be pushed (PS3.4 J.3.3.1).
-            logging.error(
-                "[N-ACTION] tx=%s could not be registered: %s", tx_uid, e
-            )
+            logging.error("[N-ACTION] tx=%s could not be registered: %s", tx_uid, e)
             return False
         return True
 
@@ -10440,9 +10624,7 @@ def _preflight_study_ts_by_class(
                 f"{base}/studies/{_quote(study_uid, safe='')}"
                 f"/series/{_quote(suid, safe='')}/instances"
             )
-            inst_rows = _qido_request(
-                inst_url, {}, http_timeout, limit=None, tls=tls
-            )
+            inst_rows = _qido_request(inst_url, {}, http_timeout, limit=None, tls=tls)
             if not isinstance(inst_rows, list) or not inst_rows:
                 missed += 1
                 continue
@@ -10671,9 +10853,7 @@ def _study_sop_uids(
             f"/series/{_quote(suid, safe='')}/instances"
         )
         try:
-            inst_rows = _qido_request(
-                inst_url, {}, http_timeout, limit=None, tls=tls
-            )
+            inst_rows = _qido_request(inst_url, {}, http_timeout, limit=None, tls=tls)
         except Exception:
             return None
         if not isinstance(inst_rows, list):
@@ -11781,9 +11961,7 @@ def _associate_for_move(
         if sop_registry is not None and partial_preflight:
             known = set(class_uids)
             missing = sorted(
-                uid
-                for uid in _proposed_ts_per_class(sop_registry)
-                if uid not in known
+                uid for uid in _proposed_ts_per_class(sop_registry) if uid not in known
             )
             if missing:
                 logging.info(
@@ -11868,7 +12046,9 @@ def _associate_for_move(
     # proposed keep their stored syntaxes as far as the budget allows.
     survivors = set(proposals)
     flat = [
-        tok for cls_uid, toks in per_class_optional.items() if cls_uid in survivors
+        tok
+        for cls_uid, toks in per_class_optional.items()
+        if cls_uid in survivors
         for tok in toks
     ]
     kept_tokens = set(_trim_optional_ts(len(survivors), True, flat))
@@ -12288,7 +12468,9 @@ def _ensure_file_meta_bytes(dicom_bytes, sop_class_uid, sop_uid, ts_uid):
     body += _ui_elem(0x0002, resolved_sc or sop_class_uid or "")
     body += _ui_elem(0x0003, resolved_si or sop_uid or "")
     body += _ui_elem(0x0010, ts)
-    body += _ui_elem(0x0012, _BRIDGE_IMPLEMENTATION_CLASS_UID)    # (0002,0000) is the number of bytes AFTER its own value field, so it is
+    body += _ui_elem(
+        0x0012, _BRIDGE_IMPLEMENTATION_CLASS_UID
+    )  # (0002,0000) is the number of bytes AFTER its own value field, so it is
     # written last and computed from the body. Encoded exactly the way pydicom
     # writes it: UL is a SHORT-VR element in this writer's grammar (see
     # `_walk_meta`), so 8-byte header + 4-byte value.
@@ -13047,9 +13229,9 @@ def _stream_and_send_study(
                     # a send whose outcome nobody observed - under a metric name
                     # the dashboards read as delivered traffic.
                     try:
-                        bytes_total.labels(
-                            direction="tx", peer=ae_label(peer_ae)
-                        ).inc(part_size)
+                        bytes_total.labels(direction="tx", peer=ae_label(peer_ae)).inc(
+                            part_size
+                        )
                     except Exception:
                         pass
                     # Bridge: track successfully sent SOPs for Storage Commitment
@@ -14020,9 +14202,7 @@ def send_n_event_report(
         # proposes BOTH roles; a peer that declines leaves the default roles,
         # which the response check below reports.
         ae.add_requested_context(StorageCommitmentPushModel, ImplicitVRLittleEndian)
-        sc_role = build_role(
-            StorageCommitmentPushModel, scu_role=True, scp_role=True
-        )
+        sc_role = build_role(StorageCommitmentPushModel, scu_role=True, scp_role=True)
 
         # "No accepted presentation contexts" is normal for SCPs that
         # do not implement the push model. Quiet ONLY this thread's pynetdicom
@@ -14036,13 +14216,9 @@ def send_n_event_report(
         try:
             _PN_QUIET.on = True
             try:
-                assoc = ae.associate(
-                    host, port, ae_title=calling_ae, ext_neg=[sc_role]
-                )
+                assoc = ae.associate(host, port, ae_title=calling_ae, ext_neg=[sc_role])
                 try:
-                    associations_total.labels(
-                        role="to", ae=ae_label(calling_ae)
-                    ).inc()
+                    associations_total.labels(role="to", ae=ae_label(calling_ae)).inc()
                 except Exception:
                     pass
             finally:
@@ -14085,7 +14261,9 @@ def send_n_event_report(
             for ctx in assoc.accepted_contexts
         )
         if not sc_accepted:
-            last_err = f"SCP {calling_ae} did not grant the SCP role for storage commitment"
+            last_err = (
+                f"SCP {calling_ae} did not grant the SCP role for storage commitment"
+            )
             logging.warning("[N-EVENT] %s", last_err)
             _release_or_abort(assoc, timeout=2.0)
             continue
@@ -15194,7 +15372,9 @@ def _start_background_services(
         family = socket.AF_INET6
     elif bind_host:
         try:
-            family = socket.getaddrinfo(bind_host, args.http_port, 0, socket.SOCK_STREAM)[0][0]
+            family = socket.getaddrinfo(
+                bind_host, args.http_port, 0, socket.SOCK_STREAM
+            )[0][0]
         except OSError:
             family = socket.AF_INET
 
@@ -16368,9 +16548,11 @@ def _forward_process_batch(
             # WAS stored. Treating 0xB000/0xB006/0xB007 as a failure marked a
             # delivered instance failed, retried it, and eventually parked it in
             # undelivered/ while the destination held it all along.
-            if rsp_status == 0x0000 or (
-                0xB000 <= (rsp_status or 0) <= 0xBFFF
-            ) or rsp_status in (0x0001, 0x0107):
+            if (
+                rsp_status == 0x0000
+                or (0xB000 <= (rsp_status or 0) <= 0xBFFF)
+                or rsp_status in (0x0001, 0x0107)
+            ):
                 forward_outbox.mark_delivered(uid)
                 self_handled.add(uid)
                 forward_delivered_total.inc()

@@ -329,9 +329,7 @@ class MoveJobManager:
                 rows = self._select_pending()
                 if skip is not None:
                     rows = [
-                        r
-                        for r in rows
-                        if not skip(r[4] or "", r[5] or 0, r[2] or "")
+                        r for r in rows if not skip(r[4] or "", r[5] or 0, r[2] or "")
                     ]
                 if not rows:
                     if not self._cond.wait(timeout=timeout):

@@ -171,7 +171,7 @@ class TestB4UnparsedTailFloor:
         pass2 = (0, 0, 0, [], [], False, False, True)
         captured, calls = _run(monkeypatch, [pass1, pass2])
 
-        assert captured["success"] is False, (
-            "resumed_lost with no observed failure must not answer 0x0000"
-        )
+        assert (
+            captured["success"] is False
+        ), "resumed_lost with no observed failure must not answer 0x0000"
         assert "0 failed" not in (captured["error_message"] or ""), captured

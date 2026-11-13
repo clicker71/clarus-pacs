@@ -132,9 +132,7 @@ def record_modification(
     # string, so an audit entry for a changed numeric attribute recorded "no
     # previous value" instead of the zero it really held. Only None (no value
     # at all) becomes empty.
-    mod_attr[tag] = DataElement(
-        tag, vr, "" if old_value is None else old_value
-    )
+    mod_attr[tag] = DataElement(tag, vr, "" if old_value is None else old_value)
     mod_seq = Sequence()
     mod_seq.append(mod_attr)
     attr_item.ModifiedAttributesSequence = mod_seq

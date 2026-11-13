@@ -364,9 +364,7 @@ def _fix_cp1251_krakozyabry(ds):
             # the descent below never ran and nested text was never repaired.
             if elem.VR == "SQ":
                 continue
-            if elem.VR in _TEXT_VRS or (
-                top_level and elem.keyword in fields_to_fix
-            ):
+            if elem.VR in _TEXT_VRS or (top_level and elem.keyword in fields_to_fix):
                 _walk_tags.append(elem.tag)
         _ordered_tags = []
         if top_level:

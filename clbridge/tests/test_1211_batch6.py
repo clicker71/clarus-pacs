@@ -70,30 +70,30 @@ def test_the_request_head_is_read_under_a_total_deadline():
     from clean_code import http_server as hs
 
     src = inspect.getsource(hs.BridgeHTTPHandler._read_head_with_deadline)
-    assert "time.monotonic() + HEAD_TOTAL_TIMEOUT_SEC" in src, (
-        "the head must be bounded by one wall-clock budget"
-    )
-    assert "_HeadBudgetReader" in src, (
-        "the budget must travel with the reader so every header line re-arms it"
-    )
+    assert (
+        "time.monotonic() + HEAD_TOTAL_TIMEOUT_SEC" in src
+    ), "the head must be bounded by one wall-clock budget"
+    assert (
+        "_HeadBudgetReader" in src
+    ), "the budget must travel with the reader so every header line re-arms it"
     # The deadline must be computed before the request line is read.
     assert src.index("time.monotonic() + HEAD_TOTAL_TIMEOUT_SEC") < src.index(
         "readline"
     ), "the deadline must be set before the request line is read"
 
     one_request = inspect.getsource(hs.BridgeHTTPHandler.handle_one_request)
-    assert "_read_head_with_deadline" in one_request, (
-        "handle_one_request must route the head through the budget"
-    )
+    assert (
+        "_read_head_with_deadline" in one_request
+    ), "handle_one_request must route the head through the budget"
 
 
 def test_a_header_timeout_answers_408():
     from clean_code import http_server as hs
 
     one_request = inspect.getsource(hs.BridgeHTTPHandler.handle_one_request)
-    assert "send_error(408" in one_request, (
-        "a head timeout must answer 408, not drop the connection"
-    )
+    assert (
+        "send_error(408" in one_request
+    ), "a head timeout must answer 408, not drop the connection"
     assert hs.HEAD_TOTAL_TIMEOUT_SEC <= hs.HTTP_SOCKET_TIMEOUT_SEC
 
 
@@ -111,18 +111,18 @@ def test_an_open_batch_is_flushed_by_age():
     src = inspect.getsource(m._outbox_worker)
     code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
 
-    assert "_batch_started_at = time.monotonic()" in code, (
-        "the batch must remember when its first item was buffered"
-    )
+    assert (
+        "_batch_started_at = time.monotonic()" in code
+    ), "the batch must remember when its first item was buffered"
     assert "_batch_max_age_sec" in code, "the age trigger must be declared"
-    assert "time.monotonic() - _batch_started_at >= _batch_max_age_sec" in code, (
-        "the flush condition must include the age"
-    )
+    assert (
+        "time.monotonic() - _batch_started_at >= _batch_max_age_sec" in code
+    ), "the flush condition must include the age"
 
     limit = min(60.0, STUCK_ITEM_TIMEOUT / 4)
-    assert limit < STUCK_ITEM_TIMEOUT, (
-        "the cap must fire well before the reaper can reclaim an item"
-    )
+    assert (
+        limit < STUCK_ITEM_TIMEOUT
+    ), "the cap must fire well before the reaper can reclaim an item"
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +140,9 @@ def test_a_serialization_failure_is_per_sop(monkeypatch):
         SOPInstanceUID = "1.2.3.BAD"
 
         def __init__(self):
-            self.file_meta = type("M", (), {"TransferSyntaxUID": "1.2.840.10008.1.2.1"})()
+            self.file_meta = type(
+                "M", (), {"TransferSyntaxUID": "1.2.840.10008.1.2.1"}
+            )()
 
     def _write(fp, ds, **kwargs):
         if getattr(ds, "SOPInstanceUID", "") == "1.2.3.BAD":
@@ -172,13 +174,17 @@ def test_a_serialization_failure_keeps_the_other_parts(monkeypatch):
         SOPInstanceUID = "1.2.3.GOOD"
 
         def __init__(self):
-            self.file_meta = type("M", (), {"TransferSyntaxUID": "1.2.840.10008.1.2.1"})()
+            self.file_meta = type(
+                "M", (), {"TransferSyntaxUID": "1.2.840.10008.1.2.1"}
+            )()
 
     class _Bad:
         SOPInstanceUID = "1.2.3.BAD"
 
         def __init__(self):
-            self.file_meta = type("M", (), {"TransferSyntaxUID": "1.2.840.10008.1.2.1"})()
+            self.file_meta = type(
+                "M", (), {"TransferSyntaxUID": "1.2.840.10008.1.2.1"}
+            )()
 
     def _write(fp, ds, **kwargs):
         if getattr(ds, "SOPInstanceUID", "") == "1.2.3.BAD":
@@ -223,9 +229,7 @@ def test_stow_single_instance_returns_a_verdict_on_a_serialization_error(
         raise ValueError("invalid value for VR US")
 
     monkeypatch.setattr(hh, "dcmwrite", _write)
-    monkeypatch.setattr(
-        hh, "_http_retry", lambda fn: pytest.fail("POST attempted")
-    )
+    monkeypatch.setattr(hh, "_http_retry", lambda fn: pytest.fail("POST attempted"))
     status, _http, msg = hh.stow_single_instance(_Bad(), "http://127.0.0.1:1")
     assert status == 0xC000
     assert "Serialize" in msg
@@ -242,13 +246,11 @@ def test_an_image_level_query_is_refused(root):
 
     event = make_fake_find_event()
     event.identifier.QueryRetrieveLevel = "IMAGE"
-    fn = (
-        cfind._handle_study_root if root == "study" else cfind._handle_patient_root
-    )
+    fn = cfind._handle_study_root if root == "study" else cfind._handle_patient_root
     out = list(fn(event, "http://127.0.0.1:1/clarus/dicomweb", False, 100))
-    assert out == [(0xA900, None)], (
-        "IMAGE level has no study-row equivalent; it must be refused"
-    )
+    assert out == [
+        (0xA900, None)
+    ], "IMAGE level has no study-row equivalent; it must be refused"
 
 
 def test_an_unknown_level_is_refused_too():
@@ -259,7 +261,9 @@ def test_an_unknown_level_is_refused_too():
     event = make_fake_find_event()
     event.identifier.QueryRetrieveLevel = "FRAME"
     out = list(
-        cfind._handle_study_root(event, "http://127.0.0.1:1/clarus/dicomweb", False, 100)
+        cfind._handle_study_root(
+            event, "http://127.0.0.1:1/clarus/dicomweb", False, 100
+        )
     )
     assert out == [(0xA900, None)]
 
@@ -330,9 +334,12 @@ def test_the_byte_budget_drives_backpressure():
 
     # 2% of the slots, 400% of the bytes: slots alone would admit.
     assert _check_backpressure(400, 20000) == 0x0000
-    assert _check_backpressure(
-        400, 20000, pending_bytes=2 * 1024**3, max_queue_bytes=512 * 1024**2
-    ) == 0xC000
+    assert (
+        _check_backpressure(
+            400, 20000, pending_bytes=2 * 1024**3, max_queue_bytes=512 * 1024**2
+        )
+        == 0xC000
+    )
 
 
 def test_the_byte_budget_is_optional():
@@ -453,9 +460,7 @@ def test_the_worker_loop_consults_the_peer_gate():
     # The predicate must be wired into the SAME pick call: everything from
     # `skip=` onward must mention the gate.
     pick_body = src.split("skip=", 1)[1]
-    assert "_peer_is_busy(" in pick_body, (
-        "the gate must gate the pick itself"
-    )
+    assert "_peer_is_busy(" in pick_body, "the gate must gate the pick itself"
 
 
 def test_the_handback_does_not_burn_a_retry(tmp_path):
@@ -472,9 +477,9 @@ def test_the_handback_does_not_burn_a_retry(tmp_path):
     assert mgr.requeue_job_without_retry(claimed["id"]) is True
     again = mgr.pick_pending_job(timeout=0.01)
     assert again is not None
-    assert again["attempts"] == attempts, (
-        "a handback must not charge the job an attempt it never made"
-    )
+    assert (
+        again["attempts"] == attempts
+    ), "a handback must not charge the job an attempt it never made"
     mgr.close() if hasattr(mgr, "close") else None
 
 
@@ -522,18 +527,18 @@ def test_an_abandoned_batch_leaves_the_workingset_and_expires(tmp_path):
     tracker._tick()
 
     assert "1.2.3.90" not in tracker._jobs
-    assert tracker.pending_count() == 0, (
-        "an abandoned batch must not be counted as pending forever"
-    )
+    assert (
+        tracker.pending_count() == 0
+    ), "an abandoned batch must not be counted as pending forever"
     assert tracker.abandoned_count() == 1
     tracker.close()
 
     restarted = _tracker(_Db(path))
     try:
         assert "1.2.3.90" in restarted._abandoned
-        assert restarted.purge_abandoned(max_age_sec=3600.0) == 0, (
-            "a fresh abandonment is not expired yet"
-        )
+        assert (
+            restarted.purge_abandoned(max_age_sec=3600.0) == 0
+        ), "a fresh abandonment is not expired yet"
         assert restarted.purge_abandoned(max_age_sec=-1.0) == 1
     finally:
         restarted.close()
@@ -550,9 +555,9 @@ def test_the_purge_is_wired_into_the_hourly_cleanup():
     import clean_code.handlers.cmove as cm
 
     src = inspect.getsource(cm._cmove_cleanup_worker)
-    assert "purge_abandoned" in src, (
-        "the retention sweep must ride the existing hourly cycle"
-    )
+    assert (
+        "purge_abandoned" in src
+    ), "the retention sweep must ride the existing hourly cycle"
 
 
 # ---------------------------------------------------------------------------
@@ -580,9 +585,9 @@ def test_a_short_key_file_is_reread_before_replacement(tmp_path, monkeypatch):
     monkeypatch.setattr(utils, "_read_key", _competitor_finishes)
     got = utils._load_or_create_key()
 
-    assert got == good, (
-        "the key that finished publishing must be adopted, not overwritten"
-    )
+    assert (
+        got == good
+    ), "the key that finished publishing must be adopted, not overwritten"
     assert key_path.read_bytes() == good
 
 
@@ -626,9 +631,9 @@ def test_the_reporter_does_not_move_the_logger_level():
     import clean_code.nevent as nevent
 
     src = inspect.getsource(nevent.send_n_event_report)
-    assert "setLevel" not in src, (
-        "the process-wide pynetdicom level must not be touched"
-    )
+    assert (
+        "setLevel" not in src
+    ), "the process-wide pynetdicom level must not be touched"
     assert not hasattr(nevent, "_LEVEL_LOCK")
 
 

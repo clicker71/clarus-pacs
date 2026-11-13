@@ -126,9 +126,9 @@ class TestN4NactionCountsOnce:
             tracker.close()
 
         assert tracker.pending_count() == 0
-        assert counter._value.get() - before == 2, (
-            "exactly len(ok) counted once, after the verdict was delivered"
-        )
+        assert (
+            counter._value.get() - before == 2
+        ), "exactly len(ok) counted once, after the verdict was delivered"
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +331,9 @@ class TestN5SeriesSearchRetryable:
             raise httpx.ConnectError("refused")
 
         monkeypatch.setattr(cf, "_qido_request", boom)
-        results = list(cf.handle_c_find(event, "http://127.0.0.1:8024/dicomweb", False, 50))
+        results = list(
+            cf.handle_c_find(event, "http://127.0.0.1:8024/dicomweb", False, 50)
+        )
         assert results == [(0xA700, None)], results
 
     def test_step_b_transport_failure_is_a700(self, monkeypatch, mock_shutdown_not_set):
@@ -346,7 +348,9 @@ class TestN5SeriesSearchRetryable:
             raise httpx.ConnectError("refused")
 
         monkeypatch.setattr(cf, "_qido_request", flaky)
-        results = list(cf.handle_c_find(event, "http://127.0.0.1:8024/dicomweb", False, 50))
+        results = list(
+            cf.handle_c_find(event, "http://127.0.0.1:8024/dicomweb", False, 50)
+        )
         assert results == [(0xA700, None)], results
 
     def test_step_b_http_status_stays_a_permanent_refusal(
@@ -363,10 +367,14 @@ class TestN5SeriesSearchRetryable:
                 return [{"0020000D": {"vr": "UI", "Value": ["1.2.3.4"]}}]
             request = httpx.Request("GET", "http://x/studies/1.2.3.4/series")
             response = httpx.Response(400, request=request)
-            raise httpx.HTTPStatusError("bad request", request=request, response=response)
+            raise httpx.HTTPStatusError(
+                "bad request", request=request, response=response
+            )
 
         monkeypatch.setattr(cf, "_qido_request", flaky)
-        results = list(cf.handle_c_find(event, "http://127.0.0.1:8024/dicomweb", False, 50))
+        results = list(
+            cf.handle_c_find(event, "http://127.0.0.1:8024/dicomweb", False, 50)
+        )
         assert results == [(0xC000, None)], results
 
 
@@ -421,7 +429,7 @@ class TestN6PrintTypeChecks:
         assert "list" in captured["msg"]
 
     def test_images_string_is_a_400(self):
-        """"abc" would be iterated character by character and each character
+        """ "abc" would be iterated character by character and each character
         base64-decoded - a silent garbage print job instead of an error."""
         h, captured = _print_handler({"printer_name": "P1", "images": "abcdefg"})
         h.do_POST()
@@ -511,9 +519,7 @@ class TestN7StorageCommitmentReusesAssoc:
         )
         ctx = type("Ctx", (), {"abstract_syntax": "1.2.840.10008.1.20.1"})()
         streams = [(1, 0, 1, [(MR, "u1")], [], False, False, False)]
-        ops = _run_execute(
-            monkeypatch, streams, study_sops=["u1"], contexts=[ctx]
-        )
+        ops = _run_execute(monkeypatch, streams, study_sops=["u1"], contexts=[ctx])
 
         assert "assoc" in seen.get("kwargs", {}), seen
         assert seen["kwargs"]["assoc"] is not None

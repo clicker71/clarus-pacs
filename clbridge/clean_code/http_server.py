@@ -163,8 +163,10 @@ def _print_attr_value(vr, value):
     through untouched and pydicom's own converter applies the VR's rules;
     everything else keeps the historical string form.
     """
-    if vr in _NUMERIC_VRS and isinstance(value, (int, float)) and not isinstance(
-        value, bool
+    if (
+        vr in _NUMERIC_VRS
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
     ):
         return value
     return str(value)
@@ -268,7 +270,7 @@ class BridgeHTTPHandler(BaseHTTPRequestHandler):
     # Dependencies injected via make_bridge_handler() factory  -  NO lazy imports in do_GET!
     driver_registry = {}
     printer_registry = {}
-    bridge_ae_title = "CLBRIDGE"    # BR-P31: cached references to avoid per-request imports (P2.10 bottleneck fix)
+    bridge_ae_title = "CLBRIDGE"  # BR-P31: cached references to avoid per-request imports (P2.10 bottleneck fix)
     _outbox_ref = None  # OutboxQueue  -  reliable persistence queue
     _health_checker_ref = None  # HealthChecker  -  real server health status
     _commit_tracker_ref = None  # CommitTracker  -  Storage Commitment batches

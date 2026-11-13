@@ -5,7 +5,6 @@ members = [
     # Products live at the repository top level; crates/ holds shared
     # libraries only.
     "clarus",
-    "cltranscode",
     "clinfer",
 ]
 default-members = [

@@ -208,7 +208,9 @@ class TestJsonToDatasetMwl:
         ds = _json_to_dataset_mwl(self._workitem_json(), {"ScheduledStationAETitle"})
         # The station IS the requested key and must be there.
         assert "ScheduledProcedureStepSequence" in ds
-        assert str(ds.ScheduledProcedureStepSequence[0].ScheduledStationAETitle) == "CT1"
+        assert (
+            str(ds.ScheduledProcedureStepSequence[0].ScheduledStationAETitle) == "CT1"
+        )
 
     def test_sps_attributes_live_inside_the_sequence(self):
         """SPS attributes are NOT flat: they belong to the (0040,0100) item."""
@@ -467,6 +469,12 @@ class TestHandleMwlMapping:
         ds.QueryRetrieveLevel = "WORKLIST"
         ds.AccessionNumber = ""
         ds.RequestedProcedureID = ""
+        # PatientID is a Return key (PS3.4 Table K.6-1), but the assertion
+        # below checks it, so the identifier must NAME it: a row that carries
+        # patient identifiers the modality never asked for is not what this
+        # test is pinning, and a converter that returns only requested keys
+        # is conformant.
+        ds.PatientID = ""
         sps = Dataset()
         sps.ScheduledStationAETitle = "STATION01"
         sps.ScheduledProcedureStepID = ""
@@ -505,6 +513,9 @@ class TestHandleMwlMapping:
         pendings = [r for r in responses if r[0] == 0xFF00]
         assert pendings, "expected at least one Pending response"
         row = pendings[0][1]
+        # PatientID is a Return key (PS3.4 Table K.6-1), and the identifier
+        # above names it: the row is checked against a key the modality
+        # actually asked for, not one the bridge volunteered.
         assert str(row.PatientID) == "PT-2"
         assert "ScheduledProcedureStepSequence" in row
         item = row.ScheduledProcedureStepSequence[0]

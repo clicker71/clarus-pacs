@@ -26,9 +26,9 @@ def test_a_json_number_reaches_a_us_attribute_as_a_number():
 
     item = ds[(0x2010, 0x0510)].value[0]
     assert item.ImageBoxPosition == 1
-    assert not isinstance(item.ImageBoxPosition, str), (
-        "the number must not be coerced to a string"
-    )
+    assert not isinstance(
+        item.ImageBoxPosition, str
+    ), "the number must not be coerced to a string"
 
 
 def test_a_json_string_is_still_accepted_for_a_numeric_vr():
@@ -48,14 +48,14 @@ def test_a_multi_valued_numeric_attribute_keeps_numbers():
 
     assert _print_attr_value("US", 1) == 1
     assert _print_attr_value("IS", 2) == 2
-    assert isinstance(_print_attr_value("US", 1), int), (
-        "the value must reach pydicom as a number, not a string"
-    )
+    assert isinstance(
+        _print_attr_value("US", 1), int
+    ), "the value must reach pydicom as a number, not a string"
 
 
 def test_a_boolean_is_not_treated_as_a_number():
     from clean_code.http_server import _print_attr_value
 
-    assert _print_attr_value("US", True) == "True", (
-        "bool is an int subclass; it must keep the string form"
-    )
+    assert (
+        _print_attr_value("US", True) == "True"
+    ), "bool is an int subclass; it must keep the string form"

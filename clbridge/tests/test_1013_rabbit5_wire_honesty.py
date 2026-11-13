@@ -97,7 +97,9 @@ def _drive_cmove_generator(move_jobs, monkeypatch, poll_timeout=None):
     return gen
 
 
-def test_a_failed_job_whose_counters_match_never_advertises_zero(move_jobs, monkeypatch):
+def test_a_failed_job_whose_counters_match_never_advertises_zero(
+    move_jobs, monkeypatch
+):
     """D1: progress row has completed == total, status failed -> the count
     must be NON-zero and the status must be the honest 0xB000.
 

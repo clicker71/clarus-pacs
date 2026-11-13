@@ -81,9 +81,9 @@ class TestLockOrder:
             w.join(timeout=5.0)
 
         assert not reactor.is_alive(), "create_job blocked (lock inversion)"
-        assert all(not w.is_alive() for w in workers), (
-            "pick_pending_job blocked (lock inversion)"
-        )
+        assert all(
+            not w.is_alive() for w in workers
+        ), "pick_pending_job blocked (lock inversion)"
         assert not errors, errors
         db.close()
 
@@ -121,9 +121,9 @@ def test_two_sequence_items_with_the_same_tag_each_keep_their_own_text():
     assert str(fixed.get("SpecificCharacterSet", "")) == "ISO_IR 100"
     kept = [str(it.TextValue) for it in fixed.ContentSequence]
     assert kept[0] == first_text, f"item 1 got {kept[0]!r}"
-    assert kept[1] == second_text, (
-        f"item 2 got {kept[1]!r} - the undo copied item 1's value into it"
-    )
+    assert (
+        kept[1] == second_text
+    ), f"item 2 got {kept[1]!r} - the undo copied item 1's value into it"
     assert kept[0] != kept[1]
 
 
@@ -139,10 +139,12 @@ def test_the_down_server_requeue_passes_a_uid_not_a_tuple():
 
     src = inspect.getsource(m._outbox_worker)
     code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
-    down = code.split("not health_checker.is_healthy()")[1].split("if not _was_paused")[0]
-    assert "for _uid, _ds, _bp, _raw, _mod in list(_batch):" in down, (
-        "the batch items must be unpacked before requeue"
-    )
+    down = code.split("not health_checker.is_healthy()")[1].split("if not _was_paused")[
+        0
+    ]
+    assert (
+        "for _uid, _ds, _bp, _raw, _mod in list(_batch):" in down
+    ), "the batch items must be unpacked before requeue"
     assert "outbox.requeue(_uid," in down
 
 
@@ -163,9 +165,11 @@ class TestNactionWithoutTracker:
     def test_a_request_naming_sops_is_refused(self, monkeypatch):
         from clean_code.handlers import naction
 
-        monkeypatch.setattr(naction, "_shutdown_requested", type(
-            "S", (), {"is_set": staticmethod(lambda: False)}
-        )())
+        monkeypatch.setattr(
+            naction,
+            "_shutdown_requested",
+            type("S", (), {"is_set": staticmethod(lambda: False)})(),
+        )
         from tests.conftest import make_fake_naction_event
 
         event = make_fake_naction_event(
@@ -184,9 +188,11 @@ class TestNactionWithoutTracker:
     def test_an_empty_request_is_still_acknowledged(self, monkeypatch):
         from clean_code.handlers import naction
 
-        monkeypatch.setattr(naction, "_shutdown_requested", type(
-            "S", (), {"is_set": staticmethod(lambda: False)}
-        )())
+        monkeypatch.setattr(
+            naction,
+            "_shutdown_requested",
+            type("S", (), {"is_set": staticmethod(lambda: False)})(),
+        )
         from tests.conftest import make_fake_naction_event
 
         event = make_fake_naction_event(sop_list=[])
@@ -243,9 +249,9 @@ def test_the_frozen_verdict_survives_a_restart(tmp_path):
     restarted = _tracker(_Db(path))
     try:
         revived = restarted._jobs["1.2.3.7"]
-        assert revived.frozen_verdict == frozen, (
-            "the restored batch must re-send the SAME verdict"
-        )
+        assert (
+            revived.frozen_verdict == frozen
+        ), "the restored batch must re-send the SAME verdict"
     finally:
         restarted.close()
 
@@ -272,9 +278,9 @@ def test_an_abandoned_batch_is_not_revived_with_a_fresh_budget(tmp_path):
         revived = restarted._abandoned["1.2.3.8"]
         assert revived.abandoned is True
         assert revived.report_attempts >= MAX_REPORT_ATTEMPTS
-        assert "1.2.3.8" not in restarted._jobs, (
-            "R10: an abandoned batch is kept for inspection, not in the queue"
-        )
+        assert (
+            "1.2.3.8" not in restarted._jobs
+        ), "R10: an abandoned batch is kept for inspection, not in the queue"
     finally:
         restarted.close()
 
@@ -289,7 +295,9 @@ def test_a_rejected_probe_after_a_timeout_restores_the_gate(monkeypatch):
     import requests
 
     checker = hc_mod.HealthChecker(
-        clarus_url="http://127.0.0.1:1", mode="always", interval=0.01,
+        clarus_url="http://127.0.0.1:1",
+        mode="always",
+        interval=0.01,
         http_timeout=0.5,
     )
 
@@ -388,12 +396,14 @@ class TestCfindStatusMapping:
             raise httpx.HTTPStatusError("429", request=req, response=resp)
 
         monkeypatch.setattr(cf, "_qido_request", _raise)
-        statuses = list(cf._handle_qido_search(
-            _cfind_event(), "http://x", False, 5, 5, {"PatientName": "*"}, "C-FIND"
-        ))
-        assert statuses and statuses[0][0] == 0xA700, (
-            f"429 must be transient 0xA700, got {statuses}"
+        statuses = list(
+            cf._handle_qido_search(
+                _cfind_event(), "http://x", False, 5, 5, {"PatientName": "*"}, "C-FIND"
+            )
         )
+        assert (
+            statuses and statuses[0][0] == 0xA700
+        ), f"429 must be transient 0xA700, got {statuses}"
 
     def test_a_malformed_body_yields_a700_instead_of_escaping(self, monkeypatch):
         """QidoMalformedBodyError is a ValueError; uncaught it killed the
@@ -405,9 +415,11 @@ class TestCfindStatusMapping:
             raise QidoMalformedBodyError("proxy 200 with HTML")
 
         monkeypatch.setattr(cf, "_qido_request", _raise)
-        statuses = list(cf._handle_qido_search(
-            _cfind_event(), "http://x", False, 5, 5, {"PatientName": "*"}, "C-FIND"
-        ))
+        statuses = list(
+            cf._handle_qido_search(
+                _cfind_event(), "http://x", False, 5, 5, {"PatientName": "*"}, "C-FIND"
+            )
+        )
         assert statuses and statuses[0][0] == 0xA700
 
 
@@ -477,8 +489,9 @@ class _FakeAssoc:
         )
         return _FakeStatus(0x0000), None
 
-    def send_n_action(self, ds, action_type, class_uid, instance_uid, msg_id=1,
-                      meta_uid=None):
+    def send_n_action(
+        self, ds, action_type, class_uid, instance_uid, msg_id=1, meta_uid=None
+    ):
         self.calls.append(
             (
                 "n_action",
@@ -514,8 +527,7 @@ def _image_bytes():
     ds.PixelRepresentation = 0
     ds.PixelData = b"\x00"
     buf = io.BytesIO()
-    dcmwrite(buf, ds, implicit_vr=False, little_endian=True,
-             enforce_file_format=False)
+    dcmwrite(buf, ds, implicit_vr=False, little_endian=True, enforce_file_format=False)
     return buf.getvalue()
 
 
@@ -567,26 +579,26 @@ def _run_print(monkeypatch, assoc=None, images=None):
 class TestPrintDriverConformance:
     def test_d1_the_called_ae_is_the_printer_not_us(self, monkeypatch):
         _result, _assoc, created = _run_print(monkeypatch)
-        assert created["called"] == "PRINTER_AE", (
-            "PS3.8 9.3.2.1: the Called AE Title is the printer's"
-        )
+        assert (
+            created["called"] == "PRINTER_AE"
+        ), "PS3.8 9.3.2.1: the Called AE Title is the printer's"
         assert created["ae"].ae_title == "CLARUS_BRIDGE", "our own SCU identity"
 
     def test_d8_the_meta_sop_class_is_negotiated_and_used(self, monkeypatch):
         from pynetdicom.sop_class import BasicGrayscalePrintManagementMeta
 
         _result, assoc, created = _run_print(monkeypatch)
-        assert BasicGrayscalePrintManagementMeta in created["ae"].contexts, (
-            "PS3.4 H.3: the Print Management Meta SOP Class must be proposed"
-        )
+        assert (
+            BasicGrayscalePrintManagementMeta in created["ae"].contexts
+        ), "PS3.4 H.3: the Print Management Meta SOP Class must be proposed"
         # Every N-* primitive must carry the meta UID so the SCP can resolve
         # the operation against the negotiated meta class.
         checked = 0
         for kind, args, kwargs in assoc.calls:
             if kind in ("n_create", "n_set", "n_action"):
-                assert kwargs.get("meta_uid") == BasicGrayscalePrintManagementMeta, (
-                    f"{kind} did not pass the meta SOP class: {kwargs}"
-                )
+                assert (
+                    kwargs.get("meta_uid") == BasicGrayscalePrintManagementMeta
+                ), f"{kind} did not pass the meta SOP class: {kwargs}"
                 checked += 1
         assert checked >= 3, f"expected create/set/action, saw {checked}"
 
@@ -595,9 +607,9 @@ class TestPrintDriverConformance:
         first = assoc.calls[0]
         fs_ds = first[1][0]
         assert hasattr(fs_ds, "NumberOfCopies")
-        assert not hasattr(fs_ds, "ImageDisplayFormat"), (
-            "ImageDisplayFormat is a Film BOX attribute (PS3.4 H.4.1.2)"
-        )
+        assert not hasattr(
+            fs_ds, "ImageDisplayFormat"
+        ), "ImageDisplayFormat is a Film BOX attribute (PS3.4 H.4.1.2)"
 
     def test_d3_d4_nset_uses_the_printer_image_boxes_and_sets_position(
         self, monkeypatch
@@ -607,9 +619,9 @@ class TestPrintDriverConformance:
         sets = [c for c in assoc.calls if c[0] == "n_set"]
         assert len(sets) == 1
         ds = sets[0][1][0]
-        assert ds.ImageBoxPosition == 1, (
-            "PS3.4 H.4.1.2.4: ImageBoxPosition is required in the N-SET"
-        )
+        assert (
+            ds.ImageBoxPosition == 1
+        ), "PS3.4 H.4.1.2.4: ImageBoxPosition is required in the N-SET"
         assert sets[0][1][2] == "9.9.9.1", (
             "the N-SET must address the Image Box the printer created, not a "
             "locally generated UID"
@@ -622,9 +634,9 @@ class TestPrintDriverConformance:
         actions = [c for c in assoc.calls if c[0] == "n_action"]
         assert len(actions) == 1
         class_uid = actions[0][1][2]
-        assert class_uid == BasicFilmBox, (
-            "PS3.4 H.4.1.2.3: the Print N-ACTION addresses the Film Box"
-        )
+        assert (
+            class_uid == BasicFilmBox
+        ), "PS3.4 H.4.1.2.3: the Print N-ACTION addresses the Film Box"
 
     def test_d2_no_images_accepted_means_no_print(self, monkeypatch):
         """An unpopulated film must not be N-ACTIONed and must not be counted
@@ -637,9 +649,9 @@ class TestPrintDriverConformance:
         assoc.send_n_set = _reject
         result, assoc, _created = _run_print(monkeypatch, assoc=assoc)
         assert result.film_boxes_printed == 0
-        assert not [c for c in assoc.calls if c[0] == "n_action"], (
-            "an empty film must not be printed"
-        )
+        assert not [
+            c for c in assoc.calls if c[0] == "n_action"
+        ], "an empty film must not be printed"
 
     def test_d6_a_warning_status_does_not_abort_the_job(self, monkeypatch):
         """PS3.7 Annex C: 0xBxxx is WARNING - the primitive completed."""
@@ -652,9 +664,9 @@ class TestPrintDriverConformance:
 
         assoc.send_n_create = _warn
         result, assoc, _created = _run_print(monkeypatch, assoc=assoc)
-        assert result.film_boxes_printed == 1, (
-            "a warning on N-CREATE must not be read as a failure"
-        )
+        assert (
+            result.film_boxes_printed == 1
+        ), "a warning on N-CREATE must not be read as a failure"
 
     def test_a_failure_status_still_aborts(self, monkeypatch):
         assoc = _FakeAssoc()

@@ -29,6 +29,7 @@ from clean_code.protocol import (
     _json_first_value,
     _json_to_dataset,
     _json_to_dataset_mwl,
+    _json_to_dataset_patient,
     _json_to_dataset_series,
     _split_qido_params,
 )
@@ -371,6 +372,124 @@ def _handle_qido_search(
         yield 0x0000, None
 
 
+def _handle_patient_level(
+    event,
+    clarus_url,
+    verbose,
+    max_responses,
+    http_timeout=30,
+    tls=None,
+    expose_rejected=False,
+    qa_url="",
+):
+    """C-FIND Patient Root at PATIENT level: study QIDO, folded per patient.
+
+    PS3.4 C.6.1.1.2 Table C.6-1: PATIENT is the ROOT level of the model this
+    SCP announces, and Patient's Name (0010,0010) is the one Type R attribute
+    there. The bridge has no patient index of its own, so the level is served
+    from the same study QIDO the STUDY level uses (PS3.18 10.6: a study
+    result carries the patient attributes), folded onto one row per
+    PatientID.
+
+    Folding rules, in the order they matter:
+      - Matching keys still go to the server: the study query is built by
+        `_handle_qido_search`'s own parameter mapping, so a PatientName or
+        PatientID filter narrows the study set exactly as at STUDY level.
+      - A row keeps only the attributes Table C.6-1 defines at this level.
+        PatientName is required; the optional ones are returned when the
+        origin supplied a value (the shared converter already drops
+        empty values, so an absent tag means the origin had nothing).
+      - One row per PatientID, first-seen order: the study rows arrive
+        ordered by the origin, and re-sorting would make the response
+        unstable across servers.
+      - A study with NO PatientID cannot be identified as belonging to any
+        other, so each such study is its own row. Collapsing them would
+        assert that every anonymous study is one patient (PS3.4 C.6.1.1.2
+        note: Patient ID is the grouping key; without it there is no group).
+
+    max_responses caps the PATIENT rows (not the study rows that produced
+    them): the caller asked for patients, and 0xB001 must mean "more
+    patients exist". A study set big enough to be ambiguous is therefore
+    fetched whole - the patient count is only known after the fold, so a
+    study-level limit could hide patients behind a silent early cut.
+    """
+    ds = event.identifier
+    request_keywords = _extract_request_keywords(ds)
+    logging.info(
+        "[C-FIND] patient keywords: %s",
+        ", ".join(sorted(request_keywords)) if request_keywords else "(none)",
+    )
+    params = _build_qido_params(ds) or {}
+    base = service_base_url(clarus_url, qa_url, expose_rejected)
+    try:
+        study_rows = _qido_request(
+            f"{base}/studies",
+            params,
+            http_timeout,
+            limit=None,
+            tls=tls,
+        )
+        if not isinstance(study_rows, list):
+            study_rows = []
+    except httpx.HTTPStatusError as exc:
+        # Same classifier as the other handlers: 4xx is this query's fault,
+        # 5xx and 429 are upstream conditions the SCU should retry.
+        logging.warning(
+            "[C-FIND] QIDO HTTP %d: %s?%s",
+            exc.response.status_code,
+            f"{base}/studies",
+            _masked_query(params),
+        )
+        dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+        yield dimse, None
+        return
+    except QidoMalformedBodyError as exc:
+        logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+        yield 0xA700, None
+        return
+    except httpx.HTTPError:
+        logging.warning("[C-FIND] QIDO error: connection failed")
+        yield 0xA700, None
+        return
+
+    count = 0
+    truncated = False
+    seen = set()
+    for study_row in study_rows:
+        if getattr(event, "is_cancelled", False):
+            find_responses.labels(type="patient").inc(count)
+            yield 0xFE00, None
+            return
+        if _shutdown_requested.is_set():
+            find_responses.labels(type="patient").inc(count)
+            yield 0xC000, None
+            return
+        patient_id = _json_first_value(study_row, "00100020") or ""
+        # An empty PatientID identifies nobody, so it never merges: give each
+        # such study a key of its own instead of a shared "" bucket.
+        group_key = patient_id if patient_id else object()
+        if group_key in seen:
+            continue
+        seen.add(group_key)
+        if max_responses and count >= max_responses:
+            truncated = True
+            logging.warning(
+                "[C-FIND] Response limit reached (%d). Patients truncated.",
+                max_responses,
+            )
+            break
+        row_ds = _json_to_dataset_patient(study_row)
+        _stamp_cfind_response(event, row_ds)
+        yield 0xFF00, row_ds
+        count += 1
+
+    find_responses.labels(type="patient").inc(count)
+    if truncated:
+        yield 0xB001, None
+    else:
+        yield 0x0000, None
+
+
 def _handle_patient_root(
     event,
     clarus_url,
@@ -383,14 +502,13 @@ def _handle_patient_root(
 ):
     """C-FIND Patient Root -> QIDO-RS.
 
+    PATIENT level: one row per patient, folded from the study query
+    (_handle_patient_level) - see PS3.4 C.6.1.1.2 Table C.6-1.
     STUDY level (or level absent): GET /studies - unchanged.
     SERIES level (31.08): two-step series search, the same routing Study
     Root already applies - a patient-root SERIES query used to fall through
     to the study path and relabel study rows as SERIES, so the SCU received
     rows with no SeriesInstanceUID.
-    PATIENT level: NOT implemented - refused with 0xA900. Returning study
-    rows labelled PATIENT duplicated one patient per study, which is worse
-    than an honest refusal.
     """
     level = (
         str(getattr(event.identifier, "QueryRetrieveLevel", "") or "").strip().upper()
@@ -408,7 +526,16 @@ def _handle_patient_root(
         )
         return
     if level == "PATIENT":
-        yield 0xA900, None
+        yield from _handle_patient_level(
+            event,
+            clarus_url,
+            verbose,
+            max_responses,
+            http_timeout,
+            tls,
+            expose_rejected=expose_rejected,
+            qa_url=qa_url,
+        )
         return
     if level not in ("", "STUDY"):
         # R5: IMAGE (and anything unrecognised) has no study-level equivalent.

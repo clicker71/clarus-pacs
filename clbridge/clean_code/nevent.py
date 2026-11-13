@@ -60,6 +60,7 @@ def _pn_quiet_filter(record):
     """Drop pynetdicom records from a thread that asked for silence."""
     return not getattr(_PN_QUIET, "on", False)
 
+
 # PS3.4 J.3.2 / J.3.3: a Storage Commitment transaction needs the requestor to
 # receive the N-EVENT-REPORT the SCP pushes back, so the requestor must hold
 # BOTH roles. PS3.7 D.3.3.4 spells the requestor's proposal as an SCP/SCU Role
@@ -128,9 +129,7 @@ def send_n_event_report(
         # proposes BOTH roles; a peer that declines leaves the default roles,
         # which the response check below reports.
         ae.add_requested_context(StorageCommitmentPushModel, ImplicitVRLittleEndian)
-        sc_role = build_role(
-            StorageCommitmentPushModel, scu_role=True, scp_role=True
-        )
+        sc_role = build_role(StorageCommitmentPushModel, scu_role=True, scp_role=True)
 
         # "No accepted presentation contexts" is normal for SCPs that
         # do not implement the push model. Quiet ONLY this thread's pynetdicom
@@ -144,13 +143,9 @@ def send_n_event_report(
         try:
             _PN_QUIET.on = True
             try:
-                assoc = ae.associate(
-                    host, port, ae_title=calling_ae, ext_neg=[sc_role]
-                )
+                assoc = ae.associate(host, port, ae_title=calling_ae, ext_neg=[sc_role])
                 try:
-                    associations_total.labels(
-                        role="to", ae=ae_label(calling_ae)
-                    ).inc()
+                    associations_total.labels(role="to", ae=ae_label(calling_ae)).inc()
                 except Exception:
                     pass
             finally:
@@ -193,7 +188,9 @@ def send_n_event_report(
             for ctx in assoc.accepted_contexts
         )
         if not sc_accepted:
-            last_err = f"SCP {calling_ae} did not grant the SCP role for storage commitment"
+            last_err = (
+                f"SCP {calling_ae} did not grant the SCP role for storage commitment"
+            )
             logging.warning("[N-EVENT] %s", last_err)
             _release_or_abort(assoc, timeout=2.0)
             continue

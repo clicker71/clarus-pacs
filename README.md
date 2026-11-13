@@ -145,8 +145,8 @@ drift.
 `clinfer` is a UPS-RS Task Performer (IHE AIW-I). It claims workitems
 from Clarus, runs a site-supplied model script under a model-agnostic
 contract, and stores results back with STOW-RS. Both Pull and Triggered
-Pull workflows are supported; WebSocket Push is implemented and pending
-external validation.
+Pull workflows are supported; WebSocket Push is implemented and
+validated end-to-end with Weasis (`ups:watch`).
 
 **Standard on the wire, simple on the desk.** Everything clinfer
 exchanges with Clarus and the viewer is standard DICOMweb + UPS-RS. The

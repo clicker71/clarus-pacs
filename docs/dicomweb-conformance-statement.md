@@ -847,7 +847,8 @@ rejection rate above.
   TLS is terminated by the reverse proxy (see 11).
 - Storage Commitment retention: `[commitment] result_retention_days`
   (default 30, `0` = forever).
-- Compile-time features: `transcode` (JPEG 2000 + JPEG-LS on-the-fly),
+- Compile-time features: `transcode` (JPEG 2000 + JPEG-LS + HTJ2K-decode
+  on-the-fly),
   `s3` (cold-tier fallback), `cjk-charsets` (CJK decoding);
   `china_crypto` (planned: SM3 content-addressing instead of BLAKE3).
 
@@ -939,8 +940,10 @@ or PNG, and multi-frame instances 406 (frames are served natively via
 /frames/{N}).
 
 **13.14 HTJ2K and exotic transfer syntaxes** - High-Throughput JPEG 2000
-(4.201-4.203) and other non-listed syntaxes are stored and served as-is;
-transcode requests for them return `406`.
+(4.201-4.203) is stored and served as-is and is decoded for transcode to
+other targets (decode-only, see 9.1); only a request to encode into HTJ2K
+returns `406`. JPIP, JPX, JPEG XL, MPEG/HEVC and other non-listed syntaxes
+are stored and served as-is; transcode requests for them return `406`.
 
 **13.15 STOW exact duplicates** - deliberately `200` (idempotent), see 2.1.
 

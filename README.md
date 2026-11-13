@@ -165,6 +165,14 @@ and returns one `result.json`. clinfer validates geometry byte-for-byte
 and assembles standard DICOM objects (SEG, SR, PR, Derived, RTSTRUCT,
 TID 1500).
 
+**No patient identity crosses the ABI.** The `manifest.json` carries
+raw pixels, geometry, a pseudonymous study UID, study-level context
+(description, modalities, body part) and the requester's parameters -
+never `PatientName`, `PatientID`, `PatientSex` or `PatientBirthDate`.
+A model that needs sex or age gets them as workitem parameters
+(0074,1210), stated explicitly by the site. See the
+[ABI contract](/clinfer/abi/README.md).
+
 ## Verification
 
 Every release passes the public

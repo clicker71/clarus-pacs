@@ -997,3 +997,33 @@ back - the SR, SEG and RTSTRUCT - so a result is filed under the right
 patient. That happens inside clinfer's DICOM writer, after the processor
 has already run: those attributes never cross the ABI in either
 direction.
+
+### 15.1 If a model needs sex or age
+
+`PatientSex` (0010,0040) and `PatientAge`/`PatientBirthDate` are not in the
+manifest, on purpose. A model that genuinely needs them - a pelvis
+segmentation that distinguishes prostate from uterus, or a bone-age model -
+gets them through the parameters channel, not by widening `StudyContext`.
+
+The site states them in the workitem's Scheduled Processing Parameters
+Sequence (0074,1210), and they arrive in `manifest.parameters` exactly as
+any other requester parameter (section 3.1.2):
+
+```json
+"parameters": {
+  "Patient Sex": ["M"],
+  "Patient Age": [45]
+}
+```
+
+The script reads them like any other tunable:
+
+```python
+sex = params.text(manifest, "Patient Sex", None)
+age = params.number(manifest, "Patient Age", None)
+```
+
+That is deliberate and per-run: sex and age cross the ABI only when the
+site puts them in the workitem, never because clinfer decided to widen the
+manifest. The site is responsible for what it states, exactly as it is for
+`study.description` and the `TEXT` parameter values.

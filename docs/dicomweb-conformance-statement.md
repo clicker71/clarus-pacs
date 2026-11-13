@@ -94,7 +94,9 @@ request completes.
 **Multipart part headers:** every part of a study/series/frames multipart
 response carries
 `Content-Type: application/dicom; transfer-syntax=<stored transfer syntax>`
-(instance-level) and `Content-Location` pointing at the part resource.
+(instance-level; for an instance stored as Implicit VR Little Endian the
+parameter names the re-encoded Explicit VR Little Endian syntax — see 9)
+and `Content-Location` pointing at the part resource.
 Frame parts carry the PS3.18 media type for the stored transfer syntax:
 `image/jpeg` (JPEG Baseline/Lossless), `image/x-dicom-rle` (RLE),
 `image/x-jls` (JPEG-LS), `image/jp2` (JPEG 2000), `image/jhc` (HTJ2K),
@@ -103,9 +105,14 @@ Frame parts carry the PS3.18 media type for the stored transfer syntax:
 
 **Retrieve Transfer Syntax:** the `?transferSyntax=` query parameter per
 PS3.18 10.4.2. Instances are served in their stored transfer syntax by
-default; on-the-fly transcoding (JPEG 2000, JPEG-LS, uncompressed targets)
-is a compile-time feature (`--features transcode`). A requested transfer
-syntax that cannot be produced returns `406`.
+default, with one exception: an instance stored as Implicit VR Little
+Endian (`1.2.840.10008.1.2`) is always served re-encoded to Explicit VR
+Little Endian (`1.2.840.10008.1.2.1`), because PS3.18 8.7.3 prohibits
+Implicit VR Little Endian over Web Services; this re-encode is in every
+build (it needs no decoder). On-the-fly transcoding of compressed syntaxes
+(JPEG 2000, JPEG-LS, uncompressed targets) is a compile-time feature
+(`--features transcode`). A requested transfer syntax that cannot be
+produced returns `406`.
 
 **Retrieve Metadata:** metadata responses carry the full stored DICOM
 metadata. Values longer than 64 bytes (such as long Lookup Table values)
@@ -341,10 +348,40 @@ reason and timestamp.
   `/workitems/{subscription-sop-class-uid}/subscribers/{subscriber}` -
   the 2026d subscribe-without-payload shape (`filter` query parameter,
   11.10.1.2/11.10.1.4), global (1.2.840.10008.5.1.4.34.5) and filtered
-  (34.5.1) forms, and the `?deletionlock` query parameter (11.10). The
-  WebSocket Notification Connection (8.10.4): `GET
+  (34.5.1) forms, and the `?deletionlock` query parameter (11.10). Also
+  POST/DELETE `/workitems/{workitem}/subscribers/{subscriber}` - the
+  **Workitem Subscription** template (11.10.1.1 Table 11.10.1-1), where
+  the segment is a real workitem UID and the subscription receives events
+  for that one workitem only. All three subscription templates are
+  supported. The WebSocket Notification Connection (8.10.4): `GET
   /dicomweb/subscribers/{requester}` with the RFC 6455 upgrade headers;
   Event Reports are JSON text frames (8.10.6).
+- **`filter` belongs to the Filtered Worklist resource.** PS3.18
+  Table 11.10.1-2 ties the `filter` query parameter to
+  `1.2.840.10008.5.1.4.34.5.1`. Sent to the plain Worklist resource
+  (34.5) it is refused with `400` rather than ignored: accepting it would
+  register a subscriber that receives every workitem's events while
+  believing it asked for a subset.
+- **Supported `filter` keys (Filtered Worklist, 34.5.1).** The filtered
+  subscription accepts the workitem attributes the stored record carries,
+  matched exactly (C-FIND semantics, PS3.4 C.2.2.2), in hex-tag or PS3.6
+  keyword spelling: Study Instance UID - `0020000D` and
+  `0040A370.0020000D` (`ReferencedRequestSequence.StudyInstanceUID`) as
+  two spellings of one fact; Patient ID (`00100020`); Patient Name
+  (`00100010`); Issuer of Patient ID (`00100021`); Accession Number
+  (`00080050`, `0040A370.00080050` /
+  `ReferencedRequestSequence.AccessionNumber`);
+  Requested Procedure ID (`0040A370.00401001` /
+  `ReferencedRequestSequence.RequestedProcedureID`); Procedure Step State
+  (`00741000`); Procedure Step Label (`00741204`); Scheduled Procedure
+  Step Priority (`00741200`); Scheduled Procedure Step Start DateTime
+  (`00404005`); Input Readiness State (`00404041`); Scheduled Station Name
+  Code Value (`00404025.00080100`); Scheduled Workitem Code Value
+  (`00404018.00080100`) and Coding Scheme Designator
+  (`00404018.00080102`). A `filter` naming any other key is refused with
+  `400` naming the key - never silently dropped: a subscriber that asked
+  for a key the server cannot honour must learn so rather than receive
+  events it did not ask for.
 - **Create and Update are told apart the way the standard does:**
   Create (11.4.1.1 Table 11.4.1-1) is `POST /workitems?workitem={uid}`
   - the Workitem UID is a QUERY parameter and there is no path segment
@@ -370,15 +407,15 @@ reason and timestamp.
   only the SCHEDULED -> IN PROGRESS transition issues the lock. A payload
   that carries no merge attribute - including one that carries only the
   Transaction UID - and a present-but-empty (0040,4033), are both `400`.
-<!-- claim:rad84 url="POST /workitems/{uid}" tuid="0008,1195" merge="0040,4033 0040,4019 0040,4028" no_event="no event is published" out_of_set="outside that set" -->
+<!-- claim:rad84 url="POST /workitems/{uid}" tuid="0008,1195" merge="0040,4033 0040,4019 0040,4028 0040,4041" no_event="no event is published" out_of_set="outside that set" -->
 - **Create (11.4):** the request body may name the input study and the
   accession through the Referenced Request Sequence `(0040,A370 > 0020,000D`
   and `0040,A370 > 0008,0050)`, which is read first (it is the standard
   carriage, PS3.4 Table CC.2.5-3); the bare `(0008,0050)` and the Input
   Information Sequence `(0040,4021 > 0020,000D)` are the fallbacks. The
-  workitem RENDER states both facts through `(0040,A370)`, not as bare
-  top-level tags, so a retrieved workitem reads back in the same shape a
-  requester writes.
+  workitem RENDER states both request facts through `(0040,A370)` and
+  carries the output study assignment `(0020,000D)` at the dataset root,
+  so a retrieved workitem reads back in the same shape a requester writes.
 - **States:** SCHEDULED, IN PROGRESS, COMPLETED, CANCELED. State
   changes carry the Procedure Step State (0074,1000) and the locking
   Transaction UID (0008,1195) - both type 1 - and read nothing else
@@ -393,8 +430,16 @@ reason and timestamp.
   Requested Procedure ID (0040,A370 > 0040,1001), Procedure Step State
   (0074,1000), Procedure Step Label (0074,1204), Scheduled Workitem Code
   Value (0040,4018 > 0008,0100), Scheduled Station Name Code Value
-  (0040,4025 > 0008,0100), Patient ID (0010,0020), and Modality (0008,0060)
-  as a vendor extension (see below). An absent or empty key matches
+  (0040,4025 > 0008,0100), Patient ID (0010,0020), Patient Name (0010,0010),
+  Scheduled Procedure Step Start DateTime (0040,0405), Scheduled Procedure
+  Step Priority (0074,1200), and Modality (0008,0060) as a vendor extension
+  (see below). Worklist Label (0074,1202) is filled by the SCP when the
+  creator supplies none (falling back to the Procedure Step Label) and
+  returned from retrieve and search. A repeated matching attribute is refused
+  with 400, and the recognized search controls
+  `fuzzymatching`/`emptyvaluematching`/`multiplevaluematching` (true|false) and
+  `includefield` (non-empty) are validated; a literal `+` in a query value is
+  preserved (percent-encoding, spaces as `%20`). An absent or empty key matches
   everything; a key with a value matches exactly (case-sensitive);
   Modality, being type CS, matches case-insensitively. The station key is
   (0040,4025) Code Value; (0040,0001) Scheduled Station AE Title has no row
@@ -428,8 +473,10 @@ reason and timestamp.
 - **Optimistic locking:** state changes and updates require the current
   Transaction UID; a mismatch returns a conflict (`409`).
 - **Request Cancellation (11.8):** `POST /workitems/{uid}/cancelrequest`
-  cancels a queued (SCHEDULED) workitem (`202`, state CANCELED with the
-  reason and the Procedure Step Cancellation DateTime). A terminal
+  cancels a queued (SCHEDULED) workitem (`202`, two state reports - SCHEDULED
+  to IN PROGRESS, then IN PROGRESS to CANCELED per CC.2.2.3 - with the reason
+  and the Procedure Step Cancellation DateTime filled inside the Progress
+  Information Sequence (0074,1002)). A terminal
   (COMPLETED/CANCELED) or IN PROGRESS workitem is `409`; an unknown one is
   `404`. This is a product feature, not an AIW-I obligation (11.8 has no RAD
   number). **11.8 not supported in part:** the "UPS Cancel Requested"
@@ -553,7 +600,9 @@ mandatory set - `requestType` (=WADO), `studyUID`, `seriesUID`,
 service Base URI. The document is a fixed WADL skeleton reflecting the route
 registry (Annex H / Table H-1, INV-002): `studies`/`series`/`instances` (with
 the `metadata`, `thumbnail`, `rendered`, `bulkdata` and `frames` children),
-`workitems` (with the `{subscriptionSOPClassUID}`/`subscribers` child),
+`workitems` (with the `{workitem}/subscribers` child for the Workitem
+Subscription template and the `{subscriptionSOPClassUID}/subscribers` child for
+the Worklist and Filtered Worklist templates),
 `commitment-requests`, `modality-scheduled-procedure-steps` (MWL) and
 `modality-performed-procedure-steps` (MPPS). The instance-level `rendered`
 resource is the only `/rendered` advertised (study/series rendering is not
@@ -566,7 +615,11 @@ preflight answer (204).
 
 - **Ingest:** store-as-received; instances are accepted and stored in any
   transfer syntax present in the STOW payload, with no re-encoding.
-- **Retrieve:** served in the stored transfer syntax; a requested
+- **Retrieve:** served in the stored transfer syntax, except Implicit VR
+  Little Endian (`1.2.840.10008.1.2`), which is always served transcoded to
+  Explicit VR Little Endian (`1.2.840.10008.1.2.1`) — PS3.18 8.7.3 forbids
+  Implicit VR Little Endian over Web Services. This transcode is
+  unconditional (every build, no decoder). Any other requested
   `?transferSyntax=` requires the `transcode` build feature.
 
 ### 9.1 Transcode support (`transcode` build)

@@ -27,7 +27,7 @@
 4. No pointer arithmetic, no manual memory management, no `unsafe`
    in business logic.
 
-## Inventory (verified 29.08.2026)
+## Inventory (verified 13.11.2026)
 
 | # | Site | API | Why safe | Callers |
 |---|------|-----|----------|---------|

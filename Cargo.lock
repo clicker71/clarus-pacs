@@ -322,7 +322,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clarus"
-version = "0.3.1-beta"
+version = "0.3.2-beta"
 dependencies = [
  "blake3",
  "chrono",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "clarus-adapters"
-version = "0.3.1-beta"
+version = "0.3.2-beta"
 dependencies = [
  "blake3",
  "bytes",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "clarus-core"
-version = "0.3.1-beta"
+version = "0.3.2-beta"
 dependencies = [
  "blake3",
  "criterion",
@@ -385,11 +385,11 @@ dependencies = [
 
 [[package]]
 name = "clarus-ports"
-version = "0.3.1-beta"
+version = "0.3.2-beta"
 
 [[package]]
 name = "clinfer"
-version = "0.3.1-beta"
+version = "0.3.2-beta"
 dependencies = [
  "clarus-adapters",
  "ferrite-macros",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "cltranscode"
-version = "0.3.1-beta"
+version = "0.3.2-beta"
 dependencies = [
  "chrono",
  "clarus-adapters",

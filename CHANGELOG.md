@@ -2,6 +2,15 @@
 
 All notable changes to Clarus PACS are documented here.
 
+## [0.3.2-beta] — 2026-11-13
+
+### Performance
+
+- **STOW-RS ingest** is up to ~28% faster on HDD-backed storage: the body
+  write now uses a 1 MiB buffered writer instead of 64 KiB chunks (A/B
+  median 5.26 s → 3.78 s for an 824 MiB instance on a VMware virtual HDD).
+  Durability contract unchanged.
+
 ## [0.3.1-beta] — 2026-11-12
 
 ### Interoperability

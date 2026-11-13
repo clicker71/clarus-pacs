@@ -39,6 +39,17 @@ const JSON_CT: &[u8] = b"application/json; charset=utf-8";
 /// Stable DICOM content type used by WADO single-object and STOW.
 const DICOM_CT: &[u8] = b"application/dicom";
 
+/// STOW-RS temp-file write buffer size (single-part and multipart sinks).
+///
+/// The ingest loop feeds the sink in 64 KiB chunks (`conn::READ_BUF`), so an
+/// unbuffered `File` turns an 824 MiB WSI into ~13.4k `write(2)` syscalls,
+/// while the dd reference that established the 172-330 MB/s wall writes
+/// 1 MiB at a time. Aligning the granularity costs ONE fixed 1 MiB heap
+/// buffer per connection, allocated when the temp file is opened - zero per
+/// chunk, so the per-chunk write loop stays allocation-free (ap101). The
+/// buffer never grows: `with_capacity` pre-sizes it.
+const STOW_WRITE_BUF: usize = 1024 * 1024;
+
 /// The media type of a DICOM body that is Explicit VR Little Endian.
 ///
 /// PS3.18 8.7.3.1 gives `application/dicom` an optional `transfer-syntax`
@@ -2980,6 +2991,11 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
                 return write_resp(ctx.conn, 500, JSON_CT, &body, ka);
             }
         };
+        // Coalesce the 64 KiB read chunks into 1 MiB writes (STOW_WRITE_BUF):
+        // the raw File would issue one `write(2)` per chunk. The single 1 MiB
+        // heap buffer is allocated here, once per connection - the write loop
+        // below stays allocation-free.
+        let file = std::io::BufWriter::with_capacity(STOW_WRITE_BUF, file);
         // Fold the content hash over the bytes AS WRITTEN (one read, not two).
         let mut cas_write = clarus_core::hash::CasWrite::new(file);
         let mut body = BodyReader::new(ctx.conn, ctx.head);
@@ -3044,11 +3060,22 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
             let _ = ctx.conn.write_all_configured(&body);
             return Ok(());
         }
-        // No flush here: std File writes are unbuffered into the page cache.
-        // Durability is established LATER, by the CAS publish step - the
-        // manifest P2 fsync for the manifest, and (0710) a blob `sync_all`
-        // barrier inside `rename_temp_to_cas` before the CAS rename.
-        let (folded_blake3, file) = cas_write.finish();
+        // Flush the BufWriter tail BEFORE the CAS publish step. `BufWriter`'s
+        // Drop DOES flush its buffer, but it swallows write errors: a disk
+        // that fills during the final buffer write would otherwise let
+        // `rename_temp_to_cas` fsync and rename a TRUNCATED file under a
+        // content address that no longer names its own bytes (silent
+        // corruption, pattern #7). The explicit flush surfaces that error so
+        // the temp file is removed and the request answers 507/500. Durability
+        // itself still comes later, from the blob `sync_all` barrier inside
+        // `rename_temp_to_cas` before the CAS rename.
+        let (folded_blake3, mut file) = cas_write.finish();
+        if let Err(e) = file.flush() {
+            // A flush failure is a write failure (e.g. ENOSPC mid-tail): the
+            // temp file is partial, so remove it and answer honestly.
+            let _ = std::fs::remove_file(&temp_path);
+            return write_stow_write_error(ctx, ka, e);
+        }
         drop(file);
 
         let mut batch = crate::handlers::stow_pure::ManifestBatch::default();
@@ -3331,6 +3358,9 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
                 return write_resp(ctx.conn, 500, JSON_CT, &body, ka);
             }
         };
+        // Same 1 MiB coalescing as the single-part sink: one heap buffer per
+        // connection at open, zero per chunk in the drain loop below.
+        let file = std::io::BufWriter::with_capacity(STOW_WRITE_BUF, file);
         let mut total: u64 = 0;
         let mut oversized = false;
 
@@ -3393,10 +3423,16 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
             let _ = std::fs::remove_file(&temp_path);
             return write_stow_write_error(ctx, ka, e);
         }
-        // D6: no flush here - std File writes are unbuffered, so `flush()`
-        // would be a no-op suggesting durability that is not there (the
-        // durability comes later, from the manifest P2 fsync).
-        let (folded_blake3, file) = cas_write.finish();
+        // Flush the BufWriter tail BEFORE the CAS publish step (same reason as
+        // the single-part sink): Drop would flush but swallow a failing tail
+        // write, publishing a truncated blob under a content address that does
+        // not name its own bytes. Durability itself still comes later, from
+        // the manifest P2 fsync.
+        let (folded_blake3, mut file) = cas_write.finish();
+        if let Err(e) = file.flush() {
+            let _ = std::fs::remove_file(&temp_path);
+            return write_stow_write_error(ctx, ka, e);
+        }
         drop(file);
 
         if oversized {
@@ -4481,6 +4517,68 @@ mod tests {
             ),
             "the served media type has to name the syntax the bytes are in"
         );
+    }
+
+    /// 1311: why the STOW sinks call `flush()` BEFORE dropping the BufWriter.
+    ///
+    /// `std::io::BufWriter`'s `Drop` DOES flush its buffer, but it swallows
+    /// write errors: a disk that fills during the final buffer write would
+    /// otherwise hand `rename_temp_to_cas` a truncated blob published under a
+    /// content address that no longer names its own bytes. The explicit
+    /// `flush()` is what turns that silent corruption (pattern #7) into a
+    /// surfaced `Err`, which the handler maps to 507/500. The first block
+    /// mirrors the exact dispatch pattern (`CasWrite<BufWriter<_>>` -> finish
+    /// -> flush); the second shows drop alone hides the SAME failure.
+    #[test]
+    fn stow_bufwriter_flush_surfaces_a_failing_tail_write() {
+        // Inner writer that accepts a bounded prefix, then fails the tail.
+        struct FailAfter {
+            ok: usize,
+            written: usize,
+        }
+        impl std::io::Write for FailAfter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.written >= self.ok {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::StorageFull,
+                        "disk full at the tail write",
+                    ));
+                }
+                let n = (self.ok - self.written).min(buf.len());
+                self.written += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // < 1 MiB: the whole payload is buffered, so nothing reaches the inner
+        // writer until the buffer is flushed - exactly the handler's tail.
+        let payload = [0x5Au8; 64];
+
+        // Explicit flush (the dispatch pattern): the failure IS surfaced.
+        let mut cas = clarus_core::hash::CasWrite::new(std::io::BufWriter::with_capacity(
+            STOW_WRITE_BUF,
+            FailAfter { ok: 32, written: 0 },
+        ));
+        cas.write_all(&payload).expect("buffered write succeeds");
+        let (_, mut sink) = cas.finish();
+        assert!(
+            std::io::Write::flush(&mut sink).is_err(),
+            "the flush must surface a failing tail write"
+        );
+
+        // Drop alone: the SAME failure is swallowed - the tail bytes are lost
+        // and no error is observable. That is the corruption the flush guards
+        // against.
+        let mut cas = clarus_core::hash::CasWrite::new(std::io::BufWriter::with_capacity(
+            STOW_WRITE_BUF,
+            FailAfter { ok: 32, written: 0 },
+        ));
+        cas.write_all(&payload).expect("buffered write succeeds");
+        let (_, sink) = cas.finish();
+        drop(sink); // no panic, no error: the failure vanished
     }
 
     #[test]

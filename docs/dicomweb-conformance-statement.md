@@ -575,7 +575,8 @@ preflight answer (204).
 Endian, Explicit VR Little Endian, Explicit VR Big Endian, RLE Lossless,
 JPEG Baseline (4.50), JPEG Lossless P14 (4.57 / 4.70), JPEG-LS
 Lossless/Near-Lossless (4.80 / 4.81), JPEG 2000 Lossless/Lossy (4.90 /
-4.91).
+4.91), HTJ2K Lossless (4.201), HTJ2K Lossless RPCL (4.202), HTJ2K Lossy
+(4.203) - decode-only.
 
 **Encoders** (pixels to requested transfer syntax): Explicit VR Little
 Endian, JPEG Baseline, JPEG Lossless, JPEG-LS Lossless/Near-Lossless,
@@ -589,9 +590,11 @@ the instance remains retrievable in its stored transfer syntax. Signed
 codestream samples are preserved bit-exactly; the output carries the
 `PixelRepresentation` (0028,0103) of the stored instance.
 
-**Not supported:** High-Throughput JPEG 2000 (4.201-4.203), JPIP, JPX,
-JPEG XL, MPEG/HEVC, Deflated Explicit VR LE. Such instances are stored
-and served as-is; a transcode request for them returns `406`.
+**Not supported:** JPIP, JPX, JPEG XL, MPEG/HEVC, Deflated Explicit VR
+LE. Such instances are stored and served as-is; a transcode request for
+them returns `406`. High-Throughput JPEG 2000 (4.201-4.203) is
+decode-only: accepted and served as-is, decoded for rendering and for
+transcode to other targets, but never produced as an encode target.
 
 **Failure behavior:** a transient codec error falls back to the original
 bytes with a logged WARN; a non-conformant codestream (component count

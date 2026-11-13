@@ -308,7 +308,10 @@ sudo systemctl start clarus
 ## nginx in front
 
 nginx owns TLS and authentication. Clarus never checks a password; that is
-deliberate, and it is why the proxy headers below are not optional.
+deliberate, and it is why the proxy headers below are not optional. The full
+edge-auth reference - Basic Auth, mTLS, and LDAP via `auth_request` - lives
+in [nginx-auth.md](nginx-auth.md); the server-side keys (`trusted_proxies`,
+`require_proxy_identity`) are in "Access control" below.
 
 ```nginx
 server {

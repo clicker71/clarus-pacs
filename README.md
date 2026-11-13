@@ -231,6 +231,7 @@ flag extends that to the rest of the code).
 - [DIMSE bridge conformance statement](docs/dimse-bridge-conformance-statement.md)
 - [IHE AIW-I conformance statement](docs/aiw-i-conformance-statement.md)
 - [Production deployment guide](docs/production-setup.md)
+- [Edge authentication (nginx / LDAP / mTLS)](docs/nginx-auth.md)
 - [Admin API](docs/admin-api.md)
 - [Audit log format](docs/audit-log-format.md)
 - [Unsafe surface audit](docs/unsafe-audit.md)

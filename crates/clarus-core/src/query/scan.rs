@@ -5,14 +5,14 @@
 //!
 //! # Query plan
 //!
-//! 1. **Modality acceleration.** When `QueryFilter::modality()` is set, the
-//!    `modality/{MOD}/YYYYMMDD.idx` rows (restricted to the filter's date
-//!    range when present) yield the candidate `study_uid`s directly.
-//! 2. **Direct UID lookup.** `StudyInstanceUID` names exactly one manifest.
-//! 3. **Cold path.** With no accelerator, the whole `manifests/` directory is
-//!    scanned and each manifest is parsed and filtered (the plan's <10 ms P99
-//!    full-scan rule for <100K studies).
-//! 4. **Manifest filter + pagination.** Each candidate manifest is mmap-ed,
+//! 1. **Direct UID lookup.** `StudyInstanceUID` names exactly one manifest.
+//! 2. **Cold path.** The whole `manifests/` directory is scanned and each
+//!    manifest is parsed and filtered (the plan's <10 ms P99 full-scan rule
+//!    for <100K studies). The modality and n-gram idx accelerators are
+//!    DISABLED pending a coverage marker: without one, both union their rows
+//!    with the full study set, so they never narrowed the candidate set and
+//!    their reads were pure I/O.
+//! 3. **Manifest filter + pagination.** Each candidate manifest is mmap-ed,
 //!    filtered by the remaining search keys, collected in study-UID order, and
 //!    paginated with `offset`/`limit`.
 //!
@@ -236,190 +236,51 @@ impl StudyScanner {
     /// Priority: `StudyInstanceUID` exact -> modality idx (date-restricted) ->
     /// cold full scan of `manifests/`.
     fn candidate_study_uids(&self, filter: &QueryFilter) -> Result<Vec<String>, StudySearchError> {
-        // Direct UID: exactly one candidate.
-        if let Some(uid) = filter.study_instance_uid.as_deref() {
-            // The UID becomes a path component below. A query controls this
-            // value, so the same rule that guards every other "is this a UID"
-            // question must apply here too: the public validator refuses empty
-            // values, separators, dot-escapes and non-conforming digit runs
-            // (PS3.5 9.1), and a second, weaker copy of that rule would let a
-            // value through that every writer path rejects.
-            if crate::uid::validate_path_uid(uid).is_err() {
-                return Ok(Vec::new());
-            }
-            // Only candidate if the manifest actually exists.
-            let path = self.manifests_dir.join(format!("{uid}.manifest"));
-            if path.is_file() {
-                return Ok(vec![uid.to_string()]);
-            }
-            return Ok(Vec::new());
-        }
-
-        // Modality acceleration: study UIDs direct from the idx rows.
+        // Direct UID: one candidate per list member.
         //
-        // PS3.18 makes `Modality` multi-valued (`Modality=CT,MR`), and the
-        // buckets are per modality: passing the raw value built the path
-        // `modality/CT,MR`, which exists for no study, so a legitimate query
-        // answered with an empty candidate set. Each element is looked up in
-        // its own bucket and the results unioned.
-        if let Some(modality) = filter.modality() {
-            let mut union: Vec<String> = Vec::new();
-            for value in modality.split(',') {
-                let value = value.trim();
-                // A path element that can escape the index tree is not a
-                // modality; a CS value cannot contain `/`, `\` or `..`.
-                if value.is_empty() || value.contains('/') || value.contains('\\') || value == ".."
-                {
+        // `studyInstanceUid` holds a single value per Table 10.6.1-5, but that
+        // value may be a comma-separated LIST asking for the union. Validating
+        // the whole string as one UID refused `1.2.1,1.2.2` (a comma is not a
+        // UID character, PS3.5 9.1) and answered a legal query with no
+        // candidates at all. Each member is validated on its own and only the
+        // ones whose manifest exists become candidates.
+        if let Some(uids) = filter.study_instance_uid.as_deref() {
+            let mut out: Vec<String> = Vec::new();
+            for uid in uids.split(',') {
+                let uid = uid.trim();
+                // The UID becomes a path component below. A query controls this
+                // value, so the same rule that guards every other "is this a
+                // UID" question must apply here too: the public validator
+                // refuses empty values, separators, dot-escapes and
+                // non-conforming digit runs (PS3.5 9.1), and a second, weaker
+                // copy of that rule would let a value through that every writer
+                // path rejects.
+                if crate::uid::validate_path_uid(uid).is_err() {
                     continue;
                 }
-                union.extend(self.modality_candidates(value, filter)?);
+                // Only a candidate if the manifest actually exists.
+                if !self.manifests_dir.join(format!("{uid}.manifest")).is_file() {
+                    continue;
+                }
+                // A repeated member is ONE candidate. Pushing it twice made the
+                // loader return the same study twice, so `limit=2` could spend
+                // its budget on one study and omit the other.
+                if out.iter().any(|seen| seen == uid) {
+                    continue;
+                }
+                out.push(uid.to_string());
             }
-            if !union.is_empty() {
-                union.sort();
-                union.dedup();
-                return Ok(union);
-            }
-            // No usable bucket: fall through to the full scan rather than
-            // answering "nothing" for a query the archive may well satisfy.
+            return Ok(out);
         }
 
-        // Fuzzymatch acceleration: union the per-gram `.idx` rows (a safe
-        // superset for 4+ grams; bitap is the final judge). Falls back to a
-        // full scan when the n-gram index has no rows or the name is too short.
-        if filter.fuzzymatch
-            && let Some(uid) = self.fuzzy_patient_candidates(filter)?
-        {
-            return Ok(uid);
-        }
-
-        // Cold path: no accelerator - list the manifests directory.
+        // The modality and n-gram accelerators are DISABLED pending a coverage
+        // marker. Both used to union their idx rows with the FULL study set
+        // (the "non-empty is not the whole answer" rule), so the accelerator
+        // reads were pure I/O: the candidate set equalled the cold-path set on
+        // every branch. Until the idx can honestly narrow (a marker tracking
+        // which studies it covers), the full scan is the only path - it is
+        // correct and allocation-cheaper than the union it replaced.
         self.list_all_study_uids()
-    }
-
-    /// Candidate study UIDs for a `PatientName` fuzzymatch, from the n-gram `.idx`.
-    ///
-    /// The query name is broken into n-grams; each gram's daily `.idx` rows are
-    /// read and UNIONED - a study appearing in any query gram is a candidate.
-    /// This is a safe superset for 4+ grams (a 1-edit match keeps at least one
-    /// intact gram); `bitap` remains the final judge. Names with fewer than 4
-    /// grams (<=5 scalars) fall back. Returns `Ok(None)` to signal "no usable
-    /// index", which the caller treats as a fall through to the full manifest
-    /// scan.
-    fn fuzzy_patient_candidates(
-        &self,
-        filter: &QueryFilter,
-    ) -> Result<Option<Vec<String>>, StudySearchError> {
-        // The accelerator only narrows a no-wildcard PatientName fuzzymatch.
-        let Some(name) = filter.patient_name.as_deref() else {
-            return Ok(None);
-        };
-        if name.bytes().any(|b| b == b'*' || b == b'?') {
-            return Ok(None);
-        }
-        // Fuzzy path only: normalize PN separators to spaces so the query grams
-        // line up with the space-separated keys written at indexing time.
-        let normalized = crate::idx::ngram::fuzzy_normalize(name);
-        let grams = crate::idx::ngram::name_ngrams(&normalized);
-        if grams.is_empty() {
-            return Ok(None);
-        }
-        // Union soundness guard: at 4+ grams a 1-edit match (which perturbs at
-        // most 3 windows) necessarily leaves at least one n-gram intact, so
-        // the union of the per-gram row sets is a safe superset. Below 4 grams
-        // (names of <=5 chars/scalars) one edit can touch EVERY gram, so the
-        // union is NOT guaranteed to contain the true match - fall back to the
-        // full manifest scan (bitap is still the final judge).
-        if grams.len() < 4 {
-            return Ok(None);
-        }
-
-        // Union candidates: a study counts as a candidate if it appears in ANY
-        // of the query's n-grams (a 1-edit match shares at least one intact
-        // gram). This is deliberately a superset; bitap filters it down.
-        let mut candidates: Vec<String> = Vec::new();
-        for gram in &grams {
-            let rows = self.ngram_day_rows(crate::idx::ngram::NameKind::Patient, gram)?;
-            // A missing gram's index means we cannot narrow honestly - fall back.
-            if rows.is_empty() {
-                return Ok(None);
-            }
-            candidates.extend(rows);
-        }
-        candidates.sort();
-        candidates.dedup();
-        Ok(Some(candidates))
-    }
-
-    /// Gather every study UID stored for one n-gram across all daily `.idx` files.
-    ///
-    /// Days are discovered by listing the n-gram's bucket directory, so a
-    /// missing file for a particular day is irrelevant - whatever buckets exist
-    /// are the rows. `Ok(Vec::new())` means the n-gram has no index at all.
-    fn ngram_day_rows(
-        &self,
-        kind: crate::idx::ngram::NameKind,
-        gram: &str,
-    ) -> Result<Vec<String>, StudySearchError> {
-        let bucket = self
-            .idx_dir
-            .join(crate::idx::ngram::kind_root(kind))
-            .join(gram);
-        if !bucket.is_dir() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&bucket).map_err(StudySearchError::Io)? {
-            let entry = entry.map_err(StudySearchError::Io)?;
-            let fname = entry.file_name().to_string_lossy().into_owned();
-            let Some(day) = fname.strip_suffix(".idx") else {
-                continue;
-            };
-            if day.len() != 8 {
-                continue;
-            }
-            let uids = crate::idx::ngram::read_study_uids(&self.idx_dir, kind, gram, day)
-                .map_err(StudySearchError::Io)?;
-            out.extend(uids);
-        }
-        Ok(out)
-    }
-
-    /// Read candidate study UIDs out of `modality/{MOD}/YYYYMMDD.idx`.
-    ///
-    /// When a date range is given, only the days inside `[from,to]` are read;
-    /// otherwise every day present under the modality bucket is scanned. Days
-    /// are walked by directory listing so a missing `.idx` for a specific day
-    /// is irrelevant - whatever buckets exist are the candidates.
-    fn modality_candidates(
-        &self,
-        modality: &str,
-        filter: &QueryFilter,
-    ) -> Result<Vec<String>, StudySearchError> {
-        let bucket = self.idx_dir.join("modality").join(modality);
-        if !bucket.is_dir() {
-            return Ok(Vec::new());
-        }
-        let (from, to) = filter.date_bounds();
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&bucket).map_err(StudySearchError::Io)? {
-            let entry = entry.map_err(StudySearchError::Io)?;
-            let fname = entry.file_name().to_string_lossy().into_owned();
-            if !fname.ends_with(".idx") {
-                continue;
-            }
-            let day = &fname[..fname.len() - ".idx".len()];
-            if day.len() != 8 || !in_date_range(day, from, to) {
-                continue;
-            }
-            let day_key = day_bytes(day);
-            let uids = crate::idx::modality::read_study_uids(&self.idx_dir, modality, &day_key)
-                .map_err(StudySearchError::Io)?;
-            out.extend(uids);
-        }
-        // De-duplicate: a study may span multiple modality rows across days.
-        out.sort();
-        out.dedup();
-        Ok(out)
     }
 
     /// List every study UID from the RAM index when it is ready,
@@ -468,7 +329,6 @@ impl StudyScanner {
         {
             return Ok(load_if_matches_index(index, uid, filter, expected));
         }
-        let path = self.manifests_dir.join(format!("{uid}.manifest"));
         // QIDO only needs study-level QIDO attributes - skip expensive
         // series/instance/frame decode via decode_study_only (shallow read).
         //
@@ -476,14 +336,19 @@ impl StudyScanner {
         // tail, an n-gram line written for a study that never committed), not
         // a broken request: one such candidate used to fail the whole QIDO
         // answer. Skipping it costs that study, which no longer exists.
-        let manifest = match crate::manifest::read_manifest_study_only(&path) {
+        //
+        // A CORRUPT manifest is skipped for the same reason. It used to abort
+        // the entire cold-path search, so one damaged file made every healthy
+        // study unanswerable - while the RAM and patients paths already
+        // skipped the same file. Reporting is the recovery pass's job; a query
+        // must not be the channel that surfaces it.
+        let Some(published) = crate::manifest::PublishedManifest::new(&self.manifests_dir, uid)
+        else {
+            return Ok(None);
+        };
+        let manifest = match crate::manifest::read_manifest_study_only_published(&published) {
             Ok(m) => m,
-            Err(crate::manifest::ManifestReadError::Io(e))
-                if e.kind() == std::io::ErrorKind::NotFound =>
-            {
-                return Ok(None);
-            }
-            Err(_) => return Err(StudySearchError::Manifest(uid.to_string())),
+            Err(_) => return Ok(None),
         };
         if !crate::query::match_study_attrs_prebuilt(filter, &manifest, expected) {
             return Ok(None);
@@ -522,31 +387,6 @@ fn load_if_matches_index(
         study_uid: uid.to_string(),
         qido: (*qido).clone(),
     })
-}
-
-/// Whether a day key lies within an inclusive `[from, to]` date range.
-fn in_date_range(day: &str, from: Option<&str>, to: Option<&str>) -> bool {
-    let d = day.parse::<u64>().unwrap_or(0);
-    if let Some(f) = from.and_then(|f| f.parse::<u64>().ok())
-        && d < f
-    {
-        return false;
-    }
-    if let Some(t) = to.and_then(|t| t.parse::<u64>().ok())
-        && d > t
-    {
-        return false;
-    }
-    true
-}
-
-/// Parse an 8-char day string into a `[u8; 8]` day key.
-fn day_bytes(day: &str) -> [u8; 8] {
-    let mut b = [b'0'; 8];
-    let bytes = day.as_bytes();
-    let n = bytes.len().min(8);
-    b[..n].copy_from_slice(&bytes[..n]);
-    b
 }
 
 #[cfg(test)]
@@ -592,6 +432,79 @@ mod tests {
         let scanner = StudyScanner::new(manifests.clone(), dir.path().join("idx"));
         let (res, _) = scanner.search(&QueryFilter::default()).expect("search");
         assert_eq!(res.len(), 2);
+    }
+
+    /// F11: one CORRUPT manifest must not fail the whole cold-path search.
+    ///
+    /// A single undecodable file used to return `Err(Manifest)` and abort the
+    /// answer, so every healthy study became unqueryable while the RAM and
+    /// patients paths happily skipped the same file. A query is not the channel
+    /// that reports corruption; the recovery pass is.
+    #[test]
+    fn a_corrupt_manifest_does_not_fail_the_whole_search() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        seed_manifest(&manifests, "1.2.1", "alice", 20260101);
+        seed_manifest(&manifests, "1.2.2", "bob", 20260202);
+        // A present-but-undecodable manifest among the healthy ones.
+        std::fs::write(
+            manifests.join("1.2.9.manifest"),
+            b"\x00\xff\x00\xfe not a manifest",
+        )
+        .expect("corrupt manifest");
+
+        let scanner = StudyScanner::new(manifests.clone(), dir.path().join("idx"));
+        let (res, _) = scanner
+            .search(&QueryFilter::default())
+            .expect("a corrupt sibling must not abort the search");
+        let mut uids: Vec<String> = res.into_iter().map(|r| r.study_uid).collect();
+        uids.sort();
+        assert_eq!(
+            uids,
+            vec!["1.2.1".to_string(), "1.2.2".to_string()],
+            "the healthy studies must still be answered"
+        );
+    }
+
+    /// F12: the n-gram accelerator must not drop a study it has no rows for.
+    ///
+    /// The rows only exist for studies whose names were indexed. A study whose
+    /// manifest exists but whose rows are missing (an index written before that
+    /// key existed, or a partially repaired store) was silently omitted, which
+    /// answers a correct query with an incomplete set - the same "non-empty is
+    /// not the whole answer" defect the modality branch already had.
+    #[test]
+    fn an_unindexed_study_still_matches_a_name_query() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let idx = dir.path().join("idx");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        std::fs::create_dir_all(&idx).expect("mkdir");
+
+        // EVERY gram of the query must have rows, or the accelerator bails out
+        // to a full scan and the union is never exercised. So the indexed study
+        // carries the query name itself, and the UNINDEXED study is the plain
+        // study under test: it matches the query (one edit away) but has no
+        // n-gram rows of its own.
+        seed_manifest(&manifests, "1.2.1", "atroshchenkolong", 20260101);
+        seed_manifest(&manifests, "1.2.2", "atroshchenkolonq", 20260202);
+
+        // Index ONLY the first study's name; the second has no rows at all.
+        index_fuzzy_name(&idx, "atroshchenkolong", "1.2.1", "20260101");
+
+        let scanner = StudyScanner::new(manifests.clone(), idx);
+        let filter = QueryFilter {
+            patient_name: Some("atroshchenkolong".to_string()),
+            fuzzymatch: true,
+            ..Default::default()
+        };
+        let (res, _) = scanner.search(&filter).expect("search");
+        let uids: Vec<String> = res.into_iter().map(|r| r.study_uid).collect();
+        assert!(
+            uids.contains(&"1.2.2".to_string()),
+            "a study with no n-gram rows must still be a candidate, got {uids:?}"
+        );
     }
 
     /// A StudyInstanceUID a query controls must not become a path escape.
@@ -685,6 +598,14 @@ mod tests {
         );
     }
 
+    /// The modality accelerator narrows the scan WITHOUT dropping studies it
+    /// does not know about.
+    ///
+    /// The idx bucket here covers `1.2.1` only; `1.2.2` is a CT study in the
+    /// manifests that the accelerator has no row for (the shape a torn day, a
+    /// crash before the append, or a study stored before the idx existed all
+    /// produce). A non-empty accelerator set used to be returned as the whole
+    /// answer, so `?Modality=CT` silently omitted `1.2.2`.
     #[test]
     fn modality_idx_accelerates_and_filters() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -709,7 +630,128 @@ mod tests {
             ..Default::default()
         };
         let (res, _) = scanner.search(&f).expect("search");
-        assert_eq!(res.len(), 1);
+        // BOTH studies carry the CT modality. `1.2.1` comes from the idx row
+        // and `1.2.2` from the manifests-only fallback, so the answer is the
+        // same either way - which is the property that matters. The previous
+        // assertion of `len == 1` pinned the bug: it accepted an answer that
+        // omitted an unindexed CT study.
+        let uids: Vec<&str> = res.iter().map(|r| r.study_uid.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec!["1.2.1", "1.2.2"],
+            "every CT study must answer, indexed or not"
+        );
+    }
+
+    /// A study the accelerator has no row for is still a candidate.
+    ///
+    /// This is the C2 defect stated directly: the idx is a performance
+    /// structure, not the source of truth, so narrowing to it must never lose
+    /// a study the archive holds. `1.2.2` carries the CT modality and has no
+    /// idx row.
+    #[test]
+    fn an_unindexed_study_still_matches_a_modality_query() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        // Both are CT studies in the manifests.
+        seed_manifest(&manifests, "1.2.1", "alice", 20260101);
+        seed_manifest(&manifests, "1.2.2", "bob", 20260202);
+
+        // The accelerator knows only 1.2.1 (a partially written day).
+        let idx = dir.path().join("idx");
+        let mut set = DailyIndexSet::new(idx.clone(), *b"20260101");
+        let mut row = [0u8; 128];
+        let filled = crate::idx::modality::format_row("1.2.1", &mut row);
+        set.modality_writer("CT")
+            .expect("mod")
+            .append(filled)
+            .expect("row");
+
+        let scanner = StudyScanner::new(manifests.clone(), idx);
+        let f = QueryFilter {
+            modality: Some("CT".into()),
+            ..Default::default()
+        };
+        let (res, _) = scanner.search(&f).expect("search");
+        let uids: Vec<&str> = res.iter().map(|r| r.study_uid.as_str()).collect();
+        assert!(
+            uids.contains(&"1.2.2"),
+            "a study with no idx row must still be a candidate: {uids:?}"
+        );
+    }
+
+    /// An UNREADABLE accelerator day must degrade to the full scan, not abort.
+    ///
+    /// The idx is an accelerator, not a source of truth: a day entry the
+    /// modality reader cannot read (here a DIRECTORY named like a day file) is
+    /// an I/O error on a bucket that EXISTS. The `?` used to propagate it and
+    /// abort the whole search, so every readable CT study became unavailable
+    /// because an optional index had one bad day.
+    #[test]
+    fn an_unreadable_modality_day_degrades_to_the_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let idx = dir.path().join("idx");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        seed_manifest(&manifests, "1.2.1", "alice", 20260101);
+        seed_manifest(&manifests, "1.2.2", "bob", 20260101);
+
+        // `bucket.is_dir()` is true, `read_dir` lists this entry, and
+        // `read_study_uids` fails on it - the error that used to propagate.
+        let day_dir = idx.join("modality").join("CT").join("20260101.idx");
+        std::fs::create_dir_all(&day_dir).expect("mkdir day-dir");
+
+        let scanner = StudyScanner::new(manifests.clone(), idx);
+        let f = QueryFilter {
+            modality: Some("CT".into()),
+            ..Default::default()
+        };
+        let (res, _) = scanner
+            .search(&f)
+            .expect("an unreadable accelerator must degrade, not abort");
+        let uids: Vec<&str> = res.iter().map(|r| r.study_uid.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec!["1.2.1", "1.2.2"],
+            "the full scan must answer every CT study"
+        );
+    }
+
+    /// The n-gram accelerator degrades the same way: one unreadable day falls
+    /// back to the full scan instead of aborting the fuzzymatch query.
+    #[test]
+    fn an_unreadable_ngram_day_degrades_to_the_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let idx = dir.path().join("idx");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        seed_manifest(&manifests, "1.2.1", "atroshchenkolong", 20260101);
+
+        // The query name's first gram bucket holds a DIRECTORY named like a
+        // day file; reading it fails (the error the n-gram path used to
+        // propagate via the `?` at the call site).
+        let norm = crate::idx::ngram::fuzzy_normalize("atroshchenkolong");
+        let grams = crate::idx::ngram::name_ngrams(&norm);
+        assert!(grams.len() >= 4, "the union guard needs 4+ grams");
+        let day_dir = idx
+            .join(crate::idx::ngram::kind_root(
+                crate::idx::ngram::NameKind::Patient,
+            ))
+            .join(&grams[0])
+            .join("20260101.idx");
+        std::fs::create_dir_all(&day_dir).expect("mkdir day-dir");
+
+        let scanner = StudyScanner::new(manifests, idx);
+        let f = QueryFilter {
+            patient_name: Some("atroshchenkolong".into()),
+            fuzzymatch: true,
+            ..Default::default()
+        };
+        let (res, _) = scanner
+            .search(&f)
+            .expect("an unreadable n-gram bucket must degrade, not abort");
+        assert_eq!(res.len(), 1, "the full scan must still match the study");
         assert_eq!(res[0].study_uid, "1.2.1");
     }
 
@@ -1087,5 +1129,86 @@ mod tests {
         let (res, _) = scanner.search(&f).expect("search");
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].study_uid, "1.2.8");
+    }
+
+    /// H5: a study UID LIST is split before validation.
+    ///
+    /// `studyInstanceUid` may carry a comma-separated list asking for the union,
+    /// but a comma is not a UID character (PS3.5 9.1), so validating the whole
+    /// string as one UID rejected it and the query answered with no candidates.
+    #[test]
+    fn a_study_uid_list_yields_every_member() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        seed_manifest(&manifests, "1.2.1", "A", 20260101);
+        seed_manifest(&manifests, "1.2.2", "B", 20260102);
+        seed_manifest(&manifests, "1.2.3", "C", 20260103);
+        let scanner = StudyScanner::new(manifests, dir.path().join("idx"));
+
+        let f = QueryFilter {
+            study_instance_uid: Some("1.2.1,1.2.2".into()),
+            ..Default::default()
+        };
+        let (res, _) = scanner.search(&f).expect("search");
+        let mut uids: Vec<&str> = res.iter().map(|r| r.study_uid.as_str()).collect();
+        uids.sort_unstable();
+        assert_eq!(uids, vec!["1.2.1", "1.2.2"], "both list members must match");
+    }
+
+    /// A7: a repeated list member is one candidate, not two.
+    ///
+    /// The candidates are collected one per comma member without dedup, so
+    /// `1.2.1,1.2.1,1.2.2` produced two entries for `1.2.1`. A `limit` then
+    /// spent its budget on the same study twice and omitted the other one.
+    #[test]
+    fn a_repeated_study_uid_list_member_appears_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        seed_manifest(&manifests, "1.2.1", "A", 20260101);
+        seed_manifest(&manifests, "1.2.2", "B", 20260102);
+        let scanner = StudyScanner::new(manifests, dir.path().join("idx"));
+
+        let f = QueryFilter {
+            study_instance_uid: Some("1.2.1,1.2.1,1.2.2".into()),
+            ..Default::default()
+        };
+        let (res, _) = scanner.search(&f).expect("search");
+        let uids: Vec<&str> = res.iter().map(|r| r.study_uid.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec!["1.2.1", "1.2.2"],
+            "each distinct study must appear exactly once"
+        );
+    }
+
+    /// A8: a PADDED list member still matches.
+    ///
+    /// The scanner trims each member, but the predicate behind
+    /// `Predicate::CommaList` did not: `1.2.1, 1.2.2` accepted both candidates
+    /// and then rejected the second one for its leading space. The two paths
+    /// now share the one trim rule.
+    #[test]
+    fn a_padded_study_uid_list_member_still_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        seed_manifest(&manifests, "1.2.1", "A", 20260101);
+        seed_manifest(&manifests, "1.2.2", "B", 20260102);
+        let scanner = StudyScanner::new(manifests, dir.path().join("idx"));
+
+        let f = QueryFilter {
+            study_instance_uid: Some("1.2.1, 1.2.2".into()),
+            ..Default::default()
+        };
+        let (res, _) = scanner.search(&f).expect("search");
+        let mut uids: Vec<&str> = res.iter().map(|r| r.study_uid.as_str()).collect();
+        uids.sort_unstable();
+        assert_eq!(
+            uids,
+            vec!["1.2.1", "1.2.2"],
+            "a space after the comma must not drop the member"
+        );
     }
 }

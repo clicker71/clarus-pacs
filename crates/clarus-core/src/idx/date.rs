@@ -62,6 +62,8 @@ impl From<io::Error> for DateIndexError {
 pub struct DateIndex {
     day: [u8; DAY_LEN],
     file: File,
+    /// Set when an append failed part-way through a row.
+    poisoned: bool,
 }
 
 /// Open (or create) the append-only handle for a given day.
@@ -79,7 +81,16 @@ pub fn open_appender(dir: &Path, day: &[u8; DAY_LEN]) -> Result<DateIndex, DateI
         .append(true)
         .open(&path)
         .map_err(DateIndexError::Io)?;
-    Ok(DateIndex { day: *day, file })
+    // Same torn-tail repair as `sop_owner`: a partial write leaves a tail that
+    // is not a whole row, and the next append would start MID-ROW so every
+    // later row is shifted. Safe to truncate because this is today's file and
+    // the mmap read path maps only rolled-over days.
+    super::sop_owner::repair_torn_tail(&path, ROW_LEN).map_err(DateIndexError::Io)?;
+    Ok(DateIndex {
+        day: *day,
+        file,
+        poisoned: false,
+    })
 }
 
 /// The full path of a day's `.idx` file.
@@ -136,6 +147,12 @@ pub fn encode_row_warm<'a>(hash: &[u8; 32], staging: &'a mut [u8; ROW_LEN]) -> &
     staging
 }
 
+/// Errno reported by `append_warm` on an already-poisoned writer.
+///
+/// `EIO` rather than 0: 0 means "success" to any caller that only checks the
+/// code, and a poisoned writer must never look like one.
+const EPOISONED: i32 = 5;
+
 impl DateIndex {
     /// The day key this writer targets.
     pub fn day(&self) -> &[u8; DAY_LEN] {
@@ -151,9 +168,19 @@ impl DateIndex {
         hash: &[u8; 32],
         staging: &mut [u8; ROW_LEN],
     ) -> Result<(), DateIndexError> {
+        if self.poisoned {
+            return Err(DateIndexError::Io(io::Error::from(
+                io::ErrorKind::BrokenPipe,
+            )));
+        }
         let row = encode_row(hash, staging);
-        self.file.write_all(row).map_err(DateIndexError::Io)?;
-        Ok(())
+        match self.file.write_all(row) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.poisoned = true;
+                Err(DateIndexError::Io(e))
+            }
+        }
     }
 
     /// WARM variant: no bounds check on the row encoding AND no `io::Error`
@@ -165,15 +192,43 @@ impl DateIndex {
     /// carries NO allocator call in ANY branch - what the static no-alloc gate
     /// requires.
     pub fn append_warm(&mut self, hash: &[u8; 32], staging: &mut [u8; ROW_LEN]) -> Result<(), i32> {
+        if self.poisoned {
+            return Err(EPOISONED);
+        }
         let row = encode_row_warm(hash, staging);
         match self.file.write_all(row) {
             Ok(()) => Ok(()),
             Err(e) => {
+                self.poisoned = true;
                 let code = e.raw_os_error().unwrap_or(0);
                 std::mem::forget(e);
                 Err(code)
             }
         }
+    }
+
+    /// Whether a failed append left this handle unusable.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Replace a poisoned handle with a fresh one, repairing the torn tail.
+    ///
+    /// A 65-byte row that failed part-way leaves the file misaligned; a
+    /// retry on the same descriptor would append after the fragment and shift
+    /// every later row, which `read_hashes` then drops.
+    pub fn reopen(&mut self, dir: &Path) -> Result<(), DateIndexError> {
+        let path = file_path(dir, &self.day);
+        // Drop the old descriptor before truncating: on Windows a second
+        // handle cannot shorten a file another handle holds open.
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(DateIndexError::Io)?;
+        super::sop_owner::repair_torn_tail(&path, ROW_LEN).map_err(DateIndexError::Io)?;
+        self.poisoned = false;
+        Ok(())
     }
 
     /// Number of bytes currently in the file (for rollover sizing).
@@ -264,5 +319,45 @@ mod tests {
         idx.append(&[2u8; 32], &mut staging).expect("b");
         let data = std::fs::read(file_path(dir.path(), &day)).expect("read");
         assert_eq!(data.len(), 2 * ROW_LEN);
+    }
+
+    /// A writer that failed an append must not append again in place.
+    ///
+    /// A 65-byte row that failed part-way leaves the file misaligned; a retry
+    /// on the same handle appends after the fragment, and `read_hashes` - which
+    /// drops a trailing partial row - loses hashes behind it.
+    #[test]
+    fn a_failed_append_poisons_the_writer_until_it_reopens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = *b"20250101";
+        let mut idx = open_appender(dir.path(), &day).expect("open");
+        let mut staging = [0u8; ROW_LEN];
+        idx.append(&[1u8; 32], &mut staging).expect("a");
+
+        let path = file_path(dir.path(), &day);
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            f.write_all(b"deadbeef").expect("torn write");
+        }
+
+        idx.poisoned = true;
+        assert!(
+            idx.append(&[2u8; 32], &mut staging).is_err(),
+            "a poisoned writer must refuse further appends"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            ROW_LEN + 8
+        );
+
+        idx.reopen(dir.path()).expect("reopen");
+        assert!(!idx.is_poisoned());
+        idx.append(&[2u8; 32], &mut staging).expect("b");
+        let data = std::fs::read(&path).expect("read");
+        assert_eq!(data.len(), 2 * ROW_LEN, "rows stay 65-byte aligned");
     }
 }

@@ -58,26 +58,35 @@ fn attrs() -> StudyManifestAttrs {
 }
 
 #[test]
-fn steady_state_restamp_allocates_nothing() {
-    let m = build_manifest(&attrs());
-    let mut a = attrs();
-    let (zero_alloc, ()) = allocate_env(|| {
-        restamp_from_manifest(&mut a, &m);
-    });
-    assert!(zero_alloc, "identical identity must not allocate");
-    assert_eq!(a.patient_id.as_deref(), Some("CLIN-DEMO-001"));
-    assert_eq!(a.modality, "DX");
-}
+fn restamp_allocates_nothing_and_learns_the_merged_truth() {
+    // One #[test] owns the process-wide TestAllocator. The two former test
+    // functions ran on parallel libtest threads, so the divergent case's
+    // by-design allocations (or its ALLOC.reset()/set_enabled calls) could
+    // land inside the steady-state window and fail the zero-alloc snapshot
+    // nondeterministically.
 
-#[test]
-fn divergent_restamp_learns_the_merged_truth() {
-    let m = build_manifest(&attrs());
-    let mut a = attrs();
-    a.patient_id = Some("AUTOPAT_3820bdba2d61".to_string());
-    a.patient_name = Some("Anonymous^3820bd".to_string());
-    a.modality = "PR".to_string();
-    restamp_from_manifest(&mut a, &m);
-    assert_eq!(a.patient_id.as_deref(), Some("CLIN-DEMO-001"));
-    assert_eq!(a.patient_name.as_deref(), Some("Clinfer^Transport^Demo"));
-    assert_eq!(a.modality, "DX");
+    // Steady state: identical identity must not allocate.
+    {
+        let m = build_manifest(&attrs());
+        let mut a = attrs();
+        let (zero_alloc, ()) = allocate_env(|| {
+            restamp_from_manifest(&mut a, &m);
+        });
+        assert!(zero_alloc, "identical identity must not allocate");
+        assert_eq!(a.patient_id.as_deref(), Some("CLIN-DEMO-001"));
+        assert_eq!(a.modality, "DX");
+    }
+
+    // Divergent: the merged disk truth wins (allocates by design).
+    {
+        let m = build_manifest(&attrs());
+        let mut a = attrs();
+        a.patient_id = Some("AUTOPAT_3820bdba2d61".to_string());
+        a.patient_name = Some("Anonymous^3820bd".to_string());
+        a.modality = "PR".to_string();
+        restamp_from_manifest(&mut a, &m);
+        assert_eq!(a.patient_id.as_deref(), Some("CLIN-DEMO-001"));
+        assert_eq!(a.patient_name.as_deref(), Some("Clinfer^Transport^Demo"));
+        assert_eq!(a.modality, "DX");
+    }
 }

@@ -417,8 +417,8 @@ fn write_name_group_element(xml: &mut String, group_name: &str, value: &[u8]) {
         ("FamilyName", parts.first()),
         ("GivenName", parts.get(1)),
         ("MiddleName", parts.get(2)),
-        ("Prefix", parts.get(3)),
-        ("Suffix", parts.get(4)),
+        ("NamePrefix", parts.get(3)),
+        ("NameSuffix", parts.get(4)),
     ] {
         let Some(part) = part.filter(|p| !p.is_empty()) else {
             continue;
@@ -675,6 +675,19 @@ mod tests {
         assert!(xml.contains("<PersonName number=\"1\">"), "{xml}");
         assert!(xml.contains("<FamilyName>DOE</FamilyName>"));
         assert!(xml.contains("<GivenName>JOHN</GivenName>"));
+    }
+
+    /// PS3.19 Table 10.2-1 names the prefix/suffix components NamePrefix and
+    /// NameSuffix; `<Prefix>`/`<Suffix>` are not schema elements. Revert the
+    /// rename and this test reds.
+    #[test]
+    fn pn_prefix_suffix_components_use_schema_names() {
+        let xml =
+            to_xml(r#"{"00100010":{"vr":"PN","Value":[{"Alphabetic":"DOE^JOHN^MID^DR^JR"}]}}"#);
+        assert!(xml.contains("<NamePrefix>DR</NamePrefix>"), "{xml}");
+        assert!(xml.contains("<NameSuffix>JR</NameSuffix>"), "{xml}");
+        assert!(!xml.contains("<Prefix>"), "{xml}");
+        assert!(!xml.contains("<Suffix>"), "{xml}");
     }
 
     /// PS3.19 A.1 puts each sequence item in its own `<Item number="N">`: two

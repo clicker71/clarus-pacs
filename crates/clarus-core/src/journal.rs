@@ -523,7 +523,7 @@ pub fn format_plaintext(ev: &DecodedEvent, user_name: Option<&str>, out: &mut Ve
             }
         } else {
             out.push(b' ');
-            out.extend_from_slice(&ev.payload[..ev.payload_len]);
+            escape_plain(out, &ev.payload[..ev.payload_len]);
         }
     }
 
@@ -537,21 +537,47 @@ pub fn format_plaintext(ev: &DecodedEvent, user_name: Option<&str>, out: &mut Ve
             push_dec(out, b as u32);
         }
     } else if ev.ip_len == 16 {
+        // IPv6 is 8 groups of 16 bits (RFC 4291), NOT 16 groups of 8 bits:
+        // `::1` renders `0000:...:0001`, not sixteen one-byte groups.
         out.extend_from_slice(b" ip=");
-        for (i, &b) in ev.ip[..16].iter().enumerate() {
+        for i in 0..8 {
             if i > 0 {
                 out.push(b':');
             }
-            push_hex(out, b);
+            push_hex(out, ev.ip[2 * i]);
+            push_hex(out, ev.ip[2 * i + 1]);
         }
     }
 
     // User resolved from the registry for plaintext readability.
     if let Some(name) = user_name {
         out.extend_from_slice(b" user=");
-        out.extend_from_slice(name.as_bytes());
+        escape_plain(out, name.as_bytes());
     }
     out.push(b'\n');
+}
+
+/// Append `s` to `out`, escaping anything that would break the single-line
+/// contract of a plaintext journal entry.
+///
+/// One event must be ONE line: a CR/LF inside a payload or a user name used to
+/// split the event into two lines and detach the attribution fields that
+/// follow. CR and LF are escaped as `\\r`/`\\n`; the other C0 controls
+/// (0x00-0x1F except TAB) are rendered as `\\xNN` so a control byte never
+/// reaches the log verbatim. TAB is kept - it is the one C0 control that does
+/// not disturb line framing.
+fn escape_plain(out: &mut Vec<u8>, s: &[u8]) {
+    for &b in s {
+        match b {
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            0x00..=0x1F if b != b'\t' => {
+                out.extend_from_slice(b"\\x");
+                push_hex(out, b);
+            }
+            _ => out.push(b),
+        }
+    }
 }
 
 /// Append `v` in decimal (used for dotted-quad IP octets and STOW counts).
@@ -781,6 +807,75 @@ mod tests {
         assert!(line.contains("disk full"));
         assert!(line.contains("user=dr.smith"));
         assert!(line.ends_with('\n'));
+    }
+
+    /// An IPv6 address renders as 8 groups of 16 bits (RFC 4291), not 16
+    /// groups of 8 bits.
+    #[test]
+    fn an_ipv6_address_renders_eight_hex_groups() {
+        let mut ip = [0u8; 16];
+        ip[15] = 1; // ::1
+        let d = make_token_at(EventCode::STOW_ACCEPTED, 1, &ip, b"", 1).decode();
+        let mut out = Vec::new();
+        format_plaintext(&d, None, &mut out);
+        let line = String::from_utf8(out).expect("utf8");
+        assert!(
+            line.contains("ip=0000:0000:0000:0000:0000:0000:0000:0001"),
+            "::1 must be eight 16-bit groups: {line}"
+        );
+
+        // A non-zero IPv6 still has exactly 8 groups (7 colons).
+        let ip = [
+            0x20u8, 0x01, 0x0d, 0xb8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ];
+        let d = make_token_at(EventCode::STOW_ACCEPTED, 1, &ip, b"", 1).decode();
+        let mut out = Vec::new();
+        format_plaintext(&d, None, &mut out);
+        let line = String::from_utf8(out).expect("utf8");
+        let addr = line
+            .split("ip=")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .expect("ip= present");
+        assert_eq!(
+            addr.matches(':').count(),
+            7,
+            "an IPv6 address is 8 groups separated by 7 colons: {addr}"
+        );
+        assert_eq!(
+            addr.split(':').count(),
+            8,
+            "an IPv6 address is 8 groups: {addr}"
+        );
+    }
+
+    /// A CR/LF inside a payload or a user name must not split one event into
+    /// two lines.
+    ///
+    /// The journal is line-oriented (`tail -f`): a bare newline in either field
+    /// detached the attribution fields that follow from the event they belong
+    /// to. CR/LF are escaped and other C0 controls are hex-escaped, so the
+    /// event stays one line.
+    #[test]
+    fn control_characters_in_payload_and_user_are_escaped() {
+        let t = make_token(EventCode::STOW_REJECTED, 7, &[10, 0, 0, 1], b"bad\r\nvalue");
+        let d = t.decode();
+        let mut out = Vec::new();
+        format_plaintext(&d, Some("a\tb\x07"), &mut out);
+        let line = String::from_utf8(out).expect("utf8");
+        assert!(
+            !line.contains('\n') || line.ends_with('\n'),
+            "the only newline is the trailing terminator: {line:?}"
+        );
+        assert_eq!(line.matches('\n').count(), 1, "exactly one line: {line:?}");
+        assert!(
+            line.contains("bad\\r\\nvalue"),
+            "CR/LF must be escaped: {line:?}"
+        );
+        assert!(
+            line.contains("user=a\tb\\x07"),
+            "BEL (0x07) must be hex-escaped, TAB kept: {line:?}"
+        );
     }
 
     /// STOW_COUNTS (code 10): roundtrip the 8-byte `[stored u32][idempotent u32]`

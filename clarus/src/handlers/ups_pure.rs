@@ -287,6 +287,12 @@ fn workitem_to_record(wi: &WorkItem) -> clarus_core::ups::WorkItemRecord {
         reason_for_requested_procedure: wi.reason_for_requested_procedure.clone(),
         input_information: wi.input_information.clone(),
         performed_procedure_information: wi.performed_procedure_information.clone(),
+        // `WorkItem` (the ports model) has no write counter, so the boundary
+        // does not invent one. A handler that needs the compare-and-swap takes
+        // the revision from the STORE record it read and sets it on the record
+        // it submits; 0 here means "this caller observed nothing", which
+        // `cas_update` treats as no revision precondition.
+        revision: 0,
     }
 }
 
@@ -672,8 +678,16 @@ pub fn ups_update(
 
     // Find existing workitem (CBOR store).
     let store = workitem_store(state);
+    // The revision this handler OBSERVED. It is handed back to `cas_update`
+    // below, which is what turns a concurrent overwrite into a conflict: the
+    // Transaction UID does not change on a successful update (PS3.18 Table
+    // 11.6-1), so it alone cannot tell two read-modify-write cycles apart.
+    let observed_revision;
     let existing = match store.find_by_uid(workitem_uid) {
-        Ok(Some(rec)) => record_to_workitem(&rec),
+        Ok(Some(rec)) => {
+            observed_revision = rec.revision;
+            record_to_workitem(&rec)
+        }
         Ok(None) => {
             return Err(UpsErr {
                 status: 404,
@@ -813,8 +827,11 @@ pub fn ups_update(
     let mut record = workitem_to_record(&updated_workitem);
     record.transaction_uid = stored_tuid;
     record.updated_at = Some(stamp);
+    // Declare the state this handler merged from, so a write that landed
+    // between the read above and this call is reported as a conflict.
+    record.revision = observed_revision;
 
-    match store.cas_update(&record, cas_tuid.as_deref()) {
+    match store.cas_update(&record, cas_tuid.as_deref(), Some(observed_revision)) {
         Ok(()) => {
             // CMP-004: Notify SSE subscribers of state change
             if state_changed {
@@ -1020,7 +1037,7 @@ pub fn ups_request_cancel(
     let hop1 = if skipped_hop1 {
         Ok(())
     } else {
-        store.cas_update(&record, None)
+        store.cas_update(&record, None, None)
     };
     match hop1 {
         Ok(()) => {
@@ -1067,7 +1084,7 @@ pub fn ups_request_cancel(
     let mut record = workitem_to_record(&canceled);
     record.updated_at = Some(stamp);
 
-    match store.cas_update(&record, None) {
+    match store.cas_update(&record, None, None) {
         Ok(()) => {
             sink.notify_state_change(
                 workitem_uid,
@@ -1170,8 +1187,17 @@ pub fn ups_update_attributes(
     }
 
     let store = workitem_store(state);
+    // The revision this handler OBSERVED. It is handed back to `cas_update`
+    // below: the Transaction UID does not change on a successful update
+    // (PS3.18 Table 11.6-1), so it alone cannot tell two read-modify-write
+    // cycles apart - the revision is what turns a stale second write into a
+    // conflict instead of a silent overwrite.
+    let observed_revision;
     let existing = match store.find_by_uid(workitem_uid) {
-        Ok(Some(rec)) => record_to_workitem(&rec),
+        Ok(Some(rec)) => {
+            observed_revision = rec.revision;
+            record_to_workitem(&rec)
+        }
         Ok(None) => {
             return Err(UpsErr {
                 status: 404,
@@ -1362,8 +1388,29 @@ pub fn ups_update_attributes(
     // Requested Procedure is updatable; see
     // [`extract_referenced_request_for_update`].
     if let Some(reference) = body_obj.obj_get("0040A370") {
-        updated.reason_for_requested_procedure =
-            Some(extract_referenced_request_for_update(reference)?);
+        // The item is read first: its shape check refuses any nested attribute
+        // other than (0040,1002) with a diagnostic naming that attribute, which
+        // the sibling tests pin.
+        let reason = extract_referenced_request_for_update(reference)?;
+        // The reason lives INSIDE the Referenced Request Sequence, whose item
+        // requires a Type-1 Study Instance UID (0020,000D) to be valid (PS3.4
+        // Table CC.2.5-3). A workitem created without one cannot carry the
+        // sequence on readback - `emit_referenced_request` drops the item - so
+        // storing the reason would accept a write that never reads back.
+        // Refused BEFORE `updated` is mutated.
+        if existing
+            .input_study_uid
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .is_none()
+        {
+            return Err(bad_request(
+                "Reason for the Requested Procedure (0040,1002) lives in the \
+                 Referenced Request Sequence (0040,A370), which requires a Study \
+                 Instance UID (0020,000D); the workitem does not name one",
+            ));
+        }
+        updated.reason_for_requested_procedure = Some(reason);
     }
 
     // (0074,1216) Unified Procedure Step Performed Procedure Sequence - the
@@ -1431,14 +1478,28 @@ pub fn ups_update_attributes(
     let stamp = now_stamp();
     let mut record = workitem_to_record(&updated);
     record.updated_at = Some(stamp);
+    // Declare the state this handler merged from, so a write that landed
+    // between the read above and this call is reported as a conflict.
+    record.revision = observed_revision;
 
-    match store.cas_update(&record, in_progress.then_some(request_transaction_uid)) {
+    // Test seam: lets a concurrency test park an in-flight Update between its
+    // read and this CAS write, so two Updates observe one revision before
+    // either commits - the interleaving the revision precondition exists to
+    // catch. A no-op in production (the seam is disarmed until a test arms it
+    // for this workitem).
+    ups_test_hooks::update_pause_point(workitem_uid);
+
+    match store.cas_update(
+        &record,
+        in_progress.then_some(request_transaction_uid),
+        Some(observed_revision),
+    ) {
         Ok(()) => render_workitem_response(200, &updated, accept),
         Err(clarus_core::ups::StoreError::CasConflict(_)) => Err(UpsErr {
             status: 409,
             body: err_msg_json(
                 "Conflict",
-                "Transaction UID mismatch: workitem changed concurrently",
+                "Workitem changed concurrently: the update was based on a stale read",
             ),
         }),
         Err(e) => Err(store_err(e)),
@@ -2368,6 +2429,7 @@ pub fn ups_search(
         workflow_state: query.workflow_state.as_deref(),
         limit: query.limit,
         offset: query.offset,
+        default_offset_secs: state.config.ups.local_utc_offset_secs,
     };
     let result = workitem_store(state).search(&filter);
 
@@ -3077,5 +3139,94 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.status, 500);
+    }
+}
+
+// -- Test seam (concurrency hook) -------------------------------------------
+
+/// A one-shot pause an integration test can place between an attribute
+/// Update's read and its CAS write.
+///
+/// `ups_update_attributes` calls [`update_pause_point`] just before the CAS
+/// write. When a test arms the pause first, the next Update parks there after
+/// its read, which lets the test run a second Update on the SAME revision it
+/// just observed - the exact interleaving the revision precondition exists to
+/// catch. A sequential test cannot reach that interleaving over HTTP, because
+/// every request re-reads the current record.
+///
+/// Exposed as a public seam (not `#[cfg(test)]`) because an integration test
+/// links the library in its normal build, the same convention the `*_for_test`
+/// seams follow.
+pub mod ups_test_hooks {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    struct Pause {
+        /// The workitem UID a pause is armed for, if any.
+        armed: Option<String>,
+        /// An Update of the armed workitem is parked at the seam.
+        paused: bool,
+    }
+
+    static PAUSE: OnceLock<(Mutex<Pause>, Condvar)> = OnceLock::new();
+
+    fn pause() -> &'static (Mutex<Pause>, Condvar) {
+        PAUSE.get_or_init(|| {
+            (
+                Mutex::new(Pause {
+                    armed: None,
+                    paused: false,
+                }),
+                Condvar::new(),
+            )
+        })
+    }
+
+    /// Arm a one-shot pause for the next Update of `workitem_uid`.
+    pub fn arm_update_pause(workitem_uid: &str) {
+        let (lock, cv) = pause();
+        let mut p = lock.lock().unwrap_or_else(|e| e.into_inner());
+        p.armed = Some(workitem_uid.to_string());
+        p.paused = false;
+        cv.notify_all();
+    }
+
+    /// Block until an Update has reached the pause point (test side).
+    pub fn wait_until_update_paused() {
+        let (lock, cv) = pause();
+        let mut p = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !p.paused {
+            let (guard, _timeout) = cv
+                .wait_timeout(p, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            p = guard;
+            if std::time::Instant::now() > deadline {
+                panic!("ups test hook: an Update never reached the pause point");
+            }
+        }
+    }
+
+    /// Release the parked Update.
+    pub fn release_update_pause() {
+        let (lock, cv) = pause();
+        let mut p = lock.lock().unwrap_or_else(|e| e.into_inner());
+        p.paused = false;
+        cv.notify_all();
+    }
+
+    /// The seam itself: park when a pause is armed for THIS workitem, otherwise
+    /// return at once.
+    pub fn update_pause_point(workitem_uid: &str) {
+        let (lock, cv) = pause();
+        let mut p = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if p.armed.as_deref() != Some(workitem_uid) {
+            return;
+        }
+        p.armed = None;
+        p.paused = true;
+        cv.notify_all();
+        while p.paused {
+            p = cv.wait(p).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }

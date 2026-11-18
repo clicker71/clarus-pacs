@@ -33,6 +33,11 @@ pub fn intersect_study_uids<'a>(
     out: &mut Vec<&'a str>,
 ) {
     out.clear();
+    // `limit == Some(0)` asks for no results: return before any branch emits,
+    // so the single-list passthrough and the K-way merge both answer empty.
+    if limit == Some(0) {
+        return;
+    }
     if lists.is_empty() {
         return;
     }
@@ -193,6 +198,21 @@ mod tests {
             intersect_owned(&lists, None),
             vec!["1.2.1".to_string(), "1.2.2".to_string()]
         );
+    }
+
+    #[test]
+    fn limit_zero_is_empty() {
+        // A limit of zero names no result. The single-list passthrough used to
+        // take `min(len, 0) == 0` and was accidentally correct, but the K-way
+        // merge had no early return and emitted the first common UID anyway.
+        let lists = vec![
+            vec!["1.2.1".to_string(), "1.2.2".to_string()],
+            vec!["1.2.1".to_string(), "1.2.2".to_string()],
+        ];
+        assert_eq!(intersect_owned(&lists, Some(0)), Vec::<String>::new());
+
+        let single = vec![vec!["1.2.1".to_string()]];
+        assert_eq!(intersect_owned(&single, Some(0)), Vec::<String>::new());
     }
 
     #[test]

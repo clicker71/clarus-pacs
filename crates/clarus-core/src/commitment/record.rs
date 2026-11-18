@@ -50,6 +50,13 @@ const K_SOP_INSTANCE_UID: u64 = 2;
 const K_STATUS: u64 = 3;
 const K_FAILURE_REASON: u64 = 4;
 const K_STUDY_UID: u64 = 5;
+/// (0020,000E) of the series the instance belongs to.
+///
+/// Stored beside the study UID: Annex J.2's study-shaped answer groups results
+/// by SERIES, so a record that kept only the study could not reconstruct the
+/// hierarchy for an unavailable instance. Key 6 leaves the existing keys'
+/// meaning untouched, so an older record still decodes (the key is absent).
+const K_SERIES_UID: u64 = 6;
 
 /// The request form the user agent used (Annex J.1).
 ///
@@ -180,6 +187,13 @@ pub struct InstanceResult {
     /// results back into the study form Annex J.2 requires, without walking
     /// the archive again.
     pub study_uid: Option<String>,
+    /// (0020,000E) of the series this instance belongs to.
+    ///
+    /// Annex J.2's study-shaped answer is a Study Sequence whose items carry a
+    /// Referenced Series Sequence; without the series UID an unavailable
+    /// instance could only be reported at study level, which loses the
+    /// hierarchy the response is defined to have.
+    pub series_uid: Option<String>,
 }
 
 /// One Storage Commitment transaction, as persisted.
@@ -242,9 +256,12 @@ impl CommitmentRecord {
         writer.write_u64(K_INSTANCES)?;
         writer.write_array_header(self.instances.len() as u64)?;
         for item in &self.instances {
-            // 3 required keys plus the optional failure reason and study UID.
-            let entries =
-                3 + u64::from(item.failure_reason.is_some()) + u64::from(item.study_uid.is_some());
+            // 3 required keys plus the optional failure reason, study UID and
+            // series UID.
+            let entries = 3
+                + u64::from(item.failure_reason.is_some())
+                + u64::from(item.study_uid.is_some())
+                + u64::from(item.series_uid.is_some());
             writer.write_map_header(entries)?;
             writer.write_u64(K_SOP_CLASS_UID)?;
             writer.write_text(&item.sop_class_uid)?;
@@ -260,6 +277,43 @@ impl CommitmentRecord {
                 writer.write_u64(K_STUDY_UID)?;
                 writer.write_text(study)?;
             }
+            if let Some(series) = &item.series_uid {
+                writer.write_u64(K_SERIES_UID)?;
+                writer.write_text(series)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Check the invariants the decoder enforces, BEFORE the record is stored.
+    ///
+    /// The same rules `read_instance` applies when decoding have to hold at
+    /// the write boundary too. Without this an `outcome = Failed` with no
+    /// failure reason encodes fine and is installed; the next `find` then
+    /// rejects the file it just accepted, and a corrected insert of the same
+    /// transaction fails as `Duplicate` - the archive keeps a record it can
+    /// never read, and the user agent can never repair it.
+    ///
+    /// Returns the same `Invalid` message the decoder would, so a caller sees
+    /// one rule rather than two.
+    pub fn validate(&self) -> Result<(), RecordError> {
+        // Annex J.2: a committed instance is in the success sequence, which
+        // carries no Failure Reason; a failed one is in the failure sequence,
+        // whose whole purpose is to name why.
+        for item in &self.instances {
+            match (item.outcome, item.failure_reason) {
+                (CommitmentOutcome::Committed, Some(_)) => {
+                    return Err(RecordError::Invalid(
+                        "a committed instance must not carry a failure reason",
+                    ));
+                }
+                (CommitmentOutcome::Failed, None) => {
+                    return Err(RecordError::Invalid(
+                        "a failed instance must carry a failure reason",
+                    ));
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -271,35 +325,46 @@ impl CommitmentRecord {
         // so `160 + n*160` underestimated a large study badly enough that the
         // writer hit `BufferFull` and the record could never be stored.
         //
-        // The previous estimate counted only the per-instance UIDs, which left
-        // out every other string the record carries: the transaction UID, the
-        // request timestamp, each instance's optional study UID and failure
-        // reason. With those omitted a record whose payload was mostly reasons
-        // or study UIDs still overflowed. Every length below is exact except
-        // the framing constants, which are an upper bound:
-        //   * the top-level map holds 4 keys;
-        //   * each instance map holds 3 + its two optional keys;
-        //   * a text header is at most 9 bytes (1 type byte + 8 length) and an
-        //     integer header at most 9 bytes (uint64), so 24 bytes per key and
-        //     value covers the map keys, the array header and the numbers.
+        // Every string the record writes has to be counted, together with its
+        // own header: the transaction UID, the request timestamp, and each
+        // instance's SOP Class UID, SOP Instance UID, failure reason, study UID
+        // and series UID. A field that stops being counted does not fail loudly
+        // - the framing slack hides it until a record is long enough to spend
+        // it, and then the record cannot be stored at all.
         const FRAMING: usize = 256;
+        // A key is a uint64 header (at most 9 bytes) and an integer value at
+        // most 9 more, so 24 bytes covers a key plus the number beside it, the
+        // instance map headers and the array header.
         const PER_KEY: usize = 24;
+        // A text header is 1 type byte + 8 length bytes on top of the raw
+        // length counted in `text_bytes`.
+        const TEXT_HEADER: usize = 9;
         let mut text_bytes = self.transaction_uid.len() + self.requested_at.len();
+        let mut text_count = 2usize;
         let mut value_count = 0usize;
         for item in &self.instances {
             text_bytes += item.sop_class_uid.len() + item.sop_instance_uid.len();
+            text_count += 2;
             value_count += 1;
             if let Some(reason) = item.failure_reason {
                 text_bytes += reason.code().len();
+                text_count += 1;
                 value_count += 1;
             }
             if let Some(study) = &item.study_uid {
                 text_bytes += study.len();
+                text_count += 1;
+                value_count += 1;
+            }
+            if let Some(series) = &item.series_uid {
+                text_bytes += series.len();
+                text_count += 1;
                 value_count += 1;
             }
         }
         let capacity = FRAMING
             .saturating_add(text_bytes)
+            .saturating_add(text_count.saturating_mul(TEXT_HEADER))
             .saturating_add(self.instances.len().saturating_mul(PER_KEY))
             .saturating_add(value_count.saturating_mul(PER_KEY));
         let mut buf = vec![0u8; capacity];
@@ -406,6 +471,7 @@ fn read_instance(reader: &mut CborReader<'_>) -> Result<InstanceResult, RecordEr
     let mut outcome: Option<CommitmentOutcome> = None;
     let mut failure_reason: Option<FailureReason> = None;
     let mut study_uid: Option<String> = None;
+    let mut series_uid: Option<String> = None;
 
     for _ in 0..entries {
         let key = read_key(reader)?;
@@ -423,6 +489,7 @@ fn read_instance(reader: &mut CborReader<'_>) -> Result<InstanceResult, RecordEr
                 failure_reason = Some(FailureReason::from_code(&code)?);
             }
             K_STUDY_UID => study_uid = Some(read_text(reader)?),
+            K_SERIES_UID => series_uid = Some(read_text(reader)?),
             _ => reader.skip_value()?,
         }
     }
@@ -454,6 +521,7 @@ fn read_instance(reader: &mut CborReader<'_>) -> Result<InstanceResult, RecordEr
         outcome,
         failure_reason,
         study_uid,
+        series_uid,
     })
 }
 
@@ -484,6 +552,7 @@ mod tests {
             outcome: CommitmentOutcome::Committed,
             failure_reason: None,
             study_uid: None,
+            series_uid: None,
         }
     }
 
@@ -494,6 +563,7 @@ mod tests {
             outcome: CommitmentOutcome::Failed,
             failure_reason: Some(FailureReason::NoSuchSopInstance),
             study_uid: None,
+            series_uid: None,
         }
     }
 
@@ -744,6 +814,7 @@ mod tests {
                 outcome: CommitmentOutcome::Failed,
                 failure_reason: Some(FailureReason::ProcessingFailure),
                 study_uid: Some(long_uid("1.3.6.1.4.1.")),
+                series_uid: Some(long_uid("1.3.6.1.4.2.")),
             })
             .collect();
 
@@ -761,5 +832,80 @@ mod tests {
             "the optional study UIDs must survive the round trip"
         );
         assert_eq!(back.transaction_uid, rec.transaction_uid);
+    }
+
+    /// The series UID must survive the round trip, not only the study UID.
+    ///
+    /// Annex J.2 answers a study-shaped request with a Study Sequence whose
+    /// items carry a Referenced Series Sequence. A record that persisted only
+    /// the study could not rebuild that hierarchy after a restart, so an
+    /// unavailable instance would be reported at the wrong level.
+    #[test]
+    fn a_series_uid_survives_the_round_trip() {
+        let mut rec = record();
+        rec.instances[0].study_uid = Some("1.2.840.1.1".to_string());
+        rec.instances[0].series_uid = Some("1.2.840.1.2".to_string());
+
+        let bytes = rec.encode().expect("encode");
+        let back = CommitmentRecord::decode(&bytes).expect("decode");
+        assert_eq!(
+            back.instances[0].series_uid.as_deref(),
+            Some("1.2.840.1.2"),
+            "the series UID must be persisted beside the study UID"
+        );
+        assert_eq!(back.instances[0].study_uid.as_deref(), Some("1.2.840.1.1"));
+    }
+
+    /// The capacity estimate must cover the encoding for every optional shape.
+    ///
+    /// Comparing a rounded budget against one shape let a field drop out of the
+    /// accounting: the framing slack swallowed a missing series UID until a
+    /// record was long enough to spend it. This enumerates the optional fields
+    /// so a field that stops being counted shows up as an undersized buffer.
+    #[test]
+    fn the_capacity_estimate_covers_every_optional_field() {
+        // 64 chars is the PS3.5 maximum for a UID value.
+        let uid = "1".repeat(64);
+        for instances in [1usize, 7, 300] {
+            for &study in &[None, Some(uid.as_str())] {
+                for &series in &[None, Some(uid.as_str())] {
+                    for &failed in &[false, true] {
+                        let mut rec = record();
+                        rec.transaction_uid = uid.clone();
+                        rec.requested_at = "2024-01-01T00:00:00Z".to_string();
+                        rec.instances = (0..instances)
+                            .map(|_| InstanceResult {
+                                sop_class_uid: uid.clone(),
+                                sop_instance_uid: uid.clone(),
+                                outcome: if failed {
+                                    CommitmentOutcome::Failed
+                                } else {
+                                    CommitmentOutcome::Committed
+                                },
+                                failure_reason: failed.then_some(FailureReason::ProcessingFailure),
+                                study_uid: study.map(str::to_string),
+                                series_uid: series.map(str::to_string),
+                            })
+                            .collect();
+                        let bytes = rec.encode().unwrap_or_else(|e| {
+                            panic!(
+                                "n={instances} study={} series={} failed={failed}: {e:?}",
+                                study.is_some(),
+                                series.is_some()
+                            )
+                        });
+                        let back = CommitmentRecord::decode(&bytes).expect("decode");
+                        assert_eq!(
+                            back.instances[0].series_uid, rec.instances[0].series_uid,
+                            "series UID must round-trip with n={instances}"
+                        );
+                        assert_eq!(
+                            back.instances[0].study_uid, rec.instances[0].study_uid,
+                            "study UID must round-trip with n={instances}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

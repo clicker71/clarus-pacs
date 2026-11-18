@@ -131,6 +131,11 @@ pub fn encode_row_warm<'a>(
 pub struct SopOwnerIndex {
     day: DayKey,
     file: File,
+    /// Set when an append failed part-way through a row.
+    ///
+    /// The public field is private to the type on purpose: a caller must not
+    /// be able to clear it, or it could resubmit a row onto a fragment.
+    poisoned: bool,
 }
 
 /// Open (or create) the append-only handle for a day.
@@ -143,7 +148,86 @@ pub fn open_appender(dir: &Path, day: &DayKey) -> Result<SopOwnerIndex, SopOwner
         .append(true)
         .open(&path)
         .map_err(SopOwnerError::Io)?;
-    Ok(SopOwnerIndex { day: *day, file })
+    // A crash or an ENOSPC mid-`write_all` leaves a tail shorter than one row.
+    // The next append would then start MID-ROW, so every later row is shifted
+    // and `read_segment` (which stops at the first misaligned row) silently
+    // drops the rest - the SOP-conflict oracle would miss duplicates until the
+    // day rolled over.
+    //
+    // Truncating the partial tail is safe because this is TODAY's file: the
+    // mmap read path (`idx/preload.rs`) maps only rolled-over days, so no
+    // consumer holds a mapping over the bytes being cut.
+    repair_torn_tail(&path, ROW_LEN).map_err(SopOwnerError::Io)?;
+    Ok(SopOwnerIndex {
+        day: *day,
+        file,
+        poisoned: false,
+    })
+}
+
+/// Truncate a segment's partial trailing row, if any.
+///
+/// `row_len` is the record size; a valid file is always a whole multiple of it.
+/// Only the incomplete tail is removed - every complete row before it is kept,
+/// because the file is append-only and those rows are already published.
+pub(crate) fn repair_torn_tail(path: &Path, row_len: usize) -> std::io::Result<()> {
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        // A file that does not exist yet has nothing to repair.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let row_len = row_len as u64;
+    let aligned = len - (len % row_len);
+    if aligned == len {
+        return Ok(());
+    }
+    OpenOptions::new().write(true).open(path)?.set_len(aligned)
+}
+
+/// Truncate a variable-length, newline-terminated segment back to its last
+/// complete row.
+///
+/// Rows here are not fixed width, so alignment says nothing: the test is
+/// whether the file ends with the `\n` that terminates a row. Without it the
+/// next append would fuse onto the fragment, and the two together read back as
+/// one name that belongs to no study.
+///
+/// Only the unterminated tail goes; every complete row before it is kept.
+pub(crate) fn repair_torn_newline_tail(path: &Path) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if len == 0 {
+        return Ok(());
+    }
+    // Read the final byte: a well-formed file always ends with `\n`.
+    let mut f = OpenOptions::new().read(true).open(path)?;
+    f.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)?;
+    drop(f);
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    // Walk back to the last complete row and cut everything after it.
+    let mut all = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .open(path)?
+        .read_to_end(&mut all)?;
+    let keep = all
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_len(keep as u64)
 }
 
 /// Full path of a day's `sop_owner.idx` file.
@@ -170,9 +254,26 @@ impl SopOwnerIndex {
     /// Rows are appended in arrival order: a day segment is NOT globally
     /// sorted on disk. Lookups sort their read snapshot before binary search
     /// (`lookup_owner`).
+    ///
+    /// A failed write leaves the handle POISONED. `write_all` may have written
+    /// a prefix before failing (ENOSPC, a signal), so the file can end
+    /// mid-record; retrying on this handle would start the next row after the
+    /// fragment and misalign every row behind it, which `read_segment` then
+    /// drops. The next attempt reopens instead, and `open_appender` repairs the
+    /// tail first.
     pub fn append(&mut self, row: &[u8]) -> Result<(), SopOwnerError> {
-        self.file.write_all(row).map_err(SopOwnerError::Io)?;
-        Ok(())
+        if self.poisoned {
+            return Err(SopOwnerError::Io(io::Error::from(
+                io::ErrorKind::BrokenPipe,
+            )));
+        }
+        match self.file.write_all(row) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.poisoned = true;
+                Err(SopOwnerError::Io(e))
+            }
+        }
     }
 
     /// WARM append: like [`append`], but on failure it does NOT propagate the
@@ -184,9 +285,15 @@ impl SopOwnerIndex {
     /// the `Copy` errno and forgets the error, so the body carries no
     /// allocator call in ANY branch. The caller maps the tag to a message.
     pub fn append_warm(&mut self, row: &[u8]) -> Result<(), i32> {
+        if self.poisoned {
+            // A real errno, not a sentinel: the caller already reports this as
+            // an I/O failure, and it must not read as a clean append.
+            return Err(EPOISONED);
+        }
         match self.file.write_all(row) {
             Ok(()) => Ok(()),
             Err(e) => {
+                self.poisoned = true;
                 let code = e.raw_os_error().unwrap_or(0);
                 // Do not run the Drop glue (it would call `free`).
                 std::mem::forget(e);
@@ -194,7 +301,39 @@ impl SopOwnerIndex {
             }
         }
     }
+
+    /// Whether a failed append left this handle unusable.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Replace a poisoned handle with a fresh one, repairing the torn tail.
+    ///
+    /// A poisoned writer refuses every append until this runs: the repair is a
+    /// truncate, and doing it on a handle that may still be mid-append would
+    /// race. Here the old handle is dropped first, so the truncate sees a
+    /// quiescent file.
+    pub fn reopen(&mut self, dir: &Path) -> Result<(), SopOwnerError> {
+        let path = file_path(dir, &self.day);
+        // Drop the old descriptor BEFORE truncating: on Windows a second
+        // handle cannot shorten a file another handle holds open, and the
+        // error would read as a corrupt index.
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(SopOwnerError::Io)?;
+        repair_torn_tail(&path, ROW_LEN).map_err(SopOwnerError::Io)?;
+        self.poisoned = false;
+        Ok(())
+    }
 }
+
+/// Errno reported by `append_warm` on an already-poisoned writer.
+///
+/// `EIO` rather than 0: 0 means "success" to any caller that only checks the
+/// code, and a poisoned writer must never look like one.
+const EPOISONED: i32 = 5;
 
 /// Read a fixed-width `(sop, study)` pair from a 129-byte row.
 ///
@@ -251,6 +390,16 @@ pub struct SopOwnerSnapshot {
     rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Whether a `metadata` failure means the segment genuinely does not exist.
+///
+/// Only `NotFound` means "never written". Every other error (EACCES, EIO, a
+/// permissions change) means the segment may EXIST and could not be inspected,
+/// and reading that as "no owner" would let a conflict check accept a different
+/// owner for a segment it simply failed to look at.
+fn metadata_means_absent(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound
+}
+
 impl SopOwnerSnapshot {
     /// Load + sort a day segment into a memoizable snapshot.
     ///
@@ -260,7 +409,12 @@ impl SopOwnerSnapshot {
         let path = file_path(dir, day);
         let file_len = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
-            Err(_) => return Ok(None),
+            Err(e) => {
+                if !metadata_means_absent(&e) {
+                    return Err(SopOwnerError::Io(e));
+                }
+                return Ok(None);
+            }
         };
         let mut rows = read_segment(&path).map_err(SopOwnerError::Io)?;
         rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -321,12 +475,6 @@ impl SopOwnerSnapshot {
         }
         None
     }
-}
-
-/// Compute the current byte length of a day's `sop_owner` segment, for the
-/// memoization change check. `None` when the segment does not exist.
-pub fn segment_len(dir: &Path, day: &DayKey) -> Option<u64> {
-    std::fs::metadata(file_path(dir, day)).ok().map(|m| m.len())
 }
 
 #[cfg(test)]
@@ -417,21 +565,20 @@ mod tests {
         idx.append(&encode("1.2.1", "study-A")).unwrap();
         drop(idx);
 
-        let len1 = segment_len(dir.path(), b"20240115").unwrap();
         let snap = SopOwnerSnapshot::load(dir.path(), b"20240115")
             .unwrap()
             .unwrap();
-        assert_eq!(snap.current_len(), len1);
+        let len1 = snap.current_len();
         assert_eq!(snap.find(b"1.2.1").unwrap(), b"study-A");
 
         // Append another row; file length grows; a fresh snapshot sees it.
         let mut idx = open_appender(dir.path(), b"20240115").unwrap();
         idx.append(&encode("1.2.2", "study-B")).unwrap();
         drop(idx);
-        assert!(segment_len(dir.path(), b"20240115").unwrap() > len1);
         let snap2 = SopOwnerSnapshot::load(dir.path(), b"20240115")
             .unwrap()
             .unwrap();
+        assert!(snap2.current_len() > len1);
         assert_eq!(snap2.find(b"1.2.2").unwrap(), b"study-B");
     }
 
@@ -453,5 +600,141 @@ mod tests {
                 span.name
             );
         }
+    }
+
+    /// A tail shorter than one row must be cut before the first append.
+    ///
+    /// Without the repair the next row lands mid-row, every following row is
+    /// shifted, and `read_segment` stops at the first misaligned row - the
+    /// conflict oracle then silently loses every later SOP.
+    #[test]
+    fn a_torn_tail_is_repaired_before_the_first_append() {
+        let dir = std::env::temp_dir().join(format!("sop_torn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let day = *b"20250101";
+
+        // Seed one whole row, then simulate a crash mid-write.
+        {
+            let mut idx = open_appender(&dir, &day).unwrap();
+            let mut row = [b'x'; ROW_LEN];
+            row[ROW_LEN - 1] = b'\n';
+            idx.append(&row).unwrap();
+        }
+        let path = file_path(&dir, &day);
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"partial").unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (ROW_LEN + 7) as u64,
+            "fixture must start torn"
+        );
+
+        let mut idx = open_appender(&dir, &day).unwrap();
+        let mut row = [b'y'; ROW_LEN];
+        row[ROW_LEN - 1] = b'\n';
+        idx.append(&row).unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(
+            data.len(),
+            2 * ROW_LEN,
+            "the torn fragment must be gone and rows must stay aligned"
+        );
+        assert_eq!(data[ROW_LEN], b'y', "the new row starts on a row boundary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A writer that failed an append must not accept the next row.
+    ///
+    /// `write_all` can write a PREFIX before failing (ENOSPC). The file is then
+    /// mid-record while the handle is still open. Appending again on that
+    /// handle puts the next row after the fragment, and `read_segment` - which
+    /// stops at the first misaligned row - silently loses everything behind it.
+    /// The writer is poisoned instead, and `reopen` repairs the tail.
+    #[test]
+    fn a_failed_append_poisons_the_writer_until_it_reopens() {
+        let dir = std::env::temp_dir().join(format!("sop_poison_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let day = *b"20250101";
+
+        let mut idx = open_appender(&dir, &day).unwrap();
+        let mut row = [b'a'; ROW_LEN];
+        row[ROW_LEN - 1] = b'\n';
+        idx.append(&row).unwrap();
+        let path = file_path(&dir, &day);
+
+        // Reproduce the state a failed write leaves behind: a partial row on
+        // disk with the writer still believing it can append.
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"partial").unwrap();
+        }
+
+        // Poison the handle the way a real failed write would.
+        idx.poisoned = true;
+        let mut row2 = [b'b'; ROW_LEN];
+        row2[ROW_LEN - 1] = b'\n';
+        assert!(
+            idx.append(&row2).is_err(),
+            "a poisoned writer must refuse further appends"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            ROW_LEN + 7,
+            "the refused append must not have touched the file"
+        );
+
+        // Reopening repairs the fragment and the next row lands aligned.
+        idx.reopen(&dir).unwrap();
+        assert!(!idx.is_poisoned());
+        idx.append(&row2).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), 2 * ROW_LEN);
+        assert_eq!(data[ROW_LEN], b'b');
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only `NotFound` means "this segment was never written".
+    ///
+    /// Mapping every metadata error to `Ok(None)` made an unreadable segment
+    /// look absent, and the conflict check then accepted a DIFFERENT owner for
+    /// a segment that existed but could not be inspected.
+    /// Only `NotFound` means "this segment was never written".
+    ///
+    /// Mapping every metadata error to `Ok(None)` made an unreadable segment
+    /// look absent, and the conflict check then accepted a DIFFERENT owner for
+    /// a segment that existed but could not be inspected.
+    #[test]
+    fn only_not_found_means_the_segment_is_absent() {
+        assert!(
+            metadata_means_absent(&io::Error::from(io::ErrorKind::NotFound)),
+            "NotFound is the one error that means 'never written'"
+        );
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert!(
+                !metadata_means_absent(&io::Error::from(kind)),
+                "{kind:?} must not read as absence"
+            );
+        }
+
+        // End to end: a missing segment is still an absence.
+        let dir = std::env::temp_dir().join(format!("sop_absent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let day = *b"20250101";
+        let missing = SopOwnerSnapshot::load(&dir, &day);
+        assert!(
+            matches!(missing, Ok(None)),
+            "a never-written segment must read as absent"
+        );
     }
 }

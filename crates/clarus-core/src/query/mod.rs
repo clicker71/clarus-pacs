@@ -40,6 +40,7 @@ pub mod bitap;
 mod filter;
 pub mod json;
 pub mod patients;
+mod range;
 mod scan;
 pub mod series;
 pub mod study_index;

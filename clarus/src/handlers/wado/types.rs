@@ -222,10 +222,21 @@ fn fit_in_box(src_w: u32, src_h: u32, box_w: u32, box_h: u32) -> (u32, u32) {
 /// is missing/malformed.
 pub fn extract_transfer_syntax_from_accept_str(accept: Option<&str>) -> Option<String> {
     let accept = accept?;
-    for part in accept.split(';') {
-        let part = part.trim();
-        if let Some(ts) = part.strip_prefix("transfer-syntax=") {
-            return Some(ts.trim_matches('"').trim().to_string());
+    // RFC 9110 8.3: media ranges are comma-separated and each carries its own
+    // parameter list, so split on ',' FIRST - a `transfer-syntax` in one range
+    // must not leak across a range boundary. Within a range, parameters are
+    // ';'-separated `name=value` pairs; the first segment is the media type
+    // itself (no '='), so it is skipped by `split_once`.
+    for range in accept.split(',') {
+        for param in range.split(';') {
+            let Some((name, value)) = param.split_once('=') else {
+                continue;
+            };
+            // Parameter names are case-insensitive and may be padded around
+            // '=' (RFC 9110 5.6.1); the value may be quoted.
+            if name.trim().eq_ignore_ascii_case("transfer-syntax") {
+                return Some(value.trim().trim_matches('"').trim().to_string());
+            }
         }
     }
     None
@@ -264,6 +275,30 @@ mod tests {
         assert_eq!(
             extract_transfer_syntax_from_accept_str(Some("multipart/related")),
             None
+        );
+    }
+
+    /// A multi-range Accept header: only the FIRST range carrying the
+    /// parameter wins, and a later `application/dicom+json` range is ignored.
+    #[test]
+    fn multi_range_accept_parses_the_transfer_syntax() {
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; type=\"application/dicom\"; \
+                 transfer-syntax=1.2.840.10008.1.2.4.80, application/dicom+json; q=0.9"
+            )),
+            Some("1.2.840.10008.1.2.4.80".to_string())
+        );
+    }
+
+    /// Parameter names are case-insensitive and may be spaced around '='.
+    #[test]
+    fn transfer_syntax_parameter_is_case_insensitive_and_spaced() {
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; Transfer-Syntax = 1.2.840.10008.1.2.1"
+            )),
+            Some("1.2.840.10008.1.2.1".to_string())
         );
     }
 }

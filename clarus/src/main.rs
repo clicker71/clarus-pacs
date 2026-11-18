@@ -172,10 +172,10 @@ fn try_write_pid_file(pid_path: &std::path::Path, pid: u32) -> Result<bool, ()> 
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let old_pid_str = std::fs::read_to_string(pid_path).unwrap_or_default();
             let old_pid = old_pid_str.trim().parse::<u32>().ok();
-            // Same reasoning as `guard_live_holder`: in a container our pid is
-            // 1 on every run, so a leftover PID file names a process that is
-            // certainly us. Treating it as a live foreign holder deadlocks the
-            // service behind a file only an operator can remove.
+            // In a container our pid is 1 on every run, so a leftover PID
+            // file names a process that is certainly us. Treating it as a live
+            // foreign holder deadlocks the service behind a file only an
+            // operator can remove.
             let stale = match old_pid {
                 Some(p) if p == pid => true,
                 Some(p) => !is_process_alive(p),
@@ -196,10 +196,12 @@ fn try_write_pid_file(pid_path: &std::path::Path, pid: u32) -> Result<bool, ()> 
                 pid_path.display(),
                 old_pid_str.trim()
             );
-            // Remove-then-create is not atomic, but this runs once at
-            // startup before serving; a race here means two processes
-            // started at the same instant, which the create_new below
-            // still catches for the loser.
+            // A LIVE pid is never removed: the FATAL branch above refuses
+            // before any remove. This branch runs only after the pid was
+            // proven dead or unparseable. Mutual exclusion is the data-dir
+            // guard's job (an OS file lock); this PID file is diagnostics
+            // only, so a remove here cannot let two servers share a port -
+            // the create_new below still catches the loser.
             let _ = std::fs::remove_file(pid_path);
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -307,57 +309,42 @@ fn is_process_alive_impl(_pid: u32) -> bool {
 // The getrlimit FFI lives in the audited OS boundary (clarus_server::ffi).
 
 // -- Data-directory startup guard ---------------------------------------
-// One instance per data directory: a second
-// Clarus pointed at the same data directory must not start. This is NOT a
-// lock - it is a single create_new at startup with one liveness check; no
-// TTL/stale/steal policy at runtime. A crash leaves a file with a dead pid,
-// which the next start overwrites (nginx style, like the pid-file).
+// One instance per data directory: a second Clarus pointed at the same data
+// directory must not start. The mutex is an OS advisory file lock
+// (`File::try_lock`) on `{data_root}/.clarus-data.lock`: the kernel releases
+// it when the holding process dies, so a crash leaves no stale state to
+// reason about and there is no TTL/steal policy at runtime. The file content
+// `pid:port` is diagnostics only.
 //
-// Cross-host NAS: a pid from another host looks dead locally, so the guard
-// yields and both instances start - that is the documented cluster scenario
-// (Valkey/cluster-redis), NOT handled here.
+// Cross-host NAS: advisory locks are per-host, so two hosts can still both
+// acquire the guard on a shared filesystem - that is the documented cluster
+// scenario (Valkey/cluster-redis), NOT handled here.
 
-/// Removes the data-dir guard file when dropped; held for the process lifetime.
+/// Held for the process lifetime: the open handle keeps the OS lock alive, and
+/// the kernel releases it when the process dies - no stale-file cleanup step.
 struct DataDirGuard {
+    /// The locked handle. Dropping it releases the lock; the field is held for
+    /// that lifetime, never read.
+    _file: std::fs::File,
     path: std::path::PathBuf,
 }
 
 impl Drop for DataDirGuard {
     fn drop(&mut self) {
+        // Best-effort removal; the OS lock is the real mutual exclusion and is
+        // released when `_file` drops.
         let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Decide how to handle an existing guard file.
-///
-/// Returns `Some(pid_str)` when the existing guard names a live process - the
-/// startup path must refuse. Returns `None` when the holder is dead or the
-/// content is empty/unparseable - the guard may be taken over (nginx style).
-fn guard_live_holder(old_content: &str) -> Option<String> {
-    let pid = old_content
-        .trim()
-        .split(':')
-        .next()
-        .and_then(|p| p.parse::<u32>().ok());
-    match pid {
-        // A guard naming OUR pid is the leftover of a previous run that had
-        // the same number: in a container Clarus is PID 1 every time, so the
-        // guard written before a kill -9 or an OOM reports "alive" (PID 1 is
-        // now this process) and every restart refuses to start until the file
-        // is removed by hand. A pid file cannot name itself as a live foreign
-        // holder, so this is always stale.
-        Some(pid) if pid == std::process::id() => None,
-        Some(pid) if is_process_alive(pid) => Some(old_content.trim().to_string()),
-        _ => None,
     }
 }
 
 /// Acquire the `{data_root}/.clarus-data.lock` startup guard, or refuse to
 /// start when another live instance already holds it.
 ///
-/// Content is `pid:port` for diagnostics. If the file already exists but its
-/// pid is dead (or the content is empty/unparseable), the guard is taken over
-/// (nginx style, as the pid-file does). Returns the guard to hold for life.
+/// The mutex is an OS advisory file lock (`File::try_lock`), not the file's
+/// existence: the kernel releases the lock when the holding process dies, so a
+/// stale guard needs no liveness check and no remove step. The file content is
+/// `pid:port`, diagnostics only. Returns the guard to hold for the process
+/// lifetime.
 fn acquire_data_dir_guard(data_root: &std::path::Path, port: u16) -> DataDirGuard {
     let guard_path = data_root.join(".clarus-data.lock");
     let pid = std::process::id();
@@ -374,67 +361,57 @@ fn acquire_data_dir_guard(data_root: &std::path::Path, port: u16) -> DataDirGuar
         std::process::exit(1);
     }
 
-    match std::fs::OpenOptions::new()
+    // `create(true)` opens a stale file in place (locking that inode) instead
+    // of replacing it: a replace would let a second starter lock a NEW inode
+    // while the first still holds the old one. The payload is rewritten below,
+    // after the lock is held.
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
+        .create(true)
+        // Keep the old content until the lock is held: truncating on open
+        // would destroy the `pid:port` of a live holder before `try_lock`
+        // even runs. The rewrite happens below, after the lock is acquired.
+        .truncate(false)
         .open(&guard_path)
     {
-        Ok(mut f) => {
-            use std::io::Write;
-            let _ = writeln!(f, "{payload}");
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let old = std::fs::read_to_string(&guard_path).unwrap_or_default();
-            match guard_live_holder(&old) {
-                Some(live) => {
-                    eprintln!(
-                        "[FATAL] Data directory {} is already in use by pid {} \
-                         (port {}). One instance per data directory (see clarus.conf \
-                         [btree]/[storage]); remove {} manually if stale.",
-                        data_root.display(),
-                        live,
-                        port,
-                        guard_path.display()
-                    );
-                    std::process::exit(1);
-                }
-                None => {
-                    eprintln!(
-                        "[WARN] Stale data-dir guard {} (pid={} is dead). Overwriting.",
-                        guard_path.display(),
-                        old.trim()
-                    );
-                    let _ = std::fs::remove_file(&guard_path);
-                    // `create_new` is the whole point of this guard: it is an
-                    // atomic test-and-set. Two instances starting at the same
-                    // moment after a crash both see a stale file and both
-                    // remove it, so swallowing the error here let BOTH take
-                    // the lock and write to one CAS. The loser has to stop.
-                    match std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&guard_path)
-                    {
-                        Ok(mut f) => {
-                            use std::io::Write;
-                            let _ = writeln!(f, "{payload}");
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[FATAL] Another instance took the data-dir guard {} \
-                                 while this one was replacing the stale file: {}",
-                                guard_path.display(),
-                                e
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-        }
+        Ok(f) => f,
         Err(e) => {
             eprintln!(
-                "[FATAL] Cannot create data-dir guard {}: {}",
+                "[FATAL] Cannot open data-dir guard {}: {}",
+                guard_path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    match file.try_lock() {
+        Ok(()) => {
+            // Owns the directory for the process lifetime. Rewrite the
+            // diagnostic payload; the lock outlives the write because the
+            // handle stays open inside the returned guard.
+            use std::io::{Seek, SeekFrom, Write};
+            let _ = file.set_len(0);
+            let _ = file.seek(SeekFrom::Start(0));
+            let _ = writeln!(file, "{payload}");
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let old = std::fs::read_to_string(&guard_path).unwrap_or_default();
+            eprintln!(
+                "[FATAL] Data directory {} is already in use by pid {} \
+                 (port {}). One instance per data directory (see clarus.conf \
+                 [btree]/[storage]); remove {} manually if stale.",
+                data_root.display(),
+                old.trim(),
+                port,
+                guard_path.display()
+            );
+            std::process::exit(1);
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            eprintln!(
+                "[FATAL] Cannot lock data-dir guard {}: {}",
                 guard_path.display(),
                 e
             );
@@ -442,7 +419,10 @@ fn acquire_data_dir_guard(data_root: &std::path::Path, port: u16) -> DataDirGuar
         }
     }
 
-    DataDirGuard { path: guard_path }
+    DataDirGuard {
+        _file: file,
+        path: guard_path,
+    }
 }
 
 // -- manifest-degraded startup sanity check ------------------------
@@ -655,6 +635,13 @@ fn main() {
             } else {
                 args.ups.coding_schemes.join(", ")
             }
+        );
+        // -- [ups] local_utc_offset (offset-free DT comparison frame) -----
+        // Offset-free DT values are local time (PS3.5 6.2); this is the frame
+        // the UPS search compares them in when no `&ZZXX` is present.
+        println!(
+            "  ups.local_utc_offset: {} (default offset for offset-free DT values)",
+            clarus_server::config::utc_offset_canonical(args.ups.local_utc_offset_secs)
         );
         return;
     }
@@ -891,15 +878,14 @@ fn main() {
         // mappings are dropped immediately below - this warms the OS page
         // cache, it does not hold RAM.
         {
-            let idx_root = std::path::PathBuf::from(&args.btree.idx_dir);
             let today =
                 clarus_core::idx::rollover::day_key_from_system_time(std::time::SystemTime::now());
-            let maps = clarus_core::idx::preload::preload_all(
-                std::path::Path::new(""),
-                &idx_root,
-                today,
-                args.btree.preload_days,
-            );
+            // The sealed-day claim is the rollover writer's; obtaining the
+            // root from the writer (not from a path the caller chose) is what
+            // makes the mmap preload's soundness argument reachable.
+            let sealed = shadow.sealed_idx_root();
+            let maps =
+                clarus_core::idx::preload::preload_all(&sealed, today, args.btree.preload_days);
             clarus_server::clog_info!(
                 preloaded = maps.len(),
                 "index preload: mapped recent immutable .idx files"
@@ -1334,13 +1320,25 @@ mod tests {
         }
     }
 
+    /// Read the diagnostic payload through the guard's own locked handle.
+    ///
+    /// The Windows lock (`LockFileEx`) is MANDATORY, so any OTHER handle - even
+    /// a read-only one in this process - is denied the locked byte range. The
+    /// lock holder's own handle can still read it, which is what this uses.
+    fn guard_content(guard: &mut DataDirGuard) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+        let _ = guard._file.seek(SeekFrom::Start(0));
+        let mut content = String::new();
+        let _ = guard._file.read_to_string(&mut content);
+        content
+    }
+
     /// First acquire creates the guard file with the current pid.
     #[test]
     fn guard_first_acquire_writes_our_pid() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let guard_path = dir.path().join(".clarus-data.lock");
-        let _guard = acquire_data_dir_guard(dir.path(), 8024);
-        let content = std::fs::read_to_string(&guard_path).expect("guard file present");
+        let mut guard = acquire_data_dir_guard(dir.path(), 8024);
+        let content = guard_content(&mut guard);
         let pid = content
             .trim()
             .split(':')
@@ -1363,72 +1361,16 @@ mod tests {
         assert!(!guard_path.exists(), "guard removed on drop");
     }
 
-    /// An existing guard naming OUR pid is the leftover of a previous run, not
-    /// a conflict: in a container Clarus is PID 1 on every start, so the guard
-    /// surviving a kill -9 reports "alive" (PID 1 is now this process) and
-    /// every restart would refuse until an operator removed the file by hand.
-    #[test]
-    fn guard_own_pid_is_a_stale_leftover() {
-        let own = format!("{}:8024", std::process::id());
-        assert_eq!(
-            guard_live_holder(&own),
-            None,
-            "a guard naming our own pid is a leftover of a same-pid run"
-        );
-    }
-
-    /// A guard naming a DIFFERENT live pid is a real conflict (must refuse).
-    ///
-    /// The live holder is our own parent process, which is by construction
-    /// alive and has a pid distinct from ours.
-    #[test]
-    fn guard_foreign_live_pid_is_a_conflict() {
-        let parent = std::process::id();
-        let other = (1..=u32::MAX)
-            .find(|p| *p != parent && is_process_alive(*p))
-            .expect("some other pid is alive");
-        let alive = format!("{other}:8024");
-        let holder = guard_live_holder(&alive);
-        assert_eq!(
-            holder.as_deref(),
-            Some(alive.as_str()),
-            "foreign live pid => refuse"
-        );
-    }
-
-    /// An existing guard naming a DEAD (reaped child) pid is stale - takeover.
-    #[test]
-    fn guard_dead_pid_is_stale() {
-        let dead = format!("{}:8024", dead_pid());
-        assert_eq!(guard_live_holder(&dead), None, "dead pid => takeover");
-    }
-
-    /// Empty / unparseable guard content is treated as dead (takeover).
-    #[test]
-    fn guard_empty_or_unparseable_is_stale() {
-        assert_eq!(guard_live_holder(""), None, "empty => stale");
-        assert_eq!(
-            guard_live_holder("not-a-pid:8024"),
-            None,
-            "unparseable => stale"
-        );
-        assert_eq!(guard_live_holder("   "), None, "whitespace => stale");
-        assert_eq!(
-            guard_live_holder("99999999:8024"),
-            None,
-            "dead-looking pid => stale"
-        );
-    }
-
-    /// Rewriting over a stale (dead pid) guard succeeds: file is replaced.
+    /// Taking over a stale (dead pid) guard succeeds: the file is opened in
+    /// place, the OS lock is taken, and the payload is rewritten to our pid.
     #[test]
     fn guard_takes_over_stale_guard() {
         let dir = tempfile::tempdir().expect("tempdir");
         let guard_path = dir.path().join(".clarus-data.lock");
         // Plant a stale guard with a reaped (dead) pid.
         std::fs::write(&guard_path, format!("{}:9999", dead_pid())).expect("plant stale");
-        let _guard = acquire_data_dir_guard(dir.path(), 8024);
-        let content = std::fs::read_to_string(&guard_path).expect("guard file present");
+        let mut guard = acquire_data_dir_guard(dir.path(), 8024);
+        let content = guard_content(&mut guard);
         let pid = content
             .trim()
             .split(':')
@@ -1443,37 +1385,117 @@ mod tests {
         );
     }
 
-    /// A guard that reappears between "stale" and "take it" must stop startup.
+    /// The guard must hold an OS file lock: a second open handle on the same
+    /// file cannot take the lock while the guard is alive.
     ///
-    /// The takeover is `remove` then `create_new`; two instances starting at
-    /// once after a crash both observe the stale file, both remove, and the
-    /// loser's `create_new` reports `AlreadyExists`. Retrying the remove, or
-    /// treating the error as success, put two writers in one CAS. The loser
-    /// must exit, so this asserts the takeover attempt itself is a
-    /// test-and-set rather than a blind write.
+    /// This is the property the remove+create form could not provide: the
+    /// kernel is the mutex, so even an in-process second handle observes the
+    /// exclusion (byte-range lock per handle on Windows, flock per open file
+    /// description on Linux). Deterministic - no process spawn - and the
+    /// falsifier for this task.
     #[test]
-    fn a_guard_taken_during_the_takeover_is_not_overwritten() {
+    fn the_guard_holds_an_os_file_lock() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = acquire_data_dir_guard(dir.path(), 8024);
         let guard_path = dir.path().join(".clarus-data.lock");
-        std::fs::write(&guard_path, format!("{}:9999", dead_pid())).expect("plant stale");
-
-        // The rival instance wins the race: it replaces the stale file with
-        // its own guard before our `create_new` runs.
-        let rival = format!("{}:8025", std::process::id());
-        std::fs::write(&guard_path, &rival).expect("rival guard");
-
-        let taken = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&guard_path);
+        let second = std::fs::File::open(&guard_path).expect("open second handle");
+        let outcome = second.try_lock();
         assert!(
-            matches!(&taken, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
-            "a guard that reappeared during the takeover must not be overwritten"
+            matches!(outcome, Err(std::fs::TryLockError::WouldBlock)),
+            "the guard must hold an exclusive OS lock, got {:?}",
+            outcome
         );
-        assert_eq!(
-            std::fs::read_to_string(&guard_path).expect("guard intact"),
-            rival,
-            "the rival's guard survives: the loser never truncates it"
+    }
+
+    /// Child helper for `two_concurrent_starts_exactly_one_holds_the_guard`.
+    ///
+    /// Acquires the guard for the data dir named by `CLARUS_GUARD_DIR`, signals
+    /// acquisition through `CLARUS_GUARD_ACQUIRED`, then holds the guard until
+    /// `CLARUS_GUARD_RELEASE` appears. The loser never reaches the signal:
+    /// `acquire_data_dir_guard` exits(1) on the lock conflict first.
+    #[test]
+    fn guard_acquire_child() {
+        // No-op in the ordinary suite; meaningful only when spawned with the
+        // env vars below by the two-process test.
+        let Ok(dir) = std::env::var("CLARUS_GUARD_DIR") else {
+            return;
+        };
+        let port: u16 = std::env::var("CLARUS_GUARD_PORT")
+            .expect("CLARUS_GUARD_PORT")
+            .parse()
+            .expect("port");
+        let acquired = std::env::var("CLARUS_GUARD_ACQUIRED").expect("CLARUS_GUARD_ACQUIRED");
+        let release = std::env::var("CLARUS_GUARD_RELEASE").expect("CLARUS_GUARD_RELEASE");
+
+        let _guard = acquire_data_dir_guard(std::path::Path::new(&dir), port);
+        std::fs::write(&acquired, b"1").expect("signal acquired");
+        while !std::path::Path::new(&release).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Two starts pointed at the same data directory: exactly one holds the
+    /// guard, the other exits non-zero.
+    ///
+    /// Spawned as real processes because `File::try_lock` is per open file
+    /// description (per handle on Windows), so two handles in one process do
+    /// not model two servers. The first child signals acquisition and holds
+    /// the guard; the second must then be refused by the kernel lock, so the
+    /// outcome does not depend on spawn timing.
+    #[test]
+    fn two_concurrent_starts_exactly_one_holds_the_guard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Plant a stale guard: both children start from the takeover case the
+        // old remove+create form raced on.
+        std::fs::write(
+            dir.path().join(".clarus-data.lock"),
+            format!("{}:9999", dead_pid()),
+        )
+        .expect("plant stale guard");
+
+        let acquired = dir.path().join("acquired");
+        let release = dir.path().join("release");
+        let exe = std::env::current_exe().expect("current exe");
+
+        let spawn_child = |port: u16, acq: &std::path::Path| {
+            std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg("tests::guard_acquire_child")
+                .env("CLARUS_GUARD_DIR", dir.path())
+                .env("CLARUS_GUARD_PORT", port.to_string())
+                .env("CLARUS_GUARD_ACQUIRED", acq)
+                .env("CLARUS_GUARD_RELEASE", &release)
+                .spawn()
+                .expect("spawn holder")
+        };
+
+        let mut holder = spawn_child(8024, &acquired);
+        // Bounded wait for the holder to acquire.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !acquired.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first start never acquired the guard"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // The second start must be refused by the kernel lock.
+        let mut loser = spawn_child(8025, &dir.path().join("acquired-loser"));
+        let loser_status = loser.wait().expect("wait loser");
+        assert!(
+            !loser_status.success(),
+            "the second start must exit non-zero, got {:?}",
+            loser_status.code()
+        );
+
+        // Release the holder and let it exit cleanly.
+        std::fs::write(&release, b"1").expect("release holder");
+        let holder_status = holder.wait().expect("wait holder");
+        assert!(
+            holder_status.success(),
+            "the holder must exit cleanly after release, got {:?}",
+            holder_status.code()
         );
     }
 

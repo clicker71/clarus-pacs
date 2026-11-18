@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
-"""Clarus Bridge v0.3.1-beta - DIMSE to DICOMweb bridge.
+"""Clarus Bridge v0.3.3-beta - DIMSE to DICOMweb bridge.
 
 C-STORE to STOW-RS, C-FIND to QIDO-RS,  MWL to UPS-RS, N-ACTION to Storage
 Commitment, C-MOVE to WADO-RS streaming plus C-STORE forwarding.
@@ -26,7 +26,7 @@ CLI:
 import logging
 from urllib.parse import urlsplit
 
-VERSION = "0.3.1-beta"
+VERSION = "0.3.3-beta"
 
 class ConfParser:
     """Parses clbridge.conf (nginx-style: [section], key = value, # comment)."""
@@ -4991,7 +4991,7 @@ from pydicom.datadict import dictionary_VR, keyword_dict
 # rewrites this line when it assembles clbridge.py; in the source tree the
 # value is the placeholder, which is also the honest answer for a bundle cut
 # outside a repository.
-BUNDLE_STAMP = "7ed2af53"
+BUNDLE_STAMP = "ab08ecb0"
 
 # Per-socket-operation deadline for a request. A print job is a JSON body with
 # base64 images on a LAN, so 30 s is far beyond any legitimate transfer while

@@ -38,7 +38,7 @@
 
 use crate::state::AppState;
 use clarus_adapters::storage::ContentAddressedStorage;
-use clarus_core::manifest::{TIER_COLD, TIER_HOT, read_manifest};
+use clarus_core::manifest::{TIER_COLD, TIER_HOT, read_manifest_copy};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -387,7 +387,12 @@ fn collect_tombstones(manifest_dir: &Path) -> std::io::Result<(Vec<Tombstone>, u
             continue;
         }
         let del_path = entry.path();
-        let m = match read_manifest(&del_path) {
+        // A tombstone is a manifest the delete renamed to `.del`, so it is the
+        // same file class but no longer the published name. It is read with the
+        // copying reader: the `.del` name is not one the writer publishes, and
+        // a rename has already fixed its contents, so mapping it would gain
+        // nothing while widening what the sealed type has to vouch for.
+        let m = match clarus_core::manifest::read_manifest_copy(&del_path) {
             Ok(m) => m,
             Err(e) => {
                 crate::clog_warn!(
@@ -495,16 +500,20 @@ pub(crate) fn collect_referenced_counted(
     for entry in std::fs::read_dir(manifest_dir)? {
         let entry = entry?;
         let fname = entry.file_name().to_string_lossy().into_owned();
-        if !fname.ends_with(".manifest") {
+        let Some(_) = fname.strip_suffix(".manifest") else {
             continue;
-        }
+        };
         let path = entry.path();
         // A manifest that cannot be decoded stops the whole scan instead of
         // being skipped: returning a set that is missing one study's hashes
         // makes every blob of that study look unreferenced, and the erase pass
         // would then unlink images of a study still in the archive. Deferring
         // costs an erase pass; guessing costs an instance.
-        let m = read_manifest(&path).map_err(|e| {
+        //
+        // This directory is not vouched for by the server wrapper (metrics
+        // passes arbitrary manifest dirs here), so the read copies rather
+        // than maps. The erase pass is control-plane, not a zero-alloc path.
+        let m = read_manifest_copy(&path).map_err(|e| {
             std::io::Error::other(format!(
                 "erase worker: unreadable live manifest {}: {e}",
                 path.display()

@@ -17,7 +17,7 @@
 //! is only meaningful on a quiet process. This binary runs a single test and
 //! creates no threads, so the count is the current thread's.
 
-use clarus_core::manifest::{Manifest, write_manifest};
+use clarus_core::manifest::{Manifest, TrustedManifestDir, write_manifest};
 use clarus_core::manifest_cache::get_or_load;
 use clarus_core::stow::StudyManifestAttrs;
 use ferrite_testkit::heap::TestAllocator;
@@ -41,14 +41,19 @@ fn a_cache_hit_never_allocates() {
     let path = dir.path().join(format!("{study}.manifest"));
     write_manifest(&path, &sample_manifest(study)).expect("write manifest");
 
+    // The test publishes its own manifest via tmp-file + rename and never
+    // truncates it in place, so it can vouch for the dir it just wrote.
+    // SAFETY: same publication invariant the server's ffi.rs voucher asserts.
+    let trusted = unsafe { TrustedManifestDir::new_unchecked(dir.path()) };
+
     // Warm the slot: the FIRST call is a miss and decodes from disk.
-    let warm = get_or_load(dir.path(), study).expect("miss decode");
+    let warm = get_or_load(&trusted, study).expect("miss decode");
 
     ALLOC.set_enabled(false);
     ALLOC.reset();
     ALLOC.set_enabled(true);
     let before = ALLOC.snapshot();
-    let hit = get_or_load(dir.path(), study).expect("hit");
+    let hit = get_or_load(&trusted, study).expect("hit");
     let after = ALLOC.snapshot();
     ALLOC.set_enabled(false);
 

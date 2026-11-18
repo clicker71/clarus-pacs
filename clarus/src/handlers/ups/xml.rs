@@ -143,7 +143,7 @@ fn keyword_for(tag: &str) -> &'static str {
         "00321032" => "RequestingPhysician",
         "00400002" => "ScheduledProcedureStepStartDate",
         "00400003" => "ScheduledProcedureStepStartTime",
-        "00400009" => "ScheduledProcedureStepSequence",
+        "00400009" => "ScheduledProcedureStepID",
         "00400010" => "ScheduledStationName",
         "00401001" => "RequestedProcedureID",
         "00401002" => "ReasonForTheRequestedProcedure",
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(
             out,
             "<DicomAttribute tag=\"00400009\" vr=\"SH\" \
-             keyword=\"ScheduledProcedureStepSequence\"></DicomAttribute>",
+             keyword=\"ScheduledProcedureStepID\"></DicomAttribute>",
             "an empty issuer is a zero-length attribute, not an empty value"
         );
         assert!(
@@ -935,7 +935,7 @@ mod tests {
         assert_eq!(
             out,
             "<DicomAttribute tag=\"00400009\" vr=\"SH\" \
-             keyword=\"ScheduledProcedureStepSequence\">\
+             keyword=\"ScheduledProcedureStepID\">\
              <Value number=\"1\">ISSUER-1</Value></DicomAttribute>"
         );
     }

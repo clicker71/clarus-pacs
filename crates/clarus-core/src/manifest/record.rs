@@ -410,19 +410,47 @@ impl Manifest {
     }
 }
 
-/// Size of an attribute value in bytes once encoded.
+/// Size of an attribute value in bytes once encoded, including its tag key.
+///
+/// Every branch must be a conservative upper bound on `encode_attr_value`
+/// plus the 5-byte `write_u64(tag)` key the enclosing `encode_study` /
+/// `encode_series` / `encode_instance` loops write for the attribute. An
+/// over-count only wastes buffer bytes (the buffer is truncated to `written`);
+/// an under-count makes `CborWriter` return `BufferFull` for a manifest the
+/// decoder accepts, so the "conservative upper bound" claim in
+/// [`Manifest::encoded_size_hint`] would be a lie.
 fn attr_encoded_size(v: &AttrValue) -> usize {
     match v {
-        AttrValue::UInt(_) => 9, // tag key + u64 (4-byte arg typical)
+        // Tag key (5) + write_u64 value. A u32-range value encodes as a 1-byte
+        // CBOR header + 4-byte argument = 5 bytes (cbor/encode.rs `write_head`
+        // 0x1a form), so a UInt attribute is 10 bytes, not 9.
+        AttrValue::UInt(_) => 10,
         AttrValue::Text(s) => s.len() + 9,
         AttrValue::Bytes(b) => b.len() + 9,
-        AttrValue::Array(items) => 2 + items.iter().map(attr_encoded_size).sum::<usize>(),
+        // Tag key (5) + array header allowance (2) + each unkeyed item. The
+        // per-item recursion adds a key per item, over-counting each, which is
+        // safe - the items are scalars with no key of their own.
+        AttrValue::Array(items) => 5 + 2 + items.iter().map(attr_encoded_size).sum::<usize>(),
     }
 }
 
 // -- Encoders ------------------------------------------------------------
 
 fn encode_sys(w: &mut CborWriter<'_>, sys: &SysHeader) -> Result<(), ManifestError> {
+    // Mirror the decoder's bounds (read_sys below): a value the decoder will
+    // reject must fail HERE, before any bytes are written, so the publish path
+    // never renames a poisoned manifest into place. The instance model's
+    // `Default` leaves `storage_tier` at 0, and `build_manifest_full`
+    // overwrites its TIER_HOT seed with that field - encoding it as-is would
+    // put a tier-0 header on disk that every later read fails to decode.
+    if sys.version == 0 {
+        return Err(ManifestError::MalformedEnvelope(
+            "unsupported sys version 0",
+        ));
+    }
+    if !matches!(sys.storage_tier, TIER_HOT | TIER_COLD | TIER_S3) {
+        return Err(ManifestError::MalformedEnvelope("unknown storage tier"));
+    }
     w.write_map_header(4)?;
     w.write_u64(SYS_VERSION)?;
     w.write_u64(sys.version as u64)?;
@@ -645,15 +673,37 @@ fn decode_envelope(r: &mut CborReader<'_>, depth: Depth) -> Result<Manifest, Man
                                 // distinct modalities in first-occurrence order.
                                 //
                                 // Anything that is NOT a text value must still
-                                // be consumed WHOLE. Skipping the header but
-                                // not the payload left the reader parked on the
-                                // modality's own bytes, so the rest of the
-                                // series map decoded as garbage.
+                                // be consumed WHOLE, or the reader parks on the
+                                // modality's own bytes and the rest of the
+                                // series map decodes as garbage. `next()` already
+                                // consumed a scalar UInt/Bytes whole, so nothing
+                                // remains; for ArrayStart/MapStart it consumed
+                                // only the HEADER, so the elements must be
+                                // skipped explicitly. The full-decode path
+                                // (stamp_study_aggregates) drops a non-text
+                                // modality the same way - it contributes nothing
+                                // to ModalitiesInStudy.
                                 match r.next()? {
                                     CborToken::Text(s) => {
                                         append_distinct_modality(&mut modality_agg, s)
                                     }
-                                    _ => r.skip_value()?,
+                                    // `next()` consumed the whole scalar - nothing remains.
+                                    CborToken::UInt(_) | CborToken::Bytes(_) => {}
+                                    // `next()` consumed only the header; skip exactly n elements.
+                                    CborToken::ArrayStart(n) => {
+                                        for _ in 0..n {
+                                            r.skip_value()?;
+                                        }
+                                    }
+                                    // MapStart cannot be produced by encode_attr_value, but
+                                    // skip it correctly (2n items) rather than desyncing, for a
+                                    // hostile/corrupt manifest.
+                                    CborToken::MapStart(n) => {
+                                        for _ in 0..n {
+                                            r.skip_value()?; // key
+                                            r.skip_value()?; // value
+                                        }
+                                    }
                                 }
                             } else {
                                 // Skip a series attribute value - not needed.
@@ -1179,6 +1229,31 @@ pub mod tests {
         roundtrip_eq(&sample_manifest());
     }
 
+    /// The encoder must refuse the same values the decoder rejects, BEFORE
+    /// any byte is produced, so the publish path never renames a poisoned
+    /// manifest into place. Revert the encode-side check and this test reds
+    /// (encode would return Ok for both).
+    #[test]
+    fn encode_refuses_unknown_tier_and_zero_version() {
+        let mut tier_zero = sample_manifest();
+        tier_zero.sys.storage_tier = 0;
+        match tier_zero.encode() {
+            Err(ManifestError::MalformedEnvelope(why)) => {
+                assert_eq!(why, "unknown storage tier");
+            }
+            other => panic!("tier 0 must be refused at encode, got {other:?}"),
+        }
+
+        let mut version_zero = sample_manifest();
+        version_zero.sys.version = 0;
+        match version_zero.encode() {
+            Err(ManifestError::MalformedEnvelope(why)) => {
+                assert_eq!(why, "unsupported sys version 0");
+            }
+            other => panic!("version 0 must be refused at encode, got {other:?}"),
+        }
+    }
+
     /// A frame number above `u16::MAX` must survive the CBOR round trip.
     ///
     /// This is the whole point of widening `FrameRecord.number`: a whole-slide
@@ -1518,6 +1593,58 @@ pub mod tests {
         );
     }
 
+    /// A non-text series Modality is consumed WHOLE by the study-only decode,
+    /// so the series-map walk stays aligned and the non-text value contributes
+    /// nothing to ModalitiesInStudy (matching the full-decode aggregation).
+    ///
+    /// Our encoder always writes Modality as Text, so this arm is defensive;
+    /// before the fix `skip_value` double-consumed a scalar (reading the next
+    /// map key as a value) or skipped only one array element, desyncing the
+    /// walk into a decode error or wrong counts.
+    #[test]
+    fn decode_study_only_consumes_non_text_modality_whole() {
+        let build = |modality: AttrValue| -> Manifest {
+            Manifest {
+                sys: SysHeader {
+                    version: 1,
+                    storage_tier: TIER_HOT,
+                    total_pixel_bytes: 0,
+                    arrived_at: 0,
+                },
+                study: StudyQido::default(),
+                series: vec![SeriesRecord {
+                    attrs: vec![
+                        (0x0020_000e, AttrValue::Text("1.2.840.9.7".into())),
+                        (0x0008_0060, modality),
+                    ],
+                    instances: vec![],
+                }],
+            }
+        };
+
+        // Scalar UInt: `next()` consumes it whole, nothing must be skipped.
+        let uint = build(AttrValue::UInt(42));
+        let bytes = uint.encode().expect("encode uint modality");
+        let decoded = Manifest::decode_study_only(&bytes).expect("uint decodes");
+        assert_eq!(decoded.study.series_count, 1);
+        assert_eq!(decoded.study.instance_count, 0);
+        assert_eq!(
+            decoded.study.modalities_in_study, None,
+            "a non-text modality contributes nothing to the aggregate"
+        );
+
+        // Array: `next()` consumed only the header, every element is skipped.
+        let array = build(AttrValue::Array(vec![
+            AttrValue::Text("CT".into()),
+            AttrValue::Text("MR".into()),
+        ]));
+        let bytes = array.encode().expect("encode array modality");
+        let decoded = Manifest::decode_study_only(&bytes).expect("array decodes");
+        assert_eq!(decoded.study.series_count, 1);
+        assert_eq!(decoded.study.instance_count, 0);
+        assert_eq!(decoded.study.modalities_in_study, None);
+    }
+
     #[test]
     fn roundtrip_series_with_empty_attrs() {
         let m = Manifest {
@@ -1695,5 +1822,64 @@ pub mod tests {
             Manifest::decode(&bytes).unwrap_err(),
             ManifestError::InvalidHashLen(3)
         );
+    }
+
+    /// 100 study attrs of empty arrays must encode and round-trip.
+    ///
+    /// The pre-fix bound counted an Array attribute as 2 bytes (the array
+    /// header only, no tag key), so `encoded_size_hint` returned ~330 against
+    /// an actual ~687 and `Manifest::encode` failed with `BufferFull` for a
+    /// manifest the decoder accepts. The bound is part of the public record
+    /// format, so it must not lie - "conservative upper bound" has to mean
+    /// "no valid manifest can overflow it".
+    #[test]
+    fn encode_succeeds_for_one_hundred_empty_array_study_attrs() {
+        let mut m = Manifest {
+            sys: SysHeader {
+                version: 1,
+                storage_tier: TIER_HOT,
+                total_pixel_bytes: 0,
+                arrived_at: 0,
+            },
+            study: StudyQido::default(),
+            series: Vec::new(),
+        };
+        // Real DICOM tags live in groups 0002..FFFF and encode as the 5-byte
+        // `write_u64` form (0x1a + u32). Small tags (0..99) would encode in
+        // 1-2 bytes and never exercise the missing-key under-count.
+        for i in 0u32..100 {
+            m.study
+                .attrs
+                .push((0x0008_0000 + i, AttrValue::Array(Vec::new())));
+        }
+        let bytes = m.encode().expect("100 empty-array study attrs must encode");
+        let decoded = Manifest::decode(&bytes).expect("decode");
+        assert_eq!(decoded, m, "round-trip mismatch");
+    }
+
+    /// A study attr holding the largest u32-range UInt must round-trip.
+    ///
+    /// The pre-fix bound counted a UInt as 9 bytes against an actual 10
+    /// (tag key 5 + value header 1 + argument 4), so the 25% margin silently
+    /// absorbed the missing byte. `u32::MAX` exercises the full 5-byte value
+    /// form, the case the old constant under-counted.
+    #[test]
+    fn encode_round_trips_uint_max_study_attr() {
+        let m = Manifest {
+            sys: SysHeader {
+                version: 1,
+                storage_tier: TIER_HOT,
+                total_pixel_bytes: 0,
+                arrived_at: 0,
+            },
+            study: StudyQido {
+                attrs: vec![(0x0008_0020, AttrValue::UInt(u64::from(u32::MAX)))],
+                ..Default::default()
+            },
+            series: Vec::new(),
+        };
+        let bytes = m.encode().expect("encode");
+        let decoded = Manifest::decode(&bytes).expect("decode");
+        assert_eq!(decoded, m, "round-trip mismatch");
     }
 }

@@ -165,18 +165,30 @@ pub fn sendfile_response(
     use std::os::windows::io::AsRawSocket as _;
     (&*out).write_all(head)?;
 
-    // Body-only path: the file is opened fresh at offset 0, so TransmitFile
-    // sends exactly `len` bytes from the start. `len > u32::MAX` or `0` falls
-    // back to the copy loop (robust, no per-part allocation).
-    if len != 0 && len <= u32::MAX as u64 {
+    // Body-only path: `TransmitFile` sends from its handle's CURRENT position,
+    // which a concurrent `seek_read` on the caller's handle can move. The FFI
+    // call reopens the file so the cursor it moves belongs to an independent
+    // file object, leaving the caller's handle free for range reads.
+    //
+    // The size guard is `TransmitFile`'s own limit (0x7FFF_FFFE), not
+    // `u32::MAX`: a body just above it would pass a `u32::MAX` check, fail in
+    // the kernel after the head was written, and desynchronise the connection.
+    //
+    // A failed `TransmitFile` reports no sent-byte count, so the body may
+    // already be partly on the wire. Restarting it from offset 0 would append
+    // the whole body to a prefix and corrupt the stream under a Content-Length
+    // that promised one body; the error is propagated instead.
+    if len != 0 && len <= crate::ffi::TRANSMIT_FILE_MAX {
         let ok = crate::ffi::transmit_file(
             out.as_raw_socket() as usize,
             file.as_raw_handle() as usize,
             len as u32,
+            0,
         );
         if ok != 0 {
             return Ok(());
         }
+        return Err(io::Error::other("TransmitFile failed after a partial send"));
     }
     copy_loop_userspace(out, file, 0, len)
 }
@@ -217,8 +229,7 @@ fn copy_loop(
             // SAFETY: both descriptors are live for the whole call (owned by
             // the caller's `out` and `file`); `off` is a local; the syscall
             // reports errors by return value and never causes UB.
-            let n =
-                crate::ffi::sendfile_once(out_fd, in_fd, &mut off, (len - sent) as libc::size_t);
+            let n = crate::ffi::sendfile_once(out_fd, in_fd, &mut off, bounded_count(len - sent));
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if errno_is_unsupported(&e) {
@@ -281,27 +292,76 @@ fn copy_loop_userspace(
     start: u64,
     len: u64,
 ) -> io::Result<()> {
-    use std::io::Read as _;
-    use std::io::{Seek, SeekFrom, Write as _};
-    let mut file = file.try_clone()?;
-    file.seek(SeekFrom::Start(start))?;
+    use std::io::Write as _;
     let mut buf = vec![0u8; COPY_BUF]; // heap: avoids burning the 512 KiB worker stack
+    let mut offset = start;
     let mut remaining = len;
     while remaining > 0 {
-        // Read only what is left. `read` may fill up to the whole buffer, so a
-        // 1 KiB range would have read 64 KiB off the file, written it to the
+        // Read only what is left. A bare `read` may fill up to the whole
+        // buffer, so a 1 KiB range would have read 64 KiB, written it to the
         // socket and then underflowed `remaining` on the subtraction - sending
         // the next response's bytes early and corrupting the keep-alive
         // stream.
-        let want = (remaining as usize).min(buf.len());
-        let n = file.read(&mut buf[..want])?;
+        // Bounded in u64 FIRST: `remaining as usize` truncates a span >= 4 GiB
+        // to zero on a 32-bit target, which reads an empty slice and then
+        // reports `UnexpectedEof`. The buffer is a small constant, so the
+        // narrowed value is always in range.
+        let want = remaining.min(buf.len() as u64) as usize;
+        // Positional read, NOT `try_clone` + `seek`: a clone shares the file
+        // cursor, so seeking on it moves the CALLER's cursor too and two
+        // transfers over the same `File` would read from each other's offsets.
+        // `read_at` leaves the shared cursor alone.
+        let n = read_at_offset(file, &mut buf[..want], offset)?;
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "copy EOF"));
         }
         (&*out).write_all(&buf[..n])?;
+        offset += n as u64;
         remaining -= n as u64;
     }
     Ok(())
+}
+
+/// Read at an absolute offset without touching the file's shared cursor.
+#[cfg(unix)]
+fn read_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_at(buf, offset)
+}
+
+/// Windows has the same positional primitive; `seek_read` does not move the
+/// handle position either.
+#[cfg(windows)]
+fn read_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt as _;
+    file.seek_read(buf, offset)
+}
+
+/// Fallback for targets with neither extension: clone so the seek is private.
+#[cfg(not(any(unix, windows)))]
+fn read_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read(buf)
+}
+
+/// A transfer count narrowed to this platform's count type WITHOUT truncating.
+///
+/// `libc::size_t` is 32 bits on a 32-bit target, so `remaining as size_t` turns
+/// a 4 GiB span into zero - the kernel is then asked to send nothing, and the
+/// loop reports `UnexpectedEof` on a body that is still being served.
+///
+/// The value is clamped in `u64` and only then narrowed, so a huge span is sent
+/// in several bounded calls instead of one zero-length call. Clamping (not
+/// erroring) is correct here: each partial send advances `sent`, so the loop
+/// makes progress and the caller's `len` is still served in full.
+#[cfg(unix)]
+fn bounded_count(remaining: u64) -> libc::size_t {
+    // `size_t::MAX` is the largest single-call count; anything above it is sent
+    // in the next iteration.
+    let max = libc::size_t::MAX as u64;
+    remaining.min(max) as libc::size_t
 }
 
 /// Send `len` bytes of `file` starting at `start`, following `head`.
@@ -328,21 +388,45 @@ pub fn sendfile_response_at(
     // to the file size today (`wado_range::parse_range_header_str`), but this
     // is the function that does the arithmetic, so it validates its own inputs.
     // The kernel copy cannot make this decision for us - it only sees offsets.
-    start
+    let total = start
         .checked_add(len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range overflow"))?;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if libc::off_t::try_from(start.saturating_add(len)).is_err() {
-        // 32-bit targets without large-file support carry an i32 `off_t`, so a
-        // span above 2 GiB would truncate and the kernel would read from the
-        // wrong offset while the head still promised 206. Those targets can
-        // still serve the bytes, just through the userspace loop.
-        return copy_loop_userspace(out, file, start, len);
-    }
+    // 32-bit targets without large-file support carry an i32 `off_t`, so a
+    // span above 2 GiB would truncate and the kernel would read from the wrong
+    // offset. Those targets can still serve the bytes, just through the
+    // userspace loop. The DECISION is taken before the head is written,
+    // because the head promises a 206 and there is no way back afterwards.
+    //
+    // The kernel copy exists only on Unix (Windows uses the userspace loop for
+    // every span), so the flag is only meaningful there - but it is computed
+    // on every target so both arms of the decision are always compiled.
+    let fits_off_t = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            libc::off_t::try_from(total).is_ok()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = total;
+            true
+        }
+    };
+
+    // One write point for the head, so no transfer path can start without it.
+    // The fallback used to `return copy_loop_userspace(..)` before this line,
+    // which sent the BODY with no status line, no Content-Type and no
+    // Content-Length - the client saw a headless byte stream and could only
+    // time out.
     (&*out).write_all(head)?;
+
     #[cfg(unix)]
-    return copy_loop(out, file, start, len);
-    #[cfg(windows)]
+    if fits_off_t {
+        return copy_loop(out, file, start, len);
+    }
+    // Not reached on Unix when `fits_off_t` holds (the `return` above), and
+    // the only path on Windows.
+    #[cfg(not(unix))]
+    let _ = fits_off_t;
     copy_loop_userspace(out, file, start, len)
 }
 
@@ -397,6 +481,177 @@ mod tests {
             &out[..],
             b"HTTP/1.1 200 OK\r\nx-pragma: once\r\nx-clarus: definitum semel\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
         );
+    }
+
+    /// F10: the userspace copy must read AT an offset, not seek a clone.
+    ///
+    /// `try_clone` shares the file cursor, so `seek` on the clone also moves the
+    /// ORIGINAL handle's position. Two concurrent transfers over one `File`
+    /// (a warm-cache sendfile fallback and a range request, say) then read from
+    /// each other's offsets and splice the wrong bytes into a response.
+    ///
+    /// The observable consequence is that interleaving two spans over ONE
+    /// handle must still return each span's own bytes. A shared seek makes the
+    /// second read start wherever the first left the cursor.
+    #[test]
+    fn interleaved_positional_reads_keep_their_own_offsets() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.write_all(b"0123456789abcdef").expect("write");
+        let file = f.reopen().expect("reopen");
+
+        // Interleave: a span at 10, then one at 0, then 10 again.
+        let mut a = [0u8; 4];
+        let n = super::read_at_offset(&file, &mut a, 10).expect("read 10");
+        assert_eq!(&a[..n], b"abcd");
+
+        let mut b = [0u8; 4];
+        let n = super::read_at_offset(&file, &mut b, 0).expect("read 0");
+        assert_eq!(
+            &b[..n],
+            b"0123",
+            "the second span must come from ITS offset, not from where the \
+             first read left a shared cursor"
+        );
+
+        let mut c = [0u8; 4];
+        let n = super::read_at_offset(&file, &mut c, 10).expect("read 10 again");
+        assert_eq!(&c[..n], b"abcd", "the offset is absolute, not incremental");
+    }
+
+    /// The Windows transfer must name its span, not inherit the cursor.
+    ///
+    /// `TransmitFile` with a null `OVERLAPPED` sends from the handle's CURRENT
+    /// position, which `seek_read` moves even though it returns the requested
+    /// offset's bytes. A full-object send racing a range read could therefore
+    /// stream the range's span under the full object's Content-Length.
+    ///
+    /// And a failed `TransmitFile` reports no sent-byte count: re-running the
+    /// userspace loop from offset 0 would append a whole body to the bytes the
+    /// kernel already wrote.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_transfer_names_its_span_and_never_restarts_it() {
+        let src = include_str!("response.rs");
+        let start = src
+            .find("pub fn sendfile_response")
+            .expect("sendfile_response must exist");
+        let rest = &src[start..];
+        let end = rest.find("\n/// Send `len` bytes").expect("next item");
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("crate::ffi::transmit_file("),
+            "the body must go through the kernel transfer"
+        );
+        assert!(
+            !body.contains("seek("),
+            "the transfer must not depend on the shared cursor"
+        );
+        assert!(
+            body.contains("TransmitFile failed"),
+            "a failed send must be propagated, not restarted"
+        );
+        // The fallback exists only for spans the kernel path cannot take.
+        let fallback_pos = body.find("copy_loop_userspace").expect("fallback");
+        let guard_pos = body
+            .find("TRANSMIT_FILE_MAX")
+            .expect("span guard must name the API's own ceiling");
+        assert!(
+            guard_pos < fallback_pos,
+            "the userspace loop must sit behind the span guard"
+        );
+    }
+
+    /// A4: the size guard is `TransmitFile`'s limit, not `u32::MAX`.
+    ///
+    /// The API refuses a single transfer above 0x7FFF_FFFE. A guard written as
+    /// `u32::MAX` admits the bytes in between, so the call passes the check,
+    /// fails in the kernel after the head is already on the wire, and
+    /// desynchronises the connection.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_guard_matches_the_api_ceiling() {
+        assert_eq!(
+            crate::ffi::TRANSMIT_FILE_MAX,
+            2_147_483_646,
+            "the guard must be TransmitFile's documented maximum"
+        );
+        let cap = crate::ffi::TRANSMIT_FILE_MAX;
+        assert!(cap < u32::MAX as u64, "the ceiling is below u32::MAX");
+        assert!(0x7FFF_FFFEu64 <= cap, "the last legal size is admitted");
+        assert!(
+            0x7FFF_FFFFu64 > cap,
+            "the first illegal size takes the userspace fallback"
+        );
+        assert!(
+            0xFFFF_FFFFu64 > cap,
+            "a u32::MAX body must not reach the kernel path"
+        );
+    }
+
+    /// A1: the transfer must not move the CALLER's file position.
+    ///
+    /// The file position lives in the file OBJECT on Windows, so a
+    /// `DuplicateHandle` copy shares it - seeking the copy moves the original's
+    /// cursor, and a concurrent `seek_read` can then race the transfer into the
+    /// wrong span. The FFI reopens the file by its final path instead, giving an
+    /// independent file object and therefore an independent position.
+    ///
+    /// The assertion is the observable consequence: a caller that parks its
+    /// cursor somewhere and then sends must find it exactly where it left it.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_transfer_leaves_the_callers_cursor_alone() {
+        use std::io::{Seek as _, SeekFrom};
+        use std::os::windows::io::AsRawHandle as _;
+        use std::os::windows::io::AsRawSocket as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("body.bin");
+        std::fs::write(&path, b"0123456789abcdef").expect("write");
+        let file = std::fs::File::open(&path).expect("open");
+
+        // Park the caller's cursor in the middle; a transfer that shares the
+        // file object will move it.
+        (&file).seek(SeekFrom::Start(6)).expect("seek");
+        let before = (&file).stream_position().expect("position");
+
+        let (server, client) = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| {
+                let addr = l.local_addr()?;
+                let client = std::net::TcpStream::connect(addr)?;
+                let (server, _) = l.accept()?;
+                Ok((server, client))
+            })
+            .expect("socket pair");
+        // Drain in the background so the send cannot block on a full buffer.
+        let drain = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut sink = Vec::new();
+            let _ = (&client).take(u64::MAX).read_to_end(&mut sink);
+        });
+
+        let ok = crate::ffi::transmit_file(
+            server.as_raw_socket() as usize,
+            file.as_raw_handle() as usize,
+            8,
+            2,
+        );
+        assert_ne!(ok, 0, "the transfer must succeed");
+        let after = (&file).stream_position().expect("position");
+        assert_eq!(
+            before, after,
+            "the caller's cursor must be untouched by a transfer"
+        );
+
+        // And the caller's own positional read still starts where it asks.
+        let mut buf = [0u8; 4];
+        let n = super::read_at_offset(&file, &mut buf, 0).expect("read");
+        assert_eq!(&buf[..n], b"0123", "a positional read ignores the cursor");
+
+        drop(server);
+        let _ = drain.join();
     }
 
     /// A span whose END does not fit in `u64` is refused as `InvalidInput`, and
@@ -454,6 +709,85 @@ mod tests {
         assert!(
             super::sendfile_response_at(&out, b"", file.as_file(), 0, 10).is_ok(),
             "the full span must still succeed"
+        );
+    }
+
+    /// Every transfer path sends the HEAD before the body.
+    ///
+    /// The large-offset fallback on 32-bit targets used to `return` into the
+    /// userspace copy loop BEFORE writing the head, so the client received a
+    /// body with no status line, no Content-Type and no Content-Length. The
+    /// decision is now taken first and the head is written once, ahead of
+    /// either loop; this test pins the observable half on whichever loop the
+    /// platform takes.
+    #[test]
+    fn the_head_reaches_the_peer_before_the_body_on_every_path() {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let out = std::net::TcpStream::connect(addr).expect("connect");
+        let mut peer = listener.accept().expect("accept").0;
+
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(&mut file.as_file(), b"0123456789").expect("write");
+        file.as_file().sync_all().expect("sync");
+
+        super::sendfile_response_at(
+            &out,
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\n\r\n",
+            file.as_file(),
+            0,
+            10,
+        )
+        .expect("transfer");
+        // The write half has to close before the peer's `read_to_end` can see
+        // EOF; otherwise the read blocks until the timeout.
+        drop(out);
+
+        let mut got = Vec::new();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("timeout");
+        peer.read_to_end(&mut got).expect("read");
+
+        const HEAD: &[u8] = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\n\r\n";
+        assert!(
+            got.starts_with(HEAD),
+            "the response must open with its head, got: {:?}",
+            String::from_utf8_lossy(&got[..got.len().min(80)])
+        );
+        assert_eq!(
+            &got[HEAD.len()..],
+            b"0123456789",
+            "the body must follow the head"
+        );
+    }
+
+    /// F6: the per-call send count is clamped in u64 before narrowing.
+    ///
+    /// `libc::size_t` is 32 bits on a 32-bit target, so `remaining as size_t`
+    /// turns a 4 GiB span into ZERO: the kernel is asked to send nothing and the
+    /// loop then reports `UnexpectedEof` on a body it never attempted. Clamping
+    /// first sends the span in several bounded calls instead.
+    ///
+    /// Like F5 this is not reachable on a 64-bit host (`size_t` == u64), so the
+    /// gate is the arithmetic contract rather than an observable failure.
+    #[cfg(unix)]
+    #[test]
+    fn the_send_count_is_clamped_before_narrowing() {
+        // A span far above any 32-bit count must stay non-zero.
+        assert!(
+            super::bounded_count(1u64 << 32) > 0,
+            "a 4 GiB send must not clamp to zero, which would send nothing and \
+             then report EOF"
+        );
+        assert!(super::bounded_count(u64::MAX) > 0);
+        // Ordinary spans pass through unchanged.
+        assert_eq!(super::bounded_count(0) as u64, 0);
+        assert_eq!(super::bounded_count(1234) as u64, 1234);
+        // And the clamp is the platform maximum, not an arbitrary constant.
+        assert_eq!(
+            super::bounded_count(u64::MAX) as u64,
+            libc::size_t::MAX as u64
         );
     }
 }

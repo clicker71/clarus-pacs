@@ -138,6 +138,18 @@ pub const ROWS: DicomTag = (0x0028, 0x0010);
 /// Columns - number of columns in the image (0028,0011).
 pub const COLUMNS: DicomTag = (0x0028, 0x0011);
 
+/// NumberOfFrames (0028,0008) - IS, present only for a multi-frame instance.
+///
+/// Captured so the thumbnail routes can pick a representative frame without
+/// decoding the instance, and so the frame index they build stays inside the
+/// instance.
+pub const NUMBER_OF_FRAMES: DicomTag = (0x0028, 0x0008);
+
+/// ImageType (0008,0008) - CS, multi-valued. Value 3 is `LOCALIZER` for a
+/// scout image, which a series/study thumbnail must not pick as its
+/// representative.
+pub const IMAGE_TYPE: DicomTag = (0x0008, 0x0008);
+
 // -- Sentinel -------------------------------------------------------------
 
 /// PixelData tag - parser must stop BEFORE reading its value.

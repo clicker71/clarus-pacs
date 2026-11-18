@@ -34,10 +34,21 @@ mod read;
 mod record;
 mod write;
 
-pub use read::{ManifestReadError, read_manifest, read_manifest_at, read_manifest_study_only};
+pub use crate::ffi::TrustedManifestDir;
+#[cfg(test)]
+pub(crate) use crate::ffi::trusted_manifest_dir_for_test;
+pub use read::{
+    ManifestReadError, PublishedManifest, read_manifest, read_manifest_at, read_manifest_copy,
+    read_manifest_study_only,
+};
+#[cfg(test)]
+pub(crate) use read::{read_manifest_for_test, read_manifest_study_only_for_test};
+pub(crate) use read::{read_manifest_published, read_manifest_study_only_published};
 pub use record::{
     AttrValue, FrameRecord, InstanceRecord, Manifest, ManifestError, NOT_REJECTED_REASON,
     QUALITY_REASON_CODE, SeriesRecord, StudyQido, SysHeader, TIER_COLD, TIER_HOT, TIER_S3,
 };
 pub use write::WriteManifestError;
-pub use write::{write_bytes_atomic, write_manifest};
+#[doc(hidden)]
+pub use write::{block_manifest_write_for_test, unblock_manifest_write_for_test};
+pub use write::{write_bytes_atomic, write_bytes_atomic_validated, write_manifest};

@@ -518,6 +518,12 @@ pub struct InstancePresence {
     present: bool,
     /// (0020,000D) of the manifest that vouched for it, when one did.
     study_uid: Option<String>,
+    /// (0020,000E) of the series holding it, when a manifest vouched for it.
+    ///
+    /// Annex J.2 answers a study-shaped request with a Study Sequence whose
+    /// items carry a Referenced Series Sequence; without the series the
+    /// response cannot state the hierarchy the standard defines.
+    series_uid: Option<String>,
 }
 
 /// Does the archive hold this SOP Instance with its full pixel data?
@@ -551,15 +557,12 @@ impl ManifestCache {
     /// archive would otherwise be probed once per instance.
     fn get(
         &mut self,
-        manifest_dir: &std::path::Path,
+        state: &AppState,
         study_uid: &str,
     ) -> Option<&clarus_core::manifest::Manifest> {
         self.by_study
             .entry(study_uid.to_string())
-            .or_insert_with(|| {
-                let path = manifest_dir.join(format!("{study_uid}.manifest"));
-                clarus_core::manifest::read_manifest(&path).ok()
-            })
+            .or_insert_with(|| state.read_server_manifest(study_uid).and_then(|r| r.ok()))
             .as_ref()
     }
 }
@@ -589,26 +592,36 @@ pub fn evaluate_instances(
         let resolved = match hint {
             // A study-shaped request names the study: one probe, no scan.
             Some(study_uid) => cache
-                .get(manifest_dir, study_uid)
+                .get(state, study_uid)
                 .filter(|m| m.find_instance(sop).is_some())
-                .map(|m| m.study_instance_uid().unwrap_or(study_uid).to_string()),
+                .map(|m| {
+                    let study = m.study_instance_uid().unwrap_or(study_uid).to_string();
+                    let series = m.series_of_instance(sop).map(str::to_string);
+                    (study, series)
+                }),
             // The index names the owning study in the common case.
             None => state.shadow.sop_owner_study(sop).and_then(|owner| {
                 cache
-                    .get(manifest_dir, &owner)
+                    .get(state, &owner)
                     .filter(|m| m.find_instance(sop).is_some())
-                    .map(|m| m.study_instance_uid().unwrap_or(&owner).to_string())
+                    .map(|m| {
+                        let study = m.study_instance_uid().unwrap_or(&owner).to_string();
+                        let series = m.series_of_instance(sop).map(str::to_string);
+                        (study, series)
+                    })
             }),
         };
         match resolved {
-            Some(study_uid) => out.push(InstancePresence {
+            Some((study_uid, series_uid)) => out.push(InstancePresence {
                 present: true,
                 study_uid: Some(study_uid),
+                series_uid,
             }),
             None => {
                 out.push(InstancePresence {
                     present: false,
                     study_uid: None,
+                    series_uid: None,
                 });
                 pending.push((index, *sop));
             }
@@ -637,8 +650,7 @@ pub fn evaluate_instances(
         let Some(stem) = name.strip_suffix(".manifest") else {
             continue;
         };
-        let path = manifest_dir.join(format!("{stem}.manifest"));
-        let Ok(m) = clarus_core::manifest::read_manifest(&path) else {
+        let Some(Ok(m)) = state.read_server_manifest(stem) else {
             // A single unreadable manifest must not fail the whole check; it
             // simply cannot vouch for any instance.
             continue;
@@ -653,6 +665,7 @@ pub fn evaluate_instances(
                 out[index] = InstancePresence {
                     present: true,
                     study_uid: Some(owner.clone()),
+                    series_uid: m.series_of_instance(sop).map(str::to_string),
                 };
             } else {
                 still_pending.push((index, sop));
@@ -679,11 +692,7 @@ pub fn evaluate_instances(
 /// A study whose manifest cannot be read, or that has no instances, is left
 /// alone: nothing can be concluded about coverage, and the debounce still
 /// covers it.
-fn promote_committed_studies(
-    state: &AppState,
-    record: &CommitmentRecord,
-    manifest_dir: &std::path::Path,
-) {
+fn promote_committed_studies(state: &AppState, record: &CommitmentRecord) {
     let mut committed: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
         std::collections::HashMap::new();
     for instance in &record.instances {
@@ -704,8 +713,7 @@ fn promote_committed_studies(
     }
 
     for (study_uid, instance_uids) in committed {
-        let path = manifest_dir.join(format!("{study_uid}.manifest"));
-        let Ok(manifest) = clarus_core::manifest::read_manifest(&path) else {
+        let Some(Ok(manifest)) = state.read_server_manifest(study_uid) else {
             continue;
         };
         let stored = manifest.sop_instance_uids();
@@ -1002,6 +1010,7 @@ pub fn commit(
             // none, which is also what keeps it out of the coverage
             // comparison below.
             study_uid: study_uid.clone().or(presence.study_uid),
+            series_uid: presence.series_uid,
         });
     }
 
@@ -1023,7 +1032,7 @@ pub fn commit(
     // duplicate path above) promotes nothing, and doing it here rather than
     // in a thread keeps the one publish path (`readiness::promote`) inline
     // with the acceptance that justified it.
-    promote_committed_studies(state, &record, &dir);
+    promote_committed_studies(state, &record);
 
     let json = render_result(&record);
     let kind = classify_accept(accept);
@@ -1094,6 +1103,7 @@ mod tests {
                 CommitmentOutcome::Failed => Some(FailureReason::NoSuchSopInstance),
             },
             study_uid: study.map(str::to_string),
+            series_uid: None,
         }
     }
 

@@ -156,7 +156,15 @@ fn push_hms6(buf: &mut [u8; 6], v: u64) -> Result<(), UnrepresentableDate> {
 
 // -- XML escaping ----------------------------------------------------------
 
-/// Escape text content for XML element bodies (5 special chars).
+/// Escape text content for XML element bodies (5 special chars) and DROP the
+/// C0 controls XML 1.0 cannot represent.
+///
+/// XML 1.0 production [2] Char admits only TAB/LF/CR from the C0 block; the
+/// rest (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, including DICOM's FF and ESC) have
+/// no XML representation, and [66] forbids character references to them
+/// (standard/ps3.5/xml-control-characters.json `dropSet`). They are dropped,
+/// NOT replaced with U+FFFD: a replacement fabricates a glyph that was never
+/// in the source and is indistinguishable from a genuinely-present U+FFFD.
 fn esc_into(out: &mut Sink<'_>, s: &str) -> Result<(), StreamOverflow> {
     for &b in s.as_bytes() {
         match b {
@@ -165,6 +173,9 @@ fn esc_into(out: &mut Sink<'_>, s: &str) -> Result<(), StreamOverflow> {
             b'>' => out.extend(b"&gt;")?,
             b'"' => out.extend(b"&quot;")?,
             b'\'' => out.extend(b"&apos;")?,
+            // XML 1.0 [2]: only TAB (0x09), LF (0x0A) and CR (0x0D) are legal
+            // C0 characters; every other C0 control is dropped.
+            0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F => {}
             _ => out.push(b)?,
         }
     }
@@ -181,7 +192,11 @@ fn esc_into(out: &mut Sink<'_>, s: &str) -> Result<(), StreamOverflow> {
 /// legacy Value-based converter.
 fn write_person_name(out: &mut Sink<'_>, raw: &str) -> Result<(), StreamOverflow> {
     let groups: Vec<&str> = raw.split('=').collect();
-    out.extend(b"<PersonName>")?;
+    // `number` is REQUIRED on PersonName (PS3.19 Table A.1.5-2: "order within
+    // the Value Field, monotonically increasing from 1"). Omitting it produced
+    // a document a conforming reader may reject - and it is the sibling of the
+    // `Value` element, whose `number` this writer already emits.
+    out.extend(b"<PersonName number=\"1\">")?;
 
     // Helper: write one name group.
     fn write_name_group(
@@ -220,15 +235,23 @@ fn write_person_name(out: &mut Sink<'_>, raw: &str) -> Result<(), StreamOverflow
         {
             write_part(out, "MiddleName", m)?;
         }
+        // PS3.19 Table 10.2-1 names these NamePrefix/NameSuffix; a bare
+        // <Prefix>/<Suffix> is not an element the NativeDICOM schema defines,
+        // so a validating reader rejects the document (the twin of
+        // handlers/ups/xml.rs, which already emits the schema names).
+        // PS3.19 Table 10.2-1 names these NamePrefix/NameSuffix; a bare
+        // <Prefix>/<Suffix> is not an element the NativeDICOM schema defines,
+        // so a validating reader rejects the document (the twin of
+        // handlers/ups/xml.rs, which already emits the schema names).
         if let Some(p) = parts.get(3)
             && !p.is_empty()
         {
-            write_part(out, "Prefix", p)?;
+            write_part(out, "NamePrefix", p)?;
         }
         if let Some(s) = parts.get(4)
             && !s.is_empty()
         {
-            write_part(out, "Suffix", s)?;
+            write_part(out, "NameSuffix", s)?;
         }
 
         out.extend(b"</")?;
@@ -489,9 +512,16 @@ fn instance_text(attrs: &[(u32, AttrValue)], tag: u32) -> Option<&str> {
 
 /// Append the XML declaration and the `<NativeDicomModel>` opening root.
 ///
-/// Every `<DicomAttribute>` written afterwards is a top-level sibling under
-/// this root until [`write_xml_doc_end`] is called - the standard shape for a
-/// QIDO list response (multiple objects share one root, per PS3.19 A.1).
+/// One call opens ONE document for ONE data set. PS3.19 A.1.1 defines one
+/// `NativeDicomModel` root as one DICOM Data Set with unique tags
+/// (`standard/ps3.18/qido-xml-response.json` `nativeModelOneDataset`), and
+/// every `<DicomAttribute>` written afterwards is a top-level sibling under
+/// this root until [`write_xml_doc_end`] is called.
+///
+/// A QIDO LIST response is NOT this shape. PS3.18 10.6.3.3 answers
+/// `multipart/related; type="application/dicom+xml"` with one such document
+/// per matching object (`qidoXmlResponse`); the server assembles those parts
+/// (`clarus/src/handlers/qido_pure.rs`), not this helper.
 pub fn write_xml_doc_start(out: &mut Vec<u8>) {
     out.extend_from_slice(br#"<?xml version="1.0" encoding="UTF-8"?>"#);
     out.extend_from_slice(b"\n<NativeDicomModel xmlns=\"");
@@ -504,10 +534,18 @@ pub fn write_xml_doc_end(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\n</NativeDicomModel>\n");
 }
 
-fn copy_slice(buf: &mut [u8], src: &[u8], start: usize) -> usize {
-    let n = src.len().min(buf.len() - start);
-    buf[start..start + n].copy_from_slice(&src[..n]);
-    start + n
+/// Append `src` to `buf` at `start`, or refuse.
+///
+/// A URL is an identity, not a string to be trimmed: a truncated
+/// `RetrieveURL` still parses as a URL and points at a DIFFERENT resource, so
+/// the client retrieves the wrong object (or a 404) with no signal that
+/// anything went wrong. Overflow is reported instead, and the caller fails the
+/// response.
+fn copy_slice(buf: &mut [u8], src: &[u8], start: usize) -> Option<usize> {
+    let end = start.checked_add(src.len())?;
+    let dst = buf.get_mut(start..end)?;
+    dst.copy_from_slice(src);
+    Some(end)
 }
 
 /// Emit the QIDO "C" attribute `InstanceAvailability` (0008,0056, CS "ONLINE")
@@ -551,11 +589,14 @@ fn emit_xml_ur(
     uid: Option<&str>,
 ) -> Result<(), StreamOverflow> {
     if let (Some(base), Some(uid)) = (retrieve_base, uid) {
-        let mut url = [0u8; 320];
-        let mut n = 0;
-        n = copy_slice(&mut url, base.as_bytes(), n);
-        n = copy_slice(&mut url, path.as_bytes(), n);
-        n = copy_slice(&mut url, uid.as_bytes(), n);
+        // 320 bytes covers a 256-byte Host/scheme base plus a path and a
+        // 64-character UID (PS3.5 Section 9.1). A base longer than the
+        // QIDO header allows would overflow, and is refused rather than cut.
+        let mut url = [0u8; crate::query::json::MAX_URL_LEN];
+        let mut n = 0usize;
+        n = copy_slice(&mut url, base.as_bytes(), n).ok_or(StreamOverflow)?;
+        n = copy_slice(&mut url, path.as_bytes(), n).ok_or(StreamOverflow)?;
+        n = copy_slice(&mut url, uid.as_bytes(), n).ok_or(StreamOverflow)?;
         let s = std::str::from_utf8(&url[..n]).expect("URL is ASCII");
         write_attr_elem(out, 0x0008_1190, &AttrValue::Text(s.to_string()), "UR")?;
     }
@@ -847,6 +888,34 @@ pub fn write_series_attrs(
             "IS",
         )?;
     }
+    // (0040,0009) ScheduledProcedureStepID - SH, the scalar read out of
+    // RequestAttributesSequence (0040,0275) and stored under its own tag.
+    if let Some(s) = series_text(
+        &series.attrs,
+        crate::query::tag::SCHEDULED_PROCEDURE_STEP_ID,
+    ) && tag_pass(&filt, 0x0040_0009)
+    {
+        write_attr_elem(&mut out, 0x0040_0009, &AttrValue::Text(s.to_string()), "SH")?;
+    }
+    // (0040,0244) PerformedProcedureStepStartDate - DA, canonical 8-digit.
+    if let Some(d) = series_attr(&series.attrs, crate::query::tag::PPS_START_DATE)
+        && tag_pass(&filt, 0x0040_0244)
+    {
+        write_attr_elem(&mut out, 0x0040_0244, d, "DA")?;
+    }
+    // (0040,0245) PerformedProcedureStepStartTime - TM.
+    if let Some(s) = series_text(&series.attrs, crate::query::tag::PPS_START_TIME)
+        && tag_pass(&filt, 0x0040_0245)
+    {
+        write_attr_elem(&mut out, 0x0040_0245, &AttrValue::Text(s.to_string()), "TM")?;
+    }
+    // (0040,1001) RequestedProcedureID - SH, the second scalar of the same
+    // sequence.
+    if let Some(s) = series_text(&series.attrs, crate::query::tag::REQUESTED_PROCEDURE_ID)
+        && tag_pass(&filt, 0x0040_1001)
+    {
+        write_attr_elem(&mut out, 0x0040_1001, &AttrValue::Text(s.to_string()), "SH")?;
+    }
 
     Ok(out.len)
 }
@@ -889,15 +958,21 @@ pub fn write_instance_attrs(
     ) && !study_uid.is_empty()
         && !series_uid.is_empty()
     {
-        let mut url = [0u8; 320];
-        let mut n = 0;
-        n = copy_slice(&mut url, base.as_bytes(), n);
-        n = copy_slice(&mut url, b"/dicomweb/studies/", n);
-        n = copy_slice(&mut url, study_uid.as_bytes(), n);
-        n = copy_slice(&mut url, b"/series/", n);
-        n = copy_slice(&mut url, series_uid.as_bytes(), n);
-        n = copy_slice(&mut url, b"/instances/", n);
-        n = copy_slice(&mut url, sop.as_bytes(), n);
+        let mut url = [0u8; crate::query::json::MAX_URL_LEN];
+        let mut n = 0usize;
+        // Every segment is checked: an oversize URL is refused, never cut. A
+        // truncated URL still parses and names a different instance.
+        for part in [
+            base.as_bytes(),
+            b"/dicomweb/studies/" as &[u8],
+            study_uid.as_bytes(),
+            b"/series/",
+            series_uid.as_bytes(),
+            b"/instances/",
+            sop.as_bytes(),
+        ] {
+            n = copy_slice(&mut url, part, n).ok_or(StreamOverflow)?;
+        }
         let s = std::str::from_utf8(&url[..n]).expect("URL is ASCII");
         write_attr_elem(&mut out, 0x0008_1190, &AttrValue::Text(s.to_string()), "UR")?;
     }
@@ -942,6 +1017,54 @@ mod tests {
         }
     }
 
+    /// The four PPS/Request scalars are emitted by the XML mirror too, with
+    /// the same canonical DA/TM rendering and the same gating as JSON
+    /// (matching keys, not baseline). JSON/XML parity is the acceptance.
+    #[test]
+    fn series_xml_emits_captured_pps_request_scalars_and_matches_json() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![
+                (0x0020_000E, AttrValue::Text("1.2.840.1.2".into())),
+                (0x0040_0009, AttrValue::Text("SPID-1".into())),
+                (0x0040_0244, AttrValue::UInt(20260802)),
+                (0x0040_0245, AttrValue::Text("083000".into())),
+                (0x0040_1001, AttrValue::Text("RPID-1".into())),
+            ],
+            instances: Vec::new(),
+        };
+
+        // 1. Not named -> omitted (matching keys are not baseline).
+        let mut out = [0u8; 1024];
+        let n = write_series_attrs(&mut out, &series, Some("0008103E"), None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(!got.contains("00400009"), "not named -> omitted: {got}");
+        assert!(!got.contains("00400244"), "not named -> omitted: {got}");
+        assert!(!got.contains("00400245"), "not named -> omitted: {got}");
+        assert!(!got.contains("00401001"), "not named -> omitted: {got}");
+
+        // 2. includefield=all emits all four with canonical DA/TM rendering.
+        let n2 = write_series_attrs(&mut out, &series, Some("all"), None, None).expect("fits");
+        let got2 = String::from_utf8(out[..n2].to_vec()).unwrap();
+        assert!(got2.contains("tag=\"00400009\" vr=\"SH\""));
+        assert!(got2.contains("<Value number=\"1\">SPID-1</Value>"));
+        assert!(got2.contains("tag=\"00400244\" vr=\"DA\""));
+        assert!(got2.contains("<Value number=\"1\">20260802</Value>"));
+        assert!(got2.contains("tag=\"00400245\" vr=\"TM\""));
+        assert!(got2.contains("<Value number=\"1\">083000</Value>"));
+        assert!(got2.contains("tag=\"00401001\" vr=\"SH\""));
+        assert!(got2.contains("<Value number=\"1\">RPID-1</Value>"));
+
+        // 3. Parity with the JSON mirror: same four tags, same values.
+        let mut jbuf = [0u8; 1024];
+        let jn = crate::query::json::write_series_json(&mut jbuf, &series, Some("all"), None, None)
+            .expect("fits");
+        let jgot = String::from_utf8(jbuf[..jn].to_vec()).unwrap();
+        assert!(jgot.contains("\"20260802\""), "json DA parity: {jgot}");
+        assert!(jgot.contains("\"083000\""), "json TM parity: {jgot}");
+        assert!(jgot.contains("\"SPID-1\""), "json SPS ID parity: {jgot}");
+        assert!(jgot.contains("\"RPID-1\""), "json RPID parity: {jgot}");
+    }
+
     #[test]
     fn study_attrs_render_dicomattribute() {
         let s = study(vec![
@@ -959,8 +1082,26 @@ mod tests {
         assert!(got.contains("vr=\"CS\""));
         // PN is decomposed.
         assert!(got.contains(
-            "<PersonName><Alphabetic><FamilyName>ivanov</FamilyName><GivenName>ivan</GivenName></Alphabetic></PersonName>"
+            "<PersonName number=\"1\"><Alphabetic><FamilyName>ivanov</FamilyName><GivenName>ivan</GivenName></Alphabetic></PersonName>"
         ));
+    }
+
+    /// PS3.19 Table 10.2-1 names the prefix/suffix components NamePrefix and
+    /// NameSuffix; `<Prefix>`/`<Suffix>` are not schema elements, so a
+    /// validating reader rejects them. Revert the rename and this test reds.
+    #[test]
+    fn person_name_prefix_suffix_use_schema_element_names() {
+        let mut buf = [0u8; 256];
+        let n = {
+            let mut out = Sink::new(&mut buf);
+            write_person_name(&mut out, "Smith^John^^Dr^Jr").expect("fits");
+            out.len
+        };
+        let got = String::from_utf8(buf[..n].to_vec()).unwrap();
+        assert!(got.contains("<NamePrefix>Dr</NamePrefix>"), "{got}");
+        assert!(got.contains("<NameSuffix>Jr</NameSuffix>"), "{got}");
+        assert!(!got.contains("<Prefix>"), "{got}");
+        assert!(!got.contains("<Suffix>"), "{got}");
     }
 
     #[test]
@@ -1056,6 +1197,25 @@ mod tests {
         let mut b = [0u8; 6];
         assert_eq!(push_hms6(&mut b, 1_000_000), Err(UnrepresentableDate));
         assert_eq!(&b, b"\0\0\0\0\0\0");
+    }
+
+    /// XML-1.0-forbidden C0 controls are DROPPED, not replaced, so the output
+    /// stays well-formed without fabricating a U+FFFD glyph.
+    ///
+    /// ESC (0x1B) and NUL (0x00) have no XML 1.0 representation; a character
+    /// reference to them is also invalid (standard/ps3.5/xml-control-characters.json).
+    #[test]
+    fn xml_forbidden_c0_controls_are_dropped() {
+        let mut buf = [0u8; 64];
+        let n = {
+            let mut out = Sink::new(&mut buf);
+            esc_into(&mut out, "a\u{1b}\u{0}b\tc").expect("fits");
+            out.len
+        };
+        let got = &buf[..n];
+        assert_eq!(got, b"ab\tc", "ESC/NUL dropped, TAB kept");
+        assert!(!got.contains(&0x1b), "no ESC in output");
+        assert!(!got.contains(&0x00), "no NUL in output");
     }
 
     /// The caller must not emit a DA it could not render: a silent skip is
@@ -1229,7 +1389,7 @@ mod tests {
         // back-to-back; non-DICOM keys dropped.
         assert_eq!(
             &buf[..n],
-            b"<DicomAttribute tag=\"00080005\" vr=\"CS\" keyword=\"\"><Value number=\"1\">ISO_IR 192</Value></DicomAttribute><DicomAttribute tag=\"00100010\" vr=\"PN\" keyword=\"\"><PersonName><Alphabetic><FamilyName>SMIRNOV</FamilyName><GivenName>IVAN</GivenName></Alphabetic></PersonName></DicomAttribute><DicomAttribute tag=\"00100020\" vr=\"LO\" keyword=\"\"><Value number=\"1\">PT-UID-9</Value></DicomAttribute>"
+            b"<DicomAttribute tag=\"00080005\" vr=\"CS\" keyword=\"\"><Value number=\"1\">ISO_IR 192</Value></DicomAttribute><DicomAttribute tag=\"00100010\" vr=\"PN\" keyword=\"\"><PersonName number=\"1\"><Alphabetic><FamilyName>SMIRNOV</FamilyName><GivenName>IVAN</GivenName></Alphabetic></PersonName></DicomAttribute><DicomAttribute tag=\"00100020\" vr=\"LO\" keyword=\"\"><Value number=\"1\">PT-UID-9</Value></DicomAttribute>"
         );
     }
 

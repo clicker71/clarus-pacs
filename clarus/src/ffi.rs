@@ -15,9 +15,67 @@
 
 #![allow(unsafe_code)]
 
+use crate::state::AppState;
+use clarus_core::manifest::{Manifest, ManifestReadError};
 use std::path::Path;
 
 const MB: f64 = 1024.0 * 1024.0;
+
+impl AppState {
+    /// Read a study manifest from the configured manifest directory.
+    ///
+    /// The configured `btree.manifest_dir` is process-private and written only
+    /// by `stow/manifest.rs` via `<study>.manifest.tmp` + rename; no manifest
+    /// there is ever rewritten or truncated in place. That is exactly the
+    /// immutability invariant [`clarus_core::manifest::read_manifest`]
+    /// requires, so this is the ONE audited place the server vouches for it.
+    /// A reader of any path it does not vouch for must use
+    /// [`clarus_core::manifest::read_manifest_copy`] instead.
+    ///
+    /// Returns `None` when `study_uid` could not be a published manifest name
+    /// (a separator, an absolute path, empty, or a dotfile); otherwise the
+    /// read result.
+    pub fn read_server_manifest(
+        &self,
+        study_uid: &str,
+    ) -> Option<Result<Manifest, ManifestReadError>> {
+        let published = clarus_core::manifest::PublishedManifest::new(
+            std::path::Path::new(&self.config.btree.manifest_dir),
+            study_uid,
+        )?;
+        // The configured manifest dir is written only by `stow/manifest.rs`
+        // (tmp file + rename) and is never rewritten or truncated in place
+        // while a mapping is alive, so the publication invariant holds for any
+        // manifest in it. `PublishedManifest` additionally rejects any UID
+        // that could escape the directory.
+        Some(clarus_core::manifest::read_manifest(
+            &self.trusted_manifest_dir(),
+            &published,
+        ))
+    }
+
+    /// A [`clarus_core::manifest::TrustedManifestDir`] for the configured
+    /// `btree.manifest_dir`.
+    ///
+    /// The configured dir is process-private and written only by
+    /// `stow/manifest.rs` via `<study>.manifest.tmp` + rename; no manifest
+    /// there is ever rewritten or truncated in place. That is exactly the
+    /// immutability invariant the trusted-dir type carries, so this is the ONE
+    /// audited place the server builds one. The cache entry point
+    /// (`manifest_cache::get_or_load`) accepts only that type, so a caller
+    /// holding a raw path cannot route it into the mmap readers.
+    pub fn trusted_manifest_dir(&self) -> clarus_core::manifest::TrustedManifestDir {
+        // SAFETY: the configured manifest dir is written only by
+        // `stow/manifest.rs` (tmp file + rename) and is never rewritten or
+        // truncated in place while a mapping is alive, so the publication
+        // invariant holds for any manifest in it.
+        unsafe {
+            clarus_core::manifest::TrustedManifestDir::new_unchecked(Path::new(
+                &self.config.btree.manifest_dir,
+            ))
+        }
+    }
+}
 
 /// Whether a pid names a live process.
 ///

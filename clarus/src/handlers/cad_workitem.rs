@@ -348,6 +348,10 @@ pub fn build_record_for_entry(
         // projection and no performer report, so both opaque fields are None.
         input_information: None,
         performed_procedure_information: None,
+        // A newly minted workitem has never been written over, so the
+        // concurrency counter starts at 0 - the value `cas_update` treats as
+        // "this caller read nothing yet".
+        revision: 0,
     }
 }
 
@@ -479,7 +483,7 @@ pub fn regress_readiness_on_new_instances(
     // `None` for the expected transaction UID, the same shape `promote` uses:
     // this is a readiness revision, not a state transition, and the workitem
     // is still SCHEDULED, which is what no-performer-held means.
-    if let Err(error) = store.cas_update(&record, None) {
+    if let Err(error) = store.cas_update(&record, None, None) {
         crate::clog_warn!(
             workitem_uid = %workitem_uid,
             error = %error,

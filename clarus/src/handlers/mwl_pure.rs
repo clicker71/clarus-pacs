@@ -676,7 +676,13 @@ fn write_person_name_components(raw: &str, out: &mut String) {
         out.push_str(group_name);
         out.push('>');
         let mut parts = group.split('^');
-        for name in ["FamilyName", "GivenName", "MiddleName", "Prefix", "Suffix"] {
+        for name in [
+            "FamilyName",
+            "GivenName",
+            "MiddleName",
+            "NamePrefix",
+            "NameSuffix",
+        ] {
             let Some(part) = parts.next().filter(|p| !p.is_empty()) else {
                 continue;
             };
@@ -985,12 +991,16 @@ mod tests {
     #[test]
     fn a_person_name_is_split_into_component_groups() {
         let mut rec = record("CT01", "P1");
-        rec.patient_name = "IVANOV^IVAN^PETROVICH=ИВАНОВ^ИВАН".to_string();
+        rec.patient_name = "IVANOV^IVAN^PETROVICH^DR^JR=ИВАНОВ^ИВАН".to_string();
         let xml = sps_to_xml(&[rec]);
         assert!(
-            xml.contains("<PersonName number=\"1\"><Alphabetic><FamilyName>IVANOV</FamilyName><GivenName>IVAN</GivenName><MiddleName>PETROVICH</MiddleName></Alphabetic>"),
+            xml.contains("<PersonName number=\"1\"><Alphabetic><FamilyName>IVANOV</FamilyName><GivenName>IVAN</GivenName><MiddleName>PETROVICH</MiddleName><NamePrefix>DR</NamePrefix><NameSuffix>JR</NameSuffix></Alphabetic>"),
             "the alphabetic group carries its components: {xml}"
         );
+        // PS3.19 Table 10.2-1 names the prefix/suffix components NamePrefix/
+        // NameSuffix; a bare <Prefix>/<Suffix> is not a schema element.
+        assert!(!xml.contains("<Prefix>"), "{xml}");
+        assert!(!xml.contains("<Suffix>"), "{xml}");
         assert!(
             xml.contains("<Ideographic><FamilyName>ИВАНОВ</FamilyName>"),
             "the ideographic group is not dropped: {xml}"

@@ -17,8 +17,8 @@ use clarus_ports::StorageTier;
 
 use super::wado::error::WadoError;
 use super::wado::helpers::{
-    attr_text, attr_text_from, cas_hex_key, find_instance, inject_bulk_data_uris_native,
-    load_manifest, tier_from_u8,
+    attr_frames, attr_list, attr_text, attr_text_from, cas_hex_key, find_instance,
+    inject_bulk_data_uris_native, load_manifest, tier_from_u8,
 };
 use super::wado::types::{WadoQueryParams, extract_transfer_syntax_from_accept_str};
 use super::wado::validate_dicom_uid;
@@ -83,7 +83,7 @@ pub fn locate_object(
     validate_dicom_uid(sop_uid).inspect_err(|_| {
         crate::clog_warn!(sop_uid, "Invalid instance UID in WADO request");
     })?;
-    let manifest = load_manifest(&state.study_scanner.manifests_dir, study_uid)?;
+    let manifest = load_manifest(&state.trusted_manifest_dir(), study_uid)?;
     let expected = series_uid.and_then(|suid| {
         manifest
             .series
@@ -216,7 +216,11 @@ impl FramePixelModule {
 /// ENCAPSULATED PixelData (undefined length, empty Basic Offset Table, one
 /// Item holding the fragment) - the shape `extract_codestream` expects, so
 /// the stored fragment is passed through byte for byte.
-fn evrle_single_frame_dataset(pixel_module: &FramePixelModule, fragment: &[u8]) -> Vec<u8> {
+fn evrle_single_frame_dataset(
+    pixel_module: &FramePixelModule,
+    fragment: &[u8],
+    stored_ts: &str,
+) -> Vec<u8> {
     /// Append one Explicit VR LE element.
     fn elem(buf: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], value: &[u8]) {
         buf.extend_from_slice(&group.to_le_bytes());
@@ -241,11 +245,11 @@ fn evrle_single_frame_dataset(pixel_module: &FramePixelModule, fragment: &[u8]) 
     let mut d = Vec::with_capacity(fragment.len() + 512);
     d.extend_from_slice(&[0u8; 128]);
     d.extend_from_slice(b"DICM");
-    // Meta group: only the transfer syntax matters to the decoder, but the
-    // stored fragment arrives as Encapsulated PixelData under the SOURCE
-    // syntax, so the meta must name that same syntax for `extract_codestream`
-    // to take the item path.
-    elem(&mut d, 0x0002, 0x0010, b"UI", b"1.2.840.10008.1.2.1");
+    // Meta group: (0002,0010) is Type 1 and names the syntax of the following
+    // Data Set (PS3.10 7.1 Table 7.1-1). The fragment arrives as Encapsulated
+    // PixelData under the SOURCE syntax, so the meta must name that same
+    // syntax for `extract_codestream` to take the item path - not the target.
+    elem(&mut d, 0x0002, 0x0010, b"UI", stored_ts.as_bytes());
     // Pixel module (PS3.3 C.7.6.3): the tags the decoder reads.
     elem(
         &mut d,
@@ -283,7 +287,17 @@ fn evrle_single_frame_dataset(pixel_module: &FramePixelModule, fragment: &[u8]) 
         b"US",
         &pixel_module.bits_allocated.to_le_bytes(),
     );
-    elem(&mut d, 0x0028, 0x0102, b"US", &7u16.to_le_bytes());
+    // HighBit must be bits_allocated - 1 (PS3.3 C.7.6.3:
+    // bits_allocated >= highBit+1 >= bitsStored). A 12-in-16 source decodes
+    // into 16-bit samples but only 12 are meaningful, so HighBit is 11, not
+    // the constant 7 that only fits an 8-bit source.
+    elem(
+        &mut d,
+        0x0028,
+        0x0102,
+        b"US",
+        &pixel_module.bits_allocated.saturating_sub(1).to_le_bytes(),
+    );
     elem(&mut d, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
     // Encapsulated PixelData: undefined length, empty BOT, one Item.
     d.extend_from_slice(&0x7FE0u16.to_le_bytes());
@@ -343,7 +357,7 @@ pub fn transcode_frame_to_evrle(
     // one comparison.
     pixel_module.check_budget(max_megapixels)?;
 
-    let dataset = evrle_single_frame_dataset(pixel_module, fragment);
+    let dataset = evrle_single_frame_dataset(pixel_module, fragment, stored_ts);
     match codec.decode(&dataset) {
         Ok(pixels) => Ok(Some(pixels.data)),
         Err(clarus_adapters::codec::CodecError::NonConformantCodestream(reason)) => {
@@ -399,6 +413,32 @@ pub fn maybe_transcode(
                     "Cannot re-encode this Implicit VR instance as Explicit VR: {e}"
                 ))
             })?;
+        return Ok((
+            out,
+            clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE.to_string(),
+        ));
+    }
+    // The same rule bans Explicit VR Big Endian in the same sentence (PS3.18
+    // 8.7.3), so an EVRBE source is re-encoded to Explicit VR LE as well. It
+    // goes through the DATASET re-encoder rather than the pixel pipeline
+    // below: a BE source's Rows/Columns would be read little-endian by the
+    // budget check and silently mis-sized, and a non-image object has no
+    // pixels to decode at all. Placed before the registry check for the same
+    // reason as the Implicit VR branch - no codec is involved.
+    if stored_ts == clarus_adapters::codec::ts_uid::EXPLICIT_VR_BE
+        && target_ts == clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE
+    {
+        let out = clarus_adapters::transcode::reencode_explicit_be_to_explicit_le(&bytes).map_err(
+            |e| {
+                crate::clog_warn!(
+                    error = %e,
+                    "Re-encoding an Explicit VR Big Endian instance to Little Endian failed - 406"
+                );
+                WadoError::NotAcceptable(format!(
+                    "Cannot re-encode this Explicit VR Big Endian instance as Little Endian: {e}"
+                ))
+            },
+        )?;
         return Ok((
             out,
             clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE.to_string(),
@@ -653,6 +693,11 @@ pub fn render_thumbnail_from_bytes(
             "thumbnail requires transcode".to_string(),
         ));
     }
+    // A BE source's 16-bit headers are big-endian while everything below reads
+    // them little-endian, and the geometry also drives the byte stride, so a
+    // swapped axis would both mis-render and mis-slice. Convert first.
+    let normalised = normalise_big_endian_for_render(bytes)?;
+    let bytes: &[u8] = &normalised;
 
     let pixel_data = parser
         .extract_tag_value(bytes, (0x7FE0, 0x0010))
@@ -1374,6 +1419,39 @@ pub fn render_thumbnail_from_bytes_any(
     render_thumbnail_compressed(bytes, sop_uid, target, registry)
 }
 
+/// Thumbnail of one instance at a given frame - the representative-instance
+/// preview used by the series and study routes.
+///
+/// Frame 1 is the whole-instance path unchanged: a single-frame instance, or
+/// one whose frame count the manifest does not know, renders exactly as
+/// before. Any other frame goes through the frame renderer, which already
+/// handles both uncompressed and compressed sources and enforces the
+/// `[1, NumberOfFrames]` bound (PS3.18 10.4.3.1 Table 10.4.3-1).
+#[allow(clippy::too_many_arguments)]
+pub fn render_representative_thumbnail_any(
+    bytes: &[u8],
+    sop_uid: &str,
+    frame: u32,
+    target: (u32, u32),
+    registry: &clarus_adapters::codec::CodecRegistry,
+    pool: &crate::state::TranscodePool,
+    max_megapixels: u32,
+) -> Result<WadoResp, WadoError> {
+    if frame > 1 {
+        let frame = frame.to_string();
+        return render_frame_thumbnail_any(
+            bytes,
+            sop_uid,
+            &frame,
+            target,
+            registry,
+            pool,
+            max_megapixels,
+        );
+    }
+    render_thumbnail_from_bytes_any(bytes, sop_uid, target, registry, pool, max_megapixels)
+}
+
 /// Compressed whole-instance thumbnail. Mirror of `render_full_compressed` up
 /// to the render step: TS -> codec -> decode -> validate -> colour (SPP != 1)
 /// -> 406; then the decoded mono plane is handed to the existing
@@ -1489,6 +1567,123 @@ pub fn render_frame_thumbnail_any(
         return Err(WadoError::Busy);
     };
     render_frame_thumbnail_compressed(bytes, sop_uid, frame, target, registry)
+}
+
+/// The frame-level `/rendered` media format. Mirrors the instance `/rendered`
+/// Accept decision (PS3.18 8.7.4): JPEG (default / grayscale), PNG (RGB +
+/// grayscale), GIF (grayscale). JPEG is the only format a compressed source
+/// can be served as (PNG/GIF decode is not wired, same as the instance route).
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum FrameRenderFormat {
+    Jpeg,
+    Png,
+    Gif,
+}
+
+/// Frame-level Rendered Resource (PS3.18 10.4.1.2): render ONE frame at the
+/// requested `target` (native when the caller passes `(cols, rows)`).
+///
+/// JPEG reuses the any-TS frame-thumbnail renderer at the caller's target, so
+/// a native-size JPEG of one frame of a compressed multi-frame instance works
+/// exactly like the thumbnail - no new decode path. PNG/GIF render the RAW
+/// (uncompressed) frame through the shared Gray8/RGB encoders; a compressed
+/// source asked for PNG/GIF -> 406 (the decode to those formats is not wired,
+/// same as instance `/rendered`). Out-of-range frame -> 404 via the same
+/// extractor the `/frames/{n}` route uses.
+// 8 args: the codec context (registry + pool + max_megapixels) travels with
+// the JPEG arm exactly as `render_frame_thumbnail_any`; grouping them into a
+// struct would churn the shared render pipeline for no gain.
+#[allow(clippy::too_many_arguments)]
+pub fn render_frame_rendered_any(
+    bytes: &[u8],
+    sop_uid: &str,
+    frame: &str,
+    format: FrameRenderFormat,
+    target: (u32, u32),
+    registry: &clarus_adapters::codec::CodecRegistry,
+    pool: &crate::state::TranscodePool,
+    max_megapixels: u32,
+) -> Result<WadoResp, WadoError> {
+    if format == FrameRenderFormat::Jpeg {
+        return render_frame_thumbnail_any(
+            bytes,
+            sop_uid,
+            frame,
+            target,
+            registry,
+            pool,
+            max_megapixels,
+        );
+    }
+    if is_compressed_transfer_syntax(bytes)? {
+        return Err(WadoError::NotAcceptable(
+            "rendered PNG/GIF from compressed not wired".to_string(),
+        ));
+    }
+
+    // One frame's raw bytes via the same extractor the /frames/{n} route uses.
+    let frame_resp = extract_frame(bytes, frame)?;
+    let frame_bytes = frame_resp.body;
+
+    use clarus_adapters::dicom_rs::DicomRsParser;
+    let parser = DicomRsParser;
+    let rows = extract_u16(bytes, (0x0028, 0x0010))
+        .ok_or_else(|| WadoError::Internal("Missing Rows (0028,0010)".into()))?
+        as u32;
+    let cols = extract_u16(bytes, (0x0028, 0x0011))
+        .ok_or_else(|| WadoError::Internal("Missing Columns (0028,0011)".into()))?
+        as u32;
+    let bits_allocated = extract_u16(bytes, (0x0028, 0x0100))
+        .ok_or_else(|| WadoError::Internal("Missing BitsAllocated (0028,0100)".into()))?
+        as u32;
+    let pixel_rep = extract_u16(bytes, (0x0028, 0x0103)).unwrap_or(0);
+    let spp = extract_u16(bytes, (0x0028, 0x0002)).unwrap_or(1);
+    let photometric = parser
+        .extract_tag_value(bytes, (0x0028, 0x0004))
+        .ok()
+        .flatten()
+        .map(|v| String::from_utf8_lossy(&v).trim_matches(' ').to_string());
+    let invert = photometric.as_deref() == Some("MONOCHROME1");
+
+    if rows == 0 || cols == 0 {
+        return Err(WadoError::Internal(format!(
+            "Invalid dimensions: {rows}x{cols}"
+        )));
+    }
+
+    if spp == 3 {
+        // RGB is PNG-only (the handler already refused JPEG/GIF over RGB, but
+        // this keeps the pure renderer self-contained).
+        if format == FrameRenderFormat::Gif {
+            return Err(WadoError::NotAcceptable(
+                "rendered RGB requires Accept: image/png".to_string(),
+            ));
+        }
+        return render_rgb_png(
+            &frame_bytes,
+            RgbGeometry {
+                rows,
+                cols,
+                bits_allocated,
+            },
+            target,
+        );
+    }
+
+    let geom = RawGeometry {
+        rows,
+        cols,
+        bits_allocated,
+        pixel_rep,
+        invert,
+    };
+    match format {
+        FrameRenderFormat::Png => render_gray_png(&frame_bytes, geom, bytes, target),
+        FrameRenderFormat::Gif => render_gray_gif(&frame_bytes, geom, bytes, target),
+        // JPEG was handled above; `render_pixels_thumbnail` needs the same
+        // geometry but that arm never reaches here.
+        FrameRenderFormat::Jpeg => unreachable!("JPEG handled by render_frame_thumbnail_any"),
+    }
 }
 
 /// Compressed single-frame thumbnail: the compressed counterpart of
@@ -1656,6 +1851,10 @@ fn render_full_impl(
     if is_compressed_transfer_syntax(bytes)? {
         return render_full_compressed(bytes, sop_uid, registry);
     }
+    // Same reason as the thumbnail path: the header readers below are
+    // little-endian, so an Explicit VR Big Endian instance is converted first.
+    let normalised = normalise_big_endian_for_render(bytes)?;
+    let bytes: &[u8] = &normalised;
     let parser = DicomRsParser;
     let pixel_data = parser
         .extract_tag_value(bytes, (0x7FE0, 0x0010))
@@ -2200,6 +2399,41 @@ fn extract_u16(data: &[u8], tag: (u16, u16)) -> Option<u16> {
     }
 }
 
+/// Normalise an Explicit VR Big Endian instance to Explicit VR LE for a render.
+///
+/// The raw render paths read the 16-bit geometry with [`extract_u16`], which is
+/// little-endian by construction, so a BE source's `SamplesPerPixel 0x0001`
+/// arrives as `0x0100 = 256` and the render is refused; the thumbnail path does
+/// not check that field and would render a garbage image instead. Both paths
+/// therefore convert first, through the same dataset re-encoder
+/// [`maybe_transcode`] uses for a BE retrieve.
+///
+/// Pixel bytes are endian-agnostic in this case: 8-bit samples have no byte
+/// order, and a 16-bit sample's order is described by the dataset that the
+/// re-encoder rewrites. Returns the input unchanged for every other syntax.
+///
+/// # Errors
+/// `NotAcceptable` when a BE instance cannot be re-encoded, which is the same
+/// answer the transfer path gives for that file.
+fn normalise_big_endian_for_render(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, WadoError> {
+    let ts = clarus_adapters::dicom_rs::DicomRsParser.transfer_syntax_uid(bytes);
+    let is_be = matches!(ts.as_deref(), Some(t) if t.trim() == clarus_adapters::codec::ts_uid::EXPLICIT_VR_BE);
+    if !is_be {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    let out =
+        clarus_adapters::transcode::reencode_explicit_be_to_explicit_le(bytes).map_err(|e| {
+            crate::clog_warn!(
+                error = %e,
+                "Re-encoding an Explicit VR Big Endian instance for render failed - 406"
+            );
+            WadoError::NotAcceptable(format!(
+                "Cannot re-encode this Explicit VR Big Endian instance for rendering: {e}"
+            ))
+        })?;
+    Ok(std::borrow::Cow::Owned(out))
+}
+
 // -- Multipart/related planning ------------------------------------------
 
 /// How a multipart part is served: streamed as-is from CAS or transcoded
@@ -2247,6 +2481,13 @@ pub struct PartPlan {
     /// Emit a `Content-Location` header for this part (series- and
     /// study-level multipart).
     pub with_content_location: bool,
+    /// ImageType (0008,0008) values in file order. Used by
+    /// [`representative_plan`] to skip a LOCALIZER when choosing the instance
+    /// a study/series thumbnail previews.
+    pub image_type: Vec<String>,
+    /// NumberOfFrames (0028,0008); `None` for a single-frame instance. Used by
+    /// [`representative_plan`] to pick the middle frame of a volume.
+    pub number_of_frames: Option<u32>,
 }
 
 /// Resolve the transfer syntax to serve, mirroring `resolve_transfer_syntax`
@@ -2291,7 +2532,12 @@ pub fn resolve_part_kind(
     // PS3.18 8.7.3, before anything else: an Implicit VR LE source is served as
     // Explicit VR LE. The comparison is on the constant, and the target is the
     // constant too - a hardcoded UID here is how one spelling drifts.
-    if source_ts == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE {
+    //
+    // Explicit VR Big Endian is named in the SAME sentence, so it takes the
+    // same decision: re-encode to Explicit VR LE rather than stream as stored.
+    if source_ts == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE
+        || source_ts == clarus_adapters::codec::ts_uid::EXPLICIT_VR_BE
+    {
         return PartKind::TranscodeTo(clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE.to_string());
     }
     let Some(target_ts) = target_ts else {
@@ -2321,6 +2567,50 @@ pub fn resolve_part_kind(
 /// point of a sequester is that the instance disappears from EVERY retrieve,
 /// and a study-level pull is the route the DIMSE bridge uses for C-MOVE, so
 /// leaving it unfiltered leaked hidden images to ordinary AE clients.
+/// ImageType (0008,0008) of an instance as owned values.
+///
+/// `PartPlan` owns its data (it outlives the manifest borrow), so the borrowed
+/// view from `attr_list` is copied here rather than threaded through.
+fn image_type_of(inst: &clarus_core::manifest::InstanceRecord) -> Vec<String> {
+    attr_list(inst, clarus_core::query::tag::IMAGE_TYPE)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Position of the representative instance in a plan list, and the frame to
+/// render from it.
+///
+/// The first plan is what every thumbnail route served before, but it is a
+/// poor representative in two ordinary cases:
+///
+/// - a series often opens with a LOCALIZER (a scout projection), so the first
+///   instance looks nothing like the series it is previewing. `ImageType`
+///   (0008,0008) value 3 states `LOCALIZER`; when EVERY series of a study is
+///   localizer-only the study preview still has to show something, so the
+///   fallback is the first plan again.
+/// - a multi-frame instance (e.g. a CT volume) puts frame 1 at one end of the
+///   acquisition. The middle frame is a fairer preview.
+///
+/// Returns `(plan_index, frame_number)`. `frame_number` is 1-based, matching
+/// the `/frames/{n}` path segment (PS3.18 10.4.3.1 Table 10.4.3-1); it is
+/// always 1 for a single-frame or metadata-less instance, which is exactly
+/// what the routes served before.
+pub fn representative_plan(plans: &[PartPlan]) -> (usize, u32) {
+    let is_localizer = |p: &PartPlan| {
+        p.image_type
+            .iter()
+            .any(|v| v.trim().eq_ignore_ascii_case("LOCALIZER"))
+    };
+    let idx = plans.iter().position(|p| !is_localizer(p)).unwrap_or(0);
+    let n = plans[idx].number_of_frames.unwrap_or(1);
+    // Integer division only: a float or a rounding helper turns a frame count
+    // that is not exactly representable into an out-of-range index, and the
+    // frame segment is an integer by spec.
+    (idx, if n > 1 { n / 2 + 1 } else { 1 })
+}
+
+/// Plan the instances of a study as parts.
 pub fn plan_study_multipart(
     state: &crate::state::AppState,
     study_uid: &str,
@@ -2329,7 +2619,7 @@ pub fn plan_study_multipart(
     validate_dicom_uid(study_uid).inspect_err(|_| {
         crate::clog_warn!(study_uid, "Invalid study UID in WADO request");
     })?;
-    let manifest = load_manifest(&state.study_scanner.manifests_dir, study_uid)?;
+    let manifest = load_manifest(&state.trusted_manifest_dir(), study_uid)?;
     let mut plans = Vec::new();
     for series in &manifest.series {
         let series_uid =
@@ -2354,6 +2644,8 @@ pub fn plan_study_multipart(
                 kind: PartKind::StreamAsIs,
                 series_uid: series_uid.clone(),
                 with_content_location: true,
+                image_type: image_type_of(inst),
+                number_of_frames: attr_frames(inst),
             });
         }
     }
@@ -2383,7 +2675,7 @@ pub fn plan_series_multipart(
             crate::clog_warn!(label, uid, "Invalid UID in WADO series request");
         })?;
     }
-    let manifest = load_manifest(&state.study_scanner.manifests_dir, study_uid)?;
+    let manifest = load_manifest(&state.trusted_manifest_dir(), study_uid)?;
     let mut plans = Vec::new();
     for series in &manifest.series {
         let suid = attr_text_from(&series.attrs, clarus_core::query::tag::SERIES_INSTANCE_UID);
@@ -2408,6 +2700,8 @@ pub fn plan_series_multipart(
                 kind: PartKind::StreamAsIs,
                 series_uid: series_uid.to_string(),
                 with_content_location: true,
+                image_type: image_type_of(inst),
+                number_of_frames: attr_frames(inst),
             });
         }
     }
@@ -2419,8 +2713,7 @@ pub fn plan_series_multipart(
     Ok(plans)
 }
 
-/// First-part boundary header: `--BOUNDARY\r\n`.
-///
+/// First-part boundary header: `--BOUNDARY\r\n`.///
 /// Subsequent parts use `\r\n--BOUNDARY\r\n` (the leading `\r\n` is the
 /// trailer from the previous part, stripped by `StripTrailingCrlf`).
 pub fn part_boundary_header(boundary: &str, is_first: bool) -> String {
@@ -2446,6 +2739,99 @@ pub fn closing_delimiter(boundary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walk an Explicit VR LE element stream from `start` and return the value
+    /// slice of the first element with tag `(group, element)`. The synthesized
+    /// per-tile dataset is fixed-layout (meta group, pixel module, PixelData),
+    /// so a hand-rolled walk is enough - no parser dependency for a test.
+    fn element_value_at(d: &[u8], start: usize, group: u16, element: u16) -> &[u8] {
+        let mut i = start;
+        while i + 8 <= d.len() {
+            let g = u16::from_le_bytes([d[i], d[i + 1]]);
+            let e = u16::from_le_bytes([d[i + 2], d[i + 3]]);
+            let vr = [d[i + 4], d[i + 5]];
+            let long_form = matches!(
+                &vr,
+                b"OB"
+                    | b"OD"
+                    | b"OF"
+                    | b"OL"
+                    | b"OV"
+                    | b"OW"
+                    | b"SQ"
+                    | b"UN"
+                    | b"UC"
+                    | b"UR"
+                    | b"UT"
+            );
+            let (len, val_start) = if long_form {
+                (
+                    u32::from_le_bytes([d[i + 6], d[i + 7], d[i + 8], d[i + 9]]) as usize,
+                    i + 12,
+                )
+            } else {
+                (u16::from_le_bytes([d[i + 6], d[i + 7]]) as usize, i + 8)
+            };
+            if g == group && e == element {
+                return &d[val_start..val_start + len];
+            }
+            i = val_start + len + (len & 1); // odd-length values are padded
+        }
+        panic!("tag ({group:04x},{element:04x}) not found in EVRLE stream");
+    }
+
+    /// HighBit must be bits_allocated - 1 (PS3.3 C.7.6.3:
+    /// bits_allocated >= highBit+1 >= bitsStored), not the constant 7. A
+    /// 16-bit source decodes into 16-bit samples, so HighBit is 15.
+    #[test]
+    fn evrle_dataset_highbit_is_bits_allocated_minus_one() {
+        let m16 = FramePixelModule {
+            rows: 2,
+            columns: 2,
+            bits_allocated: 16,
+            samples_per_pixel: 1,
+        };
+        let ds = evrle_single_frame_dataset(&m16, &[0u8; 4], "1.2.840.10008.1.2.4.50");
+        let v = element_value_at(&ds, 132, 0x0028, 0x0102);
+        assert_eq!(
+            u16::from_le_bytes([v[0], v[1]]),
+            15,
+            "HighBit must be bits_allocated - 1 for a 16-bit source"
+        );
+
+        let m8 = FramePixelModule {
+            rows: 2,
+            columns: 2,
+            bits_allocated: 8,
+            samples_per_pixel: 1,
+        };
+        let ds8 = evrle_single_frame_dataset(&m8, &[0u8; 4], "1.2.840.10008.1.2.4.50");
+        let v8 = element_value_at(&ds8, 132, 0x0028, 0x0102);
+        assert_eq!(
+            u16::from_le_bytes([v8[0], v8[1]]),
+            7,
+            "HighBit must be bits_allocated - 1 for an 8-bit source"
+        );
+    }
+
+    /// (0002,0010) names the syntax of the following Data Set (PS3.10 7.1
+    /// Table 7.1-1) - the SOURCE syntax the fragment is encapsulated under,
+    /// never a hardcoded target.
+    #[test]
+    fn evrle_dataset_names_the_stored_syntax() {
+        let m = FramePixelModule {
+            rows: 2,
+            columns: 2,
+            bits_allocated: 8,
+            samples_per_pixel: 1,
+        };
+        let ds = evrle_single_frame_dataset(&m, &[0u8; 4], "1.2.840.10008.1.2.4.70");
+        let v = element_value_at(&ds, 132, 0x0002, 0x0010);
+        assert_eq!(
+            v, b"1.2.840.10008.1.2.4.70",
+            "(0002,0010) must carry the stored syntax"
+        );
+    }
 
     /// A 1x1 thumbnail of a large bright image averages EVERY source pixel.
     /// With a 32-bit accumulator the sum over ~6.7e7 pixels of 255 wraps past
@@ -3061,6 +3447,292 @@ mod compressed_thumbnail_tests {
 mod full_render_tests {
     use super::*;
 
+    /// Append an Explicit VR Big Endian element (PS3.5 7.1): the group,
+    /// element and any 32-bit length are big-endian, and numeric values are
+    /// big-endian too.
+    ///
+    /// The pad byte follows the VR's character set: PS3.5 6.2 pads a text value
+    /// with a SPACE (except UI, which uses NULL), and a binary value with NULL.
+    /// Padding a CS with NULL produces a value outside the VR's defined
+    /// character repertoire, which is not a legal instance.
+    fn push_explicit_be(out: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], value: &[u8]) {
+        out.extend_from_slice(&group.to_be_bytes());
+        out.extend_from_slice(&element.to_be_bytes());
+        out.extend_from_slice(vr);
+        let extended = matches!(
+            vr,
+            b"OB" | b"OD" | b"OF" | b"OL" | b"OV" | b"OW" | b"SQ" | b"UC" | b"UN" | b"UR" | b"UT"
+        );
+        if extended {
+            out.extend_from_slice(&[0x00, 0x00]);
+            out.extend_from_slice(&(padded_len(value.len()) as u32).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(padded_len(value.len()) as u16).to_be_bytes());
+        }
+        out.extend_from_slice(value);
+        if !value.len().is_multiple_of(2) {
+            out.push(pad_byte_for_vr(vr));
+        }
+    }
+
+    /// The pad byte a text or binary value takes when its length is odd.
+    ///
+    /// PS3.5 6.2: text VRs are padded with a SPACE so the value stays inside the
+    /// VR's character repertoire; UI is the documented exception and uses NULL
+    /// because a trailing space would change the UID. Binary VRs pad with NULL.
+    fn pad_byte_for_vr(vr: &[u8; 2]) -> u8 {
+        match vr {
+            b"UI" => 0x00,
+            b"AE" | b"AS" | b"CS" | b"DA" | b"DS" | b"DT" | b"IS" | b"LO" | b"LT" | b"PN"
+            | b"SH" | b"ST" | b"TM" | b"UC" | b"UR" | b"UT" => 0x20,
+            _ => 0x00,
+        }
+    }
+
+    /// A DICOM value is even-length (PS3.5 6.2), so an odd value is padded and
+    /// the DECLARED length includes the pad.
+    ///
+    /// Declaring the unpadded length while writing the pad put the next element
+    /// one byte early for any reader that trusts the declared length - exactly
+    /// what a well-formed file never does, so the fixture has to match.
+    fn padded_len(n: usize) -> usize {
+        n + (n & 1)
+    }
+
+    /// Build an 8-bit MONOCHROME2 Explicit VR Big Endian instance, `side`
+    /// square. Only the 16-bit HEADERS differ from an EVRLE twin; the 8-bit
+    /// pixel bytes have no byte order.
+    fn build_evrbe(side: u16, pixel_byte: u8) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0u8; 128]);
+        b.extend_from_slice(b"DICM");
+        // The file meta group is ALWAYS Explicit VR Little Endian (PS3.10
+        // 7.1), whatever the dataset syntax is.
+        push_explicit(&mut b, 0x0002, 0x0010, b"UI", b"1.2.840.10008.1.2.2");
+        push_explicit_be(&mut b, 0x0008, 0x0016, b"UI", b"1.2.840.10008.5.1.4.1.1.2");
+        push_explicit_be(&mut b, 0x0008, 0x0018, b"UI", b"1.2.3.4.5.6.7.8.9.11");
+        push_explicit_be(&mut b, 0x0028, 0x0002, b"US", &1u16.to_be_bytes());
+        push_explicit_be(&mut b, 0x0028, 0x0004, b"CS", b"MONOCHROME2");
+        push_explicit_be(&mut b, 0x0028, 0x0010, b"US", &side.to_be_bytes());
+        push_explicit_be(&mut b, 0x0028, 0x0011, b"US", &side.to_be_bytes());
+        push_explicit_be(&mut b, 0x0028, 0x0100, b"US", &8u16.to_be_bytes());
+        push_explicit_be(&mut b, 0x0028, 0x0101, b"US", &8u16.to_be_bytes());
+        push_explicit_be(&mut b, 0x0028, 0x0103, b"US", &0u16.to_be_bytes());
+        let pixels = vec![pixel_byte; (side as usize) * (side as usize)];
+        push_explicit_be(&mut b, 0x7FE0, 0x0010, b"OW", &pixels);
+        b
+    }
+
+    /// C1: the BE fixture declares the PADDED length for an odd value.
+    ///
+    /// The SOP Class UID is 25 bytes; the helper writes 26 (value + pad). A
+    /// declared length of 25 would start the next element one byte early on any
+    /// reader that trusts it, so the fixture must declare what it wrote.
+    #[test]
+    fn the_big_endian_fixture_declares_the_padded_length() {
+        let be = build_evrbe(8, 0x40);
+        // SOP Class UID (0008,0016) is a 25-char UI written by push_explicit_be.
+        let sop_class = b"1.2.840.10008.5.1.4.1.1.2";
+        assert_eq!(sop_class.len(), 25, "the fixture value is odd-length");
+        assert_eq!(padded_len(sop_class.len()), 26, "one pad byte is added");
+
+        // Locate the element by its big-endian tag instead of searching the
+        // whole buffer for the length bytes: `00 1a` can occur anywhere in a
+        // pixel payload, so a buffer-wide match proves nothing about this
+        // element's header.
+        let header = find_be_element(&be, (0x0008, 0x0016)).expect("SOP Class UID header");
+        let declared = u16::from_be_bytes([be[header + 6], be[header + 7]]);
+        assert_eq!(
+            declared as usize,
+            padded_len(sop_class.len()),
+            "the SOP Class UID must declare the padded length"
+        );
+        assert_eq!(
+            &be[header + 8..header + 8 + sop_class.len()],
+            sop_class,
+            "the declared value is the UID itself"
+        );
+
+        // And the file still parses: a shifted element would break the walk.
+        assert_eq!(
+            clarus_adapters::dicom_rs::DicomRsParser
+                .transfer_syntax_uid(&be)
+                .as_deref(),
+            Some("1.2.840.10008.1.2.2")
+        );
+    }
+
+    /// C1: a CS value padded to an even length uses a SPACE, not NULL.
+    ///
+    /// PS3.5 6.2: text VRs are padded with a SPACE so the value stays inside
+    /// the VR's character repertoire; only UI is padded with NULL. A CS padded
+    /// with NULL carries a byte the VR does not define.
+    #[test]
+    fn a_cs_value_is_padded_with_a_space() {
+        let be = build_evrbe(8, 0x40);
+        let header = find_be_element(&be, (0x0028, 0x0004)).expect("Photometric header");
+        let declared = u16::from_be_bytes([be[header + 6], be[header + 7]]) as usize;
+        // "MONOCHROME2" is 11 bytes, so exactly one pad byte follows.
+        assert_eq!(declared, 12, "odd CS value is padded to even");
+        assert_eq!(
+            be[header + 8 + 11],
+            0x20,
+            "a CS pad byte is a SPACE (PS3.5 6.2), not NULL"
+        );
+    }
+
+    /// Byte offset of an Explicit VR element's header in an EVRBE stream.
+    ///
+    /// Walks the (group, element) tag pairs from the start instead of scanning
+    /// for a byte pair, so a value that happens to contain the tag cannot be
+    /// mistaken for the element. Only the BE dataset after `DICM` is walked;
+    /// the file meta group is LE and is skipped wholesale.
+    fn find_be_element(be: &[u8], tag: (u16, u16)) -> Option<usize> {
+        // The pre-DICM preamble is exactly 128 bytes followed by the magic
+        // (PS3.10 7.1). Searching the buffer for `DICM` would also match one
+        // inside a value, so the offset is fixed rather than scanned for.
+        if be.len() < 132 || &be[128..132] != b"DICM" {
+            return None;
+        }
+        let mut pos = 132;
+        // Group 0002 is Explicit VR Little Endian whatever the dataset syntax
+        // is (PS3.10 7.1), so it is walked on its own terms and the rest of
+        // this fixture is Explicit VR Big Endian - the helper is only ever
+        // handed a file it built.
+        while pos + 12 <= be.len() && [0x02, 0x00] == [be[pos], be[pos + 1]] {
+            let vr = [be[pos + 4], be[pos + 5]];
+            // Short form: 2-byte length at +6. Long form: reserved 0000 at +6
+            // and a 4-byte length at +8. The VR decides the form, not the
+            // reserved field's value (PS3.5 7.1.2).
+            let long_form = matches!(
+                &vr,
+                b"OB"
+                    | b"OD"
+                    | b"OF"
+                    | b"OL"
+                    | b"OV"
+                    | b"OW"
+                    | b"SQ"
+                    | b"UC"
+                    | b"UN"
+                    | b"UR"
+                    | b"UT"
+            );
+            let (len, header_len) = if long_form {
+                if pos + 12 > be.len() {
+                    return None;
+                }
+                (
+                    u32::from_le_bytes([be[pos + 8], be[pos + 9], be[pos + 10], be[pos + 11]])
+                        as usize,
+                    12,
+                )
+            } else {
+                (u16::from_le_bytes([be[pos + 6], be[pos + 7]]) as usize, 8)
+            };
+            pos += header_len + (len + (len & 1));
+        }
+        while pos + 8 <= be.len() {
+            let group = u16::from_be_bytes([be[pos], be[pos + 1]]);
+            let element = u16::from_be_bytes([be[pos + 2], be[pos + 3]]);
+            let vr = [be[pos + 4], be[pos + 5]];
+            let extended = matches!(
+                &vr,
+                b"OB"
+                    | b"OD"
+                    | b"OF"
+                    | b"OL"
+                    | b"OV"
+                    | b"OW"
+                    | b"SQ"
+                    | b"UC"
+                    | b"UN"
+                    | b"UR"
+                    | b"UT"
+            );
+            let (len, header_len) = if extended {
+                if pos + 12 > be.len() {
+                    return None;
+                }
+                (
+                    u32::from_be_bytes([be[pos + 8], be[pos + 9], be[pos + 10], be[pos + 11]])
+                        as usize,
+                    12,
+                )
+            } else {
+                (u16::from_be_bytes([be[pos + 6], be[pos + 7]]) as usize, 8)
+            };
+            if (group, element) == tag {
+                return Some(pos);
+            }
+            pos += header_len + len;
+        }
+        None
+    }
+
+    /// I1: an Explicit VR Big Endian instance renders with the SAME geometry as
+    /// its little-endian twin.
+    ///
+    /// The raw render paths read Rows/Columns/SamplesPerPixel/BitsAllocated with
+    /// `extract_u16`, which is little-endian by construction. A BE `0x0001`
+    /// therefore read as `0x0100 = 256`, and `/rendered` answered 406
+    /// "samples-per-pixel 256 unsupported" for a perfectly legal instance. Both
+    /// paths now normalise through the same re-encoder a BE retrieve uses.
+    #[test]
+    fn an_explicit_vr_big_endian_instance_renders() {
+        let be = build_evrbe(64, 0x40);
+        assert!(
+            !is_compressed_transfer_syntax(&be).expect("read TS"),
+            "EVRBE is uncompressed"
+        );
+
+        // The geometry the header readers now see must be the real one.
+        let normalised = normalise_big_endian_for_render(&be).expect("normalise");
+        let rows = extract_u16(&normalised, (0x0028, 0x0010)).expect("Rows");
+        let cols = extract_u16(&normalised, (0x0028, 0x0011)).expect("Columns");
+        let spp = extract_u16(&normalised, (0x0028, 0x0002)).expect("SamplesPerPixel");
+        let bits = extract_u16(&normalised, (0x0028, 0x0100)).expect("BitsAllocated");
+        assert_eq!(
+            (rows, cols, spp, bits),
+            (64, 64, 1, 8),
+            "geometry must survive"
+        );
+
+        // /rendered returns an image instead of the 406.
+        let full = render_full_impl(
+            &be,
+            "1.2.3.4.5.6.7.8.9.11",
+            &clarus_adapters::codec::CodecRegistry::default(),
+        );
+        assert!(
+            full.is_ok(),
+            "a legal BE instance must render, got {:?}",
+            full.err()
+        );
+    }
+
+    /// The big-endian fixture is well-formed: without the conversion the
+    /// little-endian readers really do see a swapped width.
+    ///
+    /// This is the falsification anchor for the test above - it states the bug
+    /// the fix removes, so a regression to the unfixed path is visible even if
+    /// the render errand changes shape.
+    #[test]
+    fn the_big_endian_headers_really_are_byte_swapped() {
+        let be = build_evrbe(64, 0x40);
+        let raw_spp = extract_u16(&be, (0x0028, 0x0002)).expect("SamplesPerPixel");
+        assert_eq!(
+            raw_spp, 256,
+            "reading 0x0001 little-endian yields 256 - the 406 this fix removes"
+        );
+        let normalised = normalise_big_endian_for_render(&be).expect("normalise");
+        assert_eq!(
+            extract_u16(&normalised, (0x0028, 0x0002)),
+            Some(1),
+            "after conversion the value is the real SamplesPerPixel"
+        );
+    }
+
     /// Append an Explicit VR LE element (PS3.5 7.1), mirroring the integration
     /// builder in wado_smoke so the fixture is a well-formed uncompressed
     /// instance the raw render path decodes.
@@ -3081,7 +3753,10 @@ mod full_render_tests {
         }
         out.extend_from_slice(value);
         if !value.len().is_multiple_of(2) {
-            out.push(0x00); // even-length pad
+            // The pad byte follows the VR's character set (PS3.5 6.2): a SPACE
+            // for text so the value stays inside the VR's repertoire, NULL only
+            // for UI and for binary values.
+            out.push(pad_byte_for_vr(vr));
         }
     }
 
@@ -3325,5 +4000,68 @@ mod full_render_tests {
         pool.release();
         assert!(pool.try_acquire(), "permit freed after release");
         pool.release();
+    }
+
+    /// A plan list of `count` single-frame instances, all ordinary except the
+    /// indices in `localizers`, which carry ImageType value 3 = LOCALIZER.
+    fn plans_with(count: usize, localizers: &[usize]) -> Vec<PartPlan> {
+        (0..count)
+            .map(|i| PartPlan {
+                sha256: String::new(),
+                sop_uid: format!("1.2.{i}"),
+                sop_class_uid: String::new(),
+                source_ts: String::new(),
+                storage_tier: StorageTier::Hot,
+                file_size: 0,
+                kind: PartKind::StreamAsIs,
+                series_uid: String::new(),
+                with_content_location: false,
+                image_type: if localizers.contains(&i) {
+                    vec!["ORIGINAL".into(), "PRIMARY".into(), "LOCALIZER".into()]
+                } else {
+                    vec!["ORIGINAL".into(), "PRIMARY".into(), "AXIAL".into()]
+                },
+                number_of_frames: None,
+            })
+            .collect()
+    }
+
+    /// A series that opens with a scout must preview the real image, and a
+    /// study made only of scouts must still preview SOMETHING.
+    #[test]
+    fn a_localizer_is_never_the_representative_instance() {
+        // Plans 0 and 1 are localizers; plan 2 is the first real image.
+        let plans = plans_with(4, &[0, 1]);
+        assert_eq!(representative_plan(&plans), (2, 1));
+
+        // Every instance is a localizer: fall back to the first plan rather
+        // than failing - a preview of a scout beats no preview.
+        let all_scouts = plans_with(3, &[0, 1, 2]);
+        assert_eq!(representative_plan(&all_scouts), (0, 1));
+
+        // No ImageType captured at all (a record written before the capture):
+        // behave exactly as before, first plan, frame 1.
+        let bare = plans_with(2, &[]);
+        assert_eq!(representative_plan(&bare), (0, 1));
+    }
+
+    /// A multi-frame instance previews its middle frame.
+    #[test]
+    fn a_multiframe_instance_previews_its_middle_frame() {
+        let mut plans = plans_with(1, &[]);
+        plans[0].number_of_frames = Some(64);
+        // Integer division only: 64 / 2 + 1 = 33, the second of the two
+        // central frames, and always inside [1, n].
+        assert_eq!(representative_plan(&plans), (0, 33));
+
+        // Odd counts stay in range too.
+        plans[0].number_of_frames = Some(65);
+        assert_eq!(representative_plan(&plans), (0, 33));
+
+        // A count of 1 or 0 is a single-frame instance: frame 1.
+        plans[0].number_of_frames = Some(1);
+        assert_eq!(representative_plan(&plans), (0, 1));
+        plans[0].number_of_frames = Some(0);
+        assert_eq!(representative_plan(&plans), (0, 1));
     }
 }

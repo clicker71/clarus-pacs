@@ -16,11 +16,28 @@
 //! search.
 
 use crate::manifest::{
-    AttrValue, FrameRecord, InstanceRecord, Manifest, SeriesRecord, StudyQido, SysHeader, TIER_HOT,
+    AttrValue, FrameRecord, InstanceRecord, Manifest, PublishedManifest, SeriesRecord, StudyQido,
+    SysHeader, TIER_HOT, TrustedManifestDir,
 };
 use crate::query::tag;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// The published-manifest view of the study this module is about to rewrite.
+///
+/// Every writer here already holds the manifest directory and a study UID; the
+/// pair is exactly what the safe reader takes, so the path round-trip is pure
+/// ceremony. A study UID that cannot name a manifest is a caller error, not a
+/// tolerant skip: the writers below merge into an existing manifest and must
+/// not silently treat a bad name as an empty one.
+fn published_manifest(
+    manifests_dir: &Path,
+    study_uid: &str,
+) -> Result<PublishedManifest, StudyManifestError> {
+    PublishedManifest::new(manifests_dir, study_uid).ok_or_else(|| {
+        StudyManifestError::Manifest(format!("not a published manifest path: {}", study_uid))
+    })
+}
 
 /// The study-level DICOM attributes carried by a STOW-accepted study.
 ///
@@ -97,9 +114,10 @@ pub fn study_attrs(a: &StudyManifestAttrs) -> Vec<(u32, AttrValue)> {
     {
         v.push((tag::STUDY_TIME, AttrValue::Text(s.to_string())));
     }
-    if let Some(s) = a.accession_number.as_deref()
-        && !s.is_empty()
-    {
+    // PS3.18 F.2.5: these four identity attributes are PRESERVED when present
+    // but empty - `Some("")` reaches the JSON renderer as `{"vr":"VR"}` - so
+    // the empty check is dropped here, unlike the other optional text keys.
+    if let Some(s) = a.accession_number.as_deref() {
         v.push((tag::ACCESSION_NUMBER, AttrValue::Text(s.to_string())));
     }
     if !a.modality.is_empty() {
@@ -112,9 +130,7 @@ pub fn study_attrs(a: &StudyManifestAttrs) -> Vec<(u32, AttrValue)> {
     {
         v.push((tag::INSTITUTION_NAME, AttrValue::Text(s.to_string())));
     }
-    if let Some(s) = a.referring_physician.as_deref()
-        && !s.is_empty()
-    {
+    if let Some(s) = a.referring_physician.as_deref() {
         v.push((tag::REFERRING_PHYSICIAN, AttrValue::Text(s.to_string())));
     }
     if let Some(s) = a.study_description.as_deref()
@@ -151,11 +167,13 @@ pub fn study_attrs(a: &StudyManifestAttrs) -> Vec<(u32, AttrValue)> {
         v.push((tag::PATIENT_ID_ISSUER, AttrValue::Text(s.to_string())));
     }
     if let Some(s) = a.patient_birth_date.as_deref() {
-        push_date(&mut v, tag::PATIENT_BIRTH_DATE, s);
+        if s.is_empty() {
+            v.push((tag::PATIENT_BIRTH_DATE, AttrValue::Text(String::new())));
+        } else {
+            push_date(&mut v, tag::PATIENT_BIRTH_DATE, s);
+        }
     }
-    if let Some(s) = a.patient_sex.as_deref()
-        && !s.is_empty()
-    {
+    if let Some(s) = a.patient_sex.as_deref() {
         v.push((tag::PATIENT_SEX, AttrValue::Text(s.to_string())));
     }
     // OtherPatientIDsSequence (0010,1002) sorts after PatientSex (0010,0040)
@@ -248,6 +266,13 @@ pub fn restamp_from_manifest(a: &mut StudyManifestAttrs, m: &Manifest) {
     set(&mut a.patient_name, tag::PATIENT_NAME);
     set(&mut a.patient_id, tag::PATIENT_ID);
     set(&mut a.patient_id_issuer, tag::PATIENT_ID_ISSUER);
+    // (0010,1002) is written by `study_attrs` like every other restamped
+    // field, so leaving it out made the RAM copy keep the INCOMING ids while
+    // the disk kept the merged ones - the same identity split that made the
+    // index and the manifest disagree. `set` also clears the slot when the
+    // manifest has no value, which is the correct answer for a study whose
+    // ids were never captured.
+    set(&mut a.other_patient_ids, tag::OTHER_PATIENT_IDS);
     set(&mut a.patient_birth_date, tag::PATIENT_BIRTH_DATE);
     set(&mut a.patient_sex, tag::PATIENT_SEX);
     set(&mut a.study_date, tag::STUDY_DATE);
@@ -339,6 +364,15 @@ pub struct InstanceModel {
     /// the pre-existing path, kept for single-frame instances and for rows
     /// written before the table existed.
     pub frames: Vec<FrameRecord>,
+    /// NumberOfFrames (0028,0008). `None` for a single-frame instance.
+    ///
+    /// Captured at STOW so the thumbnail routes pick a frame from the manifest
+    /// rather than decoding the instance to count its frames.
+    pub number_of_frames: Option<u32>,
+    /// ImageType (0008,0008), values 1..n in file order. `LOCALIZER` among
+    /// them marks a scout image, which a series/study thumbnail skips when
+    /// choosing the representative instance.
+    pub image_type: Vec<String>,
 }
 
 /// A series to embed in the manifest, with its instances.
@@ -395,7 +429,22 @@ pub struct SeriesModel {
 /// and Instance Number are captured when known. Ascending order
 /// preserves the manifest decoder's binary-search contract.
 fn instance_attrs(m: &InstanceModel) -> Vec<(u32, AttrValue)> {
-    let mut attrs: Vec<(u32, AttrValue)> = Vec::with_capacity(5);
+    let mut attrs: Vec<(u32, AttrValue)> = Vec::with_capacity(7);
+    // ImageType (0008,0008) sorts first of the instance keys, so it is pushed
+    // first and the ascending contract needs no re-sort. Stored as an ARRAY
+    // because the element is multi-valued - a client asking for it through
+    // `/metadata` gets the values back in file order, not as one CS string.
+    if !m.image_type.is_empty() {
+        attrs.push((
+            tag::IMAGE_TYPE,
+            AttrValue::Array(
+                m.image_type
+                    .iter()
+                    .map(|v| AttrValue::Text(v.clone()))
+                    .collect(),
+            ),
+        ));
+    }
     if let Some(u) = m.sop_class_uid.as_deref()
         && !u.is_empty()
     {
@@ -409,6 +458,11 @@ fn instance_attrs(m: &InstanceModel) -> Vec<(u32, AttrValue)> {
         && !n.is_empty()
     {
         attrs.push((tag::INSTANCE_NUMBER, AttrValue::Text(n.to_string())));
+    }
+    // NumberOfFrames (0028,0008) sorts after InstanceNumber (0020,0013), so it
+    // appends here and the ascending contract still holds.
+    if let Some(n) = m.number_of_frames {
+        attrs.push((tag::NUMBER_OF_FRAMES, AttrValue::Text(n.to_string())));
     }
     // The captured references go last. Their keys are above every DICOM tag,
     // so they sort after the entries above and the ascending contract holds
@@ -625,6 +679,48 @@ fn merge_series_into(manifest: &mut Manifest, new_series: &[SeriesModel]) {
         .flat_map(|s| &s.instances)
         .map(|i| i.file_size)
         .sum();
+
+    // The study-level aggregates describe the WHOLE series tree, so keep the
+    // in-memory copy consistent with the merge that just ran. They are DERIVED
+    // values that `Manifest::decode` recomputes from the series array on every
+    // read (see `record.rs`), never a persisted field, so a cold reader can
+    // never observe a stale count.
+    stamp_study_aggregates(&mut manifest.study, &manifest.series);
+}
+
+/// Recompute the study-level aggregates from a series tree.
+///
+/// `series_count`, `instance_count` and `modalities_in_study` are DERIVED from
+/// the tree, so they have to be recalculated wherever the tree changes - a
+/// fresh build and a read-merge alike. Keeping the arithmetic in one place is
+/// what stops the two paths from disagreeing about the same study.
+fn stamp_study_aggregates(study: &mut StudyQido, series: &[SeriesRecord]) {
+    study.series_count = series.len() as u64;
+    study.instance_count = series
+        .iter()
+        .map(|s| s.instances.len() as u64)
+        .fold(0u64, |acc, n| acc.saturating_add(n));
+    let mut agg = String::new();
+    for s in series {
+        let Some(AttrValue::Text(m)) = s
+            .attrs
+            .iter()
+            .find(|(t, _)| *t == tag::MODALITY)
+            .map(|(_, v)| v)
+        else {
+            continue;
+        };
+        if m.is_empty() {
+            continue;
+        }
+        if !agg.split(',').any(|x| x == m) {
+            if !agg.is_empty() {
+                agg.push(',');
+            }
+            agg.push_str(m);
+        }
+    }
+    study.modalities_in_study = if agg.is_empty() { None } else { Some(agg) };
 }
 
 /// Update-merge new STOW instances into an existing manifest's series tree
@@ -652,7 +748,26 @@ fn replace_series_into(manifest: &mut Manifest, new_series: &[SeriesModel]) {
                     })
                 });
                 match existing_i {
-                    Some(slot) => *slot = instance_record(new_inst),
+                    Some(slot) => {
+                        // IOCM 4.66.4.2.3.1 / 4.66.4.3.3: a patient-safety
+                        // (113037) or incorrect-MWL (113038) rejection is
+                        // hide-only with no re-acceptance. The authoritative
+                        // refusal now happens BEFORE this call
+                        // (`refuse_hidden_reacceptance` in
+                        // `write_study_manifest_update`); carrying the code
+                        // forward is a defensive backstop for a caller that
+                        // reaches `replace_series_into` directly, so a
+                        // hide-only rejection is never silently dropped.
+                        // Quality (113001) and retention (113039) still clear:
+                        // a corrected AI result legitimately replaces a Quality
+                        // rejection, and retention is a lifecycle marker, not a
+                        // correctness statement.
+                        let carried = slot.rejection_reason;
+                        *slot = instance_record(new_inst);
+                        if carried == 113_037 || carried == 113_038 {
+                            slot.rejection_reason = carried;
+                        }
+                    }
                     None => existing_s.instances.push(instance_record(new_inst)),
                 }
             }
@@ -667,6 +782,14 @@ fn replace_series_into(manifest: &mut Manifest, new_series: &[SeriesModel]) {
         .flat_map(|s| &s.instances)
         .map(|i| i.file_size)
         .sum();
+
+    // The series tree just changed - possibly by gaining a series or an
+    // instance - so the study aggregates that DESCRIBE it are stale. They are
+    // derived values that `Manifest::decode` recomputes on every cold read, but
+    // this manifest is the object the cache installs and a warm reader gets it
+    // verbatim; without the restamp an update that added a series answers
+    // QIDO with the previous series_count until the entry is evicted.
+    stamp_study_aggregates(&mut manifest.study, &manifest.series);
 }
 
 /// Rebuild the series/instance capture attributes of a study manifest from
@@ -712,7 +835,42 @@ pub fn rebuild_series_attrs(manifest: &mut Manifest, series: &[SeriesModel]) {
                     })
                 });
                 match existing_i {
-                    Some(i) => merge_attrs(&mut i.attrs, fresh_inst_attrs),
+                    Some(i) => {
+                        // The rebuild re-derived this instance from the stored
+                        // blob. If the record names a DIFFERENT blob under the
+                        // same SOP UID (a re-STOW, a corrected object), its
+                        // attributes describe bytes this rebuild did not read:
+                        // merging them would attach blob-derived tags
+                        // (NumberOfFrames, pixel module) to the wrong content.
+                        // Skip the attribute merge for a different blob; the
+                        // frame-table guard below has the same reason.
+                        let same_blob = i.blake3 == new_inst.blake3;
+                        if same_blob {
+                            merge_attrs(&mut i.attrs, fresh_inst_attrs);
+                        }
+                        // A manifest written before the frame table existed
+                        // has an EMPTY table, so frame retrieval falls back to
+                        // reading the whole blob. The rebuild re-derived the
+                        // table from the stored file, so an empty table can be
+                        // filled in.
+                        //
+                        // The SOP UID is not enough to justify the copy: an
+                        // instance can be REPLACED by a different blob under
+                        // the same UID (a re-STOW, a corrected object), and
+                        // adopting byte offsets derived from the OLD blob would
+                        // point frame retrieval into the middle of unrelated
+                        // data. The hashes have to agree.
+                        //
+                        // Only an EMPTY table is replaced: a populated one was
+                        // written by the STOW that accepted the current blob,
+                        // and overwriting it with a re-derivation risks
+                        // disagreeing with the bytes actually stored. Storage
+                        // coordinates (tier, size, hashes) are left alone - the
+                        // rebuild is enrichment, not a re-registration.
+                        if same_blob && i.frames.is_empty() && !new_inst.frames.is_empty() {
+                            i.frames = new_inst.frames.clone();
+                        }
+                    }
                     None => existing_s.instances.push(instance_record(new_inst)),
                 }
             }
@@ -724,9 +882,15 @@ pub fn rebuild_series_attrs(manifest: &mut Manifest, series: &[SeriesModel]) {
 }
 
 /// Merge `fresh` attribute pairs into `target`, adding only tags that are not
-/// already present (existing values win). Both are sorted by tag, so the
-/// merge is a linear two-pointer union preserving ascending order.
-fn merge_attrs(target: &mut Vec<(u32, AttrValue)>, fresh: Vec<(u32, AttrValue)>) {
+/// already present (existing values win). The merge is a linear two-pointer
+/// union preserving ascending order, so BOTH inputs are sorted by tag first:
+/// `fresh` is sorted by construction, but `target` is decoded from a stored
+/// manifest whose byte order the decoder preserves, and a historical manifest
+/// can store its tags out of order. Sorting both makes the merge
+/// order-independent instead of trusting a contract only a comment held.
+fn merge_attrs(target: &mut Vec<(u32, AttrValue)>, mut fresh: Vec<(u32, AttrValue)>) {
+    target.sort_by_key(|(t, _)| *t);
+    fresh.sort_by_key(|(t, _)| *t);
     let mut out: Vec<(u32, AttrValue)> = Vec::with_capacity(target.len() + fresh.len());
     let mut t = 0usize;
     let mut f = 0usize;
@@ -945,11 +1109,13 @@ pub fn write_study_manifest_full(
     // B3 cache discipline: bump the slot version and take the cached entry
     // BEFORE the disk mutation. The taken Arc is ignored -
     // the merge base stays a disk read.
-    let (cache_v, _taken) = crate::manifest_cache::begin_write(&a.study_instance_uid);
+    let (cache_guard, _taken) =
+        crate::manifest_cache::WriteGuard::begin(manifests_dir, &a.study_instance_uid);
 
     // Read-merge: preserve instances already committed by earlier STOWs.
     let mut manifest = if path.exists() {
-        let mut m = crate::manifest::read_manifest(&path)
+        let published = published_manifest(manifests_dir, &a.study_instance_uid)?;
+        let mut m = crate::manifest::read_manifest_published(&published)
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
         merge_series_into(&mut m, series);
         // The RAM study index must learn the MERGED truth (the disk
@@ -976,19 +1142,14 @@ pub fn write_study_manifest_full(
     let bytes = manifest
         .encode()
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest::write_bytes_atomic(&path, &bytes)
-        .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    // Round-trip guard (A9): decode the exact in-memory bytes handed to the
-    // atomic write instead of re-opening the just-written file - same
-    // guarantee (a manifest we cannot decode is not a valid commit), half
-    // the decode cost.
-    crate::manifest::read_manifest_at(&bytes)
+    // A9 validate-before-publish: decode the exact encoded bytes BEFORE the
+    // rename so a manifest this codec cannot decode fails the write instead
+    // of replacing the previous good manifest and then erroring.
+    crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
     // B3: install the post-commit entry ONLY after the A9 guard passed.
     // encoded_len = the exact encoded bytes just committed (== file length).
-    crate::manifest_cache::end_write(
-        &a.study_instance_uid,
-        cache_v,
+    cache_guard.commit(
         std::sync::Arc::new(manifest),
         bytes.len() as u64,
         manifests_dir,
@@ -1023,11 +1184,14 @@ pub fn write_study_manifest_update(
     }
 
     // B3 cache discipline: bump + take BEFORE the disk mutation.
-    let (cache_v, _taken) = crate::manifest_cache::begin_write(&a.study_instance_uid);
+    let (cache_guard, _taken) =
+        crate::manifest_cache::WriteGuard::begin(manifests_dir, &a.study_instance_uid);
 
     let mut manifest = if path.exists() {
-        let mut m = crate::manifest::read_manifest(&path)
+        let published = published_manifest(manifests_dir, &a.study_instance_uid)?;
+        let mut m = crate::manifest::read_manifest_published(&published)
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
+        refuse_hidden_reacceptance(&m, series)?;
         replace_series_into(&mut m, series);
         // RE-STAMP the study QIDO attrs from the corrected incoming values.
         m.study.attrs = study_attrs(a);
@@ -1039,24 +1203,65 @@ pub fn write_study_manifest_update(
     stamp_derived_counts(&manifest, a);
     manifest.sys.arrived_at = now_epoch();
 
-    // A9: encode once, write the exact bytes, then verify by decoding the
-    // in-memory buffer (same guard as the full-write path).
+    // A9: encode once, then decode the exact bytes BEFORE the rename (same
+    // validate-before-publish guard as the full-write path).
     let bytes = manifest
         .encode()
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest::write_bytes_atomic(&path, &bytes)
-        .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest::read_manifest_at(&bytes)
+    crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
     // B3: install the post-commit entry ONLY after the A9 guard passed.
-    crate::manifest_cache::end_write(
-        &a.study_instance_uid,
-        cache_v,
+    cache_guard.commit(
         std::sync::Arc::new(manifest),
         bytes.len() as u64,
         manifests_dir,
     );
     Ok(path)
+}
+
+/// Whether a rejection reason is hide-only (no re-acceptance surface).
+///
+/// Mirrors the carry condition in the REPLACE path: patient safety (113037)
+/// and incorrect MWL (113038) hide an instance with no re-acceptance (IOCM
+/// 4.66.4.2.3.1 / 4.66.4.3.3), so a weaker reason must never survive in their
+/// place. Quality (113001) is re-storable and retention (113039) is a
+/// lifecycle marker, neither of which is hide-only.
+fn is_hide_only(reason: u32) -> bool {
+    reason == 113_037 || reason == 113_038
+}
+
+/// Refuse a REPLACE when an incoming SOPInstanceUID matches an existing
+/// instance whose rejection is hide-only (113037 / 113038).
+///
+/// This is the authoritative refusal, run INSIDE the coordinator lease against
+/// the freshly re-read manifest. The STOW accept gate (`hidden_reason_of`)
+/// reads the manifest without the lease, so a rejection committed between that
+/// read and this write's lease is invisible to it; by the time this scan runs,
+/// the re-read sees it and the refusal is correct. `replace_series_into`'s
+/// carry-forward remains only as a defensive backstop for a caller that
+/// reaches it without this scan.
+///
+/// 0-alloc on the accept path: `Manifest::find_instance` is a borrow-only
+/// linear scan and `is_hide_only` is a u32 compare. The `sop_uid` String is
+/// cloned only when a refusal actually happens (rare, cold).
+pub fn refuse_hidden_reacceptance(
+    manifest: &Manifest,
+    series: &[SeriesModel],
+) -> Result<(), StudyManifestError> {
+    for s in series {
+        for inst in &s.instances {
+            let Some(existing) = manifest.find_instance(&inst.sop_instance_uid) else {
+                continue;
+            };
+            if is_hide_only(existing.rejection_reason) {
+                return Err(StudyManifestError::RejectedForStore {
+                    sop_uid: inst.sop_instance_uid.clone(),
+                    reason: existing.rejection_reason,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Mark instances of `study_uid` as rejected (sequestered).
@@ -1066,12 +1271,17 @@ pub fn write_study_manifest_update(
 /// round-trip -> `end_write`. The cache invariant "entry present => entry ==
 /// disk" therefore holds across the mutation, exactly as it does for a STOW.
 ///
-/// Idempotent by design: an instance that is already rejected keeps the reason
-/// it already carries and the encoding is unchanged, so a repeated rejection
-/// note costs one read and one write and cannot flip anything back - nor can
-/// it overwrite a Quality hide with an IOCM one. An SOP UID that is not in this
-/// study is ignored - the caller resolves ownership first, and a note that
-/// names an instance of another study must not disturb this manifest.
+/// Idempotent by design, with one deliberate exception: a hide-only reason
+/// (113037 patient safety / 113038 incorrect MWL) ESCALATES a weaker stored
+/// reason (a Quality 113001 hide), because the caller groups a KOS note's
+/// references by reason and relies on arrival order, and a Quality hide is
+/// re-storable - leaving it in place would let a later corrected re-STOW
+/// clear it and surface an instance a patient-safety note still hides. A
+/// weaker reason never downgrades a hide-only one, and a same-code repetition
+/// is a no-op (`changed == 0`), so the encoding is unchanged for an identical
+/// note. An SOP UID that is not in this study is ignored - the caller
+/// resolves ownership first, and a note that names an instance of another
+/// study must not disturb this manifest.
 ///
 /// Returns the number of instances whose flag CHANGED (0 means "nothing to do"
 /// and the manifest is not rewritten at all).
@@ -1099,22 +1309,30 @@ pub fn mark_rejected(
     }
 
     // B3 cache discipline: bump + take BEFORE the disk mutation.
-    let (cache_v, _taken) = crate::manifest_cache::begin_write(study_uid);
+    let (cache_guard, _taken) = crate::manifest_cache::WriteGuard::begin(manifests_dir, study_uid);
 
-    let mut manifest = crate::manifest::read_manifest(&path)
+    let published = published_manifest(manifests_dir, study_uid)?;
+    let mut manifest = crate::manifest::read_manifest_published(&published)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
 
     let mut changed = 0usize;
     for series in manifest.series.iter_mut() {
         for instance in series.instances.iter_mut() {
-            if instance.is_rejected() {
+            // A hide-only reason (113037/113038) must ESCALATE a weaker stored
+            // reason: a Quality (113001) hide is re-storable, so leaving it in
+            // place would let a later corrected re-STOW clear it and surface an
+            // instance a patient-safety note still hides. Every other reason
+            // keeps the idempotent skip - it must never downgrade a hide-only
+            // code to a re-storable one.
+            let hide_only = is_hide_only(reason);
+            if instance.is_rejected() && !hide_only {
                 continue;
             }
             let matches = instance.attrs.iter().any(|(tag, value)| {
                 *tag == crate::query::tag::SOP_INSTANCE_UID
                     && matches!(value, crate::manifest::AttrValue::Text(uid) if sop_uids.contains(&uid.as_str()))
             });
-            if matches {
+            if matches && instance.rejection_reason != reason {
                 instance.rejection_reason = reason;
                 changed += 1;
             }
@@ -1127,9 +1345,7 @@ pub fn mark_rejected(
         let bytes = manifest
             .encode()
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-        crate::manifest_cache::end_write(
-            study_uid,
-            cache_v,
+        cache_guard.commit(
             std::sync::Arc::new(manifest),
             bytes.len() as u64,
             manifests_dir,
@@ -1137,17 +1353,13 @@ pub fn mark_rejected(
         return Ok(0);
     }
 
-    // A9: encode once, write those bytes, then verify by decoding them.
+    // A9: encode once, then decode the exact bytes BEFORE the rename.
     let bytes = manifest
         .encode()
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest::write_bytes_atomic(&path, &bytes)
+    crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest::read_manifest_at(&bytes)
-        .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest_cache::end_write(
-        study_uid,
-        cache_v,
+    cache_guard.commit(
         std::sync::Arc::new(manifest),
         bytes.len() as u64,
         manifests_dir,
@@ -1168,8 +1380,9 @@ pub fn mark_rejected(
 /// Read-only and best-effort: a missing manifest or an unreadable one reports
 /// "not rejected", which accepts the part. Refusing a store because a manifest
 /// could not be read would turn an index problem into a data-loss problem.
-pub fn hidden_reason_of(manifests_dir: &Path, study_uid: &str, sop_uid: &str) -> u32 {
-    let path = manifest_path(manifests_dir, study_uid);
+pub fn hidden_reason_of(manifests_dir: &TrustedManifestDir, study_uid: &str, sop_uid: &str) -> u32 {
+    let dir = manifests_dir.path();
+    let path = manifest_path(dir, study_uid);
     if !path.exists() {
         return crate::manifest::NOT_REJECTED_REASON;
     }
@@ -1236,9 +1449,10 @@ pub fn mark_restored(
     }
 
     // B3 cache discipline: bump + take BEFORE the disk mutation.
-    let (cache_v, _taken) = crate::manifest_cache::begin_write(study_uid);
+    let (cache_guard, _taken) = crate::manifest_cache::WriteGuard::begin(manifests_dir, study_uid);
 
-    let mut manifest = crate::manifest::read_manifest(&path)
+    let published = published_manifest(manifests_dir, study_uid)?;
+    let mut manifest = crate::manifest::read_manifest_published(&published)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
 
     let mut changed = 0usize;
@@ -1264,9 +1478,7 @@ pub fn mark_restored(
         let bytes = manifest
             .encode()
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-        crate::manifest_cache::end_write(
-            study_uid,
-            cache_v,
+        cache_guard.commit(
             std::sync::Arc::new(manifest),
             bytes.len() as u64,
             manifests_dir,
@@ -1277,13 +1489,10 @@ pub fn mark_restored(
     let bytes = manifest
         .encode()
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest::write_bytes_atomic(&path, &bytes)
+    // A9 validate-before-publish: decode the exact bytes BEFORE the rename.
+    crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest::read_manifest_at(&bytes)
-        .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest_cache::end_write(
-        study_uid,
-        cache_v,
+    cache_guard.commit(
         std::sync::Arc::new(manifest),
         bytes.len() as u64,
         manifests_dir,
@@ -1323,16 +1532,33 @@ pub fn write_study_manifest_rebuild(
     }
 
     // B3 cache discipline: bump + take BEFORE the disk mutation.
-    let (cache_v, _taken) = crate::manifest_cache::begin_write(&a.study_instance_uid);
+    let (cache_guard, _taken) =
+        crate::manifest_cache::WriteGuard::begin(manifests_dir, &a.study_instance_uid);
 
     let manifest = if path.exists() {
-        let mut m = crate::manifest::read_manifest(&path)
+        let published = published_manifest(manifests_dir, &a.study_instance_uid)?;
+        let mut m = crate::manifest::read_manifest_published(&published)
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
         // ENRICHMENT-ONLY: add missing study-level capture tags (existing
         // values win - merge_attrs semantics), then enrich the series and
         // instance records in place.
         merge_attrs(&mut m.study.attrs, study_attrs(a));
         rebuild_series_attrs(&mut m, series);
+        stamp_study_aggregates(&mut m.study, &m.series);
+        // `rebuild_series_attrs` can APPEND a series or an instance the manifest
+        // did not have, which leaves the in-memory aggregates describing the
+        // tree from before the enrichment. A cold reader never sees this -
+        // `Manifest::decode` recomputes them from the series array - but the
+        // manifest installed in the cache below is this exact object, and every
+        // warm reader gets IT. A study that gained a series during a rebuild
+        // would then answer with the old series count until the entry left the
+        // cache.
+        // The merge just wrote the DISK truth, so the incoming attrs have to be
+        // restamped from it before they reach `on_study_committed`. Without
+        // this the rebuild kept the incoming identity (a derived object's
+        // coerced placeholders) while the manifest kept the merged one, and the
+        // RAM index was re-attributed to those placeholders.
+        restamp_from_manifest(a, &m);
         // sys.arrived_at / total_pixel_bytes are deliberately NOT touched:
         // the historical arrival order and the stored byte accounting stay
         // exactly what the previous commit recorded.
@@ -1348,15 +1574,11 @@ pub fn write_study_manifest_rebuild(
     let bytes = manifest
         .encode()
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    crate::manifest::write_bytes_atomic(&path, &bytes)
-        .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    // Round-trip guard (A9): decode the exact in-memory bytes.
-    crate::manifest::read_manifest_at(&bytes)
+    // A9 validate-before-publish: decode the exact bytes BEFORE the rename.
+    crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
     // B3: install the post-commit entry ONLY after the A9 guard passed.
-    crate::manifest_cache::end_write(
-        &a.study_instance_uid,
-        cache_v,
+    cache_guard.commit(
         std::sync::Arc::new(manifest),
         bytes.len() as u64,
         manifests_dir,
@@ -1414,6 +1636,11 @@ pub enum StudyManifestError {
     Manifest(String),
     /// The study is tombstoned (`.del` exists) - re-ingest after erase.
     StudyDeleted,
+    /// An incoming instance matches an existing one whose rejection is
+    /// hide-only (113037 patient safety / 113038 incorrect MWL), so the
+    /// REPLACE is refused: IOCM 4.66.4.2.3.1 / 4.66.4.3.3 forbid re-accepting
+    /// a hidden instance. The manifest and blob are left untouched.
+    RejectedForStore { sop_uid: String, reason: u32 },
 }
 
 impl std::fmt::Display for StudyManifestError {
@@ -1424,6 +1651,10 @@ impl std::fmt::Display for StudyManifestError {
             StudyManifestError::StudyDeleted => {
                 write!(f, "study is deleted; re-ingest after erase completes")
             }
+            StudyManifestError::RejectedForStore { sop_uid, reason } => write!(
+                f,
+                "instance {sop_uid} is hidden by an IOCM rejection (reason {reason}) that forbids re-acceptance"
+            ),
         }
     }
 }
@@ -1439,7 +1670,6 @@ impl From<io::Error> for StudyManifestError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::read_manifest;
     use crate::query::QueryFilter;
 
     fn attrs() -> StudyManifestAttrs {
@@ -1464,6 +1694,133 @@ mod tests {
         }
         // Represents the study UID, date (numeric), name, id, modality, accession.
         assert_eq!(list.len(), 6);
+    }
+
+    /// F7: OtherPatientIDs (0010,1002) is written by `study_attrs`, so it must
+    /// be restamped like every other field it writes.
+    ///
+    /// The split this prevents: the manifest keeps the merged (on-disk) value
+    /// while the RAM copy keeps the incoming one, so the index and the disk
+    /// disagree about the same study's identity.
+    #[test]
+    fn restamp_takes_other_patient_ids_from_the_manifest() {
+        let mut on_disk = attrs();
+        on_disk.other_patient_ids = Some("ARCHIVED".into());
+        let m = build_manifest_full(&on_disk, &[]);
+
+        let mut incoming = attrs();
+        incoming.other_patient_ids = Some("INCOMING".into());
+        restamp_from_manifest(&mut incoming, &m);
+        assert_eq!(
+            incoming.other_patient_ids.as_deref(),
+            Some("ARCHIVED"),
+            "the RAM copy must learn the archived ids, not keep its own"
+        );
+    }
+
+    /// F7 (the clearing half): a manifest with no OtherPatientIDs must CLEAR
+    /// the incoming value rather than leave a value the disk does not have.
+    #[test]
+    fn restamp_clears_other_patient_ids_absent_from_the_manifest() {
+        let m = build_manifest_full(&attrs(), &[]);
+        let mut incoming = attrs();
+        incoming.other_patient_ids = Some("INCOMING".into());
+        restamp_from_manifest(&mut incoming, &m);
+        assert_eq!(
+            incoming.other_patient_ids, None,
+            "an id the manifest does not carry must not survive the restamp"
+        );
+    }
+
+    /// F6: the REBUILD path merges then must restamp, exactly like the full
+    /// write path.
+    ///
+    /// A derived object (PR/SEG) carries no patient identity, so its coerced
+    /// placeholder would otherwise reach `on_study_committed` and re-attribute
+    /// a live study. The two entry points merge differently (`merge_series_into`
+    /// vs `rebuild_series_attrs`), so this test drives the REBUILD one - which
+    /// is the path that was missing the restamp.
+    #[test]
+    fn the_rebuild_path_restamps_from_the_merged_manifest() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+
+        // First commit establishes the archived identity.
+        let mut first = attrs();
+        first.patient_name = Some("ivanov".into());
+        write_study_manifest_full(&manifests, &mut first, &[]).expect("first write");
+
+        // A later derived-object rebuild arrives with a different name.
+        let mut second = attrs();
+        second.patient_name = Some("petrov".into());
+        write_study_manifest_rebuild(&manifests, &mut second, &[]).expect("rebuild");
+
+        assert_eq!(
+            second.patient_name.as_deref(),
+            Some("ivanov"),
+            "the rebuild must restamp the incoming attrs from the merged disk \
+             manifest, not keep the derived object's placeholder"
+        );
+    }
+
+    /// F8 was reported as "a re-STOW persists stale study aggregates". It is
+    /// STALE: `series_count`, `instance_count` and `modalities_in_study` are
+    /// not persisted at all - `Manifest::decode` derives all three from the
+    /// series array it just read. This test pins that property, which is what
+    /// makes the reported symptom impossible: after a merge that appended a
+    /// series, the values a cold reader sees describe the merged tree.
+    #[test]
+    fn a_restow_decodes_aggregates_from_the_merged_tree() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+
+        let first_series = vec![SeriesModel {
+            series_instance_uid: "1.2.840.1.2.1".into(),
+            modality: "CT".into(),
+            instances: vec![InstanceModel {
+                sop_instance_uid: "1.2.840.1.2.1.1".into(),
+                file_size: 10,
+                storage_tier: TIER_HOT,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let mut a1 = attrs();
+        write_study_manifest_full(&manifests, &mut a1, &first_series).expect("first");
+
+        // Re-STOW: a second series with a different modality.
+        let second_series = vec![
+            first_series[0].clone(),
+            SeriesModel {
+                series_instance_uid: "1.2.840.1.2.2".into(),
+                modality: "MR".into(),
+                instances: vec![InstanceModel {
+                    sop_instance_uid: "1.2.840.1.2.2.1".into(),
+                    file_size: 20,
+                    storage_tier: TIER_HOT,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        let mut a2 = attrs();
+        write_study_manifest_full(&manifests, &mut a2, &second_series).expect("restow");
+
+        // The PERSISTED manifest is what a cold read sees.
+        let back = crate::manifest::read_manifest_for_test(&manifests.join("1.2.840.1.1.manifest"))
+            .expect("read back");
+        assert_eq!(back.study.series_count, 2, "the merge appended a series");
+        assert_eq!(back.study.instance_count, 2, "and one instance with it");
+        assert_eq!(
+            back.study.modalities_in_study.as_deref(),
+            Some("CT,MR"),
+            "the decoded modalities must describe the MERGED tree"
+        );
+        assert_eq!(back.sys.total_pixel_bytes, 30);
     }
 
     #[test]
@@ -1641,13 +1998,14 @@ mod tests {
 
     #[test]
     fn writes_and_reads_back_manifest() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
         let path = write_study_manifest(&manifests, &mut a).expect("write");
 
         assert!(path.is_file());
-        let decoded = read_manifest(&path).expect("read");
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
         // The study UID round-trips through the CBOR encode/decode boundary.
         let uid = decoded
             .study
@@ -1664,12 +2022,15 @@ mod tests {
 
     #[test]
     fn query_engine_matches_written_manifest() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
         write_study_manifest(&manifests, &mut a).expect("write");
 
-        let decoded = read_manifest(&manifests.join("1.2.840.1.1.manifest")).expect("read");
+        let decoded =
+            crate::manifest::read_manifest_for_test(&manifests.join("1.2.840.1.1.manifest"))
+                .expect("read");
         // A PatientName glob and modality comma-list must both match.
         let f = QueryFilter {
             patient_name: Some("iva*".into()),
@@ -1681,6 +2042,7 @@ mod tests {
 
     #[test]
     fn manifest_roundtrip_preserves_responsible_person_and_filters() {
+        let _g = crate::manifest_cache::test_sync::lock();
         // FR-vet stage 1: the (0010,2297) attribute survives the
         // write -> read (CBOR) boundary that BOTH the STOW path and the rebuild
         // path share (write_study_manifest_full), and a ResponsiblePerson
@@ -1692,7 +2054,9 @@ mod tests {
         a.responsible_person = Some("IVANOV^IVAN".into());
         write_study_manifest(&manifests, &mut a).expect("write");
 
-        let decoded = read_manifest(&manifests.join("1.2.840.1.1.manifest")).expect("read");
+        let decoded =
+            crate::manifest::read_manifest_for_test(&manifests.join("1.2.840.1.1.manifest"))
+                .expect("read");
         // The stored attrs keep ascending order and the vet tag between sex/date.
         let mut tags = decoded.study.attrs.iter().map(|(t, _)| *t);
         assert!(
@@ -1740,13 +2104,25 @@ mod tests {
     }
 
     #[test]
-    fn empty_optional_fields_are_omitted() {
+    fn empty_identity_attributes_are_preserved_other_optionals_omitted() {
         let mut a = attrs();
         a.patient_sex = None;
-        a.accession_number = Some("".into()); // empty -> omitted
+        a.accession_number = Some("".into()); // present-but-empty -> preserved (F.2.5)
+        a.study_description = Some("".into()); // other optional text -> omitted
         let list = study_attrs(&a);
-        assert!(!list.iter().any(|(t, _)| *t == tag::ACCESSION_NUMBER));
-        assert!(!list.iter().any(|(t, _)| *t == tag::PATIENT_SEX));
+        assert!(
+            list.iter().any(|(t, v)| *t == tag::ACCESSION_NUMBER
+                && matches!(v, AttrValue::Text(s) if s.is_empty())),
+            "present-but-empty AccessionNumber must be preserved per PS3.18 F.2.5"
+        );
+        assert!(
+            !list.iter().any(|(t, _)| *t == tag::PATIENT_SEX),
+            "absent PatientSex must stay omitted"
+        );
+        assert!(
+            !list.iter().any(|(t, _)| *t == tag::STUDY_DESCRIPTION),
+            "empty StudyDescription stays omitted (not a preserved identity key)"
+        );
     }
 
     /// A two-series / two-instance tree mirroring one STOW-accepted study.
@@ -1819,13 +2195,14 @@ mod tests {
 
     #[test]
     fn full_manifest_roundtrips_series_and_instances() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
         let series = full_series();
         let path = write_study_manifest_full(&manifests, &mut a, &series).expect("write");
 
-        let decoded = read_manifest(&path).expect("read");
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
         // Two series, each with exactly one instance.
         assert_eq!(decoded.series.len(), 2);
         assert_eq!(decoded.series[0].instances.len(), 1);
@@ -1841,6 +2218,7 @@ mod tests {
     /// finds the series from the decoded on-disk manifest.
     #[test]
     fn pps_capture_persists_and_qido_finds_series() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -1875,7 +2253,7 @@ mod tests {
         };
         let path = write_study_manifest_full(&manifests, &mut a, &[sm]).expect("write");
 
-        let decoded = read_manifest(&path).expect("read");
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
         // The PPS capture tags are on-disk (date as UInt like SERIES_DATE).
         let s0 = &decoded.series[0];
         let mut pps_date: Option<u64> = None;
@@ -1895,7 +2273,7 @@ mod tests {
         // A QIDO series filter on the PPS tags resolves the series.
         let filter = crate::query::series::SeriesFilter {
             pps_start_date: Some("20260802".into()),
-            pps_start_time: Some("11*".into()),
+            pps_start_time: Some("110000-120000".into()),
             ..Default::default()
         };
         let mut out: Vec<&crate::manifest::SeriesRecord> = Vec::new();
@@ -1916,6 +2294,7 @@ mod tests {
     /// /studies values from the RAM index (no transient empty aggregate).
     #[test]
     fn manifest_write_stamps_modalities_and_counts() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -1927,7 +2306,9 @@ mod tests {
         assert_eq!(a.modalities_in_study.as_deref(), Some("CT"));
 
         // The written manifest's study derives the same aggregate on read.
-        let decoded = read_manifest(&manifests.join("1.2.840.1.1.manifest")).expect("read");
+        let decoded =
+            crate::manifest::read_manifest_for_test(&manifests.join("1.2.840.1.1.manifest"))
+                .expect("read");
         assert_eq!(decoded.study.modalities_in_study.as_deref(), Some("CT"));
         assert_eq!(decoded.study.series_count, 2);
         assert_eq!(decoded.study.instance_count, 2);
@@ -1938,6 +2319,7 @@ mod tests {
     /// preserves `sys.arrived_at` / `total_pixel_bytes` verbatim.
     #[test]
     fn rebuild_write_enriches_existing_manifest() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let text = |attrs: &[(u32, AttrValue)], t: u32| -> Option<String> {
@@ -1970,7 +2352,7 @@ mod tests {
         }];
         write_study_manifest_full(&manifests, &mut old, &old_series).expect("old write");
         let path = manifest_path(&manifests, &old.study_instance_uid);
-        let before = read_manifest(&path).expect("read old");
+        let before = crate::manifest::read_manifest_for_test(&path).expect("read old");
         let arrived_before = before.sys.arrived_at;
         let bytes_before = before.sys.total_pixel_bytes;
         assert_eq!(bytes_before, 1234);
@@ -2002,7 +2384,7 @@ mod tests {
         }];
         write_study_manifest_rebuild(&manifests, &mut fresh, &fresh_series).expect("rebuild write");
 
-        let after = read_manifest(&path).expect("read enriched");
+        let after = crate::manifest::read_manifest_for_test(&path).expect("read enriched");
         // Study level: missing tags added, existing values win.
         assert_eq!(
             text(&after.study.attrs, tag::INSTITUTION_NAME).as_deref(),
@@ -2037,6 +2419,7 @@ mod tests {
     /// like the other writers.
     #[test]
     fn rebuild_write_guards_tombstone_and_builds_fresh() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2044,7 +2427,7 @@ mod tests {
 
         // Missing manifest -> full build, round-trips (A9 guard passed).
         let path = write_study_manifest_rebuild(&manifests, &mut a, &series).expect("fresh");
-        let decoded = read_manifest(&path).expect("roundtrip");
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("roundtrip");
         assert_eq!(decoded.sys.total_pixel_bytes, 3_500_000);
         assert_eq!(decoded.series.len(), 2);
 
@@ -2055,15 +2438,82 @@ mod tests {
         assert!(matches!(err, StudyManifestError::StudyDeleted));
     }
 
+    /// A rebuild that ADDS a series must restamp the study aggregates.
+    ///
+    /// `Manifest::decode` recomputes series/instance counts from the array, so
+    /// a cold reader is always right. The manifest installed in the cache is
+    /// the in-memory object, and a warm reader gets that one verbatim: without
+    /// the restamp a study that gained a series keeps answering with the old
+    /// count until the entry is evicted.
+    #[test]
+    fn a_rebuild_that_adds_a_series_restamps_the_cached_aggregates() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let mut a = attrs();
+
+        let one = [SeriesModel {
+            series_instance_uid: "1.2.840.1.2".into(),
+            modality: "CT".into(),
+            series_number: Some("1".into()),
+            instances: vec![InstanceModel {
+                sop_instance_uid: "1.2.840.1.3".into(),
+                blake3: [0u8; 32],
+                storage_tier: TIER_HOT,
+                transfer_syntax_uid: "1.2.840.10008.1.2.1".into(),
+                file_size: 100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        write_study_manifest_full(&manifests, &mut a, &one).expect("first write");
+        let first = crate::manifest::read_manifest_for_test(&manifest_path(
+            &manifests,
+            &a.study_instance_uid,
+        ))
+        .expect("read");
+        assert_eq!(first.study.series_count, 1);
+
+        // Rebuild carrying the existing series plus a SECOND one (MR).
+        let mut two = one.to_vec();
+        two.push(SeriesModel {
+            series_instance_uid: "1.2.840.1.9".into(),
+            modality: "MR".into(),
+            series_number: Some("2".into()),
+            ..Default::default()
+        });
+        let mut fresh = attrs();
+        write_study_manifest_rebuild(&manifests, &mut fresh, &two).expect("rebuild");
+
+        // The CACHED manifest is the object a warm reader sees; `get_or_load`
+        // is that path (it serves the cache entry when one is present).
+        let trusted = crate::manifest::trusted_manifest_dir_for_test(&manifests);
+        let cached = crate::manifest_cache::get_or_load(&trusted, &fresh.study_instance_uid)
+            .expect("rebuild installs the manifest in the cache");
+        assert_eq!(cached.series.len(), 2, "the second series is present");
+        assert_eq!(
+            cached.study.series_count, 2,
+            "the cached series_count must describe the enriched tree"
+        );
+        assert_eq!(
+            cached.study.modalities_in_study.as_deref(),
+            Some("CT,MR"),
+            "the cached modality aggregate must describe the enriched tree"
+        );
+    }
+
     #[test]
     fn full_manifest_find_instance_returns_wado_data() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
         let series = full_series();
         write_study_manifest_full(&manifests, &mut a, &series).expect("write");
 
-        let decoded = read_manifest(&manifests.join("1.2.840.1.1.manifest")).expect("read");
+        let decoded =
+            crate::manifest::read_manifest_for_test(&manifests.join("1.2.840.1.1.manifest"))
+                .expect("read");
         // WADO resolves the instance by SOP UID and gets its pure-manifest data.
         let inst = decoded
             .find_instance("1.2.840.1.5")
@@ -2080,12 +2530,13 @@ mod tests {
     /// CBOR round-trip, in ascending tag order.
     #[test]
     fn captures_series_and_instance_attributes() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
         let series = full_series();
         let path = write_study_manifest_full(&manifests, &mut a, &series).expect("write");
-        let decoded = read_manifest(&path).expect("read");
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
 
         let s0 = &decoded.series[0];
         let tags: Vec<u32> = s0.attrs.iter().map(|(t, _)| *t).collect();
@@ -2354,6 +2805,29 @@ mod tests {
                 .count(),
             1
         );
+        // The merge sorted an UNSORTED historical target (SID before Modality
+        // in the fixture) into canonical ascending order with no duplicate
+        // tag: the unsorted target used to emit Modality twice.
+        assert!(
+            s0.attrs.windows(2).all(|w| w[0].0 < w[1].0),
+            "series attrs must be strictly ascending by tag: {:?}",
+            s0.attrs
+        );
+        assert_eq!(
+            s0.attrs.iter().filter(|(t, _)| *t == tag::MODALITY).count(),
+            1,
+            "Modality must not be duplicated: {:?}",
+            s0.attrs
+        );
+        let mut tags: Vec<u32> = s0.attrs.iter().map(|(t, _)| *t).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(
+            tags.len(),
+            s0.attrs.len(),
+            "every series tag must appear exactly once: {:?}",
+            s0.attrs
+        );
         // The rebuilt manifest is a valid, round-trippable manifest.
         let re = decoded.encode().expect("encode rebuilt");
         let _ = Manifest::decode(&re).expect("rebuilt must decode");
@@ -2363,6 +2837,7 @@ mod tests {
     /// overwriting.
     #[test]
     fn second_stow_accumulates_instances() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2405,7 +2880,9 @@ mod tests {
         }];
         write_study_manifest_full(&manifests, &mut a, &second).expect("second STOW");
 
-        let decoded = read_manifest(&manifests.join("1.2.840.1.1.manifest")).expect("read");
+        let decoded =
+            crate::manifest::read_manifest_for_test(&manifests.join("1.2.840.1.1.manifest"))
+                .expect("read");
 
         // One series, but now two instances.
         assert_eq!(decoded.series.len(), 1);
@@ -2420,6 +2897,7 @@ mod tests {
     /// Repeating the same SOPInstanceUID is idempotent - no duplicates.
     #[test]
     fn duplicate_sop_instance_uid_is_skipped() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2445,7 +2923,9 @@ mod tests {
         write_study_manifest_full(&manifests, &mut a, &series).expect("first");
         write_study_manifest_full(&manifests, &mut a, &series).expect("second");
 
-        let decoded = read_manifest(&manifests.join("1.2.840.1.1.manifest")).expect("read");
+        let decoded =
+            crate::manifest::read_manifest_for_test(&manifests.join("1.2.840.1.1.manifest"))
+                .expect("read");
         // Still exactly one instance.
         assert_eq!(decoded.series.len(), 1);
         assert_eq!(decoded.series[0].instances.len(), 1);
@@ -2507,6 +2987,7 @@ mod tests {
     /// in the study attrs and `write_study_json` emits it.
     #[test]
     fn study_id_roundtrips_manifest_to_qido() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut a = StudyManifestAttrs {
             patient_name: Some("ivanov".into()),
@@ -2522,8 +3003,10 @@ mod tests {
         assert_eq!(a.num_instances, 0);
 
         // Manifest -> study attrs: 0020,0010 present.
-        let m = crate::manifest::read_manifest_study_only(&dir.path().join("1.2.840.1.1.manifest"))
-            .expect("read manifest");
+        let m = crate::manifest::read_manifest_study_only_for_test(
+            &dir.path().join("1.2.840.1.1.manifest"),
+        )
+        .expect("read manifest");
         let study_attr = m
             .study
             .attrs
@@ -2550,6 +3033,7 @@ mod tests {
 
     #[test]
     fn mark_rejected_flags_only_the_named_instances() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2566,7 +3050,7 @@ mod tests {
         .expect("mark");
         assert_eq!(changed, 1, "exactly one instance changes state");
 
-        let decoded = read_manifest(&path).expect("read");
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
         let flags: Vec<bool> = decoded
             .series
             .iter()
@@ -2581,6 +3065,7 @@ mod tests {
 
     #[test]
     fn mark_rejected_is_idempotent() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2605,8 +3090,104 @@ mod tests {
         assert_eq!(second, 0, "an already-rejected instance is a no-op");
     }
 
+    /// A hide-only reason must ESCALATE a weaker stored reason.
+    ///
+    /// The caller groups a KOS note's references by reason and calls
+    /// `mark_rejected` once per reason, relying on arrival order. If a Quality
+    /// (113001) hide lands first and a patient-safety (113037) note second,
+    /// the blanket skip used to leave the instance re-storable, so a corrected
+    /// re-STOW cleared the Quality code and surfaced it again - defeating the
+    /// hide-only guarantee of IOCM 4.66.4.2.3.1 / 4.66.4.3.3.
+    #[test]
+    fn a_hide_only_reason_escalates_a_weaker_stored_reason() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let mut a = attrs();
+        let path =
+            write_study_manifest_full(&manifests, &mut a, &full_series()).expect("write study");
+
+        let quality = mark_rejected(
+            &manifests,
+            &a.study_instance_uid,
+            &["1.2.840.1.3"],
+            crate::manifest::QUALITY_REASON_CODE,
+        )
+        .expect("quality");
+        assert_eq!(quality, 1);
+
+        let escalated = mark_rejected(&manifests, &a.study_instance_uid, &["1.2.840.1.3"], 113_037)
+            .expect("escalate");
+        assert_eq!(
+            escalated, 1,
+            "the hide-only reason must overwrite the Quality hide"
+        );
+
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
+        let instance = decoded
+            .series
+            .iter()
+            .flat_map(|s| s.instances.iter())
+            .find(|i| {
+                i.attrs.iter().any(|(t, v)| {
+                    *t == crate::query::tag::SOP_INSTANCE_UID
+                        && matches!(v, crate::manifest::AttrValue::Text(uid) if uid == "1.2.840.1.3")
+                })
+            })
+            .expect("instance");
+        assert_eq!(instance.rejection_reason, 113_037);
+    }
+
+    /// A weaker reason must never downgrade a hide-only one, and a same-code
+    /// repetition stays idempotent.
+    #[test]
+    fn a_weaker_reason_does_not_downgrade_a_hide_only_one() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let mut a = attrs();
+        let path =
+            write_study_manifest_full(&manifests, &mut a, &full_series()).expect("write study");
+
+        mark_rejected(&manifests, &a.study_instance_uid, &["1.2.840.1.3"], 113_037).expect("hide");
+
+        // Quality after patient safety: the downgrade is refused, nothing
+        // changes and the file is not rewritten.
+        let downgrade = mark_rejected(
+            &manifests,
+            &a.study_instance_uid,
+            &["1.2.840.1.3"],
+            crate::manifest::QUALITY_REASON_CODE,
+        )
+        .expect("downgrade attempt");
+        assert_eq!(
+            downgrade, 0,
+            "a weaker reason must not rewrite a hide-only one"
+        );
+
+        // The same hide-only code again: idempotent, no rewrite.
+        let repeat = mark_rejected(&manifests, &a.study_instance_uid, &["1.2.840.1.3"], 113_037)
+            .expect("repeat");
+        assert_eq!(repeat, 0, "a same-code repetition is a no-op");
+
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
+        let instance = decoded
+            .series
+            .iter()
+            .flat_map(|s| s.instances.iter())
+            .find(|i| {
+                i.attrs.iter().any(|(t, v)| {
+                    *t == crate::query::tag::SOP_INSTANCE_UID
+                        && matches!(v, crate::manifest::AttrValue::Text(uid) if uid == "1.2.840.1.3")
+                })
+            })
+            .expect("instance");
+        assert_eq!(instance.rejection_reason, 113_037);
+    }
+
     #[test]
     fn mark_rejected_ignores_unknown_and_foreign_sop_uids() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2629,6 +3210,7 @@ mod tests {
 
     #[test]
     fn mark_rejected_refuses_a_tombstoned_study() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2654,6 +3236,7 @@ mod tests {
     /// note in CAS remains the historical record.
     #[test]
     fn mark_restored_returns_the_manifest_to_its_never_rejected_bytes() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2683,6 +3266,7 @@ mod tests {
 
     #[test]
     fn mark_restored_is_idempotent() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2710,6 +3294,7 @@ mod tests {
     /// Restore is scoped to the instances named, exactly like mark_rejected.
     #[test]
     fn mark_restored_leaves_other_hidden_instances_hidden() {
+        let _g = crate::manifest_cache::test_sync::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         let mut a = attrs();
@@ -2727,7 +3312,7 @@ mod tests {
             mark_restored(&manifests, &a.study_instance_uid, &["1.2.840.1.3"]).expect("restore");
         assert_eq!(restored, 1);
 
-        let flags: Vec<bool> = read_manifest(&path)
+        let flags: Vec<bool> = crate::manifest::read_manifest_for_test(&path)
             .expect("read")
             .series
             .iter()
@@ -2765,5 +3350,360 @@ mod tests {
         )
         .expect("mark");
         assert_eq!(changed, 0);
+    }
+
+    /// A REPLACE-mode update must REFUSE a hide-only rejection, not carry it.
+    ///
+    /// `write_study_manifest_update` re-reads the manifest AFTER taking the
+    /// coordinator lease; a rejection committed between the STOW refuse check
+    /// and that lease would otherwise be invisible to the accept gate, and the
+    /// record overwrite would replace the hidden instance's blob and orphan the
+    /// original. IOCM 4.66.4.2.3.1 / 4.66.4.3.3 make 113037 / 113038 hide-only
+    /// with no re-acceptance, so the manifest layer must refuse the REPLACE and
+    /// leave the manifest and blob untouched.
+    #[test]
+    fn a_replace_update_refuses_iocm_hide_rejections() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let mut a = attrs();
+        let path =
+            write_study_manifest_full(&manifests, &mut a, &full_series()).expect("write study");
+
+        let hidden = mark_rejected(&manifests, &a.study_instance_uid, &["1.2.840.1.3"], 113_037)
+            .expect("mark");
+        assert_eq!(hidden, 1);
+
+        // A DIFFERENT blake3/size so a replace would be observable on disk.
+        let mut replacement = full_series();
+        replacement[0].instances[0].blake3 = [0x33u8; 32];
+        replacement[0].instances[0].file_size = 9_000_000;
+
+        let err = write_study_manifest_update(&manifests, &mut a, &replacement)
+            .expect_err("a hide-only rejection must refuse the REPLACE");
+        match err {
+            StudyManifestError::RejectedForStore { sop_uid, reason } => {
+                assert_eq!(sop_uid, "1.2.840.1.3");
+                assert_eq!(reason, 113_037);
+            }
+            other => panic!("expected RejectedForStore, got {other:?}"),
+        }
+
+        // The on-disk manifest still holds the ORIGINAL blake3/size and the
+        // reason is still 113037: nothing was replaced or orphaned.
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
+        let inst = decoded
+            .series
+            .iter()
+            .flat_map(|s| s.instances.iter())
+            .find(|i| {
+                i.attrs.iter().any(|(t, v)| {
+                    *t == crate::query::tag::SOP_INSTANCE_UID
+                        && matches!(
+                            v,
+                            crate::manifest::AttrValue::Text(uid) if uid == "1.2.840.1.3"
+                        )
+                })
+            })
+            .expect("instance present");
+        assert_eq!(
+            inst.rejection_reason, 113_037,
+            "a hide-only rejection must stay in place after the refused REPLACE"
+        );
+        assert_eq!(
+            inst.blake3[0], 0x11,
+            "the refused REPLACE must not replace the original blob"
+        );
+        assert_eq!(
+            inst.file_size, 2_000_000,
+            "the refused REPLACE must not replace the original size"
+        );
+
+        // mark_restored stays the ONLY path that clears an IOCM code.
+        let restored =
+            mark_restored(&manifests, &a.study_instance_uid, &["1.2.840.1.3"]).expect("restore");
+        assert_eq!(restored, 1);
+        let after = crate::manifest::read_manifest_for_test(&path).expect("read");
+        assert!(
+            after
+                .series
+                .iter()
+                .flat_map(|s| s.instances.iter())
+                .all(|i| !i.is_rejected()),
+            "mark_restored must clear the code"
+        );
+    }
+
+    /// 113038 (incorrect MWL) is hide-only too, so the REPLACE must be refused
+    /// symmetrically with 113037 (IOCM 4.66.4.3.3).
+    #[test]
+    fn a_replace_update_refuses_incorrect_mwl_rejection() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let mut a = attrs();
+        write_study_manifest_full(&manifests, &mut a, &full_series()).expect("write study");
+
+        let hidden = mark_rejected(&manifests, &a.study_instance_uid, &["1.2.840.1.3"], 113_038)
+            .expect("mark");
+        assert_eq!(hidden, 1);
+
+        let err = write_study_manifest_update(&manifests, &mut a, &full_series())
+            .expect_err("an incorrect-MWL rejection must refuse the REPLACE");
+        match err {
+            StudyManifestError::RejectedForStore { sop_uid, reason } => {
+                assert_eq!(sop_uid, "1.2.840.1.3");
+                assert_eq!(reason, 113_038);
+            }
+            other => panic!("expected RejectedForStore, got {other:?}"),
+        }
+    }
+
+    /// A Quality (113001) rejection is re-storable by design: a corrected AI
+    /// result replaces the rejected one, so a REPLACE clears it.
+    #[test]
+    fn a_replace_update_clears_a_quality_rejection() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let mut a = attrs();
+        let path =
+            write_study_manifest_full(&manifests, &mut a, &full_series()).expect("write study");
+
+        let hidden = mark_rejected(
+            &manifests,
+            &a.study_instance_uid,
+            &["1.2.840.1.3"],
+            crate::manifest::QUALITY_REASON_CODE,
+        )
+        .expect("mark");
+        assert_eq!(hidden, 1);
+
+        write_study_manifest_update(&manifests, &mut a, &full_series()).expect("update");
+
+        let decoded = crate::manifest::read_manifest_for_test(&path).expect("read");
+        let inst = decoded
+            .series
+            .iter()
+            .flat_map(|s| s.instances.iter())
+            .find(|i| {
+                i.attrs.iter().any(|(t, v)| {
+                    *t == crate::query::tag::SOP_INSTANCE_UID
+                        && matches!(
+                            v,
+                            crate::manifest::AttrValue::Text(uid) if uid == "1.2.840.1.3"
+                        )
+                })
+            })
+            .expect("instance present");
+        assert_eq!(
+            inst.rejection_reason,
+            crate::manifest::NOT_REJECTED_REASON,
+            "a Quality rejection clears on REPLACE"
+        );
+    }
+
+    /// The UPDATE path must restamp the study aggregates it just changed.
+    ///
+    /// `replace_series_into` replaces or appends records, so it can add a
+    /// series or an instance. `Manifest::decode` recomputes the counts on a
+    /// cold read - they are not persisted - but the object handed to the cache
+    /// is this one, and a warm reader sees it verbatim.
+    #[test]
+    fn an_update_that_adds_a_series_restamps_the_aggregates() {
+        let mut manifest = build_manifest_full(&attrs(), &full_series());
+        // Reproduce the state a manifest is in when it was DECODED from CBOR:
+        // the derived counts are not stored, so they arrive as zero. This is
+        // the shape every update actually starts from.
+        manifest.study.series_count = 0;
+        manifest.study.instance_count = 0;
+        manifest.study.modalities_in_study = None;
+
+        // A third series arrives on the UPDATE path.
+        let extra = SeriesModel {
+            series_instance_uid: "1.2.840.1.9".into(),
+            modality: "MR".into(),
+            series_number: Some("3".into()),
+            ..Default::default()
+        };
+        replace_series_into(&mut manifest, &[extra]);
+
+        assert_eq!(manifest.series.len(), 3);
+        assert_eq!(
+            manifest.study.series_count, 3,
+            "the aggregates must describe the tree the update produced"
+        );
+        assert_eq!(manifest.study.instance_count, 2);
+        assert_eq!(
+            manifest.study.modalities_in_study.as_deref(),
+            Some("CT,MR"),
+            "the modality aggregate must include the new series"
+        );
+    }
+
+    /// A rebuild must adopt the recovered frame table of a legacy instance.
+    ///
+    /// A manifest written before the table existed has an EMPTY one, so frame
+    /// retrieval falls back to buffering the whole blob. The rebuild re-derives
+    /// the table from the stored file; discarding it leaves that fallback in
+    /// place for every legacy multi-frame instance.
+    #[test]
+    fn a_rebuild_populates_a_legacy_instances_frame_table() {
+        let mut legacy_series = full_series();
+        // Legacy: the table was never written.
+        for s in &mut legacy_series {
+            for i in &mut s.instances {
+                i.frames = Vec::new();
+            }
+        }
+        let mut manifest = build_manifest_full(&attrs(), &legacy_series);
+        let sop = manifest.series[0].instances[0].attrs.clone();
+        assert!(
+            manifest.series[0].instances[0].frames.is_empty(),
+            "the fixture must start without a frame table"
+        );
+
+        // The rebuild re-derives the table for the same stored blob.
+        let mut recovered = legacy_series;
+        let inst_uid = match sop
+            .iter()
+            .find(|(t, _)| *t == tag::SOP_INSTANCE_UID)
+            .map(|(_, v)| v)
+        {
+            Some(AttrValue::Text(s)) => s.clone(),
+            _ => panic!("fixture must carry a SOP Instance UID"),
+        };
+        for s in &mut recovered {
+            for i in &mut s.instances {
+                if i.sop_instance_uid == inst_uid {
+                    i.frames = vec![crate::manifest::FrameRecord {
+                        number: 1,
+                        hash: [0u8; 32],
+                        offset: 128,
+                        compressed_len: 512,
+                    }];
+                }
+            }
+        }
+
+        rebuild_series_attrs(&mut manifest, &recovered);
+
+        assert_eq!(
+            manifest.series[0].instances[0].frames.len(),
+            1,
+            "the recovered frame table must replace the empty one"
+        );
+        assert_eq!(manifest.series[0].instances[0].frames[0].offset, 128);
+    }
+
+    /// A frame table derived from a DIFFERENT blob must not be adopted.
+    ///
+    /// The rebuild matches an instance by SOP Instance UID, but the same UID
+    /// can name a replacement object (a re-STOW after a corrected encode). The
+    /// recovered table's offsets describe the blob the rebuild READ, so
+    /// applying them to a manifest that points at a different blob would send
+    /// frame retrieval into the middle of unrelated bytes.
+    #[test]
+    fn a_frame_table_from_a_different_blob_is_not_adopted() {
+        let mut legacy_series = full_series();
+        for s in &mut legacy_series {
+            for i in &mut s.instances {
+                i.frames = Vec::new();
+            }
+        }
+        let mut manifest = build_manifest_full(&attrs(), &legacy_series);
+        let stored_hash = manifest.series[0].instances[0].blake3;
+        assert!(
+            manifest.series[0].instances[0].frames.is_empty(),
+            "fixture starts without a table"
+        );
+
+        // The rebuild read a DIFFERENT blob under the same SOP UID.
+        let mut recovered = legacy_series;
+        for s in &mut recovered {
+            for i in &mut s.instances {
+                i.blake3 = [0xEEu8; 32];
+                i.frames = vec![crate::manifest::FrameRecord {
+                    number: 1,
+                    hash: [0u8; 32],
+                    offset: 4096,
+                    compressed_len: 512,
+                }];
+            }
+        }
+        assert_ne!(stored_hash, [0xEEu8; 32], "hashes must differ");
+
+        rebuild_series_attrs(&mut manifest, &recovered);
+
+        assert!(
+            manifest.series[0].instances[0].frames.is_empty(),
+            "offsets from another blob must not be adopted"
+        );
+    }
+
+    /// An instance attribute derived from a DIFFERENT blob must not be merged
+    /// onto a record naming the stored blob.
+    ///
+    /// The rebuild matches by SOP Instance UID, but the same UID can name a
+    /// replacement object. A fresh NumberOfFrames captured from the wrong
+    /// bytes would attach to a record whose blob never contained them.
+    #[test]
+    fn instance_attributes_from_a_different_blob_are_not_merged() {
+        let legacy = full_series();
+        let mut manifest = build_manifest_full(&attrs(), &legacy);
+        let stored_hash = manifest.series[0].instances[0].blake3;
+        let has_nof = |attrs: &[(u32, crate::manifest::AttrValue)]| {
+            attrs.iter().any(|(t, _)| *t == tag::NUMBER_OF_FRAMES)
+        };
+        assert!(
+            !has_nof(&manifest.series[0].instances[0].attrs),
+            "the fixture must not carry NumberOfFrames yet"
+        );
+
+        // The rebuild read a DIFFERENT blob under the same SOP UID, and derived
+        // NumberOfFrames from those bytes.
+        let mut recovered = legacy;
+        for s in &mut recovered {
+            for i in &mut s.instances {
+                i.blake3 = [0xEEu8; 32];
+                i.number_of_frames = Some(99);
+            }
+        }
+        assert_ne!(stored_hash, [0xEEu8; 32], "hashes must differ");
+
+        rebuild_series_attrs(&mut manifest, &recovered);
+
+        assert!(
+            !has_nof(&manifest.series[0].instances[0].attrs),
+            "an attribute derived from another blob must not be merged onto a \
+             record naming a different blob"
+        );
+    }
+
+    /// Positive control: the SAME blob's freshly captured attribute IS merged.
+    #[test]
+    fn instance_attributes_from_the_same_blob_are_merged() {
+        let legacy = full_series();
+        let mut manifest = build_manifest_full(&attrs(), &legacy);
+        let has_nof = |attrs: &[(u32, crate::manifest::AttrValue)]| {
+            attrs.iter().any(|(t, _)| *t == tag::NUMBER_OF_FRAMES)
+        };
+        assert!(!has_nof(&manifest.series[0].instances[0].attrs));
+
+        let mut recovered = legacy;
+        for s in &mut recovered {
+            for i in &mut s.instances {
+                i.number_of_frames = Some(99);
+            }
+        }
+
+        rebuild_series_attrs(&mut manifest, &recovered);
+
+        let nof = manifest.series[0].instances[0]
+            .attrs
+            .iter()
+            .find(|(t, _)| *t == tag::NUMBER_OF_FRAMES)
+            .expect("same-blob NumberOfFrames must be merged");
+        assert!(matches!(nof.1, crate::manifest::AttrValue::Text(ref s) if s == "99"));
     }
 }

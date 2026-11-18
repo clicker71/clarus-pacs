@@ -43,7 +43,13 @@ pub struct QidoResp {
     /// HTTP status. 200 for success, 500 for a surfaced error body.
     pub status: u16,
     /// Response content type (`DICOM_JSON_CONTENT_TYPE` | XML | JSON error).
+    /// Empty for the XML path: its multipart Content-Type carries a
+    /// per-response boundary and travels as a `headers` entry instead.
     pub content_type: &'static str,
+    /// Extra headers the renderer emits before the fixed set (mirrors
+    /// `render_ups`). Only the XML path uses it (the multipart Content-Type
+    /// with its boundary); JSON/error paths leave it empty.
+    pub headers: Vec<(String, String)>,
     /// Result count >= limit -> the response is truncated. Retained so the
     /// existing constructors keep their meaning; `remaining` is the precise
     /// value the PS3.18 8.3.4.4.1 Warning needs.
@@ -198,6 +204,29 @@ fn validate_study_time(time: &str) -> bool {
         }
     }
     true
+}
+
+/// Validate a TM value in the range form PS3.4 C.2.2.2.5 requires: the exact
+/// `HHMMSS[.ffffff]`, a closed `lo-hi`, or one open end (`lo-`, `-hi`), each
+/// bound a valid TM. TM values never contain `-`, so one separator is
+/// unambiguous. A bare `-` (both ends absent) is rejected: it carries no
+/// constraint (standard/ps3.4/c-2.2.2.5-range-matching.json) and must not
+/// silently become a full scan.
+fn validate_study_time_range(time: &str) -> bool {
+    if !time.contains('-') {
+        return validate_study_time(time);
+    }
+    let Some((lo, hi)) = time.split_once('-') else {
+        return false;
+    };
+    // More than one `-` is malformed (TM carries none).
+    if hi.contains('-') {
+        return false;
+    }
+    if lo.is_empty() && hi.is_empty() {
+        return false;
+    }
+    (lo.is_empty() || validate_study_time(lo)) && (hi.is_empty() || validate_study_time(hi))
 }
 
 /// QIDO-RS query parameters (validated, never interpolated into SQL directly).
@@ -520,23 +549,29 @@ impl QidoQuery {
             }
         }
 
-        // G-02: StudyTime must match HHMMSS[.ffffff]
+        // G-02: StudyTime must match HHMMSS[.ffffff] or its range form
+        // (`lo-hi`, `lo-`, `-hi`) - a required TM matching key with
+        // PS3.4 C.2.2.2.5 range matching.
         if let Some(ref time) = self.StudyTime
-            && !validate_study_time(time)
+            && !validate_study_time_range(time)
         {
             return Err(ValidationError::InvalidStudyTime(time.clone()).into_qido_error());
         }
 
-        // PerformedProcedureStepStartDate (0040,0244) is DA `YYYYMMDD`.
+        // PerformedProcedureStepStartDate (0040,0244) is DA `YYYYMMDD` or its
+        // range form. `validate_study_date` also accepts `*` (StudyDate's
+        // wildcard); the PPS-date key never accepted `*` before and the core
+        // DA predicate does not special-case it, so `*` stays rejected here.
         if let Some(ref d) = self.PerformedProcedureStepStartDate
-            && (d.len() != 8 || !d.chars().all(|c| c.is_ascii_digit()))
+            && (d == "*" || !validate_study_date(d))
         {
             return Err(ValidationError::InvalidPerformedStepStartDate(d.clone()).into_qido_error());
         }
 
-        // PerformedProcedureStepStartTime (0040,0245) is TM `HHMMSS[.ffffff]`.
+        // PerformedProcedureStepStartTime (0040,0245) is TM `HHMMSS[.ffffff]`
+        // or its range form.
         if let Some(ref t) = self.PerformedProcedureStepStartTime
-            && !validate_study_time(t)
+            && !validate_study_time_range(t)
         {
             return Err(ValidationError::InvalidPerformedStepStartTime(t.clone()).into_qido_error());
         }
@@ -939,6 +974,7 @@ fn search_studies_btree(
             return QidoResp {
                 status: STATUS_INTERNAL_SERVER_ERROR,
                 content_type: APPLICATION_JSON,
+                headers: Vec::new(),
                 truncated: false,
                 remaining: None,
                 body: br#"{"error":"Internal server error"}"#.to_vec(),
@@ -1016,6 +1052,7 @@ fn search_studies_btree(
                 return QidoResp {
                     status: STATUS_INTERNAL_SERVER_ERROR,
                     content_type: APPLICATION_JSON,
+                    headers: Vec::new(),
                     truncated: false,
                     remaining: None,
                     body: br#"{"error":"Study too large to serialize"}"#.to_vec(),
@@ -1029,6 +1066,7 @@ fn search_studies_btree(
     QidoResp {
         status: STATUS_OK,
         content_type: DICOM_JSON_CONTENT_TYPE,
+        headers: Vec::new(),
         truncated,
         remaining,
         body,
@@ -1041,6 +1079,7 @@ fn empty_json() -> QidoResp {
     QidoResp {
         status: STATUS_OK,
         content_type: APPLICATION_JSON,
+        headers: Vec::new(),
         truncated: false,
         remaining: None,
         body: b"[]".to_vec(),
@@ -1355,19 +1394,67 @@ fn btree_internal_error() -> QidoResp {
     QidoResp {
         status: STATUS_INTERNAL_SERVER_ERROR,
         content_type: APPLICATION_JSON,
+        headers: Vec::new(),
         truncated: false,
         remaining: None,
         body: br#"{"error":"Internal server error"}"#.to_vec(),
     }
 }
 
+/// The response media type PS3.18 10.6.1 names for a QIDO-RS XML answer.
+///
+/// A search answer is a LIST of matching objects, so it is
+/// `multipart/related` with one `application/dicom+xml` part per object
+/// (each part is one `NativeDicomModel`). The boundary is per-response
+/// (`boundary_id()`), so the media type carries it and cannot be a
+/// `&'static str`; the caller travels it as a `headers` entry.
+fn qido_xml_multipart_content_type(boundary: &str) -> String {
+    format!("multipart/related; type=\"{DICOM_XML_CONTENT_TYPE}\"; boundary=\"{boundary}\"")
+}
+
+/// The empty `NativeDicomModel` document (PS3.19 A.1.5-2): the XML encoding
+/// of a zero-result QIDO answer (standard/ps3.18/qido-xml-response.json -
+/// empty XML payload = empty NativeDicomModel root element).
+fn qido_xml_empty_model() -> Vec<u8> {
+    let mut doc = Vec::with_capacity(128);
+    clarus_core::query::xml::write_xml_doc_start(&mut doc);
+    clarus_core::query::xml::write_xml_doc_end(&mut doc);
+    doc
+}
+
+/// Append one `application/dicom+xml` part to a `multipart/related` body.
+///
+/// RFC 2046 5.1.1 puts no CRLF before the FIRST delimiter and a CRLF before
+/// every later one; `first` tracks that. `Content-Length` is the document's
+/// byte length so a reader can seek each part without scanning for the
+/// boundary (which `boundary_id()` guarantees is never a prefix of a part
+/// body).
+fn push_xml_part(body: &mut Vec<u8>, boundary: &str, first: &mut bool, doc: &[u8]) {
+    if *first {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        *first = false;
+    } else {
+        body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+    }
+    body.extend_from_slice(
+        format!(
+            "Content-Type: {DICOM_XML_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n",
+            doc.len()
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(doc);
+}
+
 /// Assemble a QIDO XML response from a per-item typed attribute writer.
 ///
 /// addendum: the B-tree tiers MUST serve XML themselves, or the
 /// always-on XML producer dies with the SQLite fallback in. When the
-/// negotiated content type is XML, all items are streamed into a single
-/// `<NativeDicomModel>` root via `clarus_core::query::xml`; otherwise `None`
-/// is returned so the caller keeps the JSON path.
+/// negotiated content type is XML, each item becomes its own
+/// `NativeDicomModel` document and the documents are framed as
+/// `multipart/related` parts (PS3.18 10.6.1 / 10.6.3.3: one model per
+/// matching object, standard/ps3.18/qido-xml-response.json); otherwise
+/// `None` is returned so the caller keeps the JSON path.
 fn btree_xml<T, F>(
     items: &[T],
     mut write_attrs: F,
@@ -1381,19 +1468,40 @@ where
     if content_type != DICOM_XML_CONTENT_TYPE {
         return None;
     }
-    let mut body = Vec::with_capacity(items.len() * 128 + 64);
-    clarus_core::query::xml::write_xml_doc_start(&mut body);
-    let mut scratch = [0u8; 4096];
-    for item in items {
-        match write_attrs(&mut scratch, item) {
-            Ok(n) => body.extend_from_slice(&scratch[..n]),
-            Err(_) => return Some(btree_internal_error()),
+    let boundary = clarus_adapters::boundary_id();
+    let mut body = Vec::with_capacity(items.len().saturating_mul(160).saturating_add(96));
+    let mut first = true;
+    if items.is_empty() {
+        // PS3.18 8.3.4.4: a zero-result XML answer is an empty
+        // NativeDicomModel (PS3.19 A.1.5-2) carried as ONE part. A bare
+        // `--boundary--` is a multipart entity with no parts at all, which a
+        // reader cannot tell apart from a truncated response.
+        push_xml_part(&mut body, &boundary, &mut first, &qido_xml_empty_model());
+    } else {
+        // One reusable per-part document buffer: the attribute writer fills a
+        // 4 KiB stack scratch, so a document always fits in a small owned
+        // buffer and no per-item allocation is needed beyond the headers.
+        let mut doc = Vec::with_capacity(160);
+        let mut scratch = [0u8; 4096];
+        for item in items {
+            doc.clear();
+            clarus_core::query::xml::write_xml_doc_start(&mut doc);
+            match write_attrs(&mut scratch, item) {
+                Ok(n) => doc.extend_from_slice(&scratch[..n]),
+                Err(_) => return Some(btree_internal_error()),
+            }
+            clarus_core::query::xml::write_xml_doc_end(&mut doc);
+            push_xml_part(&mut body, &boundary, &mut first, &doc);
         }
     }
-    clarus_core::query::xml::write_xml_doc_end(&mut body);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     Some(QidoResp {
         status: STATUS_OK,
-        content_type: DICOM_XML_CONTENT_TYPE,
+        content_type: "",
+        headers: vec![(
+            "Content-Type".to_string(),
+            qido_xml_multipart_content_type(&boundary),
+        )],
         truncated,
         remaining,
         body,
@@ -1416,6 +1524,7 @@ fn qido_remaining(total_matches: usize, offset: Option<u64>, returned: u64) -> O
 fn series_filter_from(query: &QidoQuery, state: &AppState) -> clarus_core::query::SeriesFilter {
     clarus_core::query::SeriesFilter {
         series_instance_uid: query.SeriesInstanceUID.clone(),
+        series_number: query.SeriesNumber.clone(),
         modality: query.Modality.clone(),
         series_date: query.SeriesDate.clone(),
         series_time: query.SeriesTime.clone(),
@@ -1487,6 +1596,7 @@ fn render_series_page(
     QidoResp {
         status: STATUS_OK,
         content_type: DICOM_JSON_CONTENT_TYPE,
+        headers: Vec::new(),
         truncated: remaining.is_some(),
         remaining,
         body,
@@ -1547,6 +1657,7 @@ fn render_instance_page(
     QidoResp {
         status: STATUS_OK,
         content_type: DICOM_JSON_CONTENT_TYPE,
+        headers: Vec::new(),
         truncated: remaining.is_some(),
         remaining,
         body,
@@ -1571,12 +1682,13 @@ fn btree_series_search(
     if !path.is_file() {
         return empty_json();
     }
-    let manifest = match clarus_core::manifest::read_manifest(&path) {
-        Ok(m) => m,
-        Err(e) => {
+    let manifest = match state.read_server_manifest(study_uid) {
+        Some(Ok(m)) => m,
+        Some(Err(e)) => {
             crate::clog_error!(error = %e, study_uid = %study_uid, "B-tree QIDO series: undecodable manifest");
             return btree_internal_error();
         }
+        None => return empty_json(),
     };
     // No heal poke from the series path: the study was already found via the
     // study-search point (which does the provenance/absent check); series-level
@@ -1630,12 +1742,13 @@ fn btree_instances_search(
     if !path.is_file() {
         return empty_json();
     }
-    let manifest = match clarus_core::manifest::read_manifest(&path) {
-        Ok(m) => m,
-        Err(e) => {
+    let manifest = match state.read_server_manifest(study_uid) {
+        Some(Ok(m)) => m,
+        Some(Err(e)) => {
             crate::clog_error!(error = %e, study_uid = %study_uid, "B-tree QIDO instances: undecodable manifest");
             return btree_internal_error();
         }
+        None => return empty_json(),
     };
     let filter = clarus_core::query::InstanceFilter {
         sop_instance_uid: query.SOPInstanceUID.clone(),
@@ -1702,6 +1815,7 @@ fn btree_instances_search(
     QidoResp {
         status: STATUS_OK,
         content_type: DICOM_JSON_CONTENT_TYPE,
+        headers: Vec::new(),
         truncated: remaining.is_some(),
         remaining,
         body,
@@ -1728,12 +1842,13 @@ fn btree_study_instances(
     if !path.is_file() {
         return empty_json();
     }
-    let manifest = match clarus_core::manifest::read_manifest(&path) {
-        Ok(m) => m,
-        Err(e) => {
+    let manifest = match state.read_server_manifest(study_uid) {
+        Some(Ok(m)) => m,
+        Some(Err(e)) => {
             crate::clog_error!(error = %e, study_uid = %study_uid, "B-tree QIDO study instances: undecodable manifest");
             return btree_internal_error();
         }
+        None => return empty_json(),
     };
     let filter = clarus_core::query::InstanceFilter {
         sop_instance_uid: query.SOPInstanceUID.clone(),
@@ -1850,43 +1965,90 @@ pub fn qido_instances(
     ))
 }
 
-/// `GET /dicomweb/series/{SeriesInstanceUID}/instances` - Weasis-compat
-/// series-root instances QIDO (06.09 field incident).
+/// Upper bound on the remembered negative series-root lookups (1611 #14).
 ///
-/// Weasis appends "/instances" to the QIDO series RetrieveURL (0008,1190)
-/// and queries the result verbatim. The global series search emits the
-/// series-root form (`{base}/dicomweb/series/{ser}`), so this route must
-/// resolve it: scan the manifests for the owning study, then render the
-/// instances exactly like the study-scoped path.
-pub fn qido_series_root_instances(
-    state: &AppState,
-    series_uid: &str,
-    query_str: Option<&str>,
-    accept: Option<&str>,
-    retrieve_base: Option<&str>,
-    expose: bool,
-) -> Result<QidoResp, QidoError> {
-    let content_type = negotiate(accept);
-    let query = parse_and_validate(query_str, QidoLevel::Instance)?;
-    validate_uid(series_uid)?;
+/// The set holds only MISSES; a full set is cleared whole, so a fabricated UID
+/// can at worst force one extra scan per 4096 distinct misses, never unbounded
+/// growth on the request thread.
+const SERIES_MISS_CACHE_CAP: usize = 4096;
+
+fn series_miss_cache() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn series_was_missed(series_uid: &str) -> bool {
+    series_miss_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(series_uid)
+}
+
+fn remember_series_miss(series_uid: &str) {
+    let mut cache = series_miss_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SERIES_MISS_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(series_uid.to_string());
+}
+
+/// Test seam: counts `read_manifest` calls inside the legacy fallback scan so
+/// a test can prove a fabricated series UID decodes ZERO manifests on the
+/// second request (the miss cache short-circuits it).
+#[cfg(test)]
+mod series_scan_seam {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub static MANIFEST_DECODES: AtomicUsize = AtomicUsize::new(0);
+    pub fn reset() {
+        MANIFEST_DECODES.store(0, Ordering::Relaxed);
+    }
+    pub fn tick() {
+        MANIFEST_DECODES.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn count() -> usize {
+        MANIFEST_DECODES.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+fn clear_series_miss_cache() {
+    series_miss_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Legacy manifest scan: the pre-index fallback used only when the
+/// `series_owner` index does not know the series (manifests written before
+/// the index existed). Bounded by [`SERIES_MISS_CACHE_CAP`]: a UID already
+/// known absent is not re-scanned.
+fn fallback_series_owner_scan(state: &AppState, series_uid: &str) -> Option<String> {
+    if series_was_missed(series_uid) {
+        return None;
+    }
 
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let entries = match std::fs::read_dir(manifest_dir) {
         Ok(it) => it,
-        Err(_) => return Ok(empty_json()),
+        Err(_) => return None,
     };
-    let mut owner: Option<String> = None;
     for entry in entries.flatten() {
         let fname = entry.file_name().to_string_lossy().into_owned();
         let Some(stem) = fname.strip_suffix(".manifest") else {
             continue;
         };
-        let manifest = match clarus_core::manifest::read_manifest(&entry.path()) {
-            Ok(m) => m,
-            Err(_) => continue, // corrupt manifest: skip, keep scanning
+        #[cfg(test)]
+        series_scan_seam::tick();
+        let manifest = match state.read_server_manifest(stem) {
+            Some(Ok(m)) => m,
+            _ => continue, // corrupt/unreadable manifest: skip, keep scanning
         };
         let filter = clarus_core::query::SeriesFilter {
             series_instance_uid: Some(series_uid.to_string()),
+            series_number: None,
             modality: None,
             series_date: None,
             series_time: None,
@@ -1906,10 +2068,40 @@ pub fn qido_series_root_instances(
         let mut hits: Vec<&clarus_core::manifest::SeriesRecord> = Vec::new();
         clarus_core::query::search_series(&manifest, &filter, &mut hits);
         if !hits.is_empty() {
-            owner = Some(stem.to_string());
-            break;
+            return Some(stem.to_string());
         }
     }
+    remember_series_miss(series_uid);
+    None
+}
+
+/// `GET /dicomweb/series/{SeriesInstanceUID}/instances` - Weasis-compat
+/// series-root instances QIDO (06.09 field incident).
+///
+/// Weasis appends "/instances" to the QIDO series RetrieveURL (0008,1190)
+/// and queries the result verbatim. The global series search emits the
+/// series-root form (`{base}/dicomweb/series/{ser}`), so this route must
+/// resolve it. 1611 #14: consult the `series_owner` shadow index FIRST (warm
+/// O(days) lookup); only a miss falls back to the bounded legacy manifest scan
+/// above. An unknown series stays an empty result set (PS3.18 10.6.1.5), not
+/// an error.
+pub fn qido_series_root_instances(
+    state: &AppState,
+    series_uid: &str,
+    query_str: Option<&str>,
+    accept: Option<&str>,
+    retrieve_base: Option<&str>,
+    expose: bool,
+) -> Result<QidoResp, QidoError> {
+    let content_type = negotiate(accept);
+    let query = parse_and_validate(query_str, QidoLevel::Instance)?;
+    validate_uid(series_uid)?;
+
+    let owner = match state.shadow.series_owner_study(series_uid) {
+        Some(study_uid) => Some(study_uid),
+        None => fallback_series_owner_scan(state, series_uid),
+    };
+
     match owner {
         Some(study_uid) => Ok(btree_instances_search(
             state,
@@ -2104,17 +2296,32 @@ pub fn qido_patients(
 
     // -- XML branch (PS3.19, always-on since) -------------------------
     if content_type == DICOM_XML_CONTENT_TYPE {
+        // PS3.18 10.6.1 / 10.6.3.3: a search answer is a LIST, so the XML
+        // form is multipart/related with one NativeDicomModel per patient -
+        // not one root flattening every patient's attributes.
+        let boundary = clarus_adapters::boundary_id();
         let mut body = Vec::new();
-        clarus_core::query::xml::write_xml_doc_start(&mut body);
-        for p in &patients {
-            clarus_core::query::xml::write_patient_xml_into(&mut body, p);
+        let mut first = true;
+        if patients.is_empty() {
+            push_xml_part(&mut body, &boundary, &mut first, &qido_xml_empty_model());
+        } else {
+            let mut doc = Vec::with_capacity(160);
+            for p in &patients {
+                doc.clear();
+                clarus_core::query::xml::write_xml_doc_start(&mut doc);
+                clarus_core::query::xml::write_patient_xml_into(&mut doc, p);
+                clarus_core::query::xml::write_xml_doc_end(&mut doc);
+                push_xml_part(&mut body, &boundary, &mut first, &doc);
+            }
         }
-        // The legacy dicomweb_json_to_xml closes the root with no leading
-        // newline after the last attribute.
-        body.extend_from_slice(b"</NativeDicomModel>\n");
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         return Ok(QidoResp {
             status: STATUS_OK,
-            content_type: DICOM_XML_CONTENT_TYPE,
+            content_type: "",
+            headers: vec![(
+                "Content-Type".to_string(),
+                qido_xml_multipart_content_type(&boundary),
+            )],
             truncated,
             remaining: patients_remaining,
             body,
@@ -2140,6 +2347,7 @@ pub fn qido_patients(
     Ok(QidoResp {
         status: STATUS_OK,
         content_type: DICOM_JSON_CONTENT_TYPE,
+        headers: Vec::new(),
         truncated,
         remaining: patients_remaining,
         body,
@@ -2159,9 +2367,8 @@ pub fn qido_patients(
 /// archive; a fresh store legitimately has no manifests). A corrupt manifest
 /// aborts the whole request - honest surfacing, matching the scanner's
 /// lazy-recovery contract.
-fn decode_all_manifests(
-    manifest_dir: &std::path::Path,
-) -> Result<Vec<clarus_core::manifest::Manifest>, ()> {
+fn decode_all_manifests(state: &AppState) -> Result<Vec<clarus_core::manifest::Manifest>, ()> {
+    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let entries = match std::fs::read_dir(manifest_dir) {
         Ok(it) => it,
         Err(_) => return Ok(Vec::new()),
@@ -2177,8 +2384,10 @@ fn decode_all_manifests(
     names.sort();
     let mut manifests: Vec<clarus_core::manifest::Manifest> = Vec::with_capacity(names.len());
     for stem in names {
-        let path = manifest_dir.join(format!("{stem}.manifest"));
-        let m = clarus_core::manifest::read_manifest(&path).map_err(|_| ())?;
+        let m = state
+            .read_server_manifest(&stem)
+            .ok_or(())?
+            .map_err(|_| ())?;
         manifests.push(m);
     }
     Ok(manifests)
@@ -2230,15 +2439,16 @@ pub fn qido_series_global(
             // Unknown study -> empty array (200), matching the scoped route.
             return Ok(empty_json());
         }
-        let manifest = match clarus_core::manifest::read_manifest(&path) {
-            Ok(m) => m,
-            Err(e) => {
+        let manifest = match state.read_server_manifest(&study_uid) {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
                 crate::clog_error!(error = %e, study_uid = %study_uid, "QIDO global series: undecodable manifest");
                 return Err(QidoError {
                     status: STATUS_INTERNAL_SERVER_ERROR,
                     message: "Internal server error".to_string(),
                 });
             }
+            None => return Ok(empty_json()),
         };
         // Same SeriesFilter the full scan uses, so Modality and every other
         // series key still narrow WITHIN the resolved study.
@@ -2262,8 +2472,7 @@ pub fn qido_series_global(
         ));
     }
 
-    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
-    let manifests = match decode_all_manifests(manifest_dir) {
+    let manifests = match decode_all_manifests(state) {
         Ok(m) => m,
         Err(()) => {
             crate::clog_error!("QIDO global series: undecodable manifest");
@@ -2345,8 +2554,7 @@ pub fn qido_instances_global(
         ));
     }
 
-    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
-    let manifests = match decode_all_manifests(manifest_dir) {
+    let manifests = match decode_all_manifests(state) {
         Ok(m) => m,
         Err(()) => {
             crate::clog_error!("QIDO global instances: undecodable manifest");
@@ -2377,7 +2585,17 @@ pub fn qido_instances_global(
     // `qido_to_btree_filter` turns them into the same study-level matcher the
     // study route uses, so `?PatientID=P1` narrows the scan instead of
     // returning every patient's instances.
-    let study_filter = qido_to_btree_filter(&query, limit, &state.config.query);
+    let mut study_filter = qido_to_btree_filter(&query, limit, &state.config.query);
+    // Series IE keys on the relational /instances route are applied ONLY by
+    // `series_filter` (built above). `qido_to_btree_filter` also embeds them
+    // because the study route shares the helper, but keeping them in the study
+    // gate here double-filters: `?Modality=PR` matches study-level Modality
+    // ("SM" from the seed's first series) and drops the whole study, losing
+    // the matching PR series. The study route's `modality` -> study-level
+    // match is a documented deviation and stays untouched.
+    study_filter.modality = None;
+    study_filter.series_instance_uid = None;
+    study_filter.series_number = None;
     clarus_core::query::search_all_instances(
         &manifests,
         &filter,
@@ -2439,6 +2657,7 @@ pub fn qido_instances_global(
     Ok(QidoResp {
         status: STATUS_OK,
         content_type: DICOM_JSON_CONTENT_TYPE,
+        headers: Vec::new(),
         truncated: remaining.is_some(),
         remaining,
         body,
@@ -3124,6 +3343,49 @@ mod tests {
         );
     }
 
+    /// PS3.4 C.2.2.2.5: the DA/TM range forms are legal for the three
+    /// required matching keys and must validate (reaching the core matcher as
+    /// raw strings); malformed ranges still 400.
+    #[test]
+    fn test_da_tm_range_forms_validate() {
+        // StudyTime is a STUDY key; the PPS keys are SERIES keys.
+        for qs in [
+            "StudyTime=090000-110000",
+            "StudyTime=090000-",
+            "StudyTime=-110000",
+        ] {
+            assert!(
+                parse_and_validate(Some(qs), QidoLevel::Study).is_ok(),
+                "{qs} must validate"
+            );
+        }
+        for qs in [
+            "PerformedProcedureStepStartDate=20260801-20260831",
+            "PerformedProcedureStepStartTime=090000-110000",
+        ] {
+            assert!(
+                parse_and_validate(Some(qs), QidoLevel::Series).is_ok(),
+                "{qs} must validate"
+            );
+        }
+        // Malformed ranges stay 400.
+        let err = parse_and_validate(Some("StudyTime=09-"), QidoLevel::Study)
+            .expect_err("a bound shorter than HHMMSS must 400");
+        assert!(err.message.contains("StudyTime"), "{}", err.message);
+        let err = parse_and_validate(Some("StudyTime=-"), QidoLevel::Study)
+            .expect_err("a bare `-` must 400");
+        assert!(err.message.contains("StudyTime"), "{}", err.message);
+        // The PPS-date key does not accept StudyDate's `*` wildcard.
+        let err = parse_and_validate(Some("PerformedProcedureStepStartDate=*"), QidoLevel::Series)
+            .expect_err("PPS date `*` must 400");
+        assert!(
+            err.message
+                .contains("PerformedProcedureStepStartDate must match pattern YYYYMMDD"),
+            "{}",
+            err.message
+        );
+    }
+
     /// PPS series keys are FOREIGN at Study and Instance levels, native
     /// at the Series level (mirrors SeriesNumber/SeriesDate).
     #[test]
@@ -3622,5 +3884,117 @@ mod tests {
             0, 0, 0, 0, 0, "unknown",
         );
         assert!(na.contains("\"s3\":\"na\",\"s3_ms\":0,\"obj\":1"), "{na}");
+    }
+
+    /// 1611 #14: a fabricated SeriesInstanceUID is scanned at most once. The
+    /// first request walks the legacy manifests (no index); the second must
+    /// decode ZERO manifests because the miss cache short-circuits it.
+    #[test]
+    fn fabricated_series_second_request_decodes_zero_manifests() {
+        use crate::shadow::ShadowTier;
+        use clarus_adapters::storage::ContentAddressedStorage;
+        use clarus_core::manifest::{
+            AttrValue, InstanceRecord, Manifest, SeriesRecord, StudyQido, SysHeader, TIER_HOT,
+            write_manifest,
+        };
+        use clarus_core::query::StudyScanner;
+        use std::path::PathBuf;
+        use std::sync::{Arc, RwLock as StdRwLock};
+        use std::time::Instant;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let btree = tmp.path().join("btree");
+        let manifest_dir = btree.join("manifests");
+        let idx_dir = btree.join("idx");
+        let cas_dir = tmp.path().join("cas");
+        std::fs::create_dir_all(&manifest_dir).expect("manifests");
+        std::fs::create_dir_all(&idx_dir).expect("idx");
+        std::fs::create_dir_all(&cas_dir).expect("cas");
+
+        // 200 legacy manifests, written WITHOUT the series_owner index (the
+        // fallback path this test exercises). Each names a distinct series.
+        for i in 0..200u32 {
+            let study = format!("1.2.840.9999.{i}");
+            let series = format!("1.2.840.9999.{i}.1");
+            let manifest = Manifest {
+                sys: SysHeader {
+                    version: 1,
+                    storage_tier: TIER_HOT,
+                    total_pixel_bytes: 0,
+                    arrived_at: 0,
+                },
+                study: StudyQido {
+                    attrs: vec![
+                        (0x0008_0060, AttrValue::Text("CT".into())),
+                        (0x0020_000d, AttrValue::Text(study.clone())),
+                    ],
+                    ..Default::default()
+                },
+                series: vec![SeriesRecord {
+                    attrs: vec![(0x0020_000e, AttrValue::Text(series))],
+                    instances: vec![InstanceRecord {
+                        attrs: vec![(0x0008_0018, AttrValue::Text("1.2.840.9999.0.0.1".into()))],
+                        transfer_syntax: "1.2.840.10008.1.2.1".into(),
+                        storage_tier: TIER_HOT,
+                        rejection_reason: 0,
+                        blake3: [0u8; 32],
+                        file_size: 0,
+                        frames: Vec::new(),
+                    }],
+                }],
+            };
+            let path = manifest_dir.join(format!("{study}.manifest"));
+            write_manifest(&path, &manifest).expect("write manifest");
+        }
+
+        let mut config = crate::config::Config::test_default();
+        config.btree.manifest_dir = manifest_dir.to_string_lossy().to_string();
+        config.btree.idx_dir = idx_dir.to_string_lossy().to_string();
+        config.storage_dir = cas_dir.to_string_lossy().to_string();
+
+        let state = AppState {
+            cas: ContentAddressedStorage::new(PathBuf::from(config.storage_dir.clone()))
+                .expect("open cas"),
+            codec_registry: clarus_adapters::codec::CodecRegistry::default(),
+            ups_events: crate::sse_fanout::DualEventSink::new(),
+            start_time: Instant::now(),
+            metrics_ring: Arc::new(StdRwLock::new(std::collections::VecDeque::new())),
+            log_buffer: Arc::new(StdRwLock::new(std::collections::VecDeque::new())),
+            maintenance: Arc::new(StdRwLock::new(crate::state::MaintenanceState::default())),
+            #[cfg(feature = "s3")]
+            s3: Arc::new(std::sync::OnceLock::new()),
+            cold_cas: None,
+            shadow: ShadowTier::new(idx_dir.clone()),
+            study_scanner: StudyScanner::new(manifest_dir.clone(), idx_dir.clone()),
+            config,
+            workitems_dir: btree.join("workitems"),
+            commitments_dir: btree.join("commitments"),
+            transcode_pool: crate::state::TranscodePool::new(32),
+            readiness: crate::handlers::readiness::Readiness::new(),
+        };
+
+        clear_series_miss_cache();
+        series_scan_seam::reset();
+
+        // First request: full legacy scan (200 decodes), then the miss is
+        // remembered.
+        let first =
+            qido_series_root_instances(&state, "9.9.9.9.9.9", None, None, None, false).expect("ok");
+        assert_eq!(first.body, b"[]", "unknown series is an empty result set");
+        assert_eq!(
+            series_scan_seam::count(),
+            200,
+            "the first request scans every legacy manifest"
+        );
+
+        // Second request: the miss cache short-circuits the scan entirely.
+        let second =
+            qido_series_root_instances(&state, "9.9.9.9.9.9", None, None, None, false).expect("ok");
+        assert_eq!(second.body, b"[]");
+        assert_eq!(
+            series_scan_seam::count(),
+            200,
+            "the second request must decode ZERO manifests"
+        );
     }
 }

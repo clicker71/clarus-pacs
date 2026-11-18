@@ -76,6 +76,11 @@ fn decoded_manifest() -> Manifest {
                     (0x0008_103E, AttrValue::Text("Chest CT".into())),
                     (0x0020_000E, AttrValue::Text("1.2.840.1.2".into())),
                     (0x0020_0011, AttrValue::Text("1".into())), // SeriesNumber
+                    // PPS/Request matching keys: must stream 0-alloc.
+                    (0x0040_0009, AttrValue::Text("SPID-1".into())),
+                    (0x0040_0244, AttrValue::UInt(20260802)),
+                    (0x0040_0245, AttrValue::Text("083000".into())),
+                    (0x0040_1001, AttrValue::Text("RPID-1".into())),
                 ],
                 instances: vec![
                     InstanceRecord {
@@ -255,6 +260,10 @@ fn series_instance_qido_is_allocation_free() {
     let text = String::from_utf8(buf[..n].to_vec()).unwrap();
     assert!(text.contains("\"0020000E\":{\"Value\":[\"1.2.840.1.2\"],\"vr\":\"UI\"}"));
     assert!(text.contains("\"00200011\":{\"Value\":[1],\"vr\":\"IS\"}"));
+    assert!(text.contains("\"00400009\":{\"Value\":[\"SPID-1\"],\"vr\":\"SH\"}"));
+    assert!(text.contains("\"00400244\":{\"Value\":[\"20260802\"],\"vr\":\"DA\"}"));
+    assert!(text.contains("\"00400245\":{\"Value\":[\"083000\"],\"vr\":\"TM\"}"));
+    assert!(text.contains("\"00401001\":{\"Value\":[\"RPID-1\"],\"vr\":\"SH\"}"));
 
     // Filtered output keeps the mandatory baseline.
     let mut fbuf = [0u8; 2048];

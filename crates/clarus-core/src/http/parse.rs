@@ -336,8 +336,12 @@ fn apply_header<'a>(
     } else if name.eq_ignore_ascii_case(b"Sec-WebSocket-Protocol") {
         head.sec_websocket_protocol = Some(value);
     } else if name.eq_ignore_ascii_case(b"Connection") {
-        head.connection_close = has_token(value, b"close");
-        head.connection_upgrade = has_token(value, b"upgrade");
+        // RFC 9110: repeated `Connection` fields combine into ONE token list,
+        // so each occurrence ADDS its tokens. Assigning (`=`) made a later
+        // field clear the flag an earlier one set - `Connection: close` then
+        // `Connection: keep-alive` dropped `close` and vice versa.
+        head.connection_close |= has_token(value, b"close");
+        head.connection_upgrade |= has_token(value, b"upgrade");
     } else if name.eq_ignore_ascii_case(b"Expect") {
         head.expect_100_continue = has_token(value, b"100-continue");
     }
@@ -462,6 +466,18 @@ mod tests {
         assert_eq!(h.x_auth_user, Some(&b"admin"[..]));
         assert_eq!(h.x_clarus, Some(&b"definitum semel"[..]));
         assert!(consumed <= hdr.len());
+    }
+
+    #[test]
+    fn repeated_connection_fields_combine_their_tokens() {
+        // RFC 9110: repeated `Connection` fields are one token list, so the
+        // second field must ADD its tokens, not clear the first one's. With
+        // plain assignment the `close` field would reset `connection_upgrade`.
+        let mut h = RequestHead::borrow_empty();
+        let hdr = b"Connection: Upgrade\r\nConnection: close\r\n\r\n";
+        parse_headers(&mut h, hdr).expect("ok");
+        assert!(h.connection_upgrade, "the `upgrade` token must survive");
+        assert!(h.connection_close, "the `close` token must be recorded");
     }
 
     #[test]

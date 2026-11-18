@@ -20,8 +20,9 @@
 //! Deterministic empty-field generation (B-007) guarantees both tiers name the
 //! same `StudyInstanceUID`, so the study sets are directly comparable.
 //!
-//! `proptest` runs `cases` (default 256; CI passes `--cases=50000`). The
-//! full 50 000-case gate is set through the env var / harness flag.
+//! `proptest`'s case count comes from `PROPTEST_CASES` (default 256 in the
+//! harness, 50 000 in the CI sweep). No explicit `cases:` here, or the env var
+//! and `--cases` flag would be silently ignored.
 
 use clarus_core::manifest::AttrValue;
 use clarus_core::query::json::{write_instance_json, write_series_json, write_study_json};
@@ -82,6 +83,20 @@ fn name_study(mut a: Attrs) -> Attrs {
         )
         .unwrap_or_else(|_| format!("2.25.{}", fallback_id.len() as u64));
     }
+    a
+}
+
+/// Name a study's StudyInstanceUID UNIQUELY within the population.
+///
+/// `name_study` derives the UID deterministically from the raw fields, so two
+/// generated studies with identical fields get the SAME UID. `write_study_manifest`
+/// then writes both to one `{uid}.manifest`, so the B-tree tier holds ONE study
+/// while the reference holds TWO and the UID-set assertion fails on permitted
+/// input. Appending the population index makes every UID distinct, matching the
+/// manifest store's one-file-per-UID identity rule.
+fn name_study_unique(a: Attrs, index: usize) -> Attrs {
+    let mut a = name_study(a);
+    a.study_instance_uid = format!("{}.{}", a.study_instance_uid, index);
     a
 }
 
@@ -392,12 +407,7 @@ fn model_to_instance_record(m: &InstanceModel) -> clarus_core::manifest::Instanc
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig {
-        // File-I/O bound (a tempdir per case); the full 50 000-case sweep runs
-        // in CI via `--cases=50000`. Locally keep it small.
-        cases: 256,
-        .. ProptestConfig::default()
-    })]
+    #![proptest_config(ProptestConfig::default())]
 
     /// SQLite and B-tree must answer QIDO identically (set + byte-for-byte JSON).
     #[test]
@@ -405,7 +415,11 @@ proptest! {
         pop in proptest::collection::vec(arb_study(), 0..6),
         filter in arb_filter(),
     ) {
-        let mut pop: Vec<Attrs> = pop.into_iter().map(name_study).collect();
+        let mut pop: Vec<Attrs> = pop
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| name_study_unique(a, i))
+            .collect();
         // -- B-tree tier: write each study as a CBOR manifest --
         let dir = tempfile::tempdir().unwrap();
         let manifests = dir.path().join("manifests");
@@ -614,7 +628,11 @@ proptest! {
         pop in proptest::collection::vec(arb_study(), 0..6),
         filter in arb_filter(),
     ) {
-        let mut pop: Vec<Attrs> = pop.into_iter().map(name_study).collect();
+        let mut pop: Vec<Attrs> = pop
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| name_study_unique(a, i))
+            .collect();
         let dir = tempfile::tempdir().unwrap();
         let manifests = dir.path().join("manifests");
         let idx = dir.path().join("idx");
@@ -651,4 +669,50 @@ proptest! {
             );
         }
     }
+}
+
+/// Two generated studies with identical raw fields must not alias one manifest
+/// path: the deterministic UID would be identical for both, so the B-tree tier
+/// would hold ONE manifest while the reference holds TWO. The population-index
+/// suffix keeps them distinct.
+#[test]
+fn identical_studies_own_distinct_manifests() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifests = dir.path().join("manifests");
+    std::fs::create_dir_all(&manifests).unwrap();
+
+    // Two studies whose raw fields are byte-identical.
+    let base = Attrs {
+        patient_name: Some("same".to_string()),
+        patient_id: Some("P1".to_string()),
+        study_date: Some("20240101".to_string()),
+        modality: "CT".to_string(),
+        accession_number: Some("A1".to_string()),
+        study_instance_uid: String::new(),
+        ..Default::default()
+    };
+    let mut pop: Vec<Attrs> = vec![base.clone(), base]
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| name_study_unique(a, i))
+        .collect();
+
+    for a in &mut pop {
+        write_study_manifest(&manifests, a).unwrap();
+    }
+
+    // B-tree tier: one manifest per unique UID.
+    let mut files = 0usize;
+    for entry in std::fs::read_dir(&manifests).unwrap() {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy().into_owned();
+        if name.ends_with(".manifest") {
+            files += 1;
+        }
+    }
+    assert_eq!(files, pop.len(), "each generated study must own a manifest");
+    assert_ne!(
+        pop[0].study_instance_uid, pop[1].study_instance_uid,
+        "identical raw fields must not produce the same UID"
+    );
 }

@@ -418,9 +418,21 @@ fn render_qido(
             if resp.status == 200 {
                 let mut heads: Vec<u8> = Vec::new();
                 heads.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
-                heads.extend_from_slice(b"Content-Type: ");
-                heads.extend_from_slice(resp.content_type.as_bytes());
-                heads.extend_from_slice(b"\r\nx-pragma: once\r\nx-clarus: definitum semel\r\n");
+                // The XML path carries its multipart Content-Type (with a
+                // per-response boundary) as a header; JSON keeps it in
+                // `content_type`. Mirrors `render_ups`/`render_workflow`.
+                for (k, v) in &resp.headers {
+                    heads.extend_from_slice(k.as_bytes());
+                    heads.extend_from_slice(b": ");
+                    heads.extend_from_slice(v.as_bytes());
+                    heads.extend_from_slice(b"\r\n");
+                }
+                if !resp.content_type.is_empty() {
+                    heads.extend_from_slice(b"Content-Type: ");
+                    heads.extend_from_slice(resp.content_type.as_bytes());
+                    heads.extend_from_slice(b"\r\n");
+                }
+                heads.extend_from_slice(b"x-pragma: once\r\nx-clarus: definitum semel\r\n");
                 heads.extend_from_slice(clarus_core::http::response::CORS_ALLOW_ORIGIN);
                 // PS3.18 8.3.4.4.1: when more matches remain, the response
                 // SHALL carry the fixed-format Warning, with <service> being
@@ -1811,6 +1823,10 @@ pub static ROUTES: &[(&str, HandlerFn)] = &[
     (
         "wado_frame_thumbnail",
         crate::dispatch_streams::h_wado_frame_thumbnail,
+    ),
+    (
+        "wado_frame_rendered",
+        crate::dispatch_streams::h_wado_frame_rendered,
     ),
     ("wado_frame", crate::dispatch_streams::h_wado_frame),
     ("wado_bulkdata", crate::dispatch_streams::h_wado_bulkdata),

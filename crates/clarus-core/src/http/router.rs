@@ -93,8 +93,50 @@ fn uid_ok(uid: &[u8]) -> bool {
     has_digit
 }
 
-fn frame_ok(frame: &[u8]) -> bool {
+/// A single `{frames}` value for `/thumbnail` and `/rendered`.
+///
+/// Those two resources answer ONE representation (PS3.18 8.7.4-1), and Table
+/// 10.4.4-1 has no multipart form for either, so a list is not a target they
+/// can serve; a list there stays `400`.
+fn frame_single_ok(frame: &[u8]) -> bool {
     !frame.is_empty() && frame.iter().all(|b| b.is_ascii_digit())
+}
+
+/// A `{frames}` value for the Frame Pixel Data resource.
+///
+/// PS3.18 10.4.1.1.6 spells the slot `{frames}` - one URI-template variable
+/// (7.2.3), not a single number - and 8.7.3.3 models multi-frame bulk data as
+/// "one [representation] for each Frame". The standard does NOT define the
+/// list grammar (no separator, no range notation, no 1-based statement), so
+/// this gate accepts the comma form the whole ecosystem shares (dcm4chee,
+/// Orthanc, dicomweb-client) and nothing else. Ranges are deliberately absent:
+/// a range is attacker-chosen cardinality expanded at request time, and the
+/// grammar would be our own invention.
+///
+/// Structural checks stay in the handler: this is a cheap byte gate that maps
+/// garbage to `400` without allocating.
+///
+/// Public so the ap101 gate can measure it directly: the whole point of the
+/// byte-level shape check is that it costs nothing.
+pub fn frame_ok(frame: &[u8]) -> bool {
+    if frame.is_empty() {
+        return false;
+    }
+    let mut expect_digit = true;
+    for &b in frame {
+        if b == b',' {
+            // No leading, trailing, or doubled comma.
+            if expect_digit {
+                return false;
+            }
+            expect_digit = true;
+        } else if b.is_ascii_digit() {
+            expect_digit = false;
+        } else {
+            return false;
+        }
+    }
+    !expect_digit
 }
 
 /// Max path segments we will ever inspect (deepest route has 9).
@@ -183,6 +225,13 @@ fn qa_segments_with_rest(path: &[u8]) -> Option<QaSegments<'_>> {
 /// read surface, so STOW/PUT/DELETE there fall through and answer 404 rather
 /// than silently writing through a root the caller was told is read-only.
 pub fn match_route<'a>(method: Method, path: &'a [u8]) -> RouterOutcome<'a> {
+    // PS3.18 URI templates have no empty path segments: a doubled slash is a
+    // malformed request, not a wildcard to collapse. Reject it before the
+    // method dispatch so `DELETE /dicomweb/workitems//1.2.3` cannot route as
+    // the workitem UID `1.2.3`. `windows(2)` is a pure byte scan, no heap.
+    if path.windows(2).any(|w| w == b"//") {
+        return RouterOutcome::BadUid;
+    }
     match method {
         Method::Get | Method::Head => {
             if let Some((segs, n, _rest)) = qa_segments_with_rest(path) {
@@ -509,16 +558,29 @@ fn match_get<'a>(path: &'a [u8], segs: &[&'a [u8]]) -> RouterOutcome<'a> {
                     }
                 }
                 // C2 (B3 all-or-none, PS3.18 10.4.1.1.4): frame-level thumbnail
-                // `.../instances/{sop}/frames/{n}/thumbnail` (len 10). A frame
-                // is not an instance, so `/rendered` does not name one here.
+                // `.../instances/{sop}/frames/{n}/thumbnail` (len 10), and the
+                // frame-level Rendered Resource (PS3.18 10.4.1.2)
+                // `.../instances/{sop}/frames/{n}/rendered` (1411). One frame
+                // is a Target Resource, so `/rendered` names a single frame
+                // here (unlike study/series `/rendered`, which stay unmapped).
                 if segs.len() == 10 && seg_eq(segs[7], "frames") {
                     let frame = segs[8];
-                    if !frame_ok(frame) {
+                    if !frame_single_ok(frame) {
                         return RouterOutcome::BadUid;
                     }
                     if seg_eq(segs[9], "thumbnail") {
                         return m3(
                             "wado_frame_thumbnail",
+                            Access::Default,
+                            KeepAlive::On,
+                            study,
+                            series,
+                            sop,
+                        );
+                    }
+                    if seg_eq(segs[9], "rendered") {
+                        return m3(
+                            "wado_frame_rendered",
                             Access::Default,
                             KeepAlive::On,
                             study,
@@ -1101,6 +1163,23 @@ mod tests {
     }
 
     #[test]
+    fn a_doubled_slash_in_the_path_is_rejected() {
+        // PS3.18 URI templates have no empty path segments. A doubled slash
+        // must be a 400, not a silent collapse onto the resource (for DELETE,
+        // a workitem UID).
+        assert!(matches!(
+            match_route(Method::Delete, b"/dicomweb/workitems//1.2.3"),
+            RouterOutcome::BadUid
+        ));
+        // A single trailing slash is not a doubled slash: the capabilities
+        // root still routes.
+        match match_route(Method::Get, b"/dicomweb/") {
+            RouterOutcome::Match(m) => assert_eq!(m.id, "capabilities"),
+            other => panic!("expected capabilities, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn series_search_matches_with_study_uid() {
         match match_route(Method::Get, b"/dicomweb/studies/1.2.3/series") {
             RouterOutcome::Match(m) => {
@@ -1152,13 +1231,14 @@ mod tests {
     }
 
     /// PS3.18 8.7.8/8.7.9: `/rendered` is implemented at the INSTANCE level
-    /// only. At the study/series/frame level the name used to resolve to the
-    /// thumbnail handler, which served the thumbnail bytes under the rendered
-    /// name - a MANDATORY deviation (10.4.3.3.3 wants a rendering of all
-    /// instances, which 8.7.4-1 gives no image/jpeg for). Those names are now
-    /// honest 404s; the instance-level resource is unchanged.
+    /// and the FRAME level (one frame of a multi-frame instance, 10.4.1.2).
+    /// At the study/series level the name used to resolve to the thumbnail
+    /// handler, which served the thumbnail bytes under the rendered name - a
+    /// MANDATORY deviation (10.4.3.3.3 wants a rendering of all instances,
+    /// which 8.7.4-1 gives no image/jpeg for). Those names are now honest
+    /// 404s; the instance-level and frame-level resources are unchanged.
     #[test]
-    fn rendered_is_an_instance_level_resource_only() {
+    fn rendered_is_an_instance_or_frame_level_resource_only() {
         match match_route(
             Method::Get,
             b"/dicomweb/studies/1.2.840.1.2/series/3.4.5.6/instances/7.8.9/rendered",
@@ -1166,10 +1246,18 @@ mod tests {
             RouterOutcome::Match(m) => assert_eq!(m.id, "wado_rendered"),
             other => panic!("expected wado_rendered, got {other:?}"),
         }
+        // 1411: the frame-level Rendered Resource is a Target Resource: one
+        // frame, one rendering (PS3.18 10.4.1.2), distinct from the thumbnail.
+        match match_route(
+            Method::Get,
+            b"/dicomweb/studies/1.2.840.1.2/series/3.4.5.6/instances/7.8.9/frames/2/rendered",
+        ) {
+            RouterOutcome::Match(m) => assert_eq!(m.id, "wado_frame_rendered"),
+            other => panic!("expected wado_frame_rendered, got {other:?}"),
+        }
         for path in [
             &b"/dicomweb/studies/1.2.840.1.2/rendered"[..],
             b"/dicomweb/studies/1.2.840.1.2/series/3.4.5.6/rendered",
-            b"/dicomweb/studies/1.2.840.1.2/series/3.4.5.6/instances/7.8.9/frames/2/rendered",
         ] {
             assert!(
                 matches!(match_route(Method::Get, path), RouterOutcome::NotFound),
@@ -1764,5 +1852,92 @@ mod tests {
                 "{path:?} must not resolve"
             );
         }
+    }
+
+    const FRAME_PATH: &[u8] =
+        b"/dicomweb/studies/1.2.840.1.2/series/3.4.5.6/instances/7.8.9/frames/";
+
+    /// Route id for a `{frames}` tail, or the non-match class as a marker.
+    ///
+    /// `RouterOutcome` borrows the request path, so the outcome is reduced to
+    /// its identity here; the frame tests assert the route id or `BadUid`.
+    fn frame_route(tail: &[u8]) -> &'static str {
+        let mut path = FRAME_PATH.to_vec();
+        path.extend_from_slice(tail);
+        match match_route(Method::Get, &path) {
+            RouterOutcome::Match(m) => m.id,
+            RouterOutcome::BadUid => "BAD_UID",
+            RouterOutcome::NotFound => "NOT_FOUND",
+            RouterOutcome::MethodNotAllowed { .. } => "METHOD_NOT_ALLOWED",
+            RouterOutcome::Options { .. } => "OPTIONS",
+        }
+    }
+
+    /// PS3.18 10.4.1.1.6 spells the slot `{frames}` - one URI-template variable
+    /// (7.2.3), so a comma-separated set is a legal expansion of it and must
+    /// reach the Frame Pixel Data handler.
+    #[test]
+    fn frames_comma_list_matches_wado_frame() {
+        assert_eq!(frame_route(b"1,2"), "wado_frame");
+        // A list of three, and an out-of-order duplicate: the grammar is
+        // shape-only, the handler owns the semantics.
+        assert_eq!(frame_route(b"1,2,3"), "wado_frame");
+        assert_eq!(frame_route(b"2,2,1"), "wado_frame");
+    }
+
+    /// PS3.18 8.7.4-1: a Rendered Resource yields ONE representation, and
+    /// Table 10.4.4-1 has no multipart form for the thumbnail. Both resources
+    /// therefore keep the single-frame restriction.
+    #[test]
+    fn frames_list_rejected_on_thumbnail_and_rendered() {
+        for tail in [
+            &b"1,2/thumbnail"[..],
+            &b"1,2/rendered"[..],
+            &b"1,2,3/thumbnail"[..],
+            &b"1,2,3/rendered"[..],
+        ] {
+            assert_eq!(
+                frame_route(tail),
+                "BAD_UID",
+                "{:?} must stay a single-frame resource",
+                String::from_utf8_lossy(tail)
+            );
+        }
+        // The single-frame forms are unchanged.
+        assert_eq!(frame_route(b"2/thumbnail"), "wado_frame_thumbnail");
+        assert_eq!(frame_route(b"2/rendered"), "wado_frame_rendered");
+    }
+
+    /// The gate is shape-only: no empty element, no stray separator, and no
+    /// range notation (the standard defines no grammar, so the comma form is
+    /// the only one this server accepts).
+    #[test]
+    fn frames_garbage_is_bad_uid() {
+        for tail in [
+            &b"1,,2"[..],
+            &b",1"[..],
+            &b"1,"[..],
+            &b"1,,"[..],
+            &b"1-2"[..],
+            &b"-1"[..],
+            &b"a,b"[..],
+            &b"1, 2"[..],
+            &b"1;2"[..],
+            &b"1|2"[..],
+            &b"1.2"[..],
+        ] {
+            assert_eq!(
+                frame_route(tail),
+                "BAD_UID",
+                "{:?} must be BadUid",
+                String::from_utf8_lossy(tail)
+            );
+        }
+    }
+
+    /// Regression pin: a single frame number reaches the same route as before.
+    #[test]
+    fn frames_single_still_matches() {
+        assert_eq!(frame_route(b"3"), "wado_frame");
     }
 }

@@ -26,6 +26,7 @@ pub fn vr_for_tag(tag: u32) -> &'static str {
     match tag {
         0x0010_0010 => "PN", // PatientName
         0x0010_0020 => "LO", // PatientID
+        0x0010_0021 => "LO", // IssuerOfPatientID
         0x0010_0030 => "DA", // PatientBirthDate
         0x0010_0040 => "CS", // PatientSex
         0x0008_0016 => "UI", // SOPClassUID
@@ -57,6 +58,7 @@ pub fn vr_for_tag(tag: u32) -> &'static str {
         0x0020_1206 => "IS", // NumberOfStudyRelatedSeries
         0x0020_1208 => "IS", // NumberOfStudyRelatedInstances
         0x0020_0060 => "CS", // Laterality
+        0x0028_0008 => "IS", // NumberOfFrames
         0x0032_1032 => "PN", // RequestingPhysician
         0x0032_1060 => "LO", // RequestedProcedureDescription
         _ => "UN",
@@ -76,6 +78,16 @@ struct Sink<'a> {
 /// Result of a streaming write into an insufficiently-sized buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamOverflow;
+
+/// Longest retrieve URL this writer will build.
+///
+/// Every component is capped independently, so the maximum is the sum of the
+/// caps: a `retrieve_base` carrying a scheme, host and prefix plus the longest
+/// route this server serves (`/dicomweb/studies/<64>/series/<64>/instances/<64>`)
+/// needs 100 + 64 + 64 + 64 + the route literals. A UID is at most 64
+/// characters (PS3.5), so 384 covers that worst case with room for a longer
+/// base, and the writers refuse rather than truncate past it.
+pub(crate) const MAX_URL_LEN: usize = 384;
 
 impl<'a> Sink<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
@@ -158,6 +170,7 @@ pub(crate) const KEYWORD_TO_TAG: &[(&str, u32)] = &[
     ("OperatorsName", 0x0008_1070),
     ("PatientName", 0x0010_0010),
     ("PatientID", 0x0010_0020),
+    ("IssuerOfPatientID", 0x0010_0021),
     ("PatientBirthDate", 0x0010_0030),
     ("PatientSex", 0x0010_0040),
     ("BodyPartExamined", 0x0018_0015),
@@ -173,10 +186,15 @@ pub(crate) const KEYWORD_TO_TAG: &[(&str, u32)] = &[
     ("SeriesDescription", 0x0008_103E),
     ("SeriesDate", 0x0008_0021),
     ("SeriesTime", 0x0008_0031),
+    ("ScheduledProcedureStepID", 0x0040_0009),
+    ("PerformedProcedureStepStartDate", 0x0040_0244),
+    ("PerformedProcedureStepStartTime", 0x0040_0245),
+    ("RequestedProcedureID", 0x0040_1001),
     ("SOPClassUID", 0x0008_0016),
     ("SOPInstanceUID", 0x0008_0018),
     ("InstanceNumber", 0x0020_0013),
     ("NumberOfSeriesRelatedInstances", 0x0020_1209),
+    ("NumberOfFrames", 0x0028_0008),
     ("RetrieveURL", 0x0008_1190),
     ("InstanceAvailability", 0x0008_0056),
 ];
@@ -212,7 +230,7 @@ pub fn write_study_json(
     // the derived counts (0020,1206 / 0020,1208) that the SQLite study renderer
     // also emits. SpecificCharacterSet (0008,0005) is ALWAYS emitted first (owner
     // see the `emit_scs` helper below the ORDER table.
-    const ORDER: [u32; 20] = [
+    const ORDER: [u32; 21] = [
         0x0008_0020, // StudyDate
         0x0008_0030, // StudyTime
         0x0008_0050, // AccessionNumber
@@ -225,6 +243,7 @@ pub fn write_study_json(
         0x0008_1060, // NameOfPhysiciansReadingStudy
         0x0010_0010, // PatientName
         0x0010_0020, // PatientID
+        0x0010_0021, // IssuerOfPatientID
         0x0010_0030, // PatientBirthDate
         0x0010_0040, // PatientSex
         0x0020_000D, // StudyInstanceUID
@@ -378,21 +397,31 @@ fn emit_ur(
         // Build the absolute URL on a fixed stack buffer (no heap): base is a
         // borrow (<=256) + path + UID; the row's UIDs are <=64 bytes so the
         // buffer never overflows a real Host/scheme.
-        let mut url = [0u8; 320];
-        let mut n = 0;
-        n = copy_slice(&mut url, base.as_bytes(), n);
-        n = copy_slice(&mut url, path.as_bytes(), n);
-        n = copy_slice(&mut url, uid.as_bytes(), n);
+        //
+        // The bound is ENFORCED rather than assumed. A truncated URL still
+        // parses and names a different resource, so a silently cut UID is
+        // worse than a failed response: the client would retrieve the wrong
+        // instance, or a 404, with nothing to say the value was mangled.
+        let mut url = [0u8; MAX_URL_LEN];
+        let mut n = 0usize;
+        n = copy_slice(&mut url, base.as_bytes(), n).ok_or(StreamOverflow)?;
+        n = copy_slice(&mut url, path.as_bytes(), n).ok_or(StreamOverflow)?;
+        n = copy_slice(&mut url, uid.as_bytes(), n).ok_or(StreamOverflow)?;
         let s = std::str::from_utf8(&url[..n]).expect("URL is ASCII");
         emit_written_str(out, wrote, 0x0008_1190, "UR", s)?;
     }
     Ok(())
 }
 
-fn copy_slice(buf: &mut [u8], src: &[u8], start: usize) -> usize {
-    let n = src.len().min(buf.len() - start);
-    buf[start..start + n].copy_from_slice(&src[..n]);
-    start + n
+/// Append `src` to `buf` at `start`, or report that it does not fit.
+///
+/// `None` on overflow. The caller must treat that as a failed response; a
+/// capped copy would return success with a URL that names something else.
+fn copy_slice(buf: &mut [u8], src: &[u8], start: usize) -> Option<usize> {
+    let end = start.checked_add(src.len())?;
+    let dst = buf.get_mut(start..end)?;
+    dst.copy_from_slice(src);
+    Some(end)
 }
 
 /// A fixed-capacity, allocation-free includefield tag set.
@@ -590,11 +619,11 @@ pub fn write_series_json(
     // series-root instances route).
     if let Some(st) = study_uid {
         if let Some(se) = series_uid_of(series) {
-            let mut u = [0u8; 192];
-            let mut n = 0;
-            n = copy_slice(&mut u, st.as_bytes(), n);
-            n = copy_slice(&mut u, b"/series/", n);
-            n = copy_slice(&mut u, se.as_bytes(), n);
+            let mut u = [0u8; MAX_URL_LEN];
+            let mut n = 0usize;
+            n = copy_slice(&mut u, st.as_bytes(), n).ok_or(StreamOverflow)?;
+            n = copy_slice(&mut u, b"/series/", n).ok_or(StreamOverflow)?;
+            n = copy_slice(&mut u, se.as_bytes(), n).ok_or(StreamOverflow)?;
             let s = std::str::from_utf8(&u[..n]).expect("URL is ASCII");
             emit_ur(
                 &mut out,
@@ -653,6 +682,42 @@ pub fn write_series_json(
             series.instances.len() as u64,
         )?;
     }
+    // (0040,0009) ScheduledProcedureStepID - SH, the scalar read out of
+    // RequestAttributesSequence (0040,0275) and stored under its own tag.
+    if let Some(s) = series_text(&series.attrs, tag::SCHEDULED_PROCEDURE_STEP_ID)
+        && tag_pass(&filt, 0x0040_0009)
+    {
+        emit_written_str(&mut out, &mut wrote, 0x0040_0009, "SH", s)?;
+    }
+    // (0040,0244) PerformedProcedureStepStartDate - DA, canonical 8-digit.
+    if let Some(d) = series_attr(&series.attrs, tag::PPS_START_DATE)
+        && tag_pass(&filt, 0x0040_0244)
+    {
+        match d {
+            AttrValue::UInt(u) => {
+                let mut dbuf = [0u8; 8];
+                push_date8(&mut dbuf, *u);
+                emit_written_str(&mut out, &mut wrote, 0x0040_0244, "DA", bytes_to_str(&dbuf))?;
+            }
+            AttrValue::Text(s) => {
+                emit_written_str(&mut out, &mut wrote, 0x0040_0244, "DA", s)?;
+            }
+            _ => {}
+        }
+    }
+    // (0040,0245) PerformedProcedureStepStartTime - TM.
+    if let Some(s) = series_text(&series.attrs, tag::PPS_START_TIME)
+        && tag_pass(&filt, 0x0040_0245)
+    {
+        emit_written_str(&mut out, &mut wrote, 0x0040_0245, "TM", s)?;
+    }
+    // (0040,1001) RequestedProcedureID - SH, the second scalar of the same
+    // sequence.
+    if let Some(s) = series_text(&series.attrs, tag::REQUESTED_PROCEDURE_ID)
+        && tag_pass(&filt, 0x0040_1001)
+    {
+        emit_written_str(&mut out, &mut wrote, 0x0040_1001, "SH", s)?;
+    }
 
     out.push(b'}')?;
     Ok(out.len)
@@ -696,15 +761,19 @@ pub fn write_instance_json(
     emit_ia(&mut out, &mut wrote)?;
     if let (Some(base), Some(sop)) = (retrieve_base, sop_uid_of(instance)) {
         // {base}/dicomweb/studies/{study}/series/{series}/instances/{sop}
-        let mut url = [0u8; 320];
-        let mut n = 0;
-        n = copy_slice(&mut url, base.as_bytes(), n);
-        n = copy_slice(&mut url, b"/dicomweb/studies/", n);
-        n = copy_slice(&mut url, study_uid.as_bytes(), n);
-        n = copy_slice(&mut url, b"/series/", n);
-        n = copy_slice(&mut url, series_uid.as_bytes(), n);
-        n = copy_slice(&mut url, b"/instances/", n);
-        n = copy_slice(&mut url, sop.as_bytes(), n);
+        let mut url = [0u8; MAX_URL_LEN];
+        let mut n = 0usize;
+        for part in [
+            base.as_bytes(),
+            b"/dicomweb/studies/" as &[u8],
+            study_uid.as_bytes(),
+            b"/series/",
+            series_uid.as_bytes(),
+            b"/instances/",
+            sop.as_bytes(),
+        ] {
+            n = copy_slice(&mut url, part, n).ok_or(StreamOverflow)?;
+        }
         let s = std::str::from_utf8(&url[..n]).expect("URL is ASCII");
         emit_written_str(&mut out, &mut wrote, 0x0008_1190, "UR", s)?;
     }
@@ -721,6 +790,12 @@ pub fn write_instance_json(
         && tag_pass(&filt, 0x0020_0013)
     {
         emit_written_num(&mut out, &mut wrote, 0x0020_0013, "IS", n)?;
+    }
+    // (0028,0008) NumberOfFrames - IS as a JSON number. Type C "shall be
+    // present if known" (PS3.18 Table 10.6.3-5), so emitted whenever known,
+    // like InstanceAvailability (0008,0056). Omitted when absent/non-numeric.
+    if let Some(n) = instance_number(&instance.attrs, tag::NUMBER_OF_FRAMES) {
+        emit_written_num(&mut out, &mut wrote, 0x0028_0008, "IS", n)?;
     }
 
     out.push(b'}')?;
@@ -760,10 +835,10 @@ pub fn write_patient_json(buf: &mut [u8], p: &PatientQido) -> Result<usize, Stre
     // lowest tag, so it is the first outer key (before 0010,0010) to keep
     // ascending DICOM tag order among the DICOM-attribute keys.
     out.extend(b"\"00080005\":{\"Value\":[\"ISO_IR 192\"],\"vr\":\"CS\"},")?;
-    // (0010,0010) PatientName - PN, Alphabetic object form.
-    out.extend(b"\"00100010\":{\"Value\":[{\"Alphabetic\":")?;
-    write_json_string(&mut out, &p.patient_name)?;
-    out.extend(b"}],\"vr\":\"PN\"},")?;
+    // (0010,0010) PatientName - PN, component-grouped object form.
+    out.extend(b"\"00100010\":{\"Value\":[")?;
+    write_pn_object(&mut out, &p.patient_name)?;
+    out.extend(b"],\"vr\":\"PN\"},")?;
     // (0010,0020) PatientID - LO.
     out.extend(b"\"00100020\":{\"Value\":[")?;
     write_json_string(&mut out, &p.patient_uid)?;
@@ -844,6 +919,42 @@ fn emit_written_str(
     Ok(())
 }
 
+/// Emit the DICOMweb JSON object form of a PersonName value.
+///
+/// PS3.18 F.2.2: a PN JSON object has at most three properties - `Alphabetic`,
+/// `Ideographic`, `Phonetic` - separated in the DICOM value by `=`. PS3.5 6.2
+/// defines the group order, and an EMPTY group is omitted from the object.
+/// Emitting the whole value as one `Alphabetic` loses that structure, so a
+/// client asking for `Ideographic` sees a name that looks ungrouped.
+///
+/// Within a group the `^` component separators are preserved verbatim: the
+/// grouping and the components answer different questions, and F.2.2 only
+/// splits the former.
+fn write_pn_object(out: &mut Sink<'_>, value: &str) -> Result<(), StreamOverflow> {
+    const KEYS: [&str; 3] = ["Alphabetic", "Ideographic", "Phonetic"];
+    out.push(b'{')?;
+    let mut wrote = false;
+    for (i, group) in value.split('=').enumerate() {
+        // More than three groups cannot be represented; F.2.2's object has
+        // exactly these three keys, so the surplus is dropped rather than
+        // folded into Phonetic (which would mislabel it).
+        let Some(key) = KEYS.get(i) else { break };
+        if group.is_empty() {
+            continue;
+        }
+        if wrote {
+            out.push(b',')?;
+        }
+        wrote = true;
+        out.push(b'"')?;
+        out.extend(key.as_bytes())?;
+        out.extend(b"\":")?;
+        write_json_string(out, group)?;
+    }
+    out.push(b'}')?;
+    Ok(())
+}
+
 /// Emit `"TAG":{"Value":[{"Alphabetic":"s"}],"vr":"PN"}` with a
 /// leading comma when `wrote` - the study-level PN JSON contract
 /// (PS3.18 Annex F.2.1, `write_attr` object form), borrowed-str form so the
@@ -860,9 +971,9 @@ fn emit_written_pn(
     *wrote = true;
     out.push(b'"')?;
     push_hex8(out, tag)?;
-    out.extend(b"\":{\"Value\":[{\"Alphabetic\":")?;
-    write_json_string(out, s)?;
-    out.extend(b"}],\"vr\":\"PN\"}")?;
+    out.extend(b"\":{\"Value\":[")?;
+    write_pn_object(out, s)?;
+    out.extend(b"],\"vr\":\"PN\"}")?;
     Ok(())
 }
 
@@ -980,17 +1091,25 @@ fn write_attr(
 ) -> Result<(), StreamOverflow> {
     out.push(b'"')?;
     push_hex8(out, tag)?;
+    // PS3.18 F.2.5: a present-but-empty attribute carries NO Value member -
+    // `{"vr":"VR"}` - so it is stated as present and empty rather than as
+    // absent. Only the study keys that preserve `Some("")` reach this branch;
+    // the other optional keys are still filtered out by `study_attrs`.
+    if matches!(value, AttrValue::Text(s) if s.is_empty()) {
+        out.extend(b"\":{\"vr\":\"")?;
+        out.extend(vr.as_bytes())?;
+        out.extend(b"\"}")?;
+        return Ok(());
+    }
     out.extend(b"\":{\"Value\":[")?;
     match value {
         AttrValue::Text(s) => {
             if vr == "PN" {
                 // DICOMweb PN JSON is an object with component keys, not a
-                // plain string. Weasis reads the Alphabetic component; the
-                // SQLite-era writer emitted exactly `{"Alphabetic":"..."}`
-                // (whole string, `^` components kept) - stay byte-compatible.
-                out.extend(b"{\"Alphabetic\":")?;
-                write_json_string(out, s)?;
-                out.push(b'}')?;
+                // plain string. Weasis reads the Alphabetic component; a PN
+                // carrying `=` groups is split so each group is reachable
+                // (PS3.18 F.2.2).
+                write_pn_object(out, s)?;
             } else {
                 write_json_string(out, s)?;
             }
@@ -1118,7 +1237,7 @@ mod tests {
             (0x0010_0030, AttrValue::UInt(19870409)),
             (0x0020_000D, AttrValue::Text("1.2.840.1.1".into())),
         ]);
-        let mut out = [0u8; 512];
+        let mut out = [0u8; 1024];
         let n = write_study_json(&mut out, &s, None, None).expect("fits");
         let got = String::from_utf8(out[..n].to_vec()).unwrap();
         // DA/TM must be strings (PS3.18 F.2.1): dcm4che JSONReader (Weasis)
@@ -1140,6 +1259,36 @@ mod tests {
         assert!(got.starts_with('{') && got.ends_with('}'));
     }
 
+    /// PS3.18 F.2.5: a present-but-empty identity attribute renders as
+    /// `{"vr":"VR"}` with NO Value member; a genuinely absent tag stays absent.
+    #[test]
+    fn empty_identity_attributes_render_as_vr_only_objects() {
+        let s = qido(vec![
+            (0x0008_0050, AttrValue::Text(String::new())), // AccessionNumber SH
+            (0x0008_0090, AttrValue::Text(String::new())), // ReferringPhysicianName PN
+            (0x0010_0030, AttrValue::Text(String::new())), // PatientBirthDate DA
+            (0x0010_0040, AttrValue::Text(String::new())), // PatientSex CS
+            (0x0010_0010, AttrValue::Text("ivanov".into())), // populated control
+        ]);
+        let mut out = [0u8; 512];
+        let n = write_study_json(&mut out, &s, None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(got.contains("\"00080050\":{\"vr\":\"SH\"}"), "{got}");
+        assert!(got.contains("\"00080090\":{\"vr\":\"PN\"}"), "{got}");
+        assert!(got.contains("\"00100030\":{\"vr\":\"DA\"}"), "{got}");
+        assert!(got.contains("\"00100040\":{\"vr\":\"CS\"}"), "{got}");
+        // The populated control still renders its Value array.
+        assert!(
+            got.contains("\"00100010\":{\"Value\":[{\"Alphabetic\":\"ivanov\"}],\"vr\":\"PN\"}"),
+            "{got}"
+        );
+        // A genuinely absent tag stays absent.
+        assert!(
+            !got.contains("0020000D"),
+            "absent StudyUID must stay absent: {got}"
+        );
+    }
+
     #[test]
     fn emits_performing_and_reading_physician_as_pn_object() {
         let s = qido(vec![
@@ -1154,6 +1303,63 @@ mod tests {
         );
         assert!(
             got.contains("\"00081060\":{\"Value\":[{\"Alphabetic\":\"Read^Doc\"}],\"vr\":\"PN\"}")
+        );
+    }
+
+    /// F15: a PN carrying `=` groups must split into the F.2.2 properties.
+    ///
+    /// PS3.18 F.2.2 gives a PN JSON object exactly three component properties -
+    /// `Alphabetic`, `Ideographic`, `Phonetic` - in PS3.5 6.2 order. Emitting
+    /// the whole value as one `Alphabetic` keeps the bytes but loses the
+    /// structure, so a client rendering the ideographic form sees nothing.
+    #[test]
+    fn a_grouped_person_name_splits_into_component_properties() {
+        let s = qido(vec![(
+            0x0010_0010,
+            AttrValue::Text("Yamada^Tarou=山田^太郎=やまだ^たろう".into()),
+        )]);
+        let mut out = [0u8; 1024];
+        let n = write_study_json(&mut out, &s, None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            got.contains(
+                "\"Alphabetic\":\"Yamada^Tarou\",\"Ideographic\":\"山田^太郎\",\
+                 \"Phonetic\":\"やまだ^たろう\""
+            ),
+            "the three groups must be separate properties, got {got}"
+        );
+        // The component separator stays INSIDE each group: grouping and
+        // components answer different questions.
+        assert!(
+            !got.contains("\"Alphabetic\":\"Yamada^Tarou=山田"),
+            "a group boundary must not leak into the Alphabetic value"
+        );
+    }
+
+    /// F15 (the other half): an EMPTY group is omitted, not emitted as "".
+    ///
+    /// PS3.5 6.2 allows a group to be absent (`Yamada^Tarou==...`), which
+    /// DICOMweb represents by leaving the property out entirely.
+    #[test]
+    fn an_empty_person_name_group_is_omitted() {
+        let s = qido(vec![(
+            0x0010_0010,
+            AttrValue::Text("Yamada^Tarou==やまだ^たろう".into()),
+        )]);
+        let mut out = [0u8; 1024];
+        let n = write_study_json(&mut out, &s, None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            !got.contains("Ideographic"),
+            "an empty group must not appear as a property, got {got}"
+        );
+        assert!(
+            got.contains("\"Alphabetic\":\"Yamada^Tarou\""),
+            "the populated groups survive, got {got}"
+        );
+        assert!(
+            got.contains("\"Phonetic\":\"やまだ^たろう\""),
+            "the third group keeps its own key, got {got}"
         );
     }
 
@@ -1486,6 +1692,53 @@ mod tests {
         assert!(got.starts_with('{') && got.ends_with('}'));
     }
 
+    // The four PPS/Request scalars captured from RequestAttributesSequence are
+    // matching keys (PS3.18 Table 10.6.1-5), NOT baseline: emitted only when
+    // captured AND requested (or includefield=all / None), at their ascending
+    // tag positions after (0020,1209).
+    #[test]
+    fn series_json_emits_captured_pps_request_scalars() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![
+                (0x0020_000E, AttrValue::Text("1.2.840.1.2".into())),
+                (0x0040_0009, AttrValue::Text("SPID-1".into())),
+                (0x0040_0244, AttrValue::UInt(20260802)),
+                (0x0040_0245, AttrValue::Text("083000".into())),
+                (0x0040_1001, AttrValue::Text("RPID-1".into())),
+            ],
+            instances: Vec::new(),
+        };
+
+        // 1. Not named -> not emitted (matching keys are not baseline).
+        let mut out = [0u8; 1024];
+        let n = write_series_json(&mut out, &series, Some("0008103E"), None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(!got.contains("00400009"), "not named -> omitted: {got}");
+        assert!(!got.contains("00400244"), "not named -> omitted: {got}");
+        assert!(!got.contains("00400245"), "not named -> omitted: {got}");
+        assert!(!got.contains("00401001"), "not named -> omitted: {got}");
+
+        // 2. includefield=all emits all four with canonical DA/TM rendering.
+        let n2 = write_series_json(&mut out, &series, Some("all"), None, None).expect("fits");
+        let got2 = String::from_utf8(out[..n2].to_vec()).unwrap();
+        assert!(got2.contains("\"00400009\":{\"Value\":[\"SPID-1\"],\"vr\":\"SH\"}"));
+        assert!(got2.contains("\"00400244\":{\"Value\":[\"20260802\"],\"vr\":\"DA\"}"));
+        assert!(got2.contains("\"00400245\":{\"Value\":[\"083000\"],\"vr\":\"TM\"}"));
+        assert!(got2.contains("\"00401001\":{\"Value\":[\"RPID-1\"],\"vr\":\"SH\"}"));
+
+        // 3. The keyword form resolves to the tag and emits the matching key.
+        let n3 = write_series_json(
+            &mut out,
+            &series,
+            Some("PerformedProcedureStepStartDate"),
+            None,
+            None,
+        )
+        .expect("fits");
+        let got3 = String::from_utf8(out[..n3].to_vec()).unwrap();
+        assert!(got3.contains("\"00400244\":{\"Value\":[\"20260802\"],\"vr\":\"DA\"}"));
+    }
+
     #[test]
     fn instance_json_roundtrips_captured_attrs() {
         let instance = crate::manifest::InstanceRecord {
@@ -1525,6 +1778,154 @@ mod tests {
         assert!(got.contains("\"0020000E\":{\"Value\":[\"1.2.840.1.2\"],\"vr\":\"UI\"}"));
         assert!(got.contains("\"00200013\":{\"Value\":[7],\"vr\":\"IS\"}"));
         assert!(got.starts_with('{') && got.ends_with('}'));
+    }
+
+    // IssuerOfPatientID (0010,0021, LO) is an Optional Patient-level key
+    // (PS3.4 C.6.1.1.2): emitted under includefield=None / all / 00100021 and
+    // omitted otherwise, at its ascending-tag position between PatientID and
+    // PatientBirthDate.
+    #[test]
+    fn study_json_emits_issuer_of_patient_id() {
+        let s = qido(vec![
+            (0x0010_0020, AttrValue::Text("PID-1".into())), // PatientID
+            (0x0010_0021, AttrValue::Text("ISSUER-1".into())), // IssuerOfPatientID
+            (0x0010_0030, AttrValue::UInt(19870409)),       // PatientBirthDate
+        ]);
+        let mut out = [0u8; 1024];
+        let n = write_study_json(&mut out, &s, None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            got.contains("\"00100021\":{\"Value\":[\"ISSUER-1\"],\"vr\":\"LO\"}"),
+            "IssuerOfPatientID must emit as LO: {got}"
+        );
+        // Ascending tag order: 00100020 < 00100021 < 00100030.
+        let p_id = got.find("\"00100020\"").expect("PatientID");
+        let p_iss = got.find("\"00100021\"").expect("IssuerOfPatientID");
+        let p_dob = got.find("\"00100030\"").expect("PatientBirthDate");
+        assert!(p_id < p_iss && p_iss < p_dob, "keys must ascend: {got}");
+
+        // includefield=all is byte-identical to no filter.
+        let n_all = write_study_json(&mut out, &s, Some("all"), None).expect("fits");
+        assert_eq!(&out[..n], &out[..n_all], "all == none");
+
+        // includefield=00100021 emits it explicitly.
+        let n2 = write_study_json(&mut out, &s, Some("00100021"), None).expect("fits");
+        let got2 = String::from_utf8(out[..n2].to_vec()).unwrap();
+        assert!(
+            got2.contains("\"00100021\""),
+            "explicit includefield: {got2}"
+        );
+
+        // includefield=00100010 (PatientName) omits the Optional key, though
+        // the mandatory baseline (PatientID/PatientBirthDate) stays.
+        let n3 = write_study_json(&mut out, &s, Some("00100010"), None).expect("fits");
+        let got3 = String::from_utf8(out[..n3].to_vec()).unwrap();
+        assert!(
+            !got3.contains("00100021"),
+            "not requested -> omitted: {got3}"
+        );
+        assert!(
+            got3.contains("\"00100020\""),
+            "mandatory PatientID stays: {got3}"
+        );
+    }
+
+    // NumberOfFrames (0028,0008, IS) is Type C "shall be present if known"
+    // (PS3.18 Table 10.6.3-5): emitted whenever known regardless of
+    // includefield, omitted when absent/non-numeric.
+    #[test]
+    fn instance_json_emits_number_of_frames_when_known() {
+        let with_frames = crate::manifest::InstanceRecord {
+            attrs: vec![
+                (
+                    0x0008_0016,
+                    AttrValue::Text("1.2.840.10008.5.1.4.1.1.2".into()),
+                ),
+                (0x0008_0018, AttrValue::Text("1.2.840.1.3".into())),
+                (0x0020_0013, AttrValue::Text("7".into())),
+                (0x0028_0008, AttrValue::Text("120".into())),
+            ],
+            transfer_syntax: String::new(),
+            storage_tier: 1,
+            rejection_reason: crate::manifest::NOT_REJECTED_REASON,
+            blake3: [0u8; 32],
+            file_size: 0,
+            frames: Vec::new(),
+        };
+        let mut out = [0u8; 1024];
+        let n = write_instance_json(
+            &mut out,
+            &with_frames,
+            "1.2.840.1.1",
+            "1.2.840.1.2",
+            None,
+            None,
+        )
+        .expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            got.contains("\"00280008\":{\"Value\":[120],\"vr\":\"IS\"}"),
+            "NumberOfFrames must emit as an IS number: {got}"
+        );
+        // Type C: emitted even under a restrictive includefield, exactly like
+        // InstanceAvailability (0008,0056).
+        let n2 = write_instance_json(
+            &mut out,
+            &with_frames,
+            "1.2.840.1.1",
+            "1.2.840.1.2",
+            Some("00080018"),
+            None,
+        )
+        .expect("fits");
+        let got2 = String::from_utf8(out[..n2].to_vec()).unwrap();
+        assert!(
+            got2.contains("\"00280008\":{\"Value\":[120],\"vr\":\"IS\"}"),
+            "Type C attribute is emitted regardless of includefield: {got2}"
+        );
+
+        // An instance without NumberOfFrames omits the key.
+        let without_frames = crate::manifest::InstanceRecord {
+            attrs: vec![
+                (
+                    0x0008_0016,
+                    AttrValue::Text("1.2.840.10008.5.1.4.1.1.2".into()),
+                ),
+                (0x0008_0018, AttrValue::Text("1.2.840.1.3".into())),
+                (0x0020_0013, AttrValue::Text("7".into())),
+            ],
+            transfer_syntax: String::new(),
+            storage_tier: 1,
+            rejection_reason: crate::manifest::NOT_REJECTED_REASON,
+            blake3: [0u8; 32],
+            file_size: 0,
+            frames: Vec::new(),
+        };
+        let n3 = write_instance_json(
+            &mut out,
+            &without_frames,
+            "1.2.840.1.1",
+            "1.2.840.1.2",
+            None,
+            None,
+        )
+        .expect("fits");
+        let got3 = String::from_utf8(out[..n3].to_vec()).unwrap();
+        assert!(
+            !got3.contains("00280008"),
+            "absent NumberOfFrames stays absent: {got3}"
+        );
+    }
+
+    #[test]
+    fn keyword_tag_resolves_issuer_and_number_of_frames() {
+        assert_eq!(keyword_tag("IssuerOfPatientID"), Some(0x0010_0021));
+        assert_eq!(keyword_tag("NumberOfFrames"), Some(0x0028_0008));
+        assert_eq!(
+            keyword_tag("numberofframes"),
+            Some(0x0028_0008),
+            "keyword lookup is case-insensitive"
+        );
     }
 
     #[test]
@@ -1636,5 +2037,43 @@ mod tests {
         assert!(si.contains(
             "\"00081190\":{\"Value\":[\"http://qido.test/dicomweb/studies/1.2.840.1.1/series/1.2.840.1.2/instances/1.2.840.1.3\"],\"vr\":\"UR\"}"
         ));
+    }
+
+    /// A legal maximum identity must fit the URL scratch.
+    ///
+    /// Each component is bounded independently: a base at the caller's limit
+    /// plus three UIDs at the PS3.5 limit of 64 characters. Sizing the scratch
+    /// below that total made a legal request fail with `StreamOverflow` even
+    /// when the caller's output buffer was large enough - a refusal the client
+    /// cannot act on, for an identity the standard allows.
+    #[test]
+    fn a_maximum_identity_fits_the_url_scratch() {
+        // 100 bytes of scheme + host + prefix.
+        let base = format!("http://{}/prefix", "h".repeat(86));
+        assert_eq!(base.len(), 100);
+        // 64 characters each, the PS3.5 UID maximum.
+        let study = format!("1{}", "2".repeat(63));
+        let series = format!("1{}", "3".repeat(63));
+        let sop = format!("1{}", "4".repeat(63));
+        assert_eq!((study.len(), series.len(), sop.len()), (64, 64, 64));
+
+        let instance = crate::manifest::InstanceRecord {
+            attrs: vec![(tag::SOP_INSTANCE_UID, AttrValue::Text(sop.clone()))],
+            transfer_syntax: String::new(),
+            storage_tier: 1,
+            rejection_reason: crate::manifest::NOT_REJECTED_REASON,
+            blake3: [0u8; 32],
+            file_size: 0,
+            frames: Vec::new(),
+        };
+        let mut buf = [0u8; 1024];
+        let n = write_instance_json(&mut buf, &instance, &study, &series, None, Some(&base))
+            .expect("a maximum identity must fit");
+        let s = String::from_utf8(buf[..n].to_vec()).unwrap();
+        let want = format!("{base}/dicomweb/studies/{study}/series/{series}/instances/{sop}");
+        assert!(
+            s.contains(&want),
+            "the full retrieve URL must be emitted intact, got {s}"
+        );
     }
 }

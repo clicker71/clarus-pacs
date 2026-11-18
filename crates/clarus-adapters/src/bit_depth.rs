@@ -153,7 +153,13 @@ fn extract_first_ds(data: &[u8], tag: (u16, u16)) -> Option<f64> {
 ///
 /// `US` is binary little endian (PS3.5 Table 6.2-1), not text, so it cannot go
 /// through the decimal-string reader.
-fn extract_first_us(data: &[u8], tag: (u16, u16)) -> Option<u16> {
+///
+/// Public because the frames route labels a part with an Explicit VR LE
+/// transfer syntax and has to know whether the stored samples are two bytes
+/// wide before it may make that claim: reading BitsAllocated with a
+/// little-endian reader would answer a byte-reversed number for a Big Endian
+/// source.
+pub fn extract_first_us(data: &[u8], tag: (u16, u16)) -> Option<u16> {
     let raw = find_tag_value(data, tag)?;
     if raw.len() < 2 {
         return None;
@@ -164,6 +170,54 @@ fn extract_first_us(data: &[u8], tag: (u16, u16)) -> Option<u16> {
     } else {
         u16::from_le_bytes([raw[0], raw[1]])
     })
+}
+
+/// The PixelData (7FE0,0010) VR, as the two VR bytes from the element header.
+///
+/// Public because the frames route must know whether a stored pixel stream is
+/// OB (single bytes, byte-order independent) or OW (16-bit words whose byte
+/// order follows the transfer syntax) before it may swap a Big Endian
+/// instance's samples into the Explicit VR LE label it declares. BitsAllocated
+/// is not enough: DICOM permits BitsAllocated=8 with an OW PixelData (two
+/// 8-bit samples packed per 16-bit word), and such a Big Endian word is byte
+/// reversed just like a 16-bit sample.
+///
+/// `None` when the element header is not in `data` (a bounded prefix that does
+/// not reach PixelData) or the dataset is Implicit VR (no VR on the wire).
+pub fn pixel_data_vr(data: &[u8]) -> Option<[u8; 2]> {
+    let grammar = grammar_of(data);
+    if grammar.implicit() {
+        return None;
+    }
+    let mut pos = dicom_data_start(data)?;
+    let end = data.len();
+    while pos + 4 <= end {
+        let g = grammar.u16(data, pos);
+        let e = grammar.u16(data, pos + 2);
+        pos += 4;
+        if (g, e) == (0x7FE0, 0x0010) {
+            if pos + 2 > end {
+                return None;
+            }
+            return Some([data[pos], data[pos + 1]]);
+        }
+        if g == 0xFFFE {
+            if pos + 4 > end {
+                return None;
+            }
+            let len = grammar.u32(data, pos) as usize;
+            pos += 4;
+            if len == 0xFFFF_FFFF {
+                continue;
+            }
+            skip_value(&mut pos, len);
+            continue;
+        }
+        if !skip_element(data, &mut pos, grammar) {
+            return None;
+        }
+    }
+    None
 }
 
 // ===========================================================================
@@ -1071,5 +1125,26 @@ mod tests {
             out.extend_from_slice(&v.to_be_bytes());
         }
         out
+    }
+
+    /// The PixelData VR is read from the element header, not inferred from
+    /// BitsAllocated: an 8-bit instance can still store OW, and the frames
+    /// route keys its byte swap on the VR.
+    #[test]
+    fn pixel_data_vr_reads_the_element_header() {
+        // The 16-bit BE fixture stores PixelData as OW.
+        let be = build_be_test_dicom(&[0x1234, 0x5678], 2, 1, (40.0, 400.0));
+        assert_eq!(pixel_data_vr(&be), Some(*b"OW"));
+
+        // Rewriting only the VR pair turns the same element into an OB
+        // PixelData - BitsAllocated is unchanged, so a reader keying on the
+        // sample width could not tell the two apart.
+        let mut ob = build_be_test_dicom(&[0x1234, 0x5678], 2, 1, (40.0, 400.0));
+        let at = ob
+            .windows(4)
+            .position(|w| w == [0x7F, 0xE0, 0x00, 0x10])
+            .expect("PixelData tag");
+        ob[at + 4..at + 6].copy_from_slice(b"OB");
+        assert_eq!(pixel_data_vr(&ob), Some(*b"OB"));
     }
 }

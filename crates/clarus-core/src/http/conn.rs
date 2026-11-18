@@ -89,6 +89,7 @@ pub fn set_timeouts(stream: &TcpStream, recv: Duration, send: Duration) -> io::R
 ///
 /// `Idle` carries the byte count already in the caller's buffer so a poll
 /// slice that expired mid-head can be resumed without dropping those bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadRead {
     /// The head terminator was found; the value is the head length.
     Complete(usize),
@@ -130,6 +131,13 @@ pub struct Conn {
     body_drained: u64,
     /// `Content-Length` of the current request, when one was announced.
     announced_body: Option<u64>,
+    /// Absolute deadline for the request head, armed by [`Conn::begin_head`].
+    ///
+    /// A socket receive timeout is re-armed on every `read`, so it alone
+    /// bounds each SLICE and not the whole head: a peer trickling one byte
+    /// inside every slice would keep a worker indefinitely. The loop compares
+    /// against this instant instead.
+    head_deadline: Option<std::time::Instant>,
 }
 
 impl Conn {
@@ -145,6 +153,7 @@ impl Conn {
             unread_body: false,
             body_drained: 0,
             announced_body: None,
+            head_deadline: None,
         }
     }
 
@@ -237,7 +246,10 @@ impl Conn {
     /// count of the head (request line + headers + trailing blank line). Any
     /// bytes beyond the `\r\n\r\n` terminator belong to the request body:
     /// they are moved to [`Conn::prefetched`] so the body reader can consume
-    /// them. `timeout` is the header deadline.
+    /// them. Bytes left in [`Conn::prefetched`] by the PREVIOUS request's body
+    /// belong to THIS request's head (a pipelined second request) and are
+    /// adopted into `buf` before the socket is read, exactly like
+    /// [`Conn::begin_head`]. `timeout` is the header deadline.
     ///
     /// A2/A3: the buffer is caller-owned (a stack array in the connection
     /// loop), so the parsed head never aliases the `Conn`; socket timeouts
@@ -245,12 +257,22 @@ impl Conn {
     /// send = the configured send timeout).
     pub fn read_head(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
         set_timeouts(&self.stream, timeout, self.send_timeout)?;
-        self.prefetched.clear();
+        // Arm the ABSOLUTE deadline here too, not only in `begin_head`:
+        // `read_head_from` enforces `head_deadline`, and this entry point is
+        // reachable without `begin_head`, so an unarmed deadline meant a
+        // slow-drip peer could hold the head open indefinitely. Always a fresh
+        // instant - a leftover from a previous request would be in the past.
+        self.head_deadline = Some(std::time::Instant::now() + timeout);
+        // `prefetched` is NOT cleared here. On a persistent connection it
+        // holds the first bytes of a pipelined request that arrived with the
+        // previous one; adopting them into `buf` (exactly like `begin_head`)
+        // is the only way that request is not lost.
         self.response_bytes = 0;
         self.unread_body = false;
         self.body_drained = 0;
         self.announced_body = None;
-        match self.read_head_from(buf, 0)? {
+        let carried = self.adopt_prefetched_into(buf);
+        match self.read_head_from(buf, carried)? {
             HeadRead::Complete(n) | HeadRead::Eof(n) => Ok(n),
             // The single-deadline contract of this entry point: a timeout is
             // the header deadline expiring, so it stays an error for callers
@@ -267,12 +289,64 @@ impl Conn {
     /// bytes already buffered instead of asking the socket for them again.
     pub fn begin_head(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<HeadRead> {
         set_timeouts(&self.stream, timeout, self.send_timeout)?;
-        self.prefetched.clear();
+        // The header deadline is ABSOLUTE, not per-read. A socket timeout is
+        // re-armed on every `read`, so a peer that delivers one byte just
+        // inside each slice keeps a worker for as long as it likes; the
+        // deadline recorded here is the one the loop enforces.
+        self.head_deadline = Some(std::time::Instant::now() + timeout);
+        // `prefetched` is NOT cleared here. It holds bytes that arrived with
+        // the PREVIOUS request's header - on a persistent connection those are
+        // the first bytes of the pipelined request that follows, and dropping
+        // them loses that request entirely. They are consumed by the body
+        // reader; whatever survives belongs to the next head, so it is moved
+        // into `buf` below rather than discarded.
         self.response_bytes = 0;
         self.unread_body = false;
         self.body_drained = 0;
         self.announced_body = None;
-        self.read_head_from(buf, 0)
+        let carried = self.adopt_prefetched_into(buf);
+        self.read_head_from(buf, carried)
+    }
+
+    /// Move any unconsumed prefetched bytes into `buf` and return how many.
+    ///
+    /// The bytes belong to the NEXT request on a persistent connection: a
+    /// client is free to send two requests back to back, so the second one's
+    /// header can arrive in the same segment as the first one's body. Handing
+    /// them to the head read is the only way that request is not lost.
+    fn adopt_prefetched_into(&mut self, buf: &mut [u8]) -> usize {
+        if self.prefetched.is_empty() {
+            return 0;
+        }
+        // Move as much of the run as fits into `buf`; the remainder stays in
+        // `prefetched` as the suffix. The head read then splices the head's
+        // trailing bytes IN FRONT of that suffix (see `stash_prefetched`), so
+        // the stream order survives even when the run is longer than the head
+        // buffer.
+        let n = self.prefetched.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.prefetched[..n]);
+        self.prefetched.drain(..n);
+        n
+    }
+
+    /// Stash head-trailing body bytes ahead of any prefetched suffix.
+    ///
+    /// On the common path `prefetched` is empty (the whole run was adopted
+    /// into `buf`), so this is a plain append and costs nothing. When a
+    /// leftover suffix survives [`Conn::adopt_prefetched_into`] (a prefetched
+    /// run larger than the head buffer), those suffix bytes are EARLIER in the
+    /// stream than the head's trailing bytes and must come AFTER them:
+    /// splicing the new bytes in front keeps the stream order. Appending used
+    /// to put the later suffix first, so the body reader saw the tail before
+    /// the head's own body bytes.
+    fn stash_prefetched(&mut self, bytes: &[u8]) {
+        if self.prefetched.is_empty() {
+            self.prefetched.extend_from_slice(bytes);
+        } else {
+            let tail = std::mem::take(&mut self.prefetched);
+            self.prefetched.extend_from_slice(bytes);
+            self.prefetched.extend_from_slice(&tail);
+        }
     }
 
     /// Continue [`Conn::read_head`] from `used` bytes already collected in
@@ -282,8 +356,8 @@ impl Conn {
     /// notice a stop request while the connection idles; the bytes read
     /// before that poll stay in the caller's buffer and MUST NOT be asked for
     /// a second time, so progress is an explicit argument rather than local
-    /// state. `prefetched` and `response_bytes` are reset exactly once, by
-    /// `read_head`, at the start of the request.
+    /// state. `response_bytes` is reset exactly once, by `read_head`, at the
+    /// start of the request; `prefetched` is adopted into `buf` there.
     ///
     /// A poll slice that expires mid-head returns [`HeadRead::Idle`] with the
     /// number of bytes now in `buf`; the caller passes that count back to
@@ -291,21 +365,46 @@ impl Conn {
     /// from the socket, which is why this path does not reuse `io::Result`.
     pub fn read_head_from(&mut self, buf: &mut [u8], used: usize) -> io::Result<HeadRead> {
         let mut used = used;
+        // A head that is ALREADY complete on entry (a pipelined second request
+        // adopted from `prefetched`) must be answered without touching the
+        // socket: reading first would block on a peer that has nothing more to
+        // send. This scan also catches the first segment of a normal head.
+        if let Some(rel) = find_subslice(&buf[..used], b"\r\n\r\n") {
+            let head_end = rel + 4;
+            self.stash_prefetched(&buf[head_end..used]);
+            return Ok(HeadRead::Complete(head_end));
+        }
         loop {
-            // The terminator may sit in the middle of a read chunk (a POST
-            // body usually follows the head in the same TCP segment) - scan
-            // the whole accumulated buffer, not just the tail.
-            if let Some(rel) = find_subslice(&buf[..used], b"\r\n\r\n") {
-                let head_end = rel + 4;
-                self.prefetched.extend_from_slice(&buf[head_end..used]);
-                return Ok(HeadRead::Complete(head_end));
-            }
             if used >= buf.len() {
                 return Err(io::Error::other("head too large"));
             }
             match self.stream.read(&mut buf[used..]) {
                 Ok(0) => return Ok(HeadRead::Eof(used)),
-                Ok(n) => used += n,
+                Ok(n) => {
+                    used += n;
+                    // Scan the JUST-READ bytes BEFORE the deadline check. The
+                    // terminator may sit in the middle of a read chunk (a POST
+                    // body usually follows the head in the same TCP segment),
+                    // so the whole accumulated buffer is scanned, not just the
+                    // tail. A head whose final bytes arrive in this segment is
+                    // COMPLETE even though the absolute deadline has since
+                    // passed - checking the deadline first rejected a fully
+                    // buffered request as Idle.
+                    if let Some(rel) = find_subslice(&buf[..used], b"\r\n\r\n") {
+                        let head_end = rel + 4;
+                        self.stash_prefetched(&buf[head_end..used]);
+                        return Ok(HeadRead::Complete(head_end));
+                    }
+                    // Do not wait for the NEXT slice to notice an expired
+                    // deadline: a peer that keeps sending one byte per slice
+                    // would never be timed out by the socket option alone.
+                    if self
+                        .head_deadline
+                        .is_some_and(|d| std::time::Instant::now() >= d)
+                    {
+                        return Ok(HeadRead::Idle(used));
+                    }
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -752,5 +851,271 @@ mod tests {
             0,
             "counter must reset at the start of the next request"
         );
+    }
+
+    /// A pipelined second request survives the first one's read.
+    ///
+    /// A client may send two requests back to back, so the second request's
+    /// head can arrive in the same segment as the first one's. Those bytes are
+    /// stashed in `prefetched` by the first read; `begin_head` used to clear
+    /// the stash outright, so the second request was simply lost - the server
+    /// answered the first and then waited for a request it had already thrown
+    /// away.
+    #[test]
+    fn a_pipelined_second_request_survives_the_next_begin_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+        let mut conn = Conn::new(server, b"127.0.0.1".to_vec());
+
+        const FIRST: &[u8] = b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+        const SECOND: &[u8] = b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut both = FIRST.to_vec();
+        both.extend_from_slice(SECOND);
+        client.write_all(&both).expect("write both requests");
+
+        let mut head_buf = [0u8; HEADER_BUF_SIZE];
+        let first_len = match conn
+            .begin_head(&mut head_buf, Duration::from_secs(5))
+            .expect("first head")
+        {
+            HeadRead::Complete(n) => n,
+            other => panic!("first request must complete, got {other:?}"),
+        };
+        assert_eq!(
+            &head_buf[..first_len],
+            FIRST,
+            "the first request is the one that was answered"
+        );
+        // The second request's bytes were stashed with the first read.
+        assert_eq!(conn.prefetched, SECOND);
+
+        // The next request must START from the stash, not from a cleared one.
+        let second_len = match conn
+            .begin_head(&mut head_buf, Duration::from_secs(5))
+            .expect("second head")
+        {
+            HeadRead::Complete(n) => n,
+            other => panic!("pipelined request must complete, got {other:?}"),
+        };
+        assert_eq!(
+            &head_buf[..second_len],
+            SECOND,
+            "the pipelined request must not be lost"
+        );
+    }
+
+    /// `read_head` must adopt the prefetched run too, not only `begin_head`:
+    /// a caller using `read_head` directly on a keep-alive connection loses a
+    /// pipelined second request if the stash is cleared instead of adopted.
+    #[test]
+    fn a_pipelined_second_request_survives_the_next_read_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+        let mut conn = Conn::new(server, b"127.0.0.1".to_vec());
+
+        const FIRST: &[u8] = b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+        const SECOND: &[u8] = b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut both = FIRST.to_vec();
+        both.extend_from_slice(SECOND);
+        client.write_all(&both).expect("write both requests");
+
+        let mut head_buf = [0u8; HEADER_BUF_SIZE];
+        let first_len = conn
+            .read_head(&mut head_buf, Duration::from_secs(5))
+            .expect("first head");
+        assert_eq!(&head_buf[..first_len], FIRST, "first request parsed");
+        assert_eq!(conn.prefetched, SECOND, "second request stashed");
+
+        // A short deadline keeps the falsification fast: if the stash were
+        // cleared (the old behaviour), the second read blocks and times out.
+        let second_len = conn
+            .read_head(&mut head_buf, Duration::from_millis(300))
+            .expect("second head");
+        assert_eq!(
+            &head_buf[..second_len],
+            SECOND,
+            "the pipelined request must not be lost"
+        );
+    }
+
+    /// A prefetched run longer than the head buffer keeps its byte order.
+    ///
+    /// `adopt_prefetched_into` moves only `buf.len()` bytes and leaves the
+    /// suffix in `prefetched`; the head's trailing bytes (EARLIER in the
+    /// stream) must then be spliced IN FRONT of that suffix. Appending used to
+    /// invert the order, so the body reader saw the later suffix before the
+    /// head's own body bytes. Reverting the front-insertion makes the
+    /// surviving `prefetched` equal `suffix ++ head_body` instead of the
+    /// stream order asserted below, so the test fails - it is not vacuous.
+    #[test]
+    fn a_prefetched_run_longer_than_the_head_buffer_keeps_byte_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let _client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+        let mut conn = Conn::new(server, b"127.0.0.1".to_vec());
+
+        const HEAD: &[u8] = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 20000\r\n\r\n";
+        // One stream: head + a body long enough that the run exceeds the head
+        // buffer. The first HEADER_BUF_SIZE bytes are adopted into the caller's
+        // buffer; the rest stays in `prefetched` as the suffix.
+        let mut stream = HEAD.to_vec();
+        stream.extend((0u8..=255u8).cycle().take(20_000));
+        conn.prefetched = stream.clone();
+
+        let mut head_buf = [0u8; HEADER_BUF_SIZE];
+        let outcome = conn
+            .begin_head(&mut head_buf, Duration::from_secs(5))
+            .expect("head");
+        let head_len = match outcome {
+            HeadRead::Complete(n) => n,
+            other => panic!("the head must complete from the prefetched run, got {other:?}"),
+        };
+        assert_eq!(
+            &head_buf[..head_len],
+            HEAD,
+            "the head is parsed from the run"
+        );
+
+        // The surviving prefetched bytes must equal the body in STREAM order:
+        // head-trailing bytes first, then the suffix.
+        let expected_body = &stream[HEAD.len()..];
+        assert_eq!(
+            conn.prefetched.as_slice(),
+            expected_body,
+            "the prefetched body must keep its stream order (no inversion)"
+        );
+    }
+
+    /// The header deadline is absolute, not per-read.
+    ///
+    /// A socket receive timeout is re-armed on every `read`, so a peer that
+    /// sends one byte just inside each slice keeps a worker forever. The loop
+    /// now compares against the instant `begin_head` recorded, so a drip feed
+    /// reports `Idle` (which the serve loop decrements its budget from)
+    /// instead of looping silently.
+    #[test]
+    fn a_slow_drip_peer_cannot_hold_the_head_read_past_its_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+        let mut conn = Conn::new(server, b"127.0.0.1".to_vec());
+
+        // Trickle the head one byte at a time, well inside the socket timeout,
+        // for longer than the header deadline.
+        let drip = std::thread::spawn(move || {
+            for byte in b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n" {
+                if client.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let mut head_buf = [0u8; HEADER_BUF_SIZE];
+        // A short header deadline: the drip needs ~600 ms for the whole head.
+        let outcome = conn
+            .begin_head(&mut head_buf, Duration::from_millis(120))
+            .expect("head read");
+        match outcome {
+            HeadRead::Idle(_) => {}
+            other => {
+                panic!("a slow-drip peer must be cut off by the header deadline, got {other:?}")
+            }
+        }
+        drop(drip);
+    }
+
+    /// A head whose final bytes arrive AFTER the header deadline is still a
+    /// complete request, not an Idle timeout.
+    ///
+    /// The scan used to run at the loop top and the deadline check after the
+    /// read, so a head completed in the segment just read was rejected before
+    /// the terminator was ever looked for. The scan now runs right after the
+    /// read, before the deadline check.
+    #[test]
+    fn a_head_completed_after_the_deadline_is_complete_not_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+        let mut conn = Conn::new(server, b"127.0.0.1".to_vec());
+
+        // First segment: a partial head with no terminator. The read loop then
+        // blocks on the second read until the socket timeout returns it as
+        // Idle, which is the slow-drip behaviour this test must NOT disturb.
+        client
+            .write_all(b"GET /dicomweb/studies HTTP/1.1\r\nHost: x\r\n")
+            .expect("first segment");
+
+        let mut head_buf = [0u8; HEADER_BUF_SIZE];
+        let timeout = Duration::from_millis(150);
+        let first = conn.begin_head(&mut head_buf, timeout).expect("first read");
+        let used = match first {
+            HeadRead::Idle(n) => n,
+            other => panic!("a partial head must report Idle, got {other:?}"),
+        };
+        assert!(used > 0, "the first segment must be buffered");
+
+        // Let the absolute header deadline expire before the head completes.
+        std::thread::sleep(timeout + Duration::from_millis(80));
+
+        // The final segment arrives AFTER the deadline.
+        client
+            .write_all(b"Accept: application/dicom+json\r\n\r\n")
+            .expect("second segment");
+
+        let second = conn
+            .read_head_from(&mut head_buf, used)
+            .expect("second read");
+        match second {
+            HeadRead::Complete(n) => assert!(n > used, "the full head must be read"),
+            other => panic!("a head completed after the deadline must be Complete, got {other:?}"),
+        }
+    }
+
+    /// F9: `read_head` must arm the header deadline itself.
+    ///
+    /// `read_head_from` enforces `head_deadline`, but only `begin_head` used to
+    /// set it. `read_head` is its own public entry point and does not call
+    /// `begin_head`, so a caller on that path got no absolute deadline at all
+    /// and a drip-feeding peer could hold a worker open until it chose to
+    /// finish - the socket timeout alone is re-armed by every byte.
+    #[test]
+    fn read_head_arms_its_own_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+        let mut conn = Conn::new(server, b"127.0.0.1".to_vec());
+
+        // One byte per slice, each well inside the socket timeout, for far
+        // longer than the header deadline.
+        let drip = std::thread::spawn(move || {
+            for byte in b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n" {
+                if client.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let mut head_buf = [0u8; HEADER_BUF_SIZE];
+        let started = std::time::Instant::now();
+        let err = conn
+            .read_head(&mut head_buf, Duration::from_millis(120))
+            .expect_err("a drip-fed head must hit the header deadline");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the deadline must cut the read off, not wait for the peer: took {:?}",
+            started.elapsed()
+        );
+        drop(drip);
     }
 }

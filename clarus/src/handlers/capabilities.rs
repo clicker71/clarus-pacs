@@ -67,7 +67,10 @@ pub fn build_capabilities(base: Option<&str>) -> (u16, &'static str, Vec<u8>) {
                 <resource path="bulkdata"><method name="GET" id="Retrieve Instance Bulk Data"/></resource>
                 <resource path="frames">
                   <method name="GET" id="Retrieve Frames"/>
-                  <resource path="{frame}"><method name="GET" id="Retrieve Frame"/></resource>
+                  <resource path="{frame}">
+                    <method name="GET" id="Retrieve Frame"/>
+                    <resource path="rendered"><method name="GET" id="Retrieve Rendered Frame"/></resource>
+                  </resource>
                 </resource>
               </resource>
             </resource>
@@ -174,8 +177,9 @@ mod tests {
     }
 
     /// INV-002: every advertised resource must reflect the route registry.
-    /// `/rendered` is implemented at the INSTANCE level only (study/series
-    /// rendering would need a montage encoder), and `/pixeldata` is not
+    /// `/rendered` is implemented at the INSTANCE level AND at the FRAME level
+    /// (one frame of a multi-frame instance), but not at the study/series
+    /// level (those would need a montage encoder), and `/pixeldata` is not
     /// implemented at all (`/frames` is the pixel access).
     ///
     /// A workitem DOES have a `/subscribers` child: PS3.18 11.10.1.1
@@ -197,6 +201,10 @@ mod tests {
         assert!(
             s.contains(r#"id="Retrieve Rendered Instance""#),
             "instance-level rendered IS implemented and must be advertised"
+        );
+        assert!(
+            s.contains(r#"id="Retrieve Rendered Frame""#),
+            "frame-level rendered IS implemented and must be advertised"
         );
         assert!(
             !s.contains(r#"path="pixeldata""#),

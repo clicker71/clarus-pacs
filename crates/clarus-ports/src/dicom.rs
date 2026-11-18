@@ -143,6 +143,18 @@ pub struct InstanceMeta {
     pub rows: Option<u16>,
     /// Number of columns in the image (0028,0011). `None` for non-image SOPs.
     pub cols: Option<u16>,
+    /// NumberOfFrames (0028,0008) - IS. `None` for a single-frame instance and
+    /// for every non-image SOP.
+    ///
+    /// Captured so a thumbnail can pick a representative frame from the
+    /// manifest instead of decoding the instance to learn how many frames it
+    /// has.
+    pub number_of_frames: Option<u32>,
+    /// ImageType (0008,0008) - CS, multi-valued, in the order the file states
+    /// it (values 1..n). `LOCALIZER` in value 3 marks a scout image, which is
+    /// never a representative thumbnail: it is a projection that does not
+    /// resemble the series it belongs to.
+    pub image_type: Vec<String>,
     /// 3008 hidden-PHI: the file's own (0400,0550)/(0400,0561) sequences carry
     /// identifying values (PN/PID/BirthDate/Sex) while the patient fields were
     /// empty - the sanitizer must excise them before serving.

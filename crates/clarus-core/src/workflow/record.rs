@@ -81,38 +81,110 @@ pub struct MppsReference {
     pub sop_instance_uid: String,
 }
 
-/// Join reference pairs into one text value, `\u{1e}` between items and
-/// `\u{1f}` between the two UIDs - the append-only one-key-one-value shape
-/// [`crate::ups::record`] uses for its output list.
+/// One Performed Series Sequence (0040,0340) item: a performed series.
 ///
-/// A UID is a digit/dot string (PS3.5 9), so the unit separators cannot occur
-/// inside one. A pair whose instance UID is empty names nothing and is skipped
-/// here as well as on read: writing it would append a dangling
-/// `class<US>` item that the reader would have to reject anyway.
-fn join_references(refs: &[MppsReference]) -> String {
+/// PS3.4 Table F.7.2-1: Series Instance UID (0020,000E) is Type 1 (1/1 at
+/// N-CREATE and N-SET) inside the item; the (0008,1150)/(0008,1155) reference
+/// pairs are the referenced SOP instances of that series. A LEGACY record
+/// (flat pairs, no series UID) decodes each pair into one series with an EMPTY
+/// series_instance_uid.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PerformedSeries {
+    /// (0020,000E) Series Instance UID - Type 1. May be empty for a legacy or
+    /// non-conformant client; the value is stored faithfully, never dropped.
+    pub series_instance_uid: String,
+    /// Referenced SOP instances of the series (Referenced Image Sequence).
+    pub references: Vec<MppsReference>,
+}
+
+/// Join performed series into one text value - the append-only
+/// one-key-one-value shape [`crate::ups::record`] uses for its output list.
+///
+/// Separators (ASCII unit separators, none of which occur in a UID - PS3.5 9
+/// limits UIDs to digits and dots): `\u{1e}` (RS) between series, `\u{1c}` (FS)
+/// between a series UID and its first reference, `\u{1d}` (GS) between further
+/// references, `\u{1f}` (US) between the two UIDs of one reference.
+///
+/// A reference whose instance UID is empty names nothing and is skipped here
+/// as well as on read: writing it would append a dangling `class<US>` item the
+/// reader would have to reject anyway. An empty series_instance_uid is legal
+/// (legacy round trip) and is written as an empty first field.
+fn join_performed_series(series: &[PerformedSeries]) -> String {
     let mut joined = String::new();
-    let mut first = true;
-    for r in refs {
-        if r.sop_instance_uid.is_empty() {
-            continue;
-        }
-        if !first {
+    let mut first_series = true;
+    for s in series {
+        if !first_series {
             joined.push('\u{1e}');
         }
-        first = false;
-        joined.push_str(&r.sop_class_uid);
-        joined.push('\u{1f}');
-        joined.push_str(&r.sop_instance_uid);
+        first_series = false;
+        joined.push_str(&s.series_instance_uid);
+        let mut first_ref = true;
+        for r in &s.references {
+            if r.sop_instance_uid.is_empty() {
+                continue;
+            }
+            // FS separates the leading UID from the first reference; GS joins
+            // the further references of the same series.
+            joined.push(if first_ref { '\u{1c}' } else { '\u{1d}' });
+            first_ref = false;
+            joined.push_str(&r.sop_class_uid);
+            joined.push('\u{1f}');
+            joined.push_str(&r.sop_instance_uid);
+        }
     }
     joined
 }
 
-/// Split a joined reference list back into pairs, dropping empty items.
+/// Split a joined performed-series list back into series, dropping empty items
+/// and references with an empty instance UID.
 ///
 /// An item with an empty instance UID is dropped: `1.2.3\u{1f}` decodes to a
-/// pair that names no instance, and keeping it would put a phantom reference in
-/// the MPPS record for every truncated or hostile input.
-fn split_references(joined: &str) -> Vec<MppsReference> {
+/// reference that names no instance, and keeping it would put a phantom
+/// reference in the MPPS record for every truncated or hostile input.
+fn split_performed_series(joined: &str) -> Vec<PerformedSeries> {
+    let mut out = Vec::new();
+    for item in joined.split('\u{1e}') {
+        if item.is_empty() {
+            continue;
+        }
+        // The series UID leads, then the first reference after one FS; further
+        // references follow after GS.
+        let mut series_parts = item.splitn(2, '\u{1c}');
+        let series_instance_uid = series_parts.next().unwrap_or("").to_string();
+        let mut references = Vec::new();
+        if let Some(rest) = series_parts.next() {
+            for ref_item in rest.split('\u{1d}') {
+                if ref_item.is_empty() {
+                    continue;
+                }
+                let mut parts = ref_item.split('\u{1f}');
+                let sop_class_uid = parts.next().unwrap_or("").to_string();
+                let sop_instance_uid = parts.next().unwrap_or("").to_string();
+                if sop_instance_uid.is_empty() {
+                    continue;
+                }
+                references.push(MppsReference {
+                    sop_class_uid,
+                    sop_instance_uid,
+                });
+            }
+        }
+        out.push(PerformedSeries {
+            series_instance_uid,
+            references,
+        });
+    }
+    out
+}
+
+/// Split a LEGACY flat reference list (key 11) back into series.
+///
+/// The legacy value carries only `\u{1e}`-joined `class\u{1f}instance` pairs
+/// with no series UID; each pair becomes one series with an empty
+/// series_instance_uid, preserving the reference across an upgrade. The
+/// empty-instance-uid drop rule is the same one `split_performed_series`
+/// applies.
+fn split_legacy_references(joined: &str) -> Vec<PerformedSeries> {
     let mut out = Vec::new();
     for item in joined.split('\u{1e}') {
         if item.is_empty() {
@@ -124,9 +196,12 @@ fn split_references(joined: &str) -> Vec<MppsReference> {
         if sop_instance_uid.is_empty() {
             continue;
         }
-        out.push(MppsReference {
-            sop_class_uid,
-            sop_instance_uid,
+        out.push(PerformedSeries {
+            series_instance_uid: String::new(),
+            references: vec![MppsReference {
+                sop_class_uid,
+                sop_instance_uid,
+            }],
         });
     }
     out
@@ -410,6 +485,7 @@ const M_PERFORMED_SERIES: u64 = 11;
 const M_DISCONTINUATION_REASON: u64 = 12;
 const M_CREATED_AT: u64 = 13;
 const M_UPDATED_AT: u64 = 14;
+const M_PERFORMED_SERIES_V2: u64 = 15;
 
 /// Errors produced while encoding/decoding an MPPS record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,7 +545,7 @@ pub struct MppsRecord {
     /// NON-EMPTY when the status becomes final; `None` means the sequence was
     /// never written, `Some(vec![])` would mean it was written empty - the
     /// handler refuses the latter at a final transition.
-    pub performed_series: Option<Vec<MppsReference>>,
+    pub performed_series: Option<Vec<PerformedSeries>>,
     /// (0040,0281) Performed Procedure Step Discontinuation Reason Code
     /// Sequence - OPTIONAL (3/3). When the performer wants to use it, it is
     /// created ZERO-LENGTH at N-CREATE, because a top-level attribute cannot be
@@ -527,9 +603,9 @@ impl MppsRecord {
         // The performed series list is written as ONE text value, the same
         // one-key-one-value shape the UPS output list uses, so an older reader
         // skips a single value rather than a nested array.
-        if let Some(refs) = &self.performed_series {
-            writer.write_u64(M_PERFORMED_SERIES)?;
-            writer.write_text(&join_references(refs))?;
+        if let Some(series) = &self.performed_series {
+            writer.write_u64(M_PERFORMED_SERIES_V2)?;
+            writer.write_text(&join_performed_series(series))?;
         }
         // The discontinuation reason is written even when it is an empty
         // string: an empty value is the standard's own "created zero-length at
@@ -570,13 +646,24 @@ impl MppsRecord {
                 M_END_DATE => rec.end_date = Some(read_text(&mut reader)?),
                 M_END_TIME => rec.end_time = Some(read_text(&mut reader)?),
                 M_STUDY_UID => rec.study_uid = Some(read_text(&mut reader)?),
+                // Key 11 is the legacy flat pair list: each pair becomes one
+                // series with an EMPTY series_instance_uid, so an old record
+                // does not lose its references on upgrade.
                 M_PERFORMED_SERIES => {
                     let joined = read_text(&mut reader)?;
                     // An empty value is an EMPTY list, not `None`: the key being
                     // present is the statement "the performer wrote a series
                     // list", which is exactly the distinction the final-state
                     // check needs.
-                    rec.performed_series = Some(split_references(&joined));
+                    rec.performed_series = Some(split_legacy_references(&joined));
+                }
+                M_PERFORMED_SERIES_V2 => {
+                    let joined = read_text(&mut reader)?;
+                    // An empty value is an EMPTY list, not `None`: the key being
+                    // present is the statement "the performer wrote a series
+                    // list", which is exactly the distinction the final-state
+                    // check needs.
+                    rec.performed_series = Some(split_performed_series(&joined));
                 }
                 M_DISCONTINUATION_REASON => {
                     rec.discontinuation_reason = Some(read_text(&mut reader)?)
@@ -692,21 +779,55 @@ mod tests {
     #[test]
     fn mpps_roundtrip_with_performed_series() {
         let rec = MppsRecord {
-            performed_series: Some(vec![
-                MppsReference {
-                    sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
-                    sop_instance_uid: "1.2.3.4".to_string(),
-                },
-                MppsReference {
-                    sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
-                    sop_instance_uid: "1.2.3.5".to_string(),
-                },
-            ]),
+            performed_series: Some(vec![PerformedSeries {
+                series_instance_uid: "1.2.3.99".to_string(),
+                references: vec![
+                    MppsReference {
+                        sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
+                        sop_instance_uid: "1.2.3.4".to_string(),
+                    },
+                    MppsReference {
+                        sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
+                        sop_instance_uid: "1.2.3.5".to_string(),
+                    },
+                ],
+            }]),
             ..mpps_sample()
         };
         let bytes = rec.encode().expect("encode");
         let decoded = MppsRecord::decode(&bytes).expect("decode");
         assert_eq!(decoded, rec);
+    }
+
+    #[test]
+    fn mpps_legacy_flat_pairs_decode_to_empty_uid_series() {
+        // A record written by an older build carries key 11 with only the flat
+        // (0008,1150)/(0008,1155) pairs and no series UID. Each pair must
+        // survive as one series with an empty series_instance_uid, not be lost
+        // or folded into a single item.
+        let mut buf = vec![0u8; 4096];
+        let written = {
+            let mut writer = CborWriter::new(&mut buf);
+            writer.write_map_header(3).unwrap();
+            writer.write_u64(M_MPPS_UID).unwrap();
+            writer.write_text("1.2.3").unwrap();
+            writer.write_u64(M_STATUS).unwrap();
+            writer.write_text("COMPLETED").unwrap();
+            writer.write_u64(M_PERFORMED_SERIES).unwrap();
+            writer
+                .write_text("1.2.840.10008.5.1.4.1.1.2\u{1f}1.2.3.4\u{1e}1.2.840.10008.5.1.4.1.1.2\u{1f}1.2.3.5")
+                .unwrap();
+            writer.written()
+        };
+        buf.truncate(written);
+        let decoded = MppsRecord::decode(&buf).expect("legacy decode");
+        let series = decoded.performed_series.expect("Some");
+        assert_eq!(series.len(), 2, "one series per flat pair");
+        assert_eq!(series[0].series_instance_uid, "");
+        assert_eq!(series[0].references.len(), 1);
+        assert_eq!(series[0].references[0].sop_instance_uid, "1.2.3.4");
+        assert_eq!(series[1].series_instance_uid, "");
+        assert_eq!(series[1].references[0].sop_instance_uid, "1.2.3.5");
     }
 
     #[test]

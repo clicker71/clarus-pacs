@@ -26,6 +26,34 @@ where
     (before == after, result)
 }
 
+/// A one-byte source that returns `WouldBlock` once, driving the recoverable-
+/// error retry paths of the chunked decoder (Size hex_len survival, DataCrlf
+/// partial CRLF, Trailer line state). Those paths live in fixed `self` fields,
+/// so a retry must be zero-allocation.
+struct WouldBlockOnce {
+    data: &'static [u8],
+    pos: usize,
+    block_at: usize,
+    calls: usize,
+    blocked: bool,
+}
+
+impl Read for WouldBlockOnce {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if self.calls == self.block_at && !self.blocked {
+            self.blocked = true;
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        if self.pos >= self.data.len() || out.is_empty() {
+            return Ok(0);
+        }
+        out[0] = self.data[self.pos];
+        self.pos += 1;
+        Ok(1)
+    }
+}
+
 #[test]
 fn chunked_with_trailers_and_content_length_alloc_zero() {
     // Chunked stream: "4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Trailer: abc\r\n\r\n"
@@ -68,5 +96,110 @@ fn chunked_with_trailers_and_content_length_alloc_zero() {
     assert!(
         zero_alloc,
         "chunked + content-length body reads must be zero-allocation"
+    );
+}
+
+#[test]
+fn chunked_recoverable_error_retry_alloc_zero() {
+    // `10\r\n` + 16 payload bytes + terminating chunk. The WouldBlock lands
+    // mid size line, so the retry must carry the already-read hex digit and
+    // decode 16 bytes - not read `0` as the terminating chunk.
+    let body: &[u8] = b"10\r\n0123456789abcdef\r\n0\r\n\r\n";
+
+    let (zero_alloc, ()) = allocate_env(|| {
+        let mut cr = ChunkedReader::new(WouldBlockOnce {
+            data: body,
+            pos: 0,
+            block_at: 2, // after the `1`, before the `0`
+            calls: 0,
+            blocked: false,
+        });
+        let mut buf = [0u8; 16];
+        let mut total = 0usize;
+        loop {
+            match cr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("chunked error: {e}"),
+            }
+        }
+        assert_eq!(total, 16, "the 16-byte chunk survives the retry");
+    });
+
+    assert!(
+        zero_alloc,
+        "the chunked recoverable-error retry must be zero-allocation"
+    );
+}
+
+#[test]
+fn chunked_size_line_crlf_retry_alloc_zero() {
+    // `10\r\n` + 16 payload bytes. The WouldBlock lands between the CR and LF
+    // of the size line, so the retry must resume the LF (not re-read it as a
+    // hex digit) and decode 16 bytes - zero-allocation.
+    let body: &[u8] = b"10\r\n0123456789abcdef\r\n0\r\n\r\n";
+
+    let (zero_alloc, ()) = allocate_env(|| {
+        let mut cr = ChunkedReader::new(WouldBlockOnce {
+            data: body,
+            pos: 0,
+            block_at: 4, // after the `\r`, before the `\n` of the size line
+            calls: 0,
+            blocked: false,
+        });
+        let mut buf = [0u8; 16];
+        let mut total = 0usize;
+        loop {
+            match cr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("chunked error: {e}"),
+            }
+        }
+        assert_eq!(total, 16, "the 16-byte chunk survives the CR-LF retry");
+    });
+
+    assert!(
+        zero_alloc,
+        "the chunked size-line CRLF retry must be zero-allocation"
+    );
+}
+
+#[test]
+fn chunked_extension_skip_alloc_zero() {
+    // RFC 9112 7.1.1: `3;foo=bar` is a valid size line; only the hex prefix
+    // is the size. The extension skip is a bounded in-place scan, no heap.
+    let chunked_bytes: &[u8] = b"3;foo=bar\r\nABC\r\n0\r\n\r\n";
+
+    let (zero_alloc, ()) = allocate_env(|| {
+        let mut cr = ChunkedReader::new(Cursor::new(chunked_bytes));
+        let mut buf = [0u8; 16];
+        let mut total = 0usize;
+        loop {
+            let n = cr.read(&mut buf).expect("chunked read");
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        assert_eq!(
+            total, 3,
+            "the extension is skipped, the 3-byte chunk decodes"
+        );
+    });
+
+    assert!(
+        zero_alloc,
+        "the chunk extension skip must be zero-allocation"
     );
 }

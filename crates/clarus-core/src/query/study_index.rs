@@ -58,6 +58,23 @@ struct IndexState {
     entry_gen: Arc<HashMap<String, u64>>,
 }
 
+/// Drain a `read_dir` iterator, surfacing the first error.
+///
+/// A directory entry that cannot be read is a FAILED enumeration, not an
+/// archive with fewer studies: silently skipping it would let the build mark a
+/// partial map authoritative, and publication would drop every entry the walk
+/// never reached. `flatten()` did exactly that.
+fn collect_dir_entries<I>(iter: I) -> std::io::Result<Vec<std::fs::DirEntry>>
+where
+    I: Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
+    let mut out = Vec::new();
+    for item in iter {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
 /// A shareable, concurrency-safe RAM index of study QIDO records.
 ///
 /// `Clone` is cheap: it shares the same `Arc<RwLock<...>>`, so a background
@@ -74,7 +91,6 @@ impl StudyQidoIndex {
     pub fn new() -> Self {
         StudyQidoIndex::default()
     }
-
     /// Build the full index from a `manifests/` directory, decoding only the
     /// study section of each manifest (never series/instances/frames).
     ///
@@ -97,16 +113,39 @@ impl StudyQidoIndex {
     pub fn build_with_corrupt(manifests_dir: &Path) -> (Self, u64) {
         let mut by_uid: HashMap<String, Arc<StudyQido>> = HashMap::new();
         let mut corrupt: u64 = 0;
-        if let Ok(rd) = std::fs::read_dir(manifests_dir) {
-            for entry in rd.flatten() {
+        // A scan that cannot list the directory must NOT produce an empty
+        // index marked built: such an index is indistinguishable from a
+        // genuinely empty archive, so build_and_swap would happily replace a
+        // populated index with nothing (one EACCES on the manifests directory
+        // would empty QIDO until restart). The permission error is reported
+        // through the same counter the caller already surfaces for corrupt
+        // manifests, and the index stays unbuilt.
+        let Ok(rd) = std::fs::read_dir(manifests_dir) else {
+            return (StudyQidoIndex::new(), 1);
+        };
+        {
+            // An iterator error part-way through the scan is a FAILED
+            // enumeration, not a smaller archive. `flatten()` swallowed it and
+            // the build went on to mark a PARTIAL map built, so publication
+            // dropped every study the walk never reached - the whole point of
+            // the "unbuilt on a bad scan" rule above. Return unbuilt instead
+            // and let the live index stand.
+            let entries = match collect_dir_entries(rd) {
+                Ok(e) => e,
+                Err(_) => return (StudyQidoIndex::new(), 1),
+            };
+            for entry in entries {
                 let fname = entry.file_name().to_string_lossy().into_owned();
                 if let Some(stem) = fname.strip_suffix(".manifest") {
-                    match crate::manifest::read_manifest_study_only(&entry.path()) {
-                        Ok(m) => {
+                    let decoded = crate::manifest::PublishedManifest::new(manifests_dir, stem).map(
+                        |published| crate::manifest::read_manifest_study_only_published(&published),
+                    );
+                    match decoded {
+                        Some(Ok(m)) => {
                             // Key is the manifest file stem (== StudyInstanceUID).
                             by_uid.insert(stem.to_string(), Arc::new(m.study));
                         }
-                        Err(_) => {
+                        _ => {
                             // Corrupt manifest: skipped (mirrors the cold-scan
                             // resilience), but counted so the server can surface
                             // the degradation (manifest-degradation).
@@ -141,12 +180,19 @@ impl StudyQidoIndex {
     /// this index, which is where the stamps came from.
     pub fn replace_with_full(&self, other: &StudyQidoIndex) {
         // Compatibility entry point for callers that hold no separate
-        // watermark: the swap-time generation is the conservative choice (it
-        // keeps every entry stamped since the build was constructed, at the
-        // cost of also keeping entries the build already saw - which is a
-        // stale read, never a lost write).
-        let start_gen = self.generation();
-        self.replace_with_full_from(other, start_gen);
+        // watermark. The swap-time generation is NOT a safe watermark: it keeps
+        // only entries stamped at or after the swap, so a study indexed BEFORE
+        // the scan started and missed by it (a manifest written between the
+        // `read_dir` and the decode, or an entry the scan skipped) is dropped
+        // and vanishes from QIDO until the next rebuild.
+        //
+        // The caller here knows nothing about when the scan began, so the only
+        // watermark that cannot lose a live entry is 0: every stamped entry and
+        // every tombstone is replayed over the snapshot. The cost is that the
+        // snapshot's own view can be overridden by an older live entry (a stale
+        // read, never a lost write), which is the failure mode this merge is
+        // allowed to have.
+        self.replace_with_full_from(other, 0);
     }
 
     /// Replace this index with a build whose scan BEGAN at `start_gen`.
@@ -157,6 +203,15 @@ impl StudyQidoIndex {
     /// at swap time made it look "already in the snapshot" and the merge
     /// dropped it - the study stayed missing from QIDO until the next rebuild.
     pub fn replace_with_full_from(&self, other: &StudyQidoIndex, start_gen: u64) {
+        // A build that did not complete is not an index. Publishing it would
+        // set `built = true` on an EMPTY map and wipe the live one, so QIDO
+        // would answer "no studies" until the next restart - which is exactly
+        // what a failed `read_dir` produces. `build_with_corrupt` reports that
+        // failure by returning an unbuilt index; refuse it here, where every
+        // publication path meets.
+        if !other.ready() {
+            return;
+        }
         let built = other.snapshot();
         let mut st = self.state.write().expect("study index write");
         // Entries stamped at or after the point the build STARTED were written
@@ -385,6 +440,103 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_directory_scan_does_not_produce_a_built_empty_index() {
+        // A missing/unreadable manifests directory must not look like an
+        // archive with no studies. The old code swallowed `read_dir`'s error
+        // into an empty map and still set `built = true`, so one EACCES on the
+        // directory could make `build_and_swap` replace a populated index with
+        // nothing - QIDO would answer "no studies" until restart.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("definitely-not-here");
+        let (idx, reported) = StudyQidoIndex::build_with_corrupt(&absent);
+        assert!(
+            !idx.ready(),
+            "an unreadable directory must not yield an authoritative index"
+        );
+        assert!(idx.is_empty());
+        assert_eq!(
+            reported, 1,
+            "the failure is reported through the same counter corrupt manifests use"
+        );
+
+        // The meaningful consequence: swapping this into a populated index must
+        // not wipe it. `build_and_swap` refuses an unbuilt source.
+        let live = StudyQidoIndex::new();
+        live.upsert("1.2.7", &attrs_for("1.2.7", "keep", 20260707));
+        let generation_before = live.generation();
+        live.replace_with_full_from(&idx, generation_before);
+        assert!(
+            live.get("1.2.7").is_some(),
+            "a failed scan must not empty a populated index"
+        );
+    }
+
+    /// An error PART-WAY through the directory walk must also abort the build.
+    ///
+    /// `read_dir`'s error was handled, but `rd.flatten()` separately swallowed
+    /// each `Result`: an entry that failed to read mid-iteration was skipped
+    /// and the build marked the partial map built, so every study after that
+    /// point vanished from RAM search on publication.
+    #[test]
+    fn a_mid_iteration_directory_error_keeps_the_build_unbuilt() {
+        let mut ok: Vec<std::io::Result<std::fs::DirEntry>> = Vec::new();
+        // A real entry so the walk has something to lose, then the failure.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("1.2.840.1.1.manifest");
+        std::fs::write(&f, b"x").expect("write");
+        let real = std::fs::read_dir(dir.path()).expect("read_dir");
+        for e in real {
+            ok.push(e);
+        }
+        ok.push(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+
+        let result = collect_dir_entries(ok.into_iter());
+        assert!(
+            result.is_err(),
+            "an entry error must fail the enumeration, not shrink the archive"
+        );
+
+        // A clean enumeration still yields every entry.
+        let clean: Vec<std::io::Result<std::fs::DirEntry>> =
+            std::fs::read_dir(dir.path()).expect("read_dir").collect();
+        assert_eq!(
+            collect_dir_entries(clean.into_iter()).expect("clean").len(),
+            1
+        );
+    }
+
+    /// F13: publishing an UNBUILT index must be refused outright.
+    ///
+    /// The test above survives by accident: it passes `generation_before`, and
+    /// the merge loop happens to re-add the live entry because its stamp is
+    /// newer. That is a coincidence of the watermark, not a guard - a caller
+    /// that passes a HIGHER watermark (or an index with no live stamps to
+    /// restore) publishes the empty build and sets `built = true`, so QIDO
+    /// answers "no studies" until restart.
+    ///
+    /// This test removes the coincidence: the live index is EMPTY, so nothing
+    /// can be re-merged, and the only thing standing between a failed build and
+    /// an authoritative empty index is the `ready()` refusal.
+    #[test]
+    fn an_unbuilt_index_is_never_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("definitely-not-here");
+        let (failed, reported) = StudyQidoIndex::build_with_corrupt(&absent);
+        assert!(!failed.ready(), "the fixture must be an unbuilt index");
+        assert_eq!(reported, 1, "the scan failure is reported");
+
+        let live = StudyQidoIndex::new();
+        assert!(!live.ready(), "the live index starts unbuilt");
+        live.replace_with_full_from(&failed, 0);
+        assert!(
+            !live.ready(),
+            "a failed build must never make the live index authoritative"
+        );
+    }
+
+    #[test]
     fn build_counts_corrupt_manifest_skipped() {
         // manifest-degradation (Etap 2): the RAM index builder silently
         // skips a corrupt manifest; build_with_corrupt must report it so the
@@ -481,43 +633,43 @@ mod tests {
         assert_eq!(s.modalities_in_study.as_deref(), Some("CT,MR"));
     }
 
-    /// The watermark must come from the index doing the swap.
+    /// A swap must keep EVERY live mutation the scan did not see, not only the
+    /// ones stamped after the swap.
     ///
-    /// The comment on the old code said the builder's index "carries the
-    /// generation the build observed". It does not: `build_with_corrupt`
-    /// constructs a fresh index at generation 0. The scheme happened to work
-    /// only because a fresh counter is the smallest possible watermark. As soon
-    /// as the builder's index carries a non-zero counter - which it does
-    /// whenever the build handle is itself mutated, as the server's lazy
-    /// builder can be - the watermark jumps ahead of every live stamp and the
-    /// swap silently discards the mutations it exists to preserve.
+    /// `replace_with_full` holds no start-of-scan watermark, so any watermark
+    /// it picks above 0 drops entries indexed before the scan began that the
+    /// scan missed. Two live mutations are seeded - the first stamped well
+    /// before anything else happens, the second last - and both must survive.
+    /// Taking the swap-time generation keeps only the second, which is the
+    /// regression this pins.
     #[test]
-    fn the_watermark_is_this_indexs_own_counter() {
+    fn every_live_mutation_survives_a_swap_without_a_start_watermark() {
         let _g = serial();
         let manifests = tempfile::tempdir().expect("temp");
         let manifests = manifests.path().to_path_buf();
         let _ =
-            write_study_manifest_full(&manifests, &mut attrs_for("1.2.40", "ha", 20260140), &[]);
+            write_study_manifest_full(&manifests, &mut attrs_for("1.2.50", "ha", 20260150), &[]);
         let builder = StudyQidoIndex::build_from_dir(&manifests);
-        // The build handle is mutated too (the lazy builder does an upsert of
-        // the study it just committed before publishing).
-        builder.upsert("1.2.40", &attrs_for("1.2.40", "ha", 20260140));
-        builder.upsert("1.2.41", &attrs_for("1.2.41", "baek", 20260141));
 
         let live = StudyQidoIndex::new();
-        // A study stored while the build ran - the mutation the swap must keep.
-        live.upsert("1.2.42", &attrs_for("1.2.42", "ko", 20260142));
+        // Stamped early: the swap-time generation is far above this by the time
+        // the swap runs.
+        live.upsert("1.2.51", &attrs_for("1.2.51", "ko", 20260151));
+        // A second mutation advances the counter, widening the gap the old
+        // watermark had to clear.
+        live.upsert("1.2.52", &attrs_for("1.2.52", "ko", 20260152));
 
         live.replace_with_full(&builder);
 
         assert!(
-            live.get("1.2.42").is_some(),
-            "a live mutation must survive a swap against a moved watermark"
+            live.get("1.2.51").is_some(),
+            "the first live mutation must survive the swap"
         );
         assert!(
-            live.get("1.2.41").is_some(),
-            "the builder's own entry stays"
+            live.get("1.2.52").is_some(),
+            "the second live mutation must survive the swap"
         );
+        assert!(live.get("1.2.50").is_some(), "the scan's own entry stays");
     }
 
     /// The build watermark is taken when the scan STARTS.

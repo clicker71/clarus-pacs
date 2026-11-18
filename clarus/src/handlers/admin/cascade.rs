@@ -31,9 +31,8 @@
 
 #![forbid(unsafe_code)]
 
-use clarus_core::manifest::{AttrValue, read_manifest};
+use clarus_core::manifest::AttrValue;
 use clarus_core::query::tag;
-use clarus_core::stow::manifest_path;
 
 use crate::state::AppState;
 
@@ -257,8 +256,7 @@ pub fn collect(state: &AppState, scope: &StudyScope<'_>) -> Vec<Removal> {
             continue;
         }
         let study_uid = name.trim_end_matches(".manifest").to_string();
-        let path = manifest_path(dir, &study_uid);
-        let Ok(manifest) = read_manifest(&path) else {
+        let Some(Ok(manifest)) = state.read_server_manifest(&study_uid) else {
             continue;
         };
         for series in &manifest.series {

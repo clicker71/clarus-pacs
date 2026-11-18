@@ -125,8 +125,10 @@ pub struct OriginalAttributeItem {
 /// values written as ordinary Explicit VR LE elements, in ascending tag order
 /// so the dataset stays walkable:
 ///
-///     (0010,0010) PN PatientName
-///     (0010,0020) LO PatientID
+/// ```text
+/// (0010,0010) PN PatientName
+/// (0010,0020) LO PatientID
+/// ```
 ///
 /// Callers must place the result BEFORE (7FE0,0010) PixelData: a header
 /// attribute appended to the tail of a file is never read, because the
@@ -137,11 +139,277 @@ pub struct OriginalAttributeItem {
 #[must_use]
 pub fn build_coerced_patient_elements(patient_name: &str, patient_id: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(patient_name.len() + patient_id.len() + 16);
-    if !patient_name.is_empty() {
-        write_element(&mut out, 0x0010, 0x0010, "PN", patient_name.as_bytes());
+    if let Some(pn) = build_coerced_patient_name_element(patient_name) {
+        out.extend_from_slice(&pn);
     }
-    if !patient_id.is_empty() {
-        write_element(&mut out, 0x0010, 0x0020, "LO", patient_id.as_bytes());
+    if let Some(pid) = build_coerced_patient_id_element(patient_id) {
+        out.extend_from_slice(&pid);
+    }
+    out
+}
+
+/// The single generated (0010,0010) PatientName element, or `None` when there
+/// is no value to write.
+#[must_use]
+pub fn build_coerced_patient_name_element(patient_name: &str) -> Option<Vec<u8>> {
+    if patient_name.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(patient_name.len() + 8);
+    write_element(&mut out, 0x0010, 0x0010, "PN", patient_name.as_bytes());
+    Some(out)
+}
+
+/// The single generated (0010,0020) PatientID element, or `None` when there
+/// is no value to write.
+#[must_use]
+pub fn build_coerced_patient_id_element(patient_id: &str) -> Option<Vec<u8>> {
+    if patient_id.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(patient_id.len() + 8);
+    write_element(&mut out, 0x0010, 0x0020, "LO", patient_id.as_bytes());
+    Some(out)
+}
+
+// -- Generated patient-element placement (PS3.5 7.1 ascending tag order) ----
+
+/// One splice seam for a generated patient element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatientElementSplice {
+    /// Byte offset of the seam (the existing element's TAG offset when the
+    /// tag is present, else the offset of the first element with a larger tag
+    /// or of PixelData).
+    pub offset: usize,
+    /// Byte length of the existing element to overwrite (0 = pure insert).
+    pub replace_len: usize,
+}
+
+/// The two splice seams for the generated patient elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PatientElementSplices {
+    /// (0010,0010) PatientName.
+    pub patient_name: Option<PatientElementSplice>,
+    /// (0010,0020) PatientID.
+    pub patient_id: Option<PatientElementSplice>,
+}
+
+/// Whether a VR is one of the extended-length forms (PS3.5 7.1.2) that carry
+/// a 32-bit length after two reserved bytes.
+fn vr_is_extended(vr: [u8; 2]) -> bool {
+    matches!(
+        &vr,
+        b"OB"
+            | b"OD"
+            | b"OF"
+            | b"OL"
+            | b"OV"
+            | b"OW"
+            | b"SQ"
+            | b"SV"
+            | b"UC"
+            | b"UN"
+            | b"UR"
+            | b"UT"
+            | b"UV"
+    )
+}
+
+/// Byte offset AFTER the SequenceDelimitationItem that closes the
+/// undefined-length item/sequence whose content starts at `start`.
+///
+/// Explicit VR Little Endian only: items and delimiters carry no VR (PS3.5
+/// 7.5). Nesting is counted so an inner delimiter is not mistaken for the
+/// enclosing one.
+fn undefined_length_extent(src: &[u8], start: usize) -> Option<usize> {
+    let mut pos = start;
+    let mut nesting: u32 = 0;
+    while pos + 8 <= src.len() {
+        let tag = (
+            u16::from_le_bytes([src[pos], src[pos + 1]]),
+            u16::from_le_bytes([src[pos + 2], src[pos + 3]]),
+        );
+        if tag == (0xFFFE, 0xE000) {
+            let len = u32::from_le_bytes([src[pos + 4], src[pos + 5], src[pos + 6], src[pos + 7]]);
+            pos += 8;
+            if len == 0xFFFF_FFFF {
+                nesting += 1;
+            } else {
+                pos = pos.saturating_add(len as usize).min(src.len());
+            }
+            continue;
+        }
+        if tag == (0xFFFE, 0xE00D) || tag == (0xFFFE, 0xE0DD) {
+            pos += 8;
+            if nesting == 0 {
+                return Some(pos);
+            }
+            nesting = nesting.saturating_sub(1);
+            continue;
+        }
+        let vr = [src[pos + 4], src[pos + 5]];
+        let extended = vr_is_extended(vr);
+        let (len, value_start) = if extended {
+            if pos + 12 > src.len() {
+                return None;
+            }
+            (
+                u32::from_le_bytes([src[pos + 8], src[pos + 9], src[pos + 10], src[pos + 11]])
+                    as usize,
+                pos + 12,
+            )
+        } else {
+            (
+                u16::from_le_bytes([src[pos + 6], src[pos + 7]]) as usize,
+                pos + 8,
+            )
+        };
+        if len == 0xFFFF_FFFF {
+            nesting += 1;
+            pos = value_start;
+            continue;
+        }
+        let value_end = value_start.saturating_add(len);
+        if value_end > src.len() {
+            return None;
+        }
+        pos = value_end + (len & 1);
+    }
+    None
+}
+
+/// Locate the splice seams for the generated patient elements in an Explicit
+/// VR Little Endian dataset.
+///
+/// The stream is walked once, from the Part 10 preamble/DICM (or a bare DICM)
+/// through the dataset, stopping at PixelData. Meta-group (0002,xxxx) elements
+/// are Explicit VR LE by construction (PS3.10 7.1); the caller only runs this
+/// for a transfer syntax whose dataset non-pixel elements are Explicit VR LE.
+///
+/// Per tag:
+/// - present: `offset` is the tag's own byte offset and `replace_len` its full
+///   element extent (tag + VR + length + value + pad), so the caller REPLACES
+///   the value and the result carries exactly one occurrence;
+/// - absent: `offset` is the byte offset of the first element whose tag is
+///   GREATER (PS3.5 7.1 ascending tag order), or the PixelData offset when no
+///   larger element precedes it, and `replace_len` is 0 (insert);
+/// - no PixelData at all: `None` for both - a header attribute appended to a
+///   pixel-less dataset is never read, so the caller must leave the bytes
+///   untouched.
+pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
+    let data_start = if src.len() >= 132 && &src[128..132] == b"DICM" {
+        132
+    } else if src.len() >= 4 && &src[..4] == b"DICM" {
+        4
+    } else {
+        return PatientElementSplices::default();
+    };
+
+    let mut out = PatientElementSplices::default();
+    let mut pos = data_start;
+    let mut pixel_data_offset: Option<usize> = None;
+    let mut pn_anchor: Option<usize> = None;
+    let mut pid_anchor: Option<usize> = None;
+
+    while pos + 8 <= src.len() {
+        let tag_offset = pos;
+        let tag = (
+            u16::from_le_bytes([src[pos], src[pos + 1]]),
+            u16::from_le_bytes([src[pos + 2], src[pos + 3]]),
+        );
+
+        if tag.0 == 0xFFFE {
+            // Item / delimiter: the walk has left the header dataset (the
+            // patient tags always precede PixelData).
+            break;
+        }
+
+        let vr = [src[pos + 4], src[pos + 5]];
+        let extended = vr_is_extended(vr);
+        let (value_len, value_start) = if extended {
+            if pos + 12 > src.len() {
+                break;
+            }
+            (
+                u32::from_le_bytes([src[pos + 8], src[pos + 9], src[pos + 10], src[pos + 11]])
+                    as usize,
+                pos + 12,
+            )
+        } else {
+            (
+                u16::from_le_bytes([src[pos + 6], src[pos + 7]]) as usize,
+                pos + 8,
+            )
+        };
+
+        if tag == (0x7FE0, 0x0010) {
+            pixel_data_offset = Some(tag_offset);
+            break;
+        }
+
+        if value_len == 0xFFFF_FFFF {
+            // Undefined-length sequence: skip its whole extent (nested items
+            // counted) so the walk lands after the SequenceDelimitationItem.
+            match undefined_length_extent(src, value_start) {
+                Some(end) => {
+                    pos = end;
+                    continue;
+                }
+                None => break,
+            }
+        }
+
+        let value_end = match value_start.checked_add(value_len) {
+            Some(v) => v,
+            None => break,
+        };
+        if value_end > src.len() {
+            break;
+        }
+        // Full element extent, including the pad byte of an odd-length value.
+        let elem_len = value_end + (value_len & 1) - tag_offset;
+
+        if tag == (0x0010, 0x0010) {
+            out.patient_name = Some(PatientElementSplice {
+                offset: tag_offset,
+                replace_len: elem_len,
+            });
+        } else if tag == (0x0010, 0x0020) {
+            out.patient_id = Some(PatientElementSplice {
+                offset: tag_offset,
+                replace_len: elem_len,
+            });
+        } else {
+            if tag > (0x0010, 0x0010) && pn_anchor.is_none() {
+                pn_anchor = Some(tag_offset);
+            }
+            if tag > (0x0010, 0x0020) && pid_anchor.is_none() {
+                pid_anchor = Some(tag_offset);
+            }
+        }
+        pos = value_end + (value_len & 1);
+    }
+
+    // No PixelData -> nothing to splice (the attribute would be unreachable).
+    if pixel_data_offset.is_none() {
+        return PatientElementSplices::default();
+    }
+
+    if out.patient_name.is_none() {
+        out.patient_name = pn_anchor
+            .or(pixel_data_offset)
+            .map(|offset| PatientElementSplice {
+                offset,
+                replace_len: 0,
+            });
+    }
+    if out.patient_id.is_none() {
+        out.patient_id = pid_anchor
+            .or(pixel_data_offset)
+            .map(|offset| PatientElementSplice {
+                offset,
+                replace_len: 0,
+            });
     }
     out
 }

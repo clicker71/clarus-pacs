@@ -85,6 +85,14 @@ const K_PERFORMED_PROCEDURE_INFORMATION: u64 = 34;
 // fact from key 20 (the input study inside the Referenced Request Sequence).
 const K_WORKLIST_LABEL: u64 = 35;
 const K_OUTPUT_STUDY_UID: u64 = 36;
+/// Monotonic write counter.
+///
+/// PS3.18 11.6 makes the Transaction UID the proof that the caller observed a
+/// state, but the UID does NOT change on a successful update (Table 11.6-1
+/// keeps it), so it cannot distinguish two writes that both read the same
+/// state. This counter can: every successful write bumps it, and a caller can
+/// hand back the value it observed.
+const K_REVISION: u64 = 37;
 
 /// A single UPS workitem, as persisted in `workitems/{uid}.cbor`.
 ///
@@ -267,6 +275,15 @@ pub struct WorkItemRecord {
     /// one nested attribute is typed 3/3 - so the Update transaction can
     /// change the reason and nothing else about the request.
     pub reason_for_requested_procedure: Option<String>,
+    /// Monotonic write counter (key 37), `0` for a record never updated.
+    ///
+    /// The Transaction UID proves the caller observed SOME state, but PS3.18
+    /// Table 11.6-1 keeps it unchanged across a successful update, so two
+    /// read-modify-write cycles holding the same UID both pass a comparison
+    /// against it and the second silently overwrites the first. Comparing and
+    /// bumping this counter instead makes the second writer's stale read
+    /// visible as a conflict.
+    pub revision: u64,
 }
 
 /// One item of (0040,4033) Output Information Sequence.
@@ -373,9 +390,12 @@ impl WorkItemRecord {
         .filter(|p| **p)
         .count();
 
-        // Fields: optional `id`, 3 required strings, plus the optional strings.
+        // Fields: optional `id`, 3 required strings, plus the optional strings,
+        // plus the optional revision.
         let id_present = self.id.is_some();
-        let entry_count = (id_present as u64) + 3 + optional_present as u64;
+        let revision_present = self.revision != 0;
+        let entry_count =
+            (id_present as u64) + 3 + optional_present as u64 + (revision_present as u64);
         writer.write_map_header(entry_count)?;
 
         // id (optional, written only when present).
@@ -548,6 +568,13 @@ impl WorkItemRecord {
         // Keys 35 and 36 close the set, LAST so the map keys stay ascending.
         write_opt_str(writer, K_WORKLIST_LABEL, self.worklist_label.as_deref())?;
         write_opt_str(writer, K_OUTPUT_STUDY_UID, self.output_study_uid.as_deref())?;
+        // The revision is written only when non-zero, so a record that was
+        // never updated keeps the exact bytes it had before the counter
+        // existed - the format stays append-only.
+        if self.revision != 0 {
+            writer.write_u64(K_REVISION)?;
+            writer.write_u64(self.revision)?;
+        }
 
         Ok(())
     }
@@ -700,6 +727,12 @@ impl WorkItemRecord {
                 }
                 K_OUTPUT_STUDY_UID => {
                     rec.output_study_uid = Some(read_text(&mut reader, "output_study_uid")?)
+                }
+                K_REVISION => {
+                    let CborToken::UInt(v) = reader.next()? else {
+                        return Err(WorkItemError::Malformed("revision is not an integer"));
+                    };
+                    rec.revision = v;
                 }
                 K_OUTPUT_INFORMATION => {
                     let joined = read_text(&mut reader, "output_information")?;

@@ -47,7 +47,13 @@ pub fn reencode_implicit_to_explicit(dicom_bytes: &[u8]) -> Result<Vec<u8>, Code
     let data_start = if dicom_bytes.len() >= 132 && &dicom_bytes[128..132] == b"DICM" {
         132
     } else if dicom_bytes.len() >= 4 && &dicom_bytes[0..4] == b"DICM" {
-        4
+        // DICM at offset zero means the 128-byte preamble (PS3.10 7.1) is
+        // missing. Refuse rather than guess: stamping DICM at [128..132] over
+        // the meta group that follows would overwrite meta bytes, or panic
+        // when the meta group ends inside that span.
+        return Err(CodecError::InvalidMetadata(
+            "DICM at offset zero: missing 128-byte preamble".into(),
+        ));
     } else {
         return Err(CodecError::InvalidMetadata(
             "No DICM prefix: not a DICOM file".into(),
@@ -59,7 +65,7 @@ pub fn reencode_implicit_to_explicit(dicom_bytes: &[u8]) -> Result<Vec<u8>, Code
     // The meta group is copied verbatim first so `ensure_file_meta` can find
     // its own elements and replace the transfer syntax UID in place.
     out.extend_from_slice(&dicom_bytes[..dataset_start]);
-    if out.len() < 128 {
+    if out.len() < 132 {
         return Err(CodecError::InvalidMetadata("Truncated preamble".into()));
     }
     out[128..132].copy_from_slice(b"DICM");
@@ -70,6 +76,103 @@ pub fn reencode_implicit_to_explicit(dicom_bytes: &[u8]) -> Result<Vec<u8>, Code
         dicom_bytes.len(),
         true,
     )?;
+    ensure_file_meta(&mut out, dicom_bytes, crate::codec::ts_uid::EXPLICIT_VR_LE);
+    Ok(out)
+}
+
+/// Re-encode a DATASET from Explicit VR Big Endian to Explicit VR Little
+/// Endian, without running a codec.
+///
+/// PS3.18 8.7.3 bans Implicit VR LE AND Explicit VR Big Endian from Web
+/// Services in the same sentence, and the ban is not image-scoped. An EVRBE
+/// object therefore cannot be served as stored, yet `transcode_dicom` is the
+/// wrong tool for the job: it decodes the pixel data first, so it (a) needs
+/// Rows/Columns it may not be given a working answer for on a BE source and
+/// (b) has nothing to fall back on for an object with no PixelData at all.
+///
+/// This is the dataset-level answer, the BE mirror of
+/// [`reencode_implicit_to_explicit`]. Each element is re-emitted in Explicit
+/// VR LE with its value byte-swapped BY ITS VR: a 16-bit OW PixelData is
+/// swapped two bytes at a time, which is exactly what a BE pixel element
+/// needs, while an 8-bit OB one is not touched because the VR says its
+/// samples are single bytes. Nothing is decoded and nothing is re-quantised,
+/// so a value survives bit for bit.
+///
+/// # Errors
+/// - the file has no File Meta Information to locate the dataset from
+/// - the dataset walk hits a truncated or undefined-length element, whose
+///   inner items cannot be byte-swapped without knowing their VRs
+pub fn reencode_explicit_be_to_explicit_le(dicom_bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
+    let data_start = if dicom_bytes.len() >= 132 && &dicom_bytes[128..132] == b"DICM" {
+        132
+    } else if dicom_bytes.len() >= 4 && &dicom_bytes[0..4] == b"DICM" {
+        // DICM at offset zero means the 128-byte preamble (PS3.10 7.1) is
+        // missing. Refuse rather than guess: stamping DICM at [128..132] over
+        // the meta group that follows would overwrite meta bytes, or panic
+        // when the meta group ends inside that span.
+        return Err(CodecError::InvalidMetadata(
+            "DICM at offset zero: missing 128-byte preamble".into(),
+        ));
+    } else {
+        return Err(CodecError::InvalidMetadata(
+            "No DICM prefix: not a DICOM file".into(),
+        ));
+    };
+    let dataset_start = find_metaheader_end(dicom_bytes, data_start)?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(dicom_bytes.len());
+    // The meta group is Explicit VR LE by definition (PS3.5 7.1), whatever the
+    // dataset is, so it is copied verbatim and then has its transfer syntax
+    // UID replaced in place - the same order the Implicit VR re-encoder uses.
+    out.extend_from_slice(&dicom_bytes[..dataset_start]);
+    if out.len() < 132 {
+        return Err(CodecError::InvalidMetadata("Truncated preamble".into()));
+    }
+    out[128..132].copy_from_slice(b"DICM");
+
+    let mut pos = dataset_start;
+    while pos + 4 <= dicom_bytes.len() {
+        let elem_start = pos;
+        let group = group_of(dicom_bytes, pos, true);
+        pos += 4;
+        if group == 0xFFFE {
+            // Item and sequence delimiters are tag + 4-byte length in both
+            // byte orders, and the length itself is the only multi-byte field
+            // - so these are copied raw, as the pixel-pipeline walk does.
+            if !skip_element(dicom_bytes, &mut pos, false, true) {
+                out.extend_from_slice(&dicom_bytes[elem_start..]);
+                return Err(CodecError::InvalidMetadata(
+                    "Cannot skip delimiter element".into(),
+                ));
+            }
+            out.extend_from_slice(&dicom_bytes[elem_start..pos]);
+            continue;
+        }
+        // PS3.5 7.5: an SQ's items and their nested attributes are encoded in
+        // the SOURCE byte order. This re-encoder only converts element headers,
+        // so a sequence would keep Big Endian item tags/lengths/values inside
+        // an Explicit VR LE dataset - mixed-endian output a conformant reader
+        // cannot address. Recursive item conversion is not implemented, so the
+        // honest answer is to refuse rather than emit bytes the label lies
+        // about. Non-SQ handling is unchanged.
+        if pos + 2 <= dicom_bytes.len() && &dicom_bytes[pos..pos + 2] == b"SQ" {
+            out.extend_from_slice(&dicom_bytes[elem_start..]);
+            return Err(CodecError::InvalidMetadata(
+                "Explicit VR Big Endian sequence is not supported".into(),
+            ));
+        }
+        copy_explicit_element(&mut out, dicom_bytes, &mut pos, elem_start, true, false)?;
+        if pos <= elem_start {
+            return Err(CodecError::InvalidMetadata(
+                "Element walk did not advance".into(),
+            ));
+        }
+    }
+    if pos > dicom_bytes.len() {
+        return Err(CodecError::InvalidMetadata(
+            "Element crosses the dataset end".into(),
+        ));
+    }
     ensure_file_meta(&mut out, dicom_bytes, crate::codec::ts_uid::EXPLICIT_VR_LE);
     Ok(out)
 }
@@ -3839,6 +3942,268 @@ mod tests {
     }
 
     // -- 3008 canonical file-meta tests (red-first) -----------------
+
+    /// One Explicit VR element in BIG ENDIAN, value bytes as given.
+    fn be_element(out: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], value: &[u8]) {
+        out.extend_from_slice(&group.to_be_bytes());
+        out.extend_from_slice(&element.to_be_bytes());
+        out.extend_from_slice(vr);
+        let extended = matches!(
+            vr,
+            b"OB" | b"OD" | b"OF" | b"OL" | b"OV" | b"OW" | b"SQ" | b"UC" | b"UN" | b"UR" | b"UT"
+        );
+        if extended {
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        }
+        out.extend_from_slice(value);
+        if !value.len().is_multiple_of(2) {
+            out.push(0);
+        }
+    }
+
+    /// A 2x2 16-bit Explicit VR Big Endian instance.
+    ///
+    /// The meta group is Explicit VR LE whatever the dataset is (PS3.5 7.1),
+    /// and the group LENGTH element is deliberately absent so the meta walk
+    /// has to stop on the first non-0002 tag - the shape a real writer
+    /// produces.
+    fn build_evrbe_16bit() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 128]);
+        out.extend_from_slice(b"DICM");
+        ref_ui(&mut out, 0x0002, b"1.2.840.10008.5.1.4.1.1.2");
+        ref_ui(&mut out, 0x0003, b"1.2.826.0.1.3680043.10.1234.9501");
+        ref_ui(&mut out, 0x0010, b"1.2.840.10008.1.2.2");
+
+        be_element(
+            &mut out,
+            0x0008,
+            0x0016,
+            b"UI",
+            b"1.2.840.10008.5.1.4.1.1.2\0",
+        );
+        be_element(
+            &mut out,
+            0x0008,
+            0x0018,
+            b"UI",
+            b"1.2.826.0.1.3680043.10.1234.9501",
+        );
+        be_element(&mut out, 0x0028, 0x0002, b"US", &1u16.to_be_bytes());
+        be_element(&mut out, 0x0028, 0x0004, b"CS", b"MONOCHROME2 ");
+        be_element(&mut out, 0x0028, 0x0010, b"US", &2u16.to_be_bytes());
+        be_element(&mut out, 0x0028, 0x0011, b"US", &2u16.to_be_bytes());
+        be_element(&mut out, 0x0028, 0x0100, b"US", &16u16.to_be_bytes());
+        be_element(&mut out, 0x0028, 0x0101, b"US", &12u16.to_be_bytes());
+        be_element(&mut out, 0x0028, 0x0102, b"US", &11u16.to_be_bytes());
+        // Four samples: 0x1234, 0x5678, 0x9ABC, 0xDEF0 in big-endian order.
+        let samples: [u16; 4] = [0x1234, 0x5678, 0x9ABC, 0xDEF0];
+        let mut pixels = Vec::new();
+        for sample in samples {
+            pixels.extend_from_slice(&sample.to_be_bytes());
+        }
+        be_element(&mut out, 0x7FE0, 0x0010, b"OW", &pixels);
+        out
+    }
+
+    /// The EVRBE re-encoder declares EVRLE and byte-swaps by VR.
+    ///
+    /// This is the property the instance route depends on: a 16-bit source's
+    /// samples must arrive little-endian, because the part/instance header
+    /// will say Explicit VR LE. An 8-bit OB source must NOT be touched - the
+    /// VR is what makes the difference, which is why the swap is per element
+    /// rather than a blanket transform of the file.
+    #[test]
+    fn evrbe_reencodes_to_evrle_with_a_vr_aware_byte_swap() {
+        let be = build_evrbe_16bit();
+        let le = reencode_explicit_be_to_explicit_le(&be).expect("re-encode");
+
+        assert_eq!(
+            extract_transfer_syntax(&le).as_deref(),
+            Some(crate::codec::ts_uid::EXPLICIT_VR_LE),
+            "the output file meta must name Explicit VR Little Endian"
+        );
+
+        // Rows/Columns/BitsAllocated read as LITTLE endian must equal the
+        // source values; a stale BE field would read 0x0200 for Rows.
+        let rows = find_le_us(&le, 0x0028, 0x0010).expect("Rows");
+        let columns = find_le_us(&le, 0x0028, 0x0011).expect("Columns");
+        let bits = find_le_us(&le, 0x0028, 0x0100).expect("BitsAllocated");
+        assert_eq!((rows, columns, bits), (2, 2, 16));
+
+        // The pixel element keeps its OW VR and now holds the same SAMPLES in
+        // little-endian order.
+        let pixels = find_element_value(&le, 0x7FE0, 0x0010).expect("PixelData");
+        let samples: Vec<u16> = pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(samples, vec![0x1234, 0x5678, 0x9ABC, 0xDEF0]);
+
+        // And the byte-level claim: the value is the big-endian bytes reversed
+        // pairwise, not re-encoded. The source is walked by its own known
+        // layout rather than by `find_element_value`, which reads Explicit VR
+        // LITTLE endian and would mis-read a big-endian length.
+        let pixels_at = be
+            .windows(8)
+            .position(|w| w[..4] == [0x7F, 0xE0, 0x00, 0x10] && &w[4..6] == b"OW")
+            .expect("source PixelData");
+        let source_len = u32::from_be_bytes([
+            be[pixels_at + 8],
+            be[pixels_at + 9],
+            be[pixels_at + 10],
+            be[pixels_at + 11],
+        ]) as usize;
+        let source_pixels = &be[pixels_at + 12..pixels_at + 12 + source_len];
+        let mut expected = source_pixels.to_vec();
+        for chunk in expected.as_chunks_mut::<2>().0 {
+            chunk.swap(0, 1);
+        }
+        assert_eq!(pixels, expected.as_slice());
+    }
+
+    /// An 8-bit OB pixel element is copied through untouched.
+    #[test]
+    fn evrbe_keeps_eight_bit_pixels_byte_identical() {
+        let mut be = Vec::new();
+        be.extend_from_slice(&[0u8; 128]);
+        be.extend_from_slice(b"DICM");
+        ref_ui(&mut be, 0x0002, b"1.2.840.10008.5.1.4.1.1.2");
+        ref_ui(&mut be, 0x0003, b"1.2.826.0.1.3680043.10.1234.9502");
+        ref_ui(&mut be, 0x0010, b"1.2.840.10008.1.2.2");
+        be_element(&mut be, 0x0028, 0x0100, b"US", &8u16.to_be_bytes());
+        let pixels: Vec<u8> = (0u8..16).collect();
+        be_element(&mut be, 0x7FE0, 0x0010, b"OB", &pixels);
+
+        let le = reencode_explicit_be_to_explicit_le(&be).expect("re-encode");
+        assert_eq!(
+            extract_transfer_syntax(&le).as_deref(),
+            Some(crate::codec::ts_uid::EXPLICIT_VR_LE)
+        );
+        assert_eq!(
+            find_element_value(&le, 0x7FE0, 0x0010).expect("PixelData"),
+            pixels.as_slice(),
+            "an OB value is single bytes and must not be swapped"
+        );
+        assert_eq!(find_le_us(&le, 0x0028, 0x0100), Some(8));
+    }
+
+    /// A non-DICOM buffer is refused rather than guessed at.
+    #[test]
+    fn evrbe_reencode_refuses_a_buffer_without_a_dicom_prefix() {
+        assert!(reencode_explicit_be_to_explicit_le(b"not a dicom file").is_err());
+    }
+
+    /// A sequence in a Big Endian source is refused, not emitted mixed-endian.
+    ///
+    /// The re-encoder converts element headers only; a sequence's items and
+    /// their nested attributes stay in the source byte order. Recursive item
+    /// conversion is not implemented, so a defined- or undefined-length SQ
+    /// must be refused rather than copied verbatim into an Explicit VR LE
+    /// dataset the label would then misdescribe.
+    #[test]
+    fn evrbe_reencode_refuses_a_sequence() {
+        let sop_class = b"1.2.840.10008.5.1.4.1.1.2";
+        let sop_instance = b"1.2.826.0.1.3680043.10.1234.9601";
+
+        // One nested item holding a single Big Endian attribute.
+        let mut item = Vec::new();
+        be_element(&mut item, 0x0008, 0x0100, b"SH", b"CODE ");
+
+        // Defined-length SQ: the item stream is the value.
+        let mut defined = Vec::new();
+        defined.extend_from_slice(&[0u8; 128]);
+        defined.extend_from_slice(b"DICM");
+        ref_ui(&mut defined, 0x0002, sop_class);
+        ref_ui(&mut defined, 0x0003, sop_instance);
+        ref_ui(&mut defined, 0x0010, b"1.2.840.10008.1.2.2");
+        let mut value = Vec::new();
+        value.extend_from_slice(&0xFFFEu16.to_be_bytes());
+        value.extend_from_slice(&0xE000u16.to_be_bytes());
+        value.extend_from_slice(&(item.len() as u32).to_be_bytes());
+        value.extend_from_slice(&item);
+        be_element(&mut defined, 0x0008, 0x1115, b"SQ", &value);
+        assert!(reencode_explicit_be_to_explicit_le(&defined).is_err());
+
+        // Undefined-length SQ: 0xFFFFFFFF length, closed by an E0DD delimiter.
+        let mut undefined = Vec::new();
+        undefined.extend_from_slice(&[0u8; 128]);
+        undefined.extend_from_slice(b"DICM");
+        ref_ui(&mut undefined, 0x0002, sop_class);
+        ref_ui(&mut undefined, 0x0003, sop_instance);
+        ref_ui(&mut undefined, 0x0010, b"1.2.840.10008.1.2.2");
+        undefined.extend_from_slice(&0x0008u16.to_be_bytes());
+        undefined.extend_from_slice(&0x1115u16.to_be_bytes());
+        undefined.extend_from_slice(b"SQ");
+        undefined.extend_from_slice(&[0u8, 0u8]);
+        undefined.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        undefined.extend_from_slice(&0xFFFEu16.to_be_bytes());
+        undefined.extend_from_slice(&0xE000u16.to_be_bytes());
+        undefined.extend_from_slice(&(item.len() as u32).to_be_bytes());
+        undefined.extend_from_slice(&item);
+        undefined.extend_from_slice(&0xFFFEu16.to_be_bytes());
+        undefined.extend_from_slice(&0xE0DDu16.to_be_bytes());
+        undefined.extend_from_slice(&0u32.to_be_bytes());
+        assert!(reencode_explicit_be_to_explicit_le(&undefined).is_err());
+    }
+
+    /// A DICM-at-offset-zero file (no 128-byte preamble) is refused, not
+    /// panicked on.
+    ///
+    /// The pre-fix code accepted `out.len() >= 128` and then indexed
+    /// `out[128..132]`: a meta group that ended exactly at offset 128 made
+    /// that index out of bounds.
+    #[test]
+    fn a_prefix_only_file_is_refused_without_panicking() {
+        let mut be = Vec::new();
+        be.extend_from_slice(b"DICM");
+        be.extend_from_slice(&0x0002u16.to_le_bytes());
+        be.extend_from_slice(&0x0010u16.to_le_bytes());
+        be.extend_from_slice(b"UI");
+        be.extend_from_slice(&116u16.to_le_bytes());
+        be.extend_from_slice(&[b'x'; 116]);
+        assert_eq!(be.len(), 128, "meta group ends exactly at offset 128");
+
+        assert!(reencode_explicit_be_to_explicit_le(&be).is_err());
+        assert!(reencode_implicit_to_explicit(&be).is_err());
+    }
+
+    /// The value bytes of the first element with this tag, walking Explicit VR
+    /// LE from the dataset start.
+    fn find_element_value(data: &[u8], group: u16, element: u16) -> Option<&[u8]> {
+        let (_meta, start) = walk_meta(data);
+        let mut pos = start;
+        while pos + 8 <= data.len() {
+            let g = read_u16_le(data, pos);
+            let e = read_u16_le(data, pos + 2);
+            let vr = std::str::from_utf8(&data[pos + 4..pos + 6]).ok()?;
+            let extended = matches!(
+                vr,
+                "OB" | "OD" | "OF" | "OL" | "OV" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT"
+            );
+            let (len, vo) = if extended {
+                (u32_from_slice(&data[pos + 8..pos + 12]) as usize, pos + 12)
+            } else {
+                (read_u16_le(data, pos + 6) as usize, pos + 8)
+            };
+            if (g, e) == (group, element) {
+                return Some(&data[vo..vo + len]);
+            }
+            pos = vo + len + (len % 2);
+        }
+        None
+    }
+
+    /// A `US` element's value read as little endian.
+    fn find_le_us(data: &[u8], group: u16, element: u16) -> Option<u16> {
+        let value = find_element_value(data, group, element)?;
+        Some(read_u16_le(value, 0))
+    }
 
     /// Independent reference emitter for the canonical group (same PS3.5 6.2
     /// and PS3.10 7.1 rules as the production writer): ascending (0002,0000)

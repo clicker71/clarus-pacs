@@ -6,7 +6,7 @@
 import logging
 from urllib.parse import urlsplit
 
-VERSION = "0.3.1-beta"
+VERSION = "0.3.3-beta"
 
 
 class ConfParser:

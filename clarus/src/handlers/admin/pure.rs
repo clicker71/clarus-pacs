@@ -15,7 +15,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use clarus_core::manifest::{AttrValue, read_manifest, write_manifest};
+use clarus_core::manifest::{AttrValue, write_manifest};
 use clarus_core::query::tag;
 use clarus_core::stow::{acquire, manifest_path};
 
@@ -89,7 +89,7 @@ pub fn admin_status(state: &AppState) -> Result<AdminResp, AdminErr> {
     let uptime = state.start_time.elapsed().as_secs();
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let studies = count_studies_from_manifests(manifest_dir);
-    let instances = count_instances_from_manifests(manifest_dir);
+    let instances = count_instances_from_manifests(state);
     let (cas_files, cas_bytes) = cas_store_stats(state);
     let cas_size = cas_bytes;
     let memory_rss_mb = get_memory_rss_mb();
@@ -164,17 +164,18 @@ fn count_studies_from_manifests(dir: &std::path::Path) -> u64 {
 /// Walks every `*.manifest` file and sums `series[].instances.len()`, skipping
 /// tombstones (`.del`) and unreadable/corrupt manifests (conservative - a
 /// corrupt manifest is omitted rather than aborting a stats endpoint).
-fn count_instances_from_manifests(dir: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn count_instances_from_manifests(state: &AppState) -> u64 {
+    let Ok(entries) = std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir))
+    else {
         return 0;
     };
     let mut total: u64 = 0;
     for e in entries.flatten() {
-        let path = e.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("manifest") {
+        let fname = e.file_name().to_string_lossy().into_owned();
+        let Some(stem) = fname.strip_suffix(".manifest") else {
             continue;
-        }
-        if let Ok(m) = read_manifest(&path) {
+        };
+        if let Some(Ok(m)) = state.read_server_manifest(stem) {
             total += m
                 .series
                 .iter()
@@ -414,8 +415,7 @@ pub struct DashboardResponse {
 /// `GET /admin/v1/dashboard`.
 pub fn admin_dashboard(state: &AppState) -> Result<AdminResp, AdminErr> {
     let uptime = state.start_time.elapsed().as_secs();
-    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
-    let logical = count_instances_from_manifests(manifest_dir);
+    let logical = count_instances_from_manifests(state);
     let (cas_files, cas_bytes) = cas_store_stats(state);
     let cas_size = cas_bytes;
     let cas_size_mb = cas_size as f64 / (1024.0 * 1024.0);
@@ -555,7 +555,7 @@ pub struct StorageResponse {
 /// `GET /admin/v1/storage`.
 pub fn admin_storage(state: &AppState) -> Result<AdminResp, AdminErr> {
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
-    let logical = count_instances_from_manifests(manifest_dir);
+    let logical = count_instances_from_manifests(state);
     let (physical, cas_bytes) = cas_store_stats(state);
     let cas_size = cas_bytes;
     let cas_size_mb = cas_size as f64 / (1024.0 * 1024.0);
@@ -1916,19 +1916,13 @@ pub fn admin_instances_search(
     // 6b: SOP-UID lookups go through the manifest scan, never the SQLite
     // backend. Manifests are the post-excision source of truth for instances.
     if let Some(uid) = params.sop_instance_uid.as_deref() {
-        return manifest_instance_search(
-            std::path::Path::new(&state.config.btree.manifest_dir),
-            uid,
-            limit,
-            offset,
-            is_auditor,
-        );
+        return manifest_instance_search(state, uid, limit, offset, is_auditor);
     }
 
     // Post-SQLite: general instance search walks the B-tree
     // manifests - the post-excision source of truth - no SqliteBackend.
     let masked = manifest_instances_search_general(
-        std::path::Path::new(&state.config.btree.manifest_dir),
+        state,
         params.patient_name.as_deref(),
         params.patient_id.as_deref(),
         params.study_uid.as_deref(),
@@ -2236,13 +2230,13 @@ pub fn admin_instances_hidden(
         }
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("manifest") {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = fname.strip_suffix(".manifest") else {
             continue;
-        }
-        let m = match read_manifest(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        };
+        let m = match state.read_server_manifest(stem) {
+            Some(Ok(m)) => m,
+            _ => continue,
         };
         let st_uid = attr_text(&m.study.attrs, tag::STUDY_INSTANCE_UID).unwrap_or_default();
         if let Some(f) = params.study_uid.as_deref()
@@ -2372,11 +2366,9 @@ pub fn admin_instance_raw(state: &AppState, sop_uid: &str) -> Result<RawInstance
         Some(s) => s,
         None => return Err(not_found()),
     };
-    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
-    let path = manifest_path(manifest_dir, &study_uid);
-    let m = match read_manifest(&path) {
-        Ok(m) => m,
-        Err(_) => return Err(not_found()),
+    let m = match state.read_server_manifest(&study_uid) {
+        Some(Ok(m)) => m,
+        _ => return Err(not_found()),
     };
     let patient_id = attr_text(&m.study.attrs, tag::PATIENT_ID).unwrap_or_default();
     for series in &m.series {
@@ -2546,6 +2538,7 @@ pub fn admin_restore(state: &AppState, body: &[u8], username: &str) -> Result<Ad
             }
         };
         let cleared = match restore_instance_manifest(
+            state,
             username,
             &reason,
             uid,
@@ -2589,6 +2582,7 @@ pub fn admin_restore(state: &AppState, body: &[u8], username: &str) -> Result<Ad
 /// "nothing to do" is more useful than a success that changed nothing).
 #[allow(clippy::too_many_arguments)]
 fn restore_instance_manifest(
+    state: &AppState,
     username: &str,
     reason: &str,
     sop_uid: &str,
@@ -2597,8 +2591,10 @@ fn restore_instance_manifest(
     manifest_dir: &std::path::Path,
     audit_dir: &std::path::Path,
 ) -> Result<Option<u32>, String> {
-    let mv_path = manifest_path(manifest_dir, study_uid);
-    let m = read_manifest(&mv_path).map_err(|e| format!("read manifest: {e}"))?;
+    let m = state
+        .read_server_manifest(study_uid)
+        .ok_or_else(|| "not a published manifest path".to_string())?
+        .map_err(|e| format!("read manifest: {e}"))?;
 
     // Capture what is about to be reversed BEFORE any mutation: the reason
     // code is the record of which clinical decision this restore undoes, and
@@ -2656,14 +2652,14 @@ fn restore_instance_manifest(
 /// auditor PII masking. Unreadable manifests are skipped (best-effort scan:
 /// a study being rewritten is invisible until its atomic commit lands).
 fn manifest_instance_search(
-    manifest_dir: &std::path::Path,
+    state: &AppState,
     sop_uid: &str,
     limit: u64,
     offset: u64,
     is_auditor: bool,
 ) -> Result<AdminResp, AdminErr> {
     let mut hits: Vec<MaskedInstanceSummary> = Vec::new();
-    let entries = match std::fs::read_dir(manifest_dir) {
+    let entries = match std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir)) {
         Ok(e) => e,
         Err(_) => {
             let mut body = Vec::new();
@@ -2672,13 +2668,13 @@ fn manifest_instance_search(
         }
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("manifest") {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = fname.strip_suffix(".manifest") else {
             continue;
-        }
-        let m = match read_manifest(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        };
+        let m = match state.read_server_manifest(stem) {
+            Some(Ok(m)) => m,
+            _ => continue,
         };
         let study_uid = attr_text(&m.study.attrs, tag::STUDY_INSTANCE_UID).unwrap_or_default();
         let patient_name = attr_text(&m.study.attrs, tag::PATIENT_NAME).unwrap_or_default();
@@ -2735,7 +2731,7 @@ fn manifest_instance_search(
 /// matching the legacy render and the SOP-UID manifest search.
 #[allow(clippy::too_many_arguments)]
 fn manifest_instances_search_general(
-    manifest_dir: &std::path::Path,
+    state: &AppState,
     patient_name: Option<&str>,
     patient_uid: Option<&str>,
     study_uid: Option<&str>,
@@ -2763,18 +2759,18 @@ fn manifest_instances_search_general(
     };
 
     let mut hits: Vec<MaskedInstanceSummary> = Vec::new();
-    let entries = match std::fs::read_dir(manifest_dir) {
+    let entries = match std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir)) {
         Ok(e) => e,
         Err(_) => return hits,
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("manifest") {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = fname.strip_suffix(".manifest") else {
             continue;
-        }
-        let m = match read_manifest(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        };
+        let m = match state.read_server_manifest(stem) {
+            Some(Ok(m)) => m,
+            _ => continue,
         };
         let st_uid = attr_text(&m.study.attrs, tag::STUDY_INSTANCE_UID).unwrap_or_default();
         let st_patient = attr_text(&m.study.attrs, tag::PATIENT_NAME).unwrap_or_default();
@@ -3311,7 +3307,7 @@ pub fn admin_delete(state: &AppState, body: &[u8], username: &str) -> Result<Adm
     // The reference set is built ONCE: a study delete resolves one blob per
     // instance, and a per-blob scan would re-read the whole manifest store
     // once per instance.
-    let live_refs = live_reference_set(manifest_dir);
+    let live_refs = live_reference_set(state);
     for blake3_hex in &hashes {
         if live_refs
             .as_ref()
@@ -3442,8 +3438,7 @@ struct DeletePlan {
 /// "not found".
 fn preview_instance_delete(state: &AppState, sop_uid: &str) -> Option<DeletePlan> {
     let study_uid = state.shadow.sop_owner_study(sop_uid)?;
-    let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
-    let m = read_manifest(&manifest_path(manifest_dir, &study_uid)).ok()?;
+    let m = state.read_server_manifest(&study_uid)?.ok()?;
     let mut bytes = 0u64;
     let mut hash: Option<String> = None;
     for series in &m.series {
@@ -3463,7 +3458,7 @@ fn preview_instance_delete(state: &AppState, sop_uid: &str) -> Option<DeletePlan
     Some(DeletePlan {
         bytes,
         // One blob, one answer: the full scan is the cheapest form here.
-        shared: blob_is_referenced_live(manifest_dir, &hash),
+        shared: blob_is_referenced_live(state, &hash),
     })
 }
 
@@ -3489,11 +3484,11 @@ fn series_instance_uids(state: &AppState, series_uid: &str) -> std::collections:
         return out;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("manifest") {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = fname.strip_suffix(".manifest") else {
             continue;
-        }
-        let Ok(m) = read_manifest(&path) else {
+        };
+        let Some(Ok(m)) = state.read_server_manifest(stem) else {
             continue;
         };
         for series in &m.series {
@@ -3533,11 +3528,11 @@ fn preview_series_delete(state: &AppState, series_uid: &str) -> SeriesDeletePlan
     // exist must not pay for a store-wide scan.
     let mut live_refs: Option<Option<std::collections::HashSet<String>>> = None;
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("manifest") {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = fname.strip_suffix(".manifest") else {
             continue;
-        }
-        let Ok(m) = read_manifest(&path) else {
+        };
+        let Some(Ok(m)) = state.read_server_manifest(stem) else {
             continue;
         };
         for series in &m.series {
@@ -3554,7 +3549,7 @@ fn preview_series_delete(state: &AppState, series_uid: &str) -> SeriesDeletePlan
                 // `shared` is a per-series dedup count over the whole store, so
                 // the reference set is built once for the series rather than
                 // re-reading every manifest per instance.
-                let refs = live_refs.get_or_insert_with(|| live_reference_set(manifest_dir));
+                let refs = live_refs.get_or_insert_with(|| live_reference_set(state));
                 let referenced = match refs {
                     Some(set) => set.contains(&hash),
                     None => true, // can't verify -> keep the file
@@ -3593,7 +3588,10 @@ fn delete_instance_manifest(
         None => return Ok(None),
     };
     let mv_path = manifest_path(manifest_dir, &study_uid);
-    let m = read_manifest(&mv_path).map_err(|e| format!("read manifest: {e}"))?;
+    let m = state
+        .read_server_manifest(&study_uid)
+        .ok_or_else(|| "not a published manifest path".to_string())?
+        .map_err(|e| format!("read manifest: {e}"))?;
 
     // Locate the target instance(s) + size before removal (for the audit row).
     let mut bytes_to_free = 0u64;
@@ -3643,13 +3641,13 @@ fn delete_instance_manifest(
     // TOCTOU fix: the pre-lease copy is stale - a
     // STOW commit may have landed during the audit append. Re-read UNDER the
     // lease so the rewrite cannot lose those instances.
-    let mut m = match read_manifest(&mv_path) {
-        Ok(m) => m,
-        Err(_) => return Ok(None), // vanished concurrently; nothing to rewrite
+    let mut m = match state.read_server_manifest(&study_uid) {
+        Some(Ok(m)) => m,
+        _ => return Ok(None), // vanished concurrently; nothing to rewrite
     };
 
     // B3: drop the cached entry BEFORE the rewrite; reinstall after.
-    let (cache_v, _taken) = clarus_core::manifest_cache::begin_write(&study_uid);
+    let (cache_v, _taken) = clarus_core::manifest_cache::begin_write(manifest_dir, &study_uid);
 
     // Drop the instance(s) from the FRESH copy, then drop now-empty series.
     let mut dropped = 0usize;
@@ -3738,10 +3736,13 @@ fn delete_series_manifest(
     manifest_dir: &std::path::Path,
     audit_dir: &std::path::Path,
 ) -> Result<(Vec<BlobRef>, u64), String> {
-    let study_uid = find_study_for_series(manifest_dir, series_uid)
+    let study_uid = find_study_for_series(state, series_uid)
         .ok_or_else(|| format!("series not found: {series_uid}"))?;
     let mv_path = manifest_path(manifest_dir, &study_uid);
-    let m = read_manifest(&mv_path).map_err(|e| format!("read manifest: {e}"))?;
+    let m = state
+        .read_server_manifest(&study_uid)
+        .ok_or_else(|| "not a published manifest path".to_string())?
+        .map_err(|e| format!("read manifest: {e}"))?;
 
     let mut hashes = Vec::new();
     let mut bytes_to_free = 0u64;
@@ -3794,13 +3795,13 @@ fn delete_series_manifest(
     // TOCTOU fix: the pre-lease copy is stale - a
     // STOW commit may have landed during the audit append. Re-read UNDER the
     // lease so the rewrite cannot lose those instances.
-    let mut m = match read_manifest(&mv_path) {
-        Ok(m) => m,
-        Err(_) => return Ok((Vec::new(), 0)), // vanished concurrently
+    let mut m = match state.read_server_manifest(&study_uid) {
+        Some(Ok(m)) => m,
+        _ => return Ok((Vec::new(), 0)), // vanished concurrently
     };
 
     // B3: drop the cached entry BEFORE the rewrite; reinstall after.
-    let (cache_v, _taken) = clarus_core::manifest_cache::begin_write(&study_uid);
+    let (cache_v, _taken) = clarus_core::manifest_cache::begin_write(manifest_dir, &study_uid);
 
     if !m.series.iter().any(|s| {
         s.attrs.iter().any(|(t, v)| {
@@ -3906,8 +3907,8 @@ fn tombstone_empty_study(
 /// skipped study is exactly the one whose blobs would be unlinked by mistake:
 /// the file looks orphaned because its referrer could not be read. Deferring
 /// costs disk until the next pass; guessing costs an instance.
-fn blob_is_referenced_live(manifest_dir: &std::path::Path, blake3_hex: &str) -> bool {
-    match live_reference_set(manifest_dir) {
+fn blob_is_referenced_live(state: &AppState, blake3_hex: &str) -> bool {
+    match live_reference_set(state) {
         Some(set) => set.contains(blake3_hex),
         None => true, // can't verify -> keep the file
     }
@@ -3923,8 +3924,8 @@ fn blob_is_referenced_live(manifest_dir: &std::path::Path, blake3_hex: &str) -> 
 /// `None` when a manifest could not be read or the directory could not be
 /// listed: the caller must then treat every blob as referenced (see
 /// [`blob_is_referenced_live`] for why guessing costs an instance).
-fn live_reference_set(manifest_dir: &std::path::Path) -> Option<std::collections::HashSet<String>> {
-    let rd = std::fs::read_dir(manifest_dir).ok()?;
+fn live_reference_set(state: &AppState) -> Option<std::collections::HashSet<String>> {
+    let rd = std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir)).ok()?;
     let mut set = std::collections::HashSet::new();
     for ent in rd.flatten() {
         let name = ent.file_name();
@@ -3932,7 +3933,9 @@ fn live_reference_set(manifest_dir: &std::path::Path) -> Option<std::collections
         if !name.ends_with(".manifest") {
             continue;
         }
-        let m = read_manifest(&ent.path()).ok()?;
+        let m = state
+            .read_server_manifest(name.trim_end_matches(".manifest"))?
+            .ok()?;
         for series in &m.series {
             for inst in &series.instances {
                 set.insert(clarus_adapters::hex_encode(&inst.blake3));
@@ -3943,16 +3946,16 @@ fn live_reference_set(manifest_dir: &std::path::Path) -> Option<std::collections
 }
 
 /// Find the owning study of a series UID by scanning live manifests.
-fn find_study_for_series(manifest_dir: &std::path::Path, series_uid: &str) -> Option<String> {
+fn find_study_for_series(state: &AppState, series_uid: &str) -> Option<String> {
     let mut out = None;
-    if let Ok(rd) = std::fs::read_dir(manifest_dir) {
+    if let Ok(rd) = std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir)) {
         for ent in rd.flatten() {
             let name = ent.file_name();
             let name = name.to_string_lossy();
             if !name.ends_with(".manifest") {
                 continue;
             }
-            let Ok(m) = read_manifest(&ent.path()) else {
+            let Some(Ok(m)) = state.read_server_manifest(name.trim_end_matches(".manifest")) else {
                 continue;
             };
             let hit = m.series.iter().any(|s| {
@@ -4000,7 +4003,12 @@ fn admin_delete_study(
     } else {
         &del_path
     };
-    let (count, bytes_to_free, patient_id) = match clarus_core::manifest::read_manifest(source) {
+    // The source is either the live manifest or the tombstone, and the two do
+    // not share a file class: only the manifest is published by the temp+rename
+    // protocol, so the sealed type does not apply to the pair. This is a
+    // read-once accounting pass on a small file, so it copies rather than maps.
+    let (count, bytes_to_free, patient_id) = match clarus_core::manifest::read_manifest_copy(source)
+    {
         Ok(m) => {
             let c = m.series.iter().flat_map(|s| &s.instances).count() as u64;
             let b: u64 = m
@@ -4092,7 +4100,7 @@ fn admin_delete_study(
     // "any reference" rule is what let a study delete claim a derived object
     // of an unrelated study, and after the rename there is nothing left to
     // enumerate the study's own UIDs from.
-    let study_scope = study_scope_snapshot(&mv_path, study_uid);
+    let study_scope = study_scope_snapshot(state, study_uid);
 
     // Tombstone: atomic rename (instant visibility; readers filter .manifest).
     // Idempotent: an existing tombstone means it is already deleted.
@@ -4104,7 +4112,7 @@ fn admin_delete_study(
         let _lease = clarus_core::stow::acquire();
         // B3: drop the cached entry BEFORE the rename; no end_write - the
         // study is gone, the next get_or_load must 404 from disk.
-        let _ = clarus_core::manifest_cache::begin_write(study_uid);
+        let _ = clarus_core::manifest_cache::begin_write(manifest_dir, study_uid);
         std::fs::rename(&mv_path, &del_path).map_err(|e| {
             let mut b = Vec::new();
             let msg = format!("Tombstone rename failed: {e}");
@@ -4163,13 +4171,13 @@ fn admin_delete_study(
 /// yields an empty set, and an empty set claims nothing - the cascade then
 /// leaves derived objects alone rather than claiming every one in the store.
 fn study_scope_snapshot<'a>(
-    manifest_path: &std::path::Path,
+    state: &AppState,
     study_uid: &'a str,
 ) -> crate::handlers::admin::cascade::StudyScope<'a> {
     let mut series_uids = std::collections::HashSet::new();
     let mut instance_uids = std::collections::HashSet::new();
     let _ = (&mut series_uids, &mut instance_uids);
-    if let Ok(manifest) = read_manifest(manifest_path) {
+    if let Some(Ok(manifest)) = state.read_server_manifest(study_uid) {
         for series in &manifest.series {
             if let Some(uid) = attr_text(&series.attrs, tag::SERIES_INSTANCE_UID) {
                 series_uids.insert(uid);
@@ -4247,7 +4255,7 @@ fn remove_derived_object(
     // The lease covers the read-modify-write: editing outside it let a
     // concurrent STOW commit overwrite the removal.
     let _lease = acquire();
-    let Ok(manifest) = read_manifest(&path) else {
+    let Some(Ok(manifest)) = state.read_server_manifest(&target.study_instance_uid) else {
         // No live manifest for the owning study: the object was already taken
         // with its own study, so there is nothing left to do.
         return Ok(false);
@@ -4350,7 +4358,7 @@ fn remove_derived_object(
             );
             return Err(format!("audit append failed: {e}"));
         }
-        let _ = clarus_core::manifest_cache::begin_write(&target.study_instance_uid);
+        let _ = clarus_core::manifest_cache::begin_write(manifest_dir, &target.study_instance_uid);
         let tombstone = tombstone_path(manifest_dir, &target.study_instance_uid);
         std::fs::rename(&path, &tombstone).map_err(|e| e.to_string())?;
         // Sidecar so the erase-worker closes the loop with
@@ -4378,7 +4386,8 @@ fn remove_derived_object(
     }
     // Reinstall the entry from the rewritten manifest; without this the cache
     // stays dropped and the next read re-parses for nothing.
-    let (cache_v, _taken) = clarus_core::manifest_cache::begin_write(&target.study_instance_uid);
+    let (cache_v, _taken) =
+        clarus_core::manifest_cache::begin_write(manifest_dir, &target.study_instance_uid);
     write_manifest(&path, &manifest).map_err(|e| e.to_string())?;
     clarus_core::manifest_cache::end_write(
         &target.study_instance_uid,
@@ -4649,6 +4658,53 @@ mod tests {
         write_study_manifest_full(dir, &mut attrs, &[series]).expect("write manifest");
     }
 
+    /// A minimal `AppState` whose configured manifest dir is `manifest_dir`,
+    /// so the tests can read through the audited wrapper the same way the
+    /// server does. `manifest_dir` is exactly the dir `write_study` wrote into.
+    fn state_for(manifest_dir: &std::path::Path) -> AppState {
+        let idx_dir = manifest_dir.join("idx");
+        let storage_dir = manifest_dir.join("cas");
+        std::fs::create_dir_all(&idx_dir).expect("idx dir");
+        std::fs::create_dir_all(&storage_dir).expect("cas dir");
+
+        let mut config = crate::config::Config::test_default();
+        config.btree.manifest_dir = manifest_dir.to_string_lossy().to_string();
+        config.btree.idx_dir = idx_dir.to_string_lossy().to_string();
+        config.storage_dir = storage_dir.to_string_lossy().to_string();
+        config.min_free_disk_mb = 0;
+        config.min_free_disk_pct = 0.0;
+
+        AppState {
+            cas: clarus_adapters::storage::ContentAddressedStorage::new(storage_dir)
+                .expect("open cas"),
+            codec_registry: clarus_adapters::codec::CodecRegistry::default(),
+            ups_events: crate::sse_fanout::DualEventSink::new(),
+            start_time: std::time::Instant::now(),
+            metrics_ring: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::VecDeque::new(),
+            )),
+            log_buffer: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::VecDeque::new(),
+            )),
+            maintenance: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::state::MaintenanceState::default(),
+            )),
+            #[cfg(feature = "s3")]
+            s3: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cold_cas: None,
+            shadow: crate::shadow::ShadowTier::new(idx_dir.clone()),
+            study_scanner: clarus_core::query::StudyScanner::new(
+                manifest_dir.to_path_buf(),
+                idx_dir,
+            ),
+            config,
+            workitems_dir: manifest_dir.join("workitems"),
+            commitments_dir: manifest_dir.join("commitments"),
+            transcode_pool: crate::state::TranscodePool::new(2),
+            readiness: crate::handlers::readiness::Readiness::new(),
+        }
+    }
+
     /// The scan finds the instance and returns unmasked data for a full admin.
     #[test]
     fn manifest_search_finds_instance() {
@@ -4660,8 +4716,8 @@ mod tests {
             "1.2.3.sop",
             "Smith^John",
         );
-        let resp =
-            manifest_instance_search(tmp.path(), "1.2.3.sop", 500, 0, false).expect("search");
+        let state = state_for(tmp.path());
+        let resp = manifest_instance_search(&state, "1.2.3.sop", 500, 0, false).expect("search");
         let body = parse_json(&resp.body).expect("json");
         let arr = body.as_array().expect("array");
         assert_eq!(arr.len(), 1);
@@ -4699,7 +4755,8 @@ mod tests {
             "1.2.4.sop",
             "Smith^John",
         );
-        let resp = manifest_instance_search(tmp.path(), "1.2.4.sop", 500, 0, true).expect("search");
+        let state = state_for(tmp.path());
+        let resp = manifest_instance_search(&state, "1.2.4.sop", 500, 0, true).expect("search");
         let body = parse_json(&resp.body).expect("json");
         let arr = body.as_array().expect("array");
         assert_eq!(arr.len(), 1);
@@ -4729,14 +4786,15 @@ mod tests {
                 "Smith^John",
             );
         }
+        let state = state_for(tmp.path());
         let page =
-            manifest_instance_search(tmp.path(), "1.2.5.shared.sop", 2, 0, false).expect("search");
+            manifest_instance_search(&state, "1.2.5.shared.sop", 2, 0, false).expect("search");
         let body = parse_json(&page.body).expect("json");
         let arr = body.as_array().expect("array");
         assert_eq!(arr.len(), 2, "limit clips the page");
 
-        let tail = manifest_instance_search(tmp.path(), "1.2.5.shared.sop", 500, 1, false)
-            .expect("search");
+        let tail =
+            manifest_instance_search(&state, "1.2.5.shared.sop", 500, 1, false).expect("search");
         let body = parse_json(&tail.body).expect("json");
         let arr = body.as_array().expect("array");
         assert_eq!(arr.len(), 2, "offset skips the first hit");
@@ -4766,13 +4824,22 @@ mod tests {
             "Beta^Two",
         );
 
-        let set = live_reference_set(tmp.path()).expect("every manifest is readable");
+        let state = state_for(tmp.path());
+        let set = live_reference_set(&state).expect("every manifest is readable");
         // Both studies contributed, so no manifest was skipped.
         let stored: Vec<String> = std::fs::read_dir(tmp.path())
             .expect("dir")
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().ends_with(".manifest"))
-            .flat_map(|e| read_manifest(&e.path()).expect("manifest").series)
+            .flat_map(|e| {
+                let fname = e.file_name().to_string_lossy().into_owned();
+                let stem = fname.strip_suffix(".manifest").unwrap();
+                state
+                    .read_server_manifest(stem)
+                    .expect("published manifest path")
+                    .expect("manifest")
+                    .series
+            })
             .flat_map(|s| s.instances)
             .map(|i| clarus_adapters::hex_encode(&i.blake3))
             .collect();
@@ -4808,12 +4875,13 @@ mod tests {
         )
         .expect("corrupt manifest");
 
+        let state = state_for(tmp.path());
         assert!(
-            live_reference_set(tmp.path()).is_none(),
+            live_reference_set(&state).is_none(),
             "one undecodable manifest must not yield a partial answer"
         );
         assert!(
-            blob_is_referenced_live(tmp.path(), &"a".repeat(64)),
+            blob_is_referenced_live(&state, &"a".repeat(64)),
             "an unusable set keeps the blob"
         );
     }
@@ -5261,9 +5329,10 @@ mod tests {
         let dir = temp.path().join("manifests");
         std::fs::create_dir_all(&dir).expect("dir");
         write_study(&dir, "1.2.3.500", "1.2.3.500.1", "1.2.3.500.1.1", "Ivanov");
+        let state = state_for(&dir);
 
         let hits = manifest_instances_search_general(
-            &dir,
+            &state,
             Some("Iva*ov"),
             None,
             None,
@@ -5283,7 +5352,7 @@ mod tests {
         );
 
         let none = manifest_instances_search_general(
-            &dir,
+            &state,
             Some("Iva*xyz"),
             None,
             None,

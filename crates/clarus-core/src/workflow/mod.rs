@@ -21,5 +21,5 @@
 pub mod record;
 pub mod store;
 
-pub use record::{MppsError, MppsRecord, MppsReference, SpsError, SpsRecord};
+pub use record::{MppsError, MppsRecord, MppsReference, PerformedSeries, SpsError, SpsRecord};
 pub use store::{WorkflowStore, WorkflowStoreError};

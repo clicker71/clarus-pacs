@@ -6,10 +6,27 @@
 //! the mapping - no buffered `read()` loop, no allocation for the byte
 //! buffer. This is the read side of the plan's mmap contract (the write side
 //! is [`crate::manifest::write`]).
+//!
+//! # Why the readers take a [`TrustedManifestDir`]
+//!
+//! A mapping is only sound while its inode is immutable, and neither a
+//! `&Path` nor a [`PublishedManifest`] can establish that: a safe constructor
+//! validates only the path shape, not how the file at that path was
+//! published, so any caller (or any other thread holding a writable
+//! descriptor) could truncate the file under the mapping. [`PublishedManifest`]
+//! is therefore a PATH VALIDATOR, not a proof of publication - it rejects a
+//! UID that could escape the directory and centralizes the path join, and
+//! nothing more. The publication guarantee itself is carried by the
+//! [`TrustedManifestDir`] parameter: it is built only by code that vouches
+//! for the tmp-file + rename protocol (the audited server voucher in
+//! `clarus/src/ffi.rs`, and test fixtures that publish their own files). The
+//! mmap itself happens inside [`crate::ffi::map_manifest_dir`]. Readers of an
+//! unvouched path use [`read_manifest_copy`].
 
+use crate::ffi::TrustedManifestDir;
 use crate::manifest::record::Manifest;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Errors produced by [`read_manifest`] / [`read_manifest_at`].
 #[derive(Debug)]
@@ -31,22 +48,179 @@ impl std::fmt::Display for ManifestReadError {
 
 impl std::error::Error for ManifestReadError {}
 
-/// Read and decode a manifest from `path` by mmap-ing the whole file.
-pub fn read_manifest(path: &Path) -> Result<Manifest, ManifestReadError> {
-    // Manifests are written temp+rename (see `stow/manifest.rs`), so no writer
-    // mutates a published path in place; `MappedFile` additionally pins the
-    // descriptor for as long as the bytes are mapped.
-    let mapped = crate::ffi::MappedFile::open_readonly(path).map_err(ManifestReadError::Io)?;
+/// A manifest path named by the two halves the publish protocol is defined on.
+///
+/// This type is a PATH VALIDATOR only: it rejects a `study_uid` that could
+/// escape `manifest_dir` (a separator, an absolute path, empty, or a dotfile)
+/// and centralizes the path join, so callers do not hand-build the file name.
+/// It does NOT prove the file was published via tmp-file + rename - any safe
+/// code can construct one for an arbitrary directory and UID. The immutability
+/// precondition the mmap needs is carried by the [`TrustedManifestDir`]
+/// parameter the readers take, not by this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedManifest {
+    dir: PathBuf,
+    study_uid: String,
+}
+
+impl PublishedManifest {
+    /// The manifest of `study_uid` inside `manifest_dir`.
+    ///
+    /// Returns `None` when `study_uid` could not name a manifest file inside
+    /// `manifest_dir`: a separator or an absolute path would name a file
+    /// outside the directory, the empty string would name the directory
+    /// itself, and a leading `.` would name a hidden file. This validates the
+    /// path shape only; it does not vouch for how the file came to exist.
+    #[must_use]
+    pub fn new(manifest_dir: impl Into<PathBuf>, study_uid: impl Into<String>) -> Option<Self> {
+        let study_uid = study_uid.into();
+        if study_uid.is_empty()
+            || study_uid.contains('/')
+            || study_uid.contains('\\')
+            || Path::new(&study_uid).is_absolute()
+            || study_uid.starts_with('.')
+        {
+            return None;
+        }
+        Some(Self {
+            dir: manifest_dir.into(),
+            study_uid,
+        })
+    }
+
+    /// The directory manifests are published into.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The study UID this manifest is published under.
+    #[must_use]
+    pub fn study_uid(&self) -> &str {
+        &self.study_uid
+    }
+
+    /// The `<study>.manifest` file name.
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        format!("{}.manifest", self.study_uid)
+    }
+
+    /// The full path the mapping opens.
+    #[must_use]
+    pub fn path(&self) -> PathBuf {
+        self.dir.join(self.file_name())
+    }
+
+    /// Recover the constructor arguments from a full manifest path.
+    ///
+    /// Test-only: exists solely for the two test helpers in this module that
+    /// read fixtures by path. Production callers address a manifest by its
+    /// directory + study UID pair via [`PublishedManifest::new`], so a normal
+    /// build has no arbitrary-path mapping on the public surface.
+    #[cfg(test)]
+    #[must_use]
+    pub fn from_path(path: &Path) -> Option<Self> {
+        let dir = path.parent()?;
+        let file_name = path.file_name()?.to_str()?;
+        let study_uid = file_name.strip_suffix(".manifest")?;
+        Self::new(dir.to_path_buf(), study_uid)
+    }
+}
+
+/// Read and decode a manifest by mmap-ing the whole file.
+///
+/// `trusted` vouches that the directory the manifest lives in is published
+/// via tmp-file + rename and is never rewritten or truncated in place while
+/// the mapping is alive (the immutability invariant of
+/// [`crate::ffi::map_manifest_dir`]). [`PublishedManifest`] only validates
+/// the path shape, so the publication proof has to arrive through the trusted
+/// directory.
+pub fn read_manifest(
+    trusted: &TrustedManifestDir,
+    manifest: &PublishedManifest,
+) -> Result<Manifest, ManifestReadError> {
+    let mapped = crate::ffi::map_manifest_dir(trusted.path(), &manifest.file_name())
+        .map_err(ManifestReadError::Io)?;
     read_manifest_at(&mapped)
 }
 
 /// Same as [`read_manifest`] but parses **only** the study-level QIDO
 /// attributes - series, instance, and frame records are skipped via
 /// [`CborReader::skip_value`]. This is the QIDO hotpath.
-pub fn read_manifest_study_only(path: &Path) -> Result<Manifest, ManifestReadError> {
-    // SAFETY: same argument as `read_manifest` above.
-    let mapped = crate::ffi::MappedFile::open_readonly(path).map_err(ManifestReadError::Io)?;
+pub fn read_manifest_study_only(
+    trusted: &TrustedManifestDir,
+    manifest: &PublishedManifest,
+) -> Result<Manifest, ManifestReadError> {
+    let mapped = crate::ffi::map_manifest_dir(trusted.path(), &manifest.file_name())
+        .map_err(ManifestReadError::Io)?;
     Manifest::decode_study_only(&mapped).map_err(|e| ManifestReadError::Decode(e.to_string()))
+}
+
+/// The crate-internal read of a manifest published by `stow/manifest.rs`.
+///
+/// The writer publishes `<study>.manifest.tmp` then renames it into place,
+/// and never rewrites or truncates a manifest in place. That is the voucher
+/// [`read_manifest`] requires, and it is a property of the crate-owned
+/// manifest directory, not of the caller: every manifest in that directory was
+/// published by the writer. This helper is `pub(crate)` - only this crate's
+/// own code, which the server feeds the configured manifest directory, may
+/// call it (the mirror of `idx/preload.rs`'s `SealedIdxRoot::from_writer`).
+pub(crate) fn read_manifest_published(
+    manifest: &PublishedManifest,
+) -> Result<Manifest, ManifestReadError> {
+    let mapped = crate::ffi::map_manifest_dir(manifest.dir(), &manifest.file_name())
+        .map_err(ManifestReadError::Io)?;
+    read_manifest_at(&mapped)
+}
+
+/// Shallow twin of [`read_manifest_published`] for the QIDO hotpath.
+pub(crate) fn read_manifest_study_only_published(
+    manifest: &PublishedManifest,
+) -> Result<Manifest, ManifestReadError> {
+    let mapped = crate::ffi::map_manifest_dir(manifest.dir(), &manifest.file_name())
+        .map_err(ManifestReadError::Io)?;
+    Manifest::decode_study_only(&mapped).map_err(|e| ManifestReadError::Decode(e.to_string()))
+}
+
+/// Read a manifest from an owned byte buffer.
+///
+/// The escape hatch for a caller that must read a path it cannot vouch for - a
+/// test, a repair tool, a file already in memory. It copies instead of mapping,
+/// which costs one allocation and is the reason it is not the default: the
+/// mapped readers pay nothing, this one pays the file size.
+pub fn read_manifest_copy(path: &Path) -> Result<Manifest, ManifestReadError> {
+    let bytes = std::fs::read(path).map_err(ManifestReadError::Io)?;
+    read_manifest_at(&bytes)
+}
+
+/// Path-shaped reader for tests: every path a test builds points at a file it
+/// published itself through `write_manifest`, so unwrapping the two halves here
+/// keeps the fixtures reading like the storage they replace.
+#[cfg(test)]
+pub(crate) fn read_manifest_for_test(path: &Path) -> Result<Manifest, ManifestReadError> {
+    let published = PublishedManifest::from_path(path)
+        .ok_or_else(|| ManifestReadError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+    let trusted = crate::ffi::trusted_manifest_dir_for_test(
+        path.parent()
+            .ok_or_else(|| ManifestReadError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?,
+    );
+    read_manifest(&trusted, &published)
+}
+
+/// Test twin of [`read_manifest_study_only`], same argument as
+/// [`read_manifest_for_test`].
+#[cfg(test)]
+pub(crate) fn read_manifest_study_only_for_test(
+    path: &Path,
+) -> Result<Manifest, ManifestReadError> {
+    let published = PublishedManifest::from_path(path)
+        .ok_or_else(|| ManifestReadError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+    let trusted = crate::ffi::trusted_manifest_dir_for_test(
+        path.parent()
+            .ok_or_else(|| ManifestReadError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?,
+    );
+    read_manifest_study_only(&trusted, &published)
 }
 
 /// Decode a manifest from an already-mapped byte range.
@@ -83,6 +257,35 @@ impl Manifest {
                 })
             }) {
                 return Some(inst);
+            }
+        }
+        None
+    }
+
+    /// (0020,000E) Series Instance UID holding `sop_instance_uid`, when found.
+    ///
+    /// Annex J.2's study-shaped Storage Commitment answer is a Study Sequence
+    /// whose items carry a Referenced Series Sequence, so reporting an
+    /// unavailable instance needs the series as well as the study. Resolving it
+    /// while the manifest is already open avoids a second walk for the same
+    /// instance.
+    pub fn series_of_instance(&self, sop_instance_uid: &str) -> Option<&str> {
+        for series in &self.series {
+            let holds = series.instances.iter().any(|i| {
+                i.attrs.iter().any(|(t, v)| {
+                    *t == crate::query::tag::SOP_INSTANCE_UID
+                        && matches!(v, crate::manifest::AttrValue::Text(s) if s == sop_instance_uid)
+                })
+            });
+            if !holds {
+                continue;
+            }
+            for (t, v) in &series.attrs {
+                if *t == crate::query::tag::SERIES_INSTANCE_UID
+                    && let crate::manifest::AttrValue::Text(s) = v
+                {
+                    return Some(s.as_str());
+                }
             }
         }
         None
@@ -148,7 +351,7 @@ mod tests {
         let manifest = sample_manifest();
         write_manifest(&manifest_path, &manifest).expect("write");
 
-        let decoded = read_manifest(&manifest_path).expect("read");
+        let decoded = read_manifest_for_test(&manifest_path).expect("read");
         assert_eq!(decoded, manifest);
     }
 
@@ -157,7 +360,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nope.manifest");
         assert!(matches!(
-            read_manifest(&path),
+            read_manifest_for_test(&path),
             Err(ManifestReadError::Io(_))
         ));
     }
@@ -220,7 +423,7 @@ mod tests {
         manifest.study.modalities_in_study = None;
 
         write_manifest(&manifest_path, &manifest).expect("write empty study manifest");
-        let decoded = read_manifest(&manifest_path).expect("read empty study manifest");
+        let decoded = read_manifest_for_test(&manifest_path).expect("read empty study manifest");
 
         // The empty study round-trips its state exactly (findable by UID later).
         assert_eq!(decoded, manifest);
@@ -243,5 +446,44 @@ mod tests {
             // Unreachable: an empty study has no instances to yield.
             let _ = inst;
         }
+    }
+
+    /// A file truncated to a torn length is a decode error through the COPY
+    /// reader, never a panic or out-of-bounds access. The mmap readers are now
+    /// reachable only through the directory + study UID pair, so an arbitrary
+    /// mutable path can no longer be mapped - this pins the copy reader as the
+    /// degradation a torn file actually produces.
+    #[test]
+    fn read_manifest_copy_survives_a_torn_file() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("1.2.3.manifest");
+
+        write_manifest(&path, &sample_manifest()).expect("write");
+
+        // Keep a writable handle open while the file is truncated: the copy
+        // reader opens a fresh handle and must degrade to a decode error.
+        let mut h = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open writable");
+        h.set_len(0).expect("truncate");
+        h.write_all(b"torn").expect("write torn");
+        drop(h);
+
+        match read_manifest_copy(&path) {
+            Err(ManifestReadError::Decode(_)) => {}
+            other => panic!("torn file must be a decode error, got {other:?}"),
+        }
+
+        // The trusted pair-based reader still round-trips a re-published file.
+        write_manifest(&path, &sample_manifest()).expect("rewrite");
+        let published = PublishedManifest::new(dir.path(), "1.2.3").expect("published");
+        let trusted = crate::ffi::trusted_manifest_dir_for_test(dir.path());
+        assert_eq!(
+            read_manifest(&trusted, &published).expect("read"),
+            sample_manifest()
+        );
     }
 }

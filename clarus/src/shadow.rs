@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::series_owner::{self, SeriesOwnerIndex, SeriesOwnerSnapshot};
 use clarus_core::auth::UserRegistry;
 use clarus_core::idx::date::DateIndex;
 use clarus_core::idx::modality::ModalityIndex;
@@ -52,6 +53,20 @@ pub struct ShadowInner {
     /// (B1), so lookups skip the per-day `stat`; a mismatch with the
     /// snapshot still triggers the len-based reload fallback.
     sop_owner_lens: HashMap<DayKey, u64>,
+    /// The current day's `series_owner` appender (cold open, reused until the
+    /// day changes). Held here rather than in `DailyIndexSet` because the
+    /// rollover registry lives in `clarus_core` and this index is written by
+    /// the same `dual_write` flow (1611 #14).
+    series_owner_writer: Option<(DayKey, SeriesOwnerIndex)>,
+    /// Memoized `series_owner` day-segment snapshots (same policy as
+    /// `sop_owner_cache`).
+    series_owner_cache: HashMap<DayKey, SeriesOwnerSnapshot>,
+    /// Cached sorted day-key list of `series_owner` segments.
+    series_owner_days: Vec<DayKey>,
+    /// The day key `series_owner_days` was built for (rollover detection).
+    series_owner_days_for: Option<DayKey>,
+    /// Cached on-disk segment length per day (len-based reload fallback).
+    series_owner_lens: HashMap<DayKey, u64>,
 }
 
 #[derive(Debug)]
@@ -59,6 +74,7 @@ pub enum ShadowError {
     Date(String),
     Modality(String),
     SopOwner(String),
+    SeriesOwner(String),
 }
 
 impl ShadowError {
@@ -104,6 +120,7 @@ impl std::fmt::Display for ShadowError {
             ShadowError::Date(e) => write!(f, "date index: {e}"),
             ShadowError::Modality(e) => write!(f, "modality index: {e}"),
             ShadowError::SopOwner(e) => write!(f, "sop_owner index: {e}"),
+            ShadowError::SeriesOwner(e) => write!(f, "series_owner index: {e}"),
         }
     }
 }
@@ -123,6 +140,11 @@ impl ShadowTier {
             sop_owner_days: Vec::new(),
             sop_owner_days_for: None,
             sop_owner_lens: HashMap::new(),
+            series_owner_writer: None,
+            series_owner_cache: HashMap::new(),
+            series_owner_days: Vec::new(),
+            series_owner_days_for: None,
+            series_owner_lens: HashMap::new(),
         };
         Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -130,8 +152,20 @@ impl ShadowTier {
         }
     }
 
-    /// Append one accepted STOW to the three index kinds: dates idx + modality
-    /// idx + sop_owner.
+    /// The sealed-day root the preload path may map, obtained from the
+    /// rollover writer's own registry.
+    ///
+    /// Safe because the registry is the only protocol that seals past days
+    /// (it appends to today's file only and rolls over to a new name);
+    /// returning exactly its root is what makes the mmap preload's soundness
+    /// argument reachable without a caller-chosen path.
+    pub fn sealed_idx_root(&self) -> clarus_core::idx::preload::SealedIdxRoot {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        clarus_core::idx::preload::SealedIdxRoot::from_writer(&guard.index)
+    }
+
+    /// Append one accepted STOW to the index kinds: dates idx + modality idx +
+    /// sop_owner + series_owner.
     ///
     /// This IS the primary index write path (the SQLite tier this fn once
     /// mirrored was excised in - the name is kept for history, the
@@ -139,7 +173,8 @@ impl ShadowTier {
     ///
     /// `blake3` is the BLAKE3 digest of the stored instance bytes; `study_uid`
     /// and `modality` come from the parsed DICOM metadata; `sop_instance_uid`
-    /// is the instance's SOPInstanceUID (the `sop_owner` key).
+    /// is the instance's SOPInstanceUID (the `sop_owner` key); `series_uid` is
+    /// the instance's SeriesInstanceUID (the `series_owner` key, 1611 #14).
     ///
     /// Deliberately best-effort: any failure here is logged by the caller as
     /// `BTREE_WRITE_FAILED` and does not affect the client response.
@@ -154,6 +189,7 @@ impl ShadowTier {
         blake3: [u8; 32],
         modality: &str,
         study_uid: &str,
+        series_uid: &str,
         sop_instance_uid: &str,
     ) -> Result<(), ShadowError> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -188,6 +224,41 @@ impl ShadowTier {
         }
         if let Some(len) = guard.sop_owner_lens.get_mut(&day) {
             *len += clarus_core::idx::sop_owner::ROW_LEN as u64;
+        }
+
+        // 1611 #14: write the series_owner row (Series -> Study) in the SAME
+        // accepted-STOW flow, so the series-root QIDO oracle stays consistent
+        // with the sop_owner oracle. Cold-side append: open the day's
+        // appender once and reuse it (the rollover registry in clarus_core is
+        // fixed at startup, so `current_day` is the only day this process
+        // writes).
+        {
+            let writer = match guard.series_owner_writer.as_mut() {
+                Some((d, w)) if *d == day => w,
+                _ => {
+                    let w = series_owner::open_appender(&self.idx_dir, &day)
+                        .map_err(|e| ShadowError::SeriesOwner(e.to_string()))?;
+                    guard.series_owner_writer = Some((day, w));
+                    &mut guard
+                        .series_owner_writer
+                        .as_mut()
+                        .expect("just initialised")
+                        .1
+                }
+            };
+            writer
+                .append_pair(series_uid.as_bytes(), study_uid.as_bytes())
+                .map_err(|e| ShadowError::SeriesOwner(e.to_string()))?;
+        }
+        if let Some(snap) = guard.series_owner_cache.get_mut(&day) {
+            snap.append_row(series_uid.as_bytes(), study_uid.as_bytes());
+        }
+        if let Some(len) = guard.series_owner_lens.get_mut(&day) {
+            *len += series_owner::ROW_LEN as u64;
+        }
+        // Same one-entry-per-day membership rule as the sop_owner day list.
+        if let Err(pos) = guard.series_owner_days.binary_search(&day) {
+            guard.series_owner_days.insert(pos, day);
         }
         // The FIRST row of a day CREATES that day's file: the cached day list
         // (normally rebuilt only at rollover) must see the new key, or a
@@ -397,6 +468,80 @@ impl ShadowTier {
         }
         None
     }
+
+    /// Look up the study owner of a SeriesInstanceUID in the `series_owner`
+    /// shadow index. `None` when the series was never seen.
+    ///
+    /// 1611 #14: the same cached-day machinery as `sop_owner_study` (day-list
+    /// rebuild at rollover, memoized snapshots, len-based reload fallback) so
+    /// the series-root QIDO lookup is warm and O(days), not a manifest scan.
+    pub fn series_owner_study(&self, series: &str) -> Option<String> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        // COLD: rebuild the day list on first use / rollover (same policy as
+        // the sop_owner day list).
+        let cur_day = *guard.index.current_day();
+        if guard.series_owner_days_for != Some(cur_day) {
+            guard.series_owner_days = list_series_owner_days(&self.idx_dir);
+            guard.series_owner_days_for = Some(cur_day);
+        }
+
+        // COLD: make sure every candidate day has a valid cached snapshot.
+        let day_count = guard.series_owner_days.len();
+        for i in 0..day_count {
+            let day = guard.series_owner_days[i];
+            if !guard.series_owner_cache.contains_key(&day)
+                && let Ok(Some(snap)) = SeriesOwnerSnapshot::load(&self.idx_dir, &day)
+            {
+                guard.series_owner_lens.insert(day, snap.current_len());
+                guard.series_owner_cache.insert(day, snap);
+            }
+            let stale = match guard.series_owner_cache.get(&day) {
+                Some(snap) => guard.series_owner_lens.get(&day) != Some(&snap.current_len()),
+                None => false,
+            };
+            if stale {
+                guard.series_owner_cache.remove(&day);
+                if let Ok(Some(snap)) = SeriesOwnerSnapshot::load(&self.idx_dir, &day) {
+                    guard.series_owner_lens.insert(day, snap.current_len());
+                    guard.series_owner_cache.insert(day, snap);
+                }
+            }
+        }
+
+        // WARM: search the cached snapshots, newest day first.
+        let owner = Self::series_owner_study_warm(
+            &guard.series_owner_days,
+            &guard.series_owner_cache,
+            series,
+        )?;
+        // Materialize the answer (allocates once: the caller's `String`).
+        Some(String::from_utf8_lossy(owner).into_owned())
+    }
+
+    /// WARM lookup: search the cached `series_owner` snapshots, newest day
+    /// first.
+    ///
+    /// ZERO-ALLOCATION IN EVERY BRANCH - the same body shape as
+    /// [`Self::sop_owner_study_warm`] (borrowed day list + snapshot map, index
+    /// loop over `[u8; 8]` day keys, borrowed owner slice). `#[inline(never)]`
+    /// keeps the symbol materialized so the ap101 gate can find it.
+    #[inline(never)]
+    pub fn series_owner_study_warm<'a>(
+        days: &[DayKey],
+        cache: &'a HashMap<DayKey, SeriesOwnerSnapshot>,
+        series: &str,
+    ) -> Option<&'a [u8]> {
+        let mut i = days.len();
+        while i > 0 {
+            i -= 1;
+            let day = days.get(i)?;
+            if let Some(owner) = cache.get(day).and_then(|s| s.find_warm(series.as_bytes())) {
+                return Some(owner);
+            }
+        }
+        None
+    }
 }
 
 /// A5: scan the `sop_owner` directory once and return the sorted day keys
@@ -410,6 +555,27 @@ fn list_sop_owner_days(idx_dir: &Path) -> Vec<DayKey> {
             let name = name.to_string_lossy();
             // `YYYYMMDD.idx` (12 chars). Guard the slice to keep the
             // compiler happy about the `[..8]` prefix split.
+            if name.ends_with(".idx")
+                && name.len() == 12
+                && let Ok(bytes) = name.as_bytes()[..8].try_into()
+            {
+                days.push(bytes);
+            }
+        }
+    }
+    days.sort_unstable();
+    days
+}
+
+/// A5: scan the `series_owner` directory once and return the sorted day keys
+/// (same `read_dir` + sort tax moved out of the per-lookup path).
+fn list_series_owner_days(idx_dir: &Path) -> Vec<DayKey> {
+    let series_owner_dir = idx_dir.join("series_owner");
+    let mut days: Vec<DayKey> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&series_owner_dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
             if name.ends_with(".idx")
                 && name.len() == 12
                 && let Ok(bytes) = name.as_bytes()[..8].try_into()
@@ -481,8 +647,14 @@ mod tests {
         for i in 0..3u8 {
             let mut blake3 = [0u8; 32];
             blake3[0] = i;
-            tier.dual_write(blake3, "CT", "1.2.840.9.9", &format!("1.2.840.9.9.{i}"))
-                .expect("dual write");
+            tier.dual_write(
+                blake3,
+                "CT",
+                "1.2.840.9.9",
+                &format!("1.2.840.9.9.100.{i}"),
+                &format!("1.2.840.9.9.{i}"),
+            )
+            .expect("dual write");
         }
 
         let guard = tier.inner.lock().unwrap();

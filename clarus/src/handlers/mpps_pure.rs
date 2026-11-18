@@ -18,7 +18,7 @@
 
 #![forbid(unsafe_code)]
 
-use clarus_core::workflow::{MppsRecord, MppsReference, WorkflowStore};
+use clarus_core::workflow::{MppsRecord, MppsReference, PerformedSeries, WorkflowStore};
 
 use crate::handlers::json_common::{JsonVal, err_msg_json, push_json_str};
 use crate::handlers::ups::json::extract_tag;
@@ -45,27 +45,67 @@ fn workflow_store(state: &AppState) -> WorkflowStore {
 
 /// Extract the list of (0040,0340) Performed Series Sequence items.
 ///
-/// Each item carries a (0008,1150)/(0008,1155) reference pair (PS3.3 C.12.1).
-/// An empty sequence returns `Some(vec![])` - the distinction the final-state
-/// check depends on.
-fn extract_performed_series(obj: &JsonVal) -> Option<Vec<MppsReference>> {
+/// Each item carries a (0020,000E) Series Instance UID (Type 1 per PS3.4
+/// Table F.7.2-1, defaulting to an empty string when a non-conformant client
+/// omits it) and a (0008,1150)/(0008,1155) reference pair (PS3.3 C.12.1).
+/// One `PerformedSeries` is built per item so the series identity survives the
+/// round trip; an empty sequence returns `Some(vec![])` - the distinction the
+/// final-state check depends on.
+fn extract_performed_series(obj: &JsonVal) -> Option<Vec<PerformedSeries>> {
     let seq = obj.obj_get("00400340")?;
     let items = seq.obj_get("Value").and_then(|v| v.as_array())?;
     let mut out = Vec::new();
     for item in items {
-        let sop_class_uid = extract_tag(item, "00081150").unwrap_or_default();
-        let sop_instance_uid = extract_tag(item, "00081155").unwrap_or_default();
-        // A reference with an empty instance UID names nothing (the same rule
-        // the UPS output list applies), so it is not stored.
-        if sop_instance_uid.is_empty() {
-            continue;
-        }
-        out.push(MppsReference {
-            sop_class_uid,
-            sop_instance_uid,
+        let series_instance_uid = extract_tag(item, "0020000E").unwrap_or_default();
+        let references = extract_references(item);
+        out.push(PerformedSeries {
+            series_instance_uid,
+            references,
         });
     }
     Some(out)
+}
+
+/// Read the (0008,1150)/(0008,1155) reference pairs out of one Performed
+/// Series item.
+///
+/// The pair belongs to Referenced Image Sequence (0008,1140) (Type 2C), a
+/// separate nested sequence inside the item (PS3.4 Table F.7.2-1). A
+/// conformant SCU sends that nested shape, so it is read first; the flat pair
+/// on the series item itself is only accepted as a legacy fallback for
+/// non-conformant clients. `extract_tag` navigates `{tag}.Value[0]` as a
+/// string, so it cannot see inside the sequence item - reading only the flat
+/// form would silently drop every reference the nested client sent.
+fn extract_references(item: &JsonVal) -> Vec<MppsReference> {
+    if let Some(seq) = item.obj_get("00081140")
+        && let Some(items) = seq.obj_get("Value").and_then(|v| v.as_array())
+    {
+        let mut out = Vec::new();
+        for it in items {
+            let sop_class_uid = extract_tag(it, "00081150").unwrap_or_default();
+            let sop_instance_uid = extract_tag(it, "00081155").unwrap_or_default();
+            // A reference with an empty instance UID names nothing (the
+            // same rule the UPS output list applies), so it is not stored.
+            if sop_instance_uid.is_empty() {
+                continue;
+            }
+            out.push(MppsReference {
+                sop_class_uid,
+                sop_instance_uid,
+            });
+        }
+        return out;
+    }
+    let sop_class_uid = extract_tag(item, "00081150").unwrap_or_default();
+    let sop_instance_uid = extract_tag(item, "00081155").unwrap_or_default();
+    if sop_instance_uid.is_empty() {
+        Vec::new()
+    } else {
+        vec![MppsReference {
+            sop_class_uid,
+            sop_instance_uid,
+        }]
+    }
 }
 
 /// Read (0040,0270) > (0020,000D) - the Study Instance UID lives INSIDE the
@@ -402,15 +442,35 @@ fn write_mpps_json(out: &mut Vec<u8>, rec: &MppsRecord) {
         }
         wrote = true;
         out.extend_from_slice(b"\"00400340\":{\"Value\":[");
-        for (i, r) in series.iter().enumerate() {
+        for (i, s) in series.iter().enumerate() {
             if i > 0 {
                 out.push(b',');
             }
-            out.extend_from_slice(b"{\"00081150\":{\"Value\":[");
-            push_json_str(out, &r.sop_class_uid);
-            out.extend_from_slice(b"],\"vr\":\"UI\"},\"00081155\":{\"Value\":[");
-            push_json_str(out, &r.sop_instance_uid);
-            out.extend_from_slice(b"],\"vr\":\"UI\"}}");
+            // (0020,000E) leads the item, then the (0008,1140) sequence that
+            // carries the (0008,1150)/(0008,1155) pair(s): the pair belongs to
+            // Referenced Image Sequence (0008,1140) (Type 2C), a separate
+            // nested sequence inside the item, not to the item itself (PS3.4
+            // Table F.7.2-1). An empty reference list means "no referenced
+            // images", so the wrapper is omitted entirely then.
+            out.extend_from_slice(b"{\"0020000E\":{\"Value\":[");
+            push_json_str(out, &s.series_instance_uid);
+            out.extend_from_slice(b"],\"vr\":\"UI\"}");
+            if !s.references.is_empty() {
+                out.extend_from_slice(b",\"00081140\":{\"Value\":[");
+                for (j, r) in s.references.iter().enumerate() {
+                    if j > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(b"{\"00081150\":{\"Value\":[");
+                    push_json_str(out, &r.sop_class_uid);
+                    out.extend_from_slice(b"],\"vr\":\"UI\"},\"00081155\":{\"Value\":[");
+                    push_json_str(out, &r.sop_instance_uid);
+                    out.extend_from_slice(b"],\"vr\":\"UI\"}");
+                    out.push(b'}');
+                }
+                out.extend_from_slice(b"],\"vr\":\"SQ\"}");
+            }
+            out.push(b'}');
         }
         out.extend_from_slice(b"],\"vr\":\"SQ\"}");
     }
@@ -462,10 +522,26 @@ fn mpps_to_xml(rec: &MppsRecord) -> String {
         out.push_str(
             "<DicomAttribute tag=\"00400340\" vr=\"SQ\" keyword=\"PerformedSeriesSequence\">",
         );
-        for (i, r) in series.iter().enumerate() {
+        for (i, s) in series.iter().enumerate() {
             out.push_str(&format!("<Item number=\"{}\">", i + 1));
-            xml_value(&mut out, "00081150", "UI", Some(&r.sop_class_uid));
-            xml_value(&mut out, "00081155", "UI", Some(&r.sop_instance_uid));
+            xml_value(&mut out, "0020000E", "UI", Some(&s.series_instance_uid));
+            // Same nesting as the JSON renderer: the pair lives in the
+            // Referenced Image Sequence (0008,1140) nested inside the item
+            // (PS3.4 Table F.7.2-1); PS3.18 F.2.5 makes the DICOM-XML and
+            // DICOM-JSON models agree item for item.
+            if !s.references.is_empty() {
+                out.push_str(
+                    "<DicomAttribute tag=\"00081140\" vr=\"SQ\" \
+                     keyword=\"ReferencedImageSequence\">",
+                );
+                for (j, r) in s.references.iter().enumerate() {
+                    out.push_str(&format!("<Item number=\"{}\">", j + 1));
+                    xml_value(&mut out, "00081150", "UI", Some(&r.sop_class_uid));
+                    xml_value(&mut out, "00081155", "UI", Some(&r.sop_instance_uid));
+                    out.push_str("</Item>");
+                }
+                out.push_str("</DicomAttribute>");
+            }
             out.push_str("</Item>");
         }
         out.push_str("</DicomAttribute>");
@@ -514,11 +590,19 @@ mod tests {
     #[test]
     fn extract_performed_series_keeps_pairs_and_drops_empty_refs() {
         let v = obj(r#"{"00400340":{"vr":"SQ","Value":[
-                 {"00081150":{"vr":"UI","Value":["1.2.3"]},"00081155":{"vr":"UI","Value":["4.5.6"]}},
+                 {"0020000E":{"vr":"UI","Value":["1.2.3.99"]},
+                  "00081150":{"vr":"UI","Value":["1.2.3"]},"00081155":{"vr":"UI","Value":["4.5.6"]}},
                  {"00081150":{"vr":"UI","Value":["1.2.3"]},"00081155":{"vr":"UI","Value":[""]}}]}}"#);
         let series = extract_performed_series(&v).expect("Some");
-        assert_eq!(series.len(), 1, "an empty instance UID names nothing");
-        assert_eq!(series[0].sop_instance_uid, "4.5.6");
+        assert_eq!(series.len(), 2, "one series per 00400340 item");
+        assert_eq!(series[0].series_instance_uid, "1.2.3.99");
+        assert_eq!(series[0].references.len(), 1);
+        assert_eq!(series[0].references[0].sop_instance_uid, "4.5.6");
+        assert_eq!(series[1].series_instance_uid, "");
+        assert!(
+            series[1].references.is_empty(),
+            "an empty instance UID names nothing"
+        );
     }
 
     #[test]
@@ -599,5 +683,86 @@ mod tests {
             Some("Broken")
         );
         assert!(extract_code_reason(&obj(r#"{}"#)).is_none());
+    }
+
+    fn record_with_series() -> MppsRecord {
+        MppsRecord {
+            mpps_uid: "1.2.3".to_string(),
+            status: "COMPLETED".to_string(),
+            modality: None,
+            station_ae: None,
+            station_name: None,
+            start_date: None,
+            start_time: None,
+            end_date: None,
+            end_time: None,
+            study_uid: None,
+            performed_series: Some(vec![PerformedSeries {
+                series_instance_uid: "1.2.3.99".to_string(),
+                references: vec![MppsReference {
+                    sop_class_uid: "1.2.3".to_string(),
+                    sop_instance_uid: "4.5.6".to_string(),
+                }],
+            }]),
+            discontinuation_reason: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// The (0008,1150)/(0008,1155) reference pair belongs to Referenced Image
+    /// Sequence (0008,1140), a nested sequence inside the Performed Series item
+    /// (PS3.4 Table F.7.2-1), NOT to the item itself. Both renderers must emit
+    /// the nested shape, and the nesting must survive an encode -> decode
+    /// round trip.
+    #[test]
+    fn references_nest_under_00081140_and_round_trip() {
+        let rec = record_with_series();
+        let mut body = Vec::new();
+        write_mpps_json(&mut body, &rec);
+        let text = String::from_utf8(body).expect("utf-8");
+        assert!(
+            text.contains(r#""00081140":{"Value":[{"00081150""#),
+            "pair must nest under Referenced Image Sequence, got {text}"
+        );
+        assert!(
+            !text.contains(r#""vr":"UI"},"00081150"#),
+            "pair must not stay flat on the series item, got {text}"
+        );
+        let xml = mpps_to_xml(&rec);
+        assert!(
+            xml.contains("<DicomAttribute tag=\"00081140\" vr=\"SQ\""),
+            "{xml}"
+        );
+        // The nesting survives encode -> decode.
+        let parsed = obj(&text);
+        let series = extract_performed_series(&parsed).expect("Some");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].series_instance_uid, "1.2.3.99");
+        assert_eq!(series[0].references.len(), 1);
+        assert_eq!(series[0].references[0].sop_class_uid, "1.2.3");
+        assert_eq!(series[0].references[0].sop_instance_uid, "4.5.6");
+    }
+
+    /// A conformant SCU sends the nested (0008,1140) shape; the extractor must
+    /// read the pair from there instead of silently dropping it (bug pattern
+    /// #1: silent swallow -> optimistic default).
+    #[test]
+    fn extract_performed_series_reads_the_nested_00081140_shape() {
+        let v = obj(r#"{"00400340":{"vr":"SQ","Value":[
+                 {"0020000E":{"vr":"UI","Value":["1.2.3.99"]},
+                  "00081140":{"vr":"SQ","Value":[
+                    {"00081150":{"vr":"UI","Value":["1.2.3"]},
+                     "00081155":{"vr":"UI","Value":["4.5.6"]}},
+                    {"00081150":{"vr":"UI","Value":["1.2.7"]},
+                     "00081155":{"vr":"UI","Value":[""]}}]}}]}}"#);
+        let series = extract_performed_series(&v).expect("Some");
+        assert_eq!(series.len(), 1);
+        assert_eq!(
+            series[0].references.len(),
+            1,
+            "empty-instance items must drop"
+        );
+        assert_eq!(series[0].references[0].sop_instance_uid, "4.5.6");
     }
 }

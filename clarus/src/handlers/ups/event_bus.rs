@@ -535,7 +535,7 @@ mod tests {
             assert!(
                 pair[1] > pair[0],
                 "delivery order must follow ID order, got {:?}",
-                &ids
+                ids
             );
         }
     }

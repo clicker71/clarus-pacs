@@ -15,8 +15,8 @@ pub use coordinator::{StudyLease, acquire};
 pub use manifest::{
     InstanceModel, SeriesModel, StudyManifestAttrs, build_manifest_full, hidden_reason_of,
     index_study_names, manifest_path, mark_rejected, mark_restored, orphan_sidecar_path,
-    rebuild_series_attrs, tombstone_path, write_study_manifest, write_study_manifest_full,
-    write_study_manifest_rebuild, write_study_manifest_update,
+    rebuild_series_attrs, refuse_hidden_reacceptance, tombstone_path, write_study_manifest,
+    write_study_manifest_full, write_study_manifest_rebuild, write_study_manifest_update,
 };
 pub use validation::{
     GenerationError, fallback_study_uid_key, generate_patient_id, generate_patient_name,

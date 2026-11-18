@@ -28,6 +28,9 @@ pub enum StoreError {
     /// Compare-and-swap failed: the on-disk Transaction UID differs from the
     /// caller's expectation (the 409 optimistic-lock path).
     CasConflict(String),
+    /// The UID is not a single conforming path component (fail-closed at the
+    /// store boundary; see [`crate::uid::validate_path_uid`]).
+    InvalidUid(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -36,6 +39,7 @@ impl std::fmt::Display for StoreError {
             StoreError::Io(e) => write!(f, "workitem store I/O error: {e}"),
             StoreError::Decode(e) => write!(f, "workitem store decode error: {e}"),
             StoreError::CasConflict(uid) => write!(f, "workitem CAS conflict: {uid}"),
+            StoreError::InvalidUid(uid) => write!(f, "invalid workitem UID: {uid}"),
         }
     }
 }
@@ -56,9 +60,19 @@ impl From<io::Error> for StoreError {
 /// (see [`uid_lock`]) so two writers of the same workitem cannot interleave
 /// their read-modify-write, while writers of different workitems never
 /// contend.
+///
+/// # Deployment invariant: ONE writer process per root
+///
+/// The striped locks are PROCESS-LOCAL. Exactly one process writes this store
+/// root; multi-writer shared-root deployments (two servers, or a server and a
+/// maintenance tool, pointed at the same directory) are unsupported. There is
+/// no cross-process lock, so two such writers would be serialised only by the
+/// filesystem's atomic create (`hard_link` for inserts, `rename` for updates) -
+/// enough to avoid a torn file, but NOT enough to keep a read-modify-write
+/// coherent: the second writer's update could silently overwrite the first's.
 #[derive(Debug, Clone)]
 pub struct WorkItemStore {
-    /// Directory holding `{uid}.cbor` files.
+    /// Directory holding `{uid}.cbor` files. One process writes it (see above).
     root: PathBuf,
 }
 
@@ -142,6 +156,15 @@ pub struct StoreFilter<'a> {
     /// A `-`-separated value is a RANGE across the stored DT, which is what the
     /// standard's matchType states; a single value is an exact match.
     pub sps_start_datetime: Option<&'a str>,
+    /// Default UTC offset (seconds) applied at COMPARISON time when a DT value
+    /// carries no `&ZZXX` zone suffix.
+    ///
+    /// An offset-free DT is local time (PS3.5 6.2), so the comparison happens
+    /// in the deployment's local frame - `[ups] local_utc_offset`, default
+    /// +0000 = UTC. A value with an explicit zone keeps its own offset and
+    /// stored data is never rewritten. Default 0 keeps every other
+    /// `StoreFilter` construction byte-identical.
+    pub default_offset_secs: i64,
     /// (0074,1200) Scheduled Procedure Step Priority - a REQUIRED matching key
     /// (Single Value).
     pub sps_priority: Option<&'a str>,
@@ -167,15 +190,22 @@ impl WorkItemStore {
     }
 
     /// Path to a single workitem's CBOR file.
-    pub fn path_for(&self, uid: &str) -> PathBuf {
-        self.root.join(format!("{uid}.cbor"))
+    ///
+    /// Fails closed on a UID that is not a single conforming path component.
+    /// The store is a public library API, so a caller that forgets its own
+    /// validation must not be able to make `Path::join` escape `root`: an
+    /// absolute `{uid}.cbor` replaces the root and a separator addresses a
+    /// sibling. [`crate::uid::validate_path_uid`] is the canonical rule.
+    pub fn path_for(&self, uid: &str) -> Result<PathBuf, StoreError> {
+        crate::uid::validate_path_uid(uid).map_err(|e| StoreError::InvalidUid(e.to_string()))?;
+        Ok(self.root.join(format!("{uid}.cbor")))
     }
 
     /// Read one workitem by UID. Returns `Ok(None)` when the file does not
     /// exist (mirrors the SQLite `find_workitem_by_uid` `QueryReturnedNoRows`
     /// -> `Ok(None)` contract).
     pub fn find_by_uid(&self, uid: &str) -> Result<Option<WorkItemRecord>, StoreError> {
-        let path = self.path_for(uid);
+        let path = self.path_for(uid)?;
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -188,21 +218,15 @@ impl WorkItemStore {
 
     /// Insert a new workitem. Fails with a conflict if it already exists.
     ///
-    /// The existence check and the write are ONE critical section under the
-    /// uid's stripe lock, and the file itself is created with `hard_link` from
-    /// the temp file: a `link` that finds the target already present fails with
-    /// `AlreadyExists`, so "create only if absent" holds even against a writer
-    /// this process cannot see (another process, another container). The lock
-    /// alone would only serialise THIS process's threads.
+    /// The write runs under the uid's stripe lock and the file itself is
+    /// created with `hard_link` from the temp file: a `link` that finds the
+    /// target already present fails with `AlreadyExists`, so "create only if
+    /// absent" holds even against a writer this process cannot see (another
+    /// process, another container). The lock alone would only serialise THIS
+    /// process's threads.
     pub fn insert(&self, rec: &WorkItemRecord) -> Result<(), StoreError> {
         let stripe = uid_lock(&rec.workitem_uid);
         let _guard = stripe.lock().unwrap_or_else(|e| e.into_inner());
-        if self.find_by_uid(&rec.workitem_uid)?.is_some() {
-            return Err(StoreError::CasConflict(format!(
-                "workitem already exists: {}",
-                rec.workitem_uid
-            )));
-        }
         self.write_if_absent(rec)
     }
 
@@ -219,10 +243,30 @@ impl WorkItemStore {
     /// read and this write, and silently writing the file back would resurrect
     /// it (PS3.18 11.6 makes the Transaction UID the proof that the caller is
     /// updating a state it actually observed).
+    ///
+    /// The Transaction UID ALONE is not enough. Table 11.6-1 keeps the UID
+    /// unchanged across a successful update, so two concurrent
+    /// read-modify-write cycles that both read the same state present the same
+    /// token, both pass, and the second silently overwrites the first - the
+    /// per-UID lock below covers only this call, not the caller's read and
+    /// merge. The record's `revision` closes that: `rec.revision` is the value
+    /// the caller READ, a mismatch means somebody wrote in between, and a
+    /// successful write bumps it so the next stale reader is caught too.
+    ///
+    /// Revisions must be named explicitly with `expected_revision`.
+    ///
+    /// `Some(n)` means "I read revision n, write only if it is still n", and
+    /// `n == 0` is a real observation: a record that was created but never
+    /// updated really is at revision 0. Treating 0 as "no precondition" made
+    /// two callers who both read a revision-0 record both pass their check, so
+    /// the second overwrote the first with no conflict reported. `None` is the
+    /// separate, explicit "unconditional" case, reserved for callers that
+    /// never read a record (the create path).
     pub fn cas_update(
         &self,
         rec: &WorkItemRecord,
         expected_tuid: Option<&str>,
+        expected_revision: Option<u64>,
     ) -> Result<(), StoreError> {
         let stripe = uid_lock(&rec.workitem_uid);
         let _guard = stripe.lock().unwrap_or_else(|e| e.into_inner());
@@ -252,7 +296,53 @@ impl WorkItemStore {
             },
             (Some(_), None) => {}
         }
-        self.write_atomic(rec)
+        // The revision check runs AFTER the UID check so the more specific
+        // message wins: a caller that named the wrong transaction learns that,
+        // not that it also lost a race.
+        if let (Some(on_disk), Some(expected)) = (&existing, expected_revision)
+            && expected != on_disk.revision
+        {
+            return Err(StoreError::CasConflict(format!(
+                "workitem {} was modified concurrently: expected revision {}, on-disk {}",
+                rec.workitem_uid, expected, on_disk.revision
+            )));
+        }
+        if let (None, Some(expected)) = (&existing, expected_revision) {
+            return Err(StoreError::CasConflict(format!(
+                "workitem vanished before the update: {} (expected revision {})",
+                rec.workitem_uid, expected
+            )));
+        }
+        self.write_bumped(rec, existing.as_ref())
+    }
+
+    /// Update without any precondition.
+    ///
+    /// The explicit form of "I never read this record": it still bumps the
+    /// revision so later conditional callers notice the write, but it performs
+    /// no comparison. Callers holding an observation must use
+    /// [`Self::cas_update`] instead.
+    pub fn upsert_unconditional(&self, rec: &WorkItemRecord) -> Result<(), StoreError> {
+        let stripe = uid_lock(&rec.workitem_uid);
+        let _guard = stripe.lock().unwrap_or_else(|e| e.into_inner());
+        let existing = self.find_by_uid(&rec.workitem_uid)?;
+        self.write_bumped(rec, existing.as_ref())
+    }
+
+    /// Write `rec` with the revision bumped past whatever is on disk.
+    ///
+    /// Caller holds the stripe lock and has already applied its preconditions.
+    fn write_bumped(
+        &self,
+        rec: &WorkItemRecord,
+        existing: Option<&WorkItemRecord>,
+    ) -> Result<(), StoreError> {
+        // Bump on every successful write so a later reader holding the value it
+        // just observed is caught. Wrapping is harmless: a record would have to
+        // be written 2^64 times for the counter to repeat.
+        let mut to_write = rec.clone();
+        to_write.revision = existing.map_or(1, |e| e.revision.wrapping_add(1));
+        self.write_atomic(&to_write)
     }
 
     /// Delete a workitem by UID. Returns `true` when a file was removed.
@@ -265,9 +355,18 @@ impl WorkItemStore {
     pub fn delete(&self, uid: &str) -> Result<bool, StoreError> {
         let stripe = uid_lock(uid);
         let _guard = stripe.lock().unwrap_or_else(|e| e.into_inner());
-        let path = self.path_for(uid);
+        let path = self.path_for(uid)?;
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // The name is gone; persist the directory entry that named it
+                // too, or a crash after this delete can restore the workitem.
+                // Same barrier the insert/update paths apply after the
+                // rename/hard_link; barrier failure propagates, open failure
+                // is swallowed by the helper (see durable.rs policy).
+                #[cfg(unix)]
+                sync_parent_entry(&path)?;
+                Ok(true)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(StoreError::Io(e)),
         }
@@ -329,13 +428,24 @@ impl WorkItemStore {
 
     /// Atomically write a record via tmp + rename.
     fn write_atomic(&self, rec: &WorkItemRecord) -> Result<(), StoreError> {
-        let path = self.path_for(&rec.workitem_uid);
+        let path = self.path_for(&rec.workitem_uid)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            // `create_dir_all` persists the entries INSIDE a directory but not
+            // the directory's own name in its parent, so a first write would
+            // leave `workitems/` (and the store root above it) unpersisted.
+            crate::durable::sync_new_root_name(parent)?;
         }
         let tmp = self.write_tmp(rec)?;
         match std::fs::rename(&tmp, &path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The data is durable; persist the directory entry that names
+                // it too. Unix-only by necessity: Windows cannot open a
+                // directory for `FlushFileBuffers`.
+                #[cfg(unix)]
+                sync_parent_entry(&path)?;
+                Ok(())
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 Err(StoreError::Io(e))
@@ -352,12 +462,12 @@ impl WorkItemStore {
     /// not in the caller, because several stores (and the CAD path) write into
     /// the same directory.
     fn write_tmp(&self, rec: &WorkItemRecord) -> Result<PathBuf, StoreError> {
-        let path = self.path_for(&rec.workitem_uid);
+        let path = self.path_for(&rec.workitem_uid)?;
         let bytes = rec
             .encode()
             .map_err(|e| StoreError::Decode(e.to_string()))?;
-        let tmp = tmp_sibling(&path);
-        if let Err(e) = std::fs::write(&tmp, &bytes) {
+        let tmp = tmp_sibling(&path)?;
+        if let Err(e) = write_claimed(&tmp, &bytes) {
             let _ = std::fs::remove_file(&tmp);
             return Err(StoreError::Io(e));
         }
@@ -372,18 +482,32 @@ impl WorkItemStore {
     /// install. Returns [`StoreError::CasConflict`] when the workitem is
     /// already there.
     fn write_if_absent(&self, rec: &WorkItemRecord) -> Result<(), StoreError> {
-        let path = self.path_for(&rec.workitem_uid);
+        let path = self.path_for(&rec.workitem_uid)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            crate::durable::sync_new_root_name(parent)?;
         }
         let tmp = self.write_tmp(rec)?;
         let linked = std::fs::hard_link(&tmp, &path);
         let _ = std::fs::remove_file(&tmp);
         match linked {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(StoreError::CasConflict(
-                format!("workitem already exists: {}", rec.workitem_uid),
-            )),
+            Ok(()) => {
+                #[cfg(unix)]
+                sync_parent_entry(&path)?;
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // The link landed but its NAME was never made durable (see the
+                // commitment store's identical arm): before answering
+                // CasConflict, persist the directory entry so a retry cannot be
+                // told "already stored" for a name the next crash removes.
+                #[cfg(unix)]
+                sync_parent_entry(&path)?;
+                Err(StoreError::CasConflict(format!(
+                    "workitem already exists: {}",
+                    rec.workitem_uid
+                )))
+            }
             Err(e) => Err(StoreError::Io(e)),
         }
     }
@@ -450,8 +574,14 @@ fn matches_filter(rec: &WorkItemRecord, f: &StoreFilter<'_>) -> bool {
     // (0040,0405) ScheduledProcedureStepStartDateTime: "Single Value or Range"
     // per Table CC.2.5-3. An empty value matches everything (the zero-length
     // key convention); `<lo>-<hi>` is an inclusive range; anything else is one
-    // instant compared exactly. DT values sort lexically in DICOM's fixed
-    // `YYYYMMDDHHMMSS.FFFFFF` layout, so string comparison IS time comparison.
+    // instant compared exactly.
+    //
+    // DT is compared as an INSTANT, not as text. The offset is part of the
+    // value (PS3.5 Section 6.2), so `20261115120000+0100` and
+    // `20261115110000+0000` are the same moment while sorting differently as
+    // strings - a lexical range test therefore misses values that sit inside
+    // the range it was asked for. Values this parser cannot read fall back to
+    // the previous lexical comparison rather than being dropped.
     if let Some(v) = f.sps_start_datetime
         && !v.is_empty()
     {
@@ -459,9 +589,39 @@ fn matches_filter(rec: &WorkItemRecord, f: &StoreFilter<'_>) -> bool {
             // A workitem with no start datetime does not match a datetime query.
             return false;
         };
-        let matched = match v.split_once('-') {
-            Some((lo, hi)) => (lo.is_empty() || stored >= lo) && (hi.is_empty() || stored <= hi),
-            None => stored == v,
+        let matched = match dt_instant(stored, f.default_offset_secs) {
+            Some(stored_i) => match split_dt_range(v) {
+                // A range: both endpoints inclusive. An absent endpoint is an
+                // open end, which is what a bare `-hi` / `lo-` means.
+                (lo_txt, Some(hi_txt)) => {
+                    let lo_ok = lo_txt.is_empty()
+                        || dt_instant(lo_txt, f.default_offset_secs)
+                            .is_none_or(|lo| stored_i >= lo);
+                    let hi_ok = hi_txt.is_empty()
+                        || dt_upper_instant(hi_txt, f.default_offset_secs)
+                            .is_none_or(|hi| stored_i <= hi);
+                    lo_ok && hi_ok
+                }
+                // No separator: ONE value. A short value names a PERIOD (a
+                // day, a month, a year), not the lowest instant in it, so
+                // `20261115` matches any stored instant during that day. A
+                // full-precision value's period is one second, which keeps the
+                // exact-instant equality a single value means.
+                (_, None) => match (
+                    dt_instant(v, f.default_offset_secs),
+                    dt_upper_instant(v, f.default_offset_secs),
+                ) {
+                    (Some(lo), Some(hi)) => stored_i >= lo && stored_i <= hi,
+                    _ => false,
+                },
+            },
+            // Unparseable stored value: keep the historical behaviour.
+            None => match split_dt_range(v) {
+                (lo, Some(hi)) => {
+                    (lo.is_empty() || stored >= lo) && (hi.is_empty() || stored <= hi)
+                }
+                (_, None) => stored == v,
+            },
         };
         if !matched {
             return false;
@@ -497,21 +657,341 @@ fn matches_filter(rec: &WorkItemRecord, f: &StoreFilter<'_>) -> bool {
     true
 }
 
+/// Components of a DICOM DT value shared by [`dt_instant`] and
+/// [`dt_upper_instant`].
+///
+/// The two ends of a range must parse the SAME string with the SAME rules or
+/// they drift apart and answer the wrong worklist, so the parsing lives in one
+/// place.
+struct DtParts {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    offset_secs: i64,
+    /// Fractional second (`.FFFFFF`) scaled to nanoseconds: the fraction value
+    /// times 10^(6 - digit_count). 0 when no fraction was present.
+    nanos: u32,
+    /// Whether the value carried an explicit `.FFFFFF` fraction. A value with
+    /// `.000000` names exactly one instant, so the upper bound must not widen
+    /// it to the whole second - which is what "fraction absent, precision 14"
+    /// means. The two are only distinguishable with this flag.
+    has_fraction: bool,
+    /// The least-precise PRESENT component, as the length of the date-time
+    /// part actually in the value: 4 (year only), 6 (month), 8 (day), 10
+    /// (hour), 12 (minute), 14 (second).
+    precision: usize,
+}
+
+/// Parse a DICOM DT value into its components and UTC offset.
+///
+/// DT (PS3.5 Section 6.2) is `YYYYMMDDHHMMSS.FFFFFF&ZZXX`, where the offset is
+/// part of the VALUE. Two DT strings naming the same instant differ whenever
+/// their zones differ - `20261115120000+0100` and `20261115110000+0000` are the
+/// same moment - so a lexical comparison of the raw text is not a time
+/// comparison. Storing each value as seconds since the epoch puts every zone on
+/// one scale.
+///
+/// Returns `None` for a value this parser cannot read; the caller falls back to
+/// the lexical comparison, which is what every record used before this existed.
+fn parse_dt(value: &str, default_offset_secs: i64) -> Option<DtParts> {
+    let b = value.as_bytes();
+    // Measure the leading run of ASCII digits: that run is the date-time part
+    // `YYYYMMDDHHMMSS`, and everything after it (`.FFFFFF` fraction, `&ZZXX`
+    // offset) is NOT a component. The offset may follow a trailing-null
+    // date-time (standard/ps3.5/dt-vr.json `offsetSuffixNotAComponent`), so the
+    // component lengths MUST come from the digit-run length, never from the
+    // whole byte length - reading hour/minute/second by `b.len()` read the
+    // offset's own bytes and rejected a valid `20261116+0100`.
+    let n = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    // The date-time part is exactly 4, 6, 8, 10, 12 or 14 digits (year, month,
+    // day, hour, minute, second); any other run length is not a DT prefix.
+    if !matches!(n, 4 | 6 | 8 | 10 | 12 | 14) {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let slice = b.get(from..to)?;
+        if !slice.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(slice).ok()?.parse().ok()
+    };
+    let year = num(0, 4)?;
+    let month = if n >= 6 { num(4, 6)? } else { 1 };
+    let day = if n >= 8 { num(6, 8)? } else { 1 };
+    let hour = if n >= 10 { num(8, 10)? } else { 0 };
+    let minute = if n >= 12 { num(10, 12)? } else { 0 };
+    let second = if n >= 14 { num(12, 14)? } else { 0 };
+
+    // Fractional seconds: `.` followed by 1..6 digits (PS3.5 Table 6.2-1,
+    // `FFFFFF`). The fraction is retained, scaled to nanoseconds: dropping it
+    // reduced a value at `.900000` and a range ending `.200000` both to the
+    // whole second, so the stored value matched a range it sits OUTSIDE.
+    let mut nanos: u32 = 0;
+    let mut has_fraction = false;
+    let mut rest = &b[n..];
+    if let Some(after_dot) = rest.strip_prefix(b".") {
+        let digit_count = after_dot.iter().take_while(|c| c.is_ascii_digit()).count();
+        // PS3.5 caps the fraction at 6 digits; a longer digit run is not a
+        // conformant fraction, so only the first 6 digits scale and the rest
+        // falls through to the offset parser below.
+        let digits = digit_count.min(6);
+        if digits > 0 {
+            let frac_val: u32 = std::str::from_utf8(&after_dot[..digits])
+                .ok()?
+                .parse()
+                .ok()?;
+            nanos = frac_val * 10u32.pow((6 - digits) as u32);
+            has_fraction = true;
+        }
+        rest = after_dot.get(digit_count..).unwrap_or(&[]);
+    }
+
+    let offset_secs = match rest {
+        // No zone: an offset-free DT is local time (PS3.5 6.2). This server
+        // compares offset-free values in the deployment's local frame, which
+        // is the configured `[ups] local_utc_offset` (default +0000 = UTC);
+        // a full-precision value carrying an explicit `&ZZXX` keeps its own
+        // offset. Stored data is never rewritten.
+        [] => default_offset_secs,
+        [sign, d0, d1, d2, d3]
+            if (*sign == b'+' || *sign == b'-')
+                && [d0, d1, d2, d3].iter().all(|c| c.is_ascii_digit()) =>
+        {
+            let hours: i64 = std::str::from_utf8(&[*d0, *d1]).ok()?.parse().ok()?;
+            let minutes: i64 = std::str::from_utf8(&[*d2, *d3]).ok()?.parse().ok()?;
+            let magnitude = hours * 3600 + minutes * 60;
+            if *sign == b'+' { magnitude } else { -magnitude }
+        }
+        _ => return None,
+    };
+
+    // Which component is the last one the string actually names. A trailing
+    // null component makes the value a PERIOD
+    // (standard/ps3.5/dt-vr.json `trailingNullComponentsDenotePeriod`), and
+    // dt_upper_instant needs to know where that period ends. It is exactly the
+    // digit-run length: the offset suffix is not a component.
+    let precision = n;
+
+    Some(DtParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        offset_secs,
+        nanos,
+        has_fraction,
+        precision,
+    })
+}
+
+/// The FIRST instant a DICOM DT value names, as `(seconds, nanos)` since the
+/// epoch.
+///
+/// A truncated value fills every omitted component with its lowest value, so
+/// `20261116` reads as 2026-11-16 00:00:00 - the start of the period. Use
+/// [`dt_upper_instant`] for the other end of a range. The nanosecond part is
+/// the fractional second (0 when absent); `(sec, nanos)` tuples compare
+/// lexicographically, so a fraction-aware range test is a plain tuple
+/// comparison.
+fn dt_instant(value: &str, default_offset_secs: i64) -> Option<(i64, u32)> {
+    let p = parse_dt(value, default_offset_secs)?;
+    let days = crate::time::days_from_civil(p.year, p.month as u32, p.day as u32);
+    Some((
+        days * 86_400 + p.hour * 3600 + p.minute * 60 + p.second - p.offset_secs,
+        p.nanos,
+    ))
+}
+
+/// The LAST instant a DICOM DT value names, as `(seconds, nanos)`.
+///
+/// PS3.5 Table 6.2-1: trailing null components mean the value is "not precise
+/// to the precision of those components" - `20261116` names the WHOLE day, not
+/// midnight (standard/ps3.5/dt-vr.json `trailingNullComponentsDenotePeriod`).
+/// The upper bound of a range and a single-value key must cover the whole
+/// period, or a conformant query silently answers an empty worklist.
+///
+/// The end is the last instant of the least-precise PRESENT component. A
+/// full-precision value with no fraction names one whole second, so its upper
+/// instant is `(sec, 999_999_999)`; a full-precision value WITH a fraction
+/// names exactly that instant (`(sec, nanos)`), and `dt_instant` matches it
+/// exactly. A shorter value's period ends at the last whole second of the
+/// period (with nanos 999_999_999). The UTC offset is applied exactly as in
+/// [`dt_instant`].
+fn dt_upper_instant(value: &str, default_offset_secs: i64) -> Option<(i64, u32)> {
+    let p = parse_dt(value, default_offset_secs)?;
+    let days = crate::time::days_from_civil(p.year, p.month as u32, p.day as u32);
+    let whole_sec = days * 86_400 + p.hour * 3600 + p.minute * 60 + p.second;
+    if p.has_fraction {
+        return Some((whole_sec - p.offset_secs, p.nanos));
+    }
+    // days_from_civil rolls month=13 and day=32 into the next month, so the
+    // +1 forms need no clamp.
+    let local_end = match p.precision {
+        4 => crate::time::days_from_civil(p.year + 1, 1, 1) * 86_400 - 1,
+        6 => crate::time::days_from_civil(p.year, (p.month + 1) as u32, 1) * 86_400 - 1,
+        8 => crate::time::days_from_civil(p.year, p.month as u32, (p.day + 1) as u32) * 86_400 - 1,
+        10 => days * 86_400 + p.hour * 3600 + 3599,
+        12 => days * 86_400 + p.hour * 3600 + p.minute * 60 + 59,
+        _ => whole_sec,
+    };
+    Some((local_end - p.offset_secs, 999_999_999))
+}
+
+/// Split a DT range value into its endpoints.
+///
+/// A DT value may itself begin with an offset-free date, so the range separator
+/// cannot be found by looking for the FIRST `-`. The endpoints are separated by
+/// a `-` that follows a COMPLETE datetime, which is what `split(_once)` on
+/// `-` cannot express: `20261115120000-0500` is one instant in a negative zone,
+/// while `20261115120000-20261116` is a range. The rule used here is the one
+/// that makes both work: a `-` is a separator only when the text before it is a
+/// non-empty prefix that is ITSELF a valid range endpoint AND the text before
+/// the `-` contains no offset (an offset ends the value, so nothing may follow
+/// it inside one endpoint).
+fn split_dt_range(value: &str) -> (&str, Option<&str>) {
+    // A DT value can never start with `-`: PS3.5 Table 6.2-1 begins with the
+    // year YYYY, four digits (standard/ps3.5/dt-vr.json
+    // `leadingMinusIsRangeSeparator`). A leading `-` is therefore ALWAYS the
+    // range separator - the open lower bound of an "up to hi" range - never a
+    // value and never a negative offset. The loop below deliberately skips
+    // index 0 (a bare offset must not be misread), so this case is handled
+    // before it.
+    if let Some(hi) = value.strip_prefix('-') {
+        return ("", Some(hi));
+    }
+    // Scan candidate separators left to right; the first one whose prefix
+    // parses as an instant without consuming an offset is the separator.
+    let b = value.as_bytes();
+    for (i, c) in value.char_indices() {
+        if c != '-' || i == 0 {
+            continue;
+        }
+        // A trailing `-HHMM` is an offset sign, not a separator (PS3.5
+        // Table 6.2-1: the zone `&ZZXX` is the LAST component of a DT value
+        // and nothing follows it inside one endpoint). The offset suffix is
+        // NOT a component, so it may follow a trailing-null date-time - a
+        // date-only or hour-only prefix can carry a zone
+        // (standard/ps3.5/dt-vr.json `offsetSuffixNotAComponent`).
+        //
+        // The disambiguation between "one instant with a negative zone" and a
+        // range is the offset RANGE (PS3.5 6.2 Note 1: -1200..+1400): a `-`
+        // followed by exactly four trailing digits is the offset sign only
+        // when those digits form a VALID negative offset (HHMM <= 1200).
+        // `-0500` is valid -> one instant; `-2027` (20:27) is out of range ->
+        // the year range `2026-2027` stays a range. `-0000` parses as offset 0
+        // here, consistent with `parse_dt`.
+        if i + 5 == b.len()
+            && b[i + 1..].iter().all(|c| c.is_ascii_digit())
+            && neg_offset_magnitude_valid(&b[i + 1..])
+        {
+            continue;
+        }
+        let (lo, hi) = (&value[..i], &value[i + 1..]);
+        if dt_instant(lo, 0).is_some() && (hi.is_empty() || dt_instant(hi, 0).is_some()) {
+            return (lo, Some(hi));
+        }
+    }
+    (value, None)
+}
+
+/// Whether a four-digit `HHMM` run is a valid NEGATIVE UTC offset magnitude.
+///
+/// PS3.5 6.2 Note 1 bounds the offset to -1200..+1400, so a negative offset's
+/// magnitude must not exceed 1200. This is the one fact that tells
+/// `20261116-0500` (offset -05:00, valid) from `2026-2027` (year range: 20:27
+/// is not an offset).
+fn neg_offset_magnitude_valid(digits: &[u8]) -> bool {
+    if digits.len() != 4 {
+        return false;
+    }
+    let Ok(s) = std::str::from_utf8(digits) else {
+        return false;
+    };
+    let Ok(n) = s.parse::<u16>() else {
+        return false;
+    };
+    n <= 1200
+}
+
 /// Build `{path}.tmp` - the sibling used by the atomic rename.
-fn tmp_sibling(path: &Path) -> PathBuf {
+/// Reserve a temp sibling for `path` that no other writer can have selected.
+///
+/// The name carries pid + a process-wide counter, which makes a collision
+/// RARE but not impossible: PID namespaces let two containers share a pid, and
+/// the counter restarts at 0 after a restart, so two writers can compute the
+/// same name. `std::fs::write` would then open that name and REPLACE its
+/// contents - one writer would publish the other's bytes. `create_new` turns
+/// the collision into an error, and the retry moves to the next sequence.
+fn tmp_sibling(path: &Path) -> Result<PathBuf, StoreError> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut name = path.as_os_str().to_owned();
-    name.push(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    PathBuf::from(name)
+    // Bounded: each collision consumes a fresh sequence, so this only runs
+    // long on a pathological directory and must not spin forever.
+    const ATTEMPTS: usize = 64;
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let tmp = PathBuf::from(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            // The handle is dropped so the rename/hard_link sees a closed
+            // file (Windows will not link a file open for writing).
+            Ok(_) => return Ok(tmp),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(StoreError::Io(e)),
+        }
+    }
+    Err(StoreError::Io(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AlreadyExists, "no free temp name")
+    })))
+}
+
+/// Fill a temp file that [`tmp_sibling`] already created exclusively.
+///
+/// The bytes are flushed (`sync_all`) BEFORE the caller links/renames the file
+/// into place, so a successful publish means the data is on the medium rather
+/// than merely scheduled to be: a UPS N-CREATE / N-ACTION that answered 2xx
+/// while the bytes sat in the page cache could be empty after a crash, and the
+/// retry then fails while the performed step is lost. That is the same barrier
+/// order the commitment store uses.
+fn write_claimed(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.write_all(bytes)?;
+    crate::durable::sync_barrier(&f)
+}
+
+/// Flush the directory entry that names `path` (Unix-only).
+///
+/// A rename/hard_link updates the parent directory's entry for `path`; that
+/// entry must be flushed too or a crash can lose the NAME while the data is
+/// durable. Unix-only because Windows cannot open a directory for
+/// `FlushFileBuffers` (the same boundary the commitment store states).
+#[cfg(unix)]
+fn sync_parent_entry(path: &Path) -> Result<(), StoreError> {
+    let parent = match crate::durable::parent_entry_dir(path) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    crate::durable::sync_dir_entry(parent).map_err(StoreError::Io)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable::syncs_observed;
 
     fn sample(uid: &str, state: &str, created: &str) -> WorkItemRecord {
         WorkItemRecord {
@@ -530,6 +1010,54 @@ mod tests {
     fn store() -> WorkItemStore {
         let dir = tempfile::tempdir().expect("tempdir");
         WorkItemStore::new(dir.path().join("workitems"))
+    }
+
+    /// An occupied temp name must be SKIPPED, never overwritten.
+    ///
+    /// pid + counter makes a collision rare, not impossible: PID namespaces let
+    /// two containers share a pid, and the counter restarts at 0 after a
+    /// restart. `std::fs::write` on a shared name replaces its contents, so one
+    /// writer would publish the other's bytes. The occupied names are placed in
+    /// the allocator's own sequence window, since allocator-built names advance
+    /// the counter and cannot be pre-created from outside.
+    #[test]
+    fn an_occupied_temp_name_is_skipped_not_overwritten() {
+        let s = store();
+        let target = s.path_for("1.2.3.99").expect("valid uid");
+        std::fs::create_dir_all(s.root()).expect("root");
+
+        // Learn the current sequence from one allocation, then occupy a window
+        // starting there.
+        let probe = tmp_sibling(&target).expect("probe");
+        let seq_of = |p: &Path| -> u64 {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.rsplit('.').next())
+                .and_then(|n| n.parse().ok())
+                .expect("temp name carries its sequence")
+        };
+        let base = seq_of(&probe);
+        std::fs::write(&probe, b"other writer's bytes").expect("occupy");
+
+        const WINDOW: u64 = 32;
+        for k in 1..=WINDOW {
+            let mut name = target.as_os_str().to_owned();
+            name.push(format!(".{}.{}.tmp", std::process::id(), base + k));
+            std::fs::write(PathBuf::from(name), b"other writer's bytes").expect("occupy");
+        }
+
+        let fresh = tmp_sibling(&target).expect("a free name must be found");
+        assert!(
+            seq_of(&fresh) > base + WINDOW,
+            "every occupied name must be skipped, got seq {} in window {base}..={}",
+            seq_of(&fresh),
+            base + WINDOW
+        );
+        assert_eq!(
+            std::fs::read(&probe).expect("occupied still readable"),
+            b"other writer's bytes",
+            "an occupied temp must not be truncated"
+        );
     }
 
     #[test]
@@ -553,6 +1081,29 @@ mod tests {
         assert!(matches!(s.insert(&rec), Err(StoreError::CasConflict(_))));
     }
 
+    /// A UID that is not one conforming path component is refused at the store
+    /// boundary, not joined. `path_for` is a public API, so a caller that
+    /// forgets its own validation must get an error - and no file may be
+    /// created inside or outside the root through a foreign component.
+    #[test]
+    fn a_non_path_uid_is_rejected_at_the_store() {
+        let s = store();
+        for uid in ["..", "1.2..3", "/etc/x"] {
+            assert!(
+                matches!(s.find_by_uid(uid), Err(StoreError::InvalidUid(_))),
+                "{uid} must be refused, not joined"
+            );
+            assert!(
+                matches!(s.delete(uid), Err(StoreError::InvalidUid(_))),
+                "{uid} must be refused, not joined"
+            );
+        }
+        assert!(
+            !s.root().exists() || std::fs::read_dir(s.root()).expect("root").next().is_none(),
+            "no file may be created for a refused UID"
+        );
+    }
+
     #[test]
     fn cas_update_honours_transaction_uid() {
         let s = store();
@@ -563,7 +1114,8 @@ mod tests {
         let expected = rec.transaction_uid.clone().unwrap();
         let mut updated = rec.clone();
         updated.workflow_state = "IN PROGRESS".to_string();
-        s.cas_update(&updated, Some(&expected)).expect("cas ok");
+        s.cas_update(&updated, Some(&expected), Some(0))
+            .expect("cas ok");
         assert_eq!(
             s.find_by_uid("1.2.3")
                 .expect("find")
@@ -573,10 +1125,11 @@ mod tests {
         );
 
         // Wrong TUid -> conflict.
+        let on_disk = s.find_by_uid("1.2.3").expect("find").unwrap().revision;
         let mut again = updated.clone();
         again.workflow_state = "COMPLETED".to_string();
         assert!(matches!(
-            s.cas_update(&again, Some("WRONG")),
+            s.cas_update(&again, Some("WRONG"), Some(on_disk)),
             Err(StoreError::CasConflict(_))
         ));
     }
@@ -731,5 +1284,720 @@ mod tests {
             ..Default::default()
         };
         assert!(s.search(&f).expect("miss").0.is_empty());
+    }
+
+    /// A DT with a UTC offset must match a range naming the SAME instant.
+    ///
+    /// The offset is part of the DT value, so `20261115120000+0100` and
+    /// `20261115110000+0000` are one moment written two ways. Comparing the
+    /// strings ranks the first AFTER the second, so an inclusive range over the
+    /// second excluded the first - a workitem that was inside the window the
+    /// caller asked for.
+    #[test]
+    fn a_dt_with_an_offset_matches_an_equal_instant_range() {
+        // Local noon in +0100 IS 11:00 UTC.
+        let rec = WorkItemRecord {
+            sps_start_datetime: Some("20261115120000+0100".to_string()),
+            ..Default::default()
+        };
+
+        // The same instant, written in UTC, as a single-value range endpoint.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115110000+0000-20261115110000+0000"),
+            ..Default::default()
+        };
+        assert!(
+            matches_filter(&rec, &f),
+            "an equal instant must fall inside its own inclusive range"
+        );
+
+        // And the case the lexical comparison got wrong: the range endpoint is
+        // a bare local time with no zone.
+        let f2 = StoreFilter {
+            sps_start_datetime: Some("20261115110000-20261115110000"),
+            ..Default::default()
+        };
+        assert!(
+            matches_filter(&rec, &f2),
+            "noon +0100 is 11:00 UTC and must match an 11:00 Z range"
+        );
+
+        // Outside the window still does not match.
+        let f3 = StoreFilter {
+            sps_start_datetime: Some("20261115130000+0000-20261115140000+0000"),
+            ..Default::default()
+        };
+        assert!(!matches_filter(&rec, &f3));
+    }
+
+    /// A negative offset's `-` must not be read as the range separator.
+    ///
+    /// `20261115120000-0500` is ONE instant five hours behind UTC. Splitting on
+    /// the first `-` turned it into a range from a bare date to `0500`, which
+    /// would match a value the caller never named.
+    #[test]
+    fn a_negative_offset_is_not_a_range_separator() {
+        let rec = WorkItemRecord {
+            sps_start_datetime: Some("20261115120000-0500".to_string()),
+            ..Default::default()
+        };
+        // The same instant is 17:00 UTC.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115170000+0000"),
+            ..Default::default()
+        };
+        assert!(matches_filter(&rec, &f), "12:00 at -0500 is 17:00 UTC");
+
+        // An unrelated instant must not match through a mis-split range.
+        let other = StoreFilter {
+            sps_start_datetime: Some("20260101000000+0000"),
+            ..Default::default()
+        };
+        assert!(!matches_filter(&rec, &other));
+    }
+
+    /// A negative offset in the QUERY (not only in the stored value) is one
+    /// instant, not a range.
+    ///
+    /// The run-1 test above covered the stored side only. `dt_instant` reads a
+    /// 4-digit suffix as a year, so the old separator rule split a query
+    /// `20261115120000-0500` into `[20261115120000, 0500]` and the search
+    /// answered empty for its own value. The query side must recognise the
+    /// trailing `-HHMM` as the zone and compare the whole value as an instant.
+    #[test]
+    fn a_negative_offset_in_the_query_is_not_a_range() {
+        let s = store();
+        let mut rec = sample("1.2.840.3", "SCHEDULED", "2026-01-01");
+        rec.sps_start_datetime = Some("20261115120000-0500".to_string());
+        s.insert(&rec).expect("insert");
+
+        // The exact value as a query must match itself.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115120000-0500"),
+            ..Default::default()
+        };
+        assert_eq!(s.search(&f).expect("exact").0.len(), 1);
+
+        // The same instant written in UTC must match too.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115170000+0000"),
+            ..Default::default()
+        };
+        assert_eq!(s.search(&f).expect("utc").0.len(), 1);
+
+        // A full-datetime range still matches a value inside it.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115120000-20261116120000"),
+            ..Default::default()
+        };
+        assert_eq!(s.search(&f).expect("full range").0.len(), 1);
+
+        // A date range still behaves as a range: the stored value sits inside
+        // 2026-11-15, so it matches.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115-20261116"),
+            ..Default::default()
+        };
+        assert_eq!(s.search(&f).expect("date range").0.len(), 1);
+    }
+
+    /// A leading `-` is the open lower bound of a DT range, not a value.
+    ///
+    /// `-20261116` is the conformant UPS-RS spelling of "Scheduled Procedure
+    /// Step Start DateTime up to 20261116". The first component of a DT value
+    /// is the year YYYY (four digits), so a value never begins with `-`; the
+    /// splitter must return an empty lower endpoint, which the range arm
+    /// already treats as open. Before the fix the loop skipped index 0, the
+    /// value was read as a single instant, `dt_instant` rejected the leading
+    /// `-`, and the query matched nothing.
+    #[test]
+    fn a_leading_dash_is_an_open_lower_bound() {
+        let s = store();
+        let mut before_rec = sample("1.2.840.1", "SCHEDULED", "2026-01-01");
+        before_rec.sps_start_datetime = Some("20261115120000".to_string());
+        s.insert(&before_rec).expect("insert before");
+
+        let mut after_rec = sample("1.2.840.2", "SCHEDULED", "2026-01-01");
+        after_rec.sps_start_datetime = Some("20261117000000".to_string());
+        s.insert(&after_rec).expect("insert after");
+
+        let f = StoreFilter {
+            sps_start_datetime: Some("-20261116"),
+            ..Default::default()
+        };
+        let (hits, _) = s.search(&f).expect("search");
+        assert_eq!(hits.len(), 1, "only the instant before the bound matches");
+        assert_eq!(hits[0].workitem_uid, "1.2.840.1");
+    }
+
+    /// A short DT at the UPPER bound or as a single value covers the whole
+    /// period it names, not just its first instant.
+    ///
+    /// PS3.5 Table 6.2-1: trailing null components mean the value is "not
+    /// precise to the precision of those components", so `20261116` names all
+    /// of 2026-11-16. Before the fix the upper bound `-20261116` and a
+    /// single-value `20261116` both read as 2026-11-16 00:00:00, so a workitem
+    /// at 08:00 that day was missed and a conformant worklist query answered
+    /// empty.
+    #[test]
+    fn a_short_dt_matches_the_whole_period_it_names() {
+        let s = store();
+        let mut in_day = sample("1.2.840.5", "SCHEDULED", "2026-01-01");
+        in_day.sps_start_datetime = Some("20261116080000".to_string());
+        s.insert(&in_day).expect("insert in day");
+
+        let mut next_day = sample("1.2.840.6", "SCHEDULED", "2026-01-01");
+        next_day.sps_start_datetime = Some("20261117000000".to_string());
+        s.insert(&next_day).expect("insert next day");
+
+        // Open-lower-bound range: the upper bound covers the whole day.
+        let f = StoreFilter {
+            sps_start_datetime: Some("-20261116"),
+            ..Default::default()
+        };
+        let (hits, _) = s.search(&f).expect("up-to");
+        assert_eq!(hits.len(), 1, "08:00 on the 16th is inside `-20261116`");
+        assert_eq!(hits[0].workitem_uid, "1.2.840.5");
+
+        // Single value: a day covers any stored instant during that day.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261116"),
+            ..Default::default()
+        };
+        let (hits, _) = s.search(&f).expect("single");
+        assert_eq!(hits.len(), 1, "08:00 on the 16th is inside `20261116`");
+        assert_eq!(hits[0].workitem_uid, "1.2.840.5");
+    }
+
+    /// A day-precision DT with a POSITIVE offset is a valid value and names the
+    /// whole day in that zone, not nothing.
+    ///
+    /// PS3.5 Table 6.2-1: the offset suffix is not a component, so it may
+    /// follow a trailing-null date-time
+    /// (standard/ps3.5/dt-vr.json `offsetSuffixNotAComponent`). Before the fix
+    /// the component reads used the whole byte length, so `20261116+0100`
+    /// failed to parse and a single-value query matched nothing.
+    #[test]
+    fn a_short_dt_with_a_positive_offset_matches_the_period_it_names() {
+        let s = store();
+        let mut in_day = sample("1.2.840.7", "SCHEDULED", "2026-01-01");
+        in_day.sps_start_datetime = Some("20261116120000+0100".to_string());
+        s.insert(&in_day).expect("insert in day");
+
+        let mut next_day = sample("1.2.840.8", "SCHEDULED", "2026-01-01");
+        next_day.sps_start_datetime = Some("20261117000000+0100".to_string());
+        s.insert(&next_day).expect("insert next day");
+
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261116+0100"),
+            ..Default::default()
+        };
+        let (hits, _) = s.search(&f).expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "noon on the 16th +0100 is inside `20261116+0100`"
+        );
+        assert_eq!(hits[0].workitem_uid, "1.2.840.7");
+    }
+
+    /// An open-lower-bound upper endpoint with a positive offset covers the
+    /// whole day in that zone, so the day is not silently unbounded.
+    ///
+    /// Before the fix `dt_upper_instant("20261116+0100")` was `None`, and the
+    /// range arm read that as "no upper limit" - the query matched EVERYTHING,
+    /// including the next day.
+    #[test]
+    fn an_upper_bound_with_a_positive_offset_covers_the_whole_day() {
+        let s = store();
+        let mut in_day = sample("1.2.840.9", "SCHEDULED", "2026-01-01");
+        in_day.sps_start_datetime = Some("20261116080000+0100".to_string());
+        s.insert(&in_day).expect("insert in day");
+
+        let mut next_day = sample("1.2.840.10", "SCHEDULED", "2026-01-01");
+        next_day.sps_start_datetime = Some("20261117000000+0100".to_string());
+        s.insert(&next_day).expect("insert next day");
+
+        let f = StoreFilter {
+            sps_start_datetime: Some("-20261116+0100"),
+            ..Default::default()
+        };
+        let (hits, _) = s.search(&f).expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "08:00 on the 16th +0100 is inside `-20261116+0100`"
+        );
+        assert_eq!(hits[0].workitem_uid, "1.2.840.9");
+    }
+
+    /// An hour-precision DT with a positive offset covers the whole hour in
+    /// that zone, not just its first instant.
+    ///
+    /// `2026111612+0100` is valid (the offset suffix follows the trailing-null
+    /// minute/second components) and names 12:00..12:59 in +0100.
+    #[test]
+    fn an_hour_precision_dt_with_an_offset_covers_the_whole_hour() {
+        let s = store();
+        let mut in_hour = sample("1.2.840.11", "SCHEDULED", "2026-01-01");
+        in_hour.sps_start_datetime = Some("20261116123000+0100".to_string());
+        s.insert(&in_hour).expect("insert in hour");
+
+        let mut next_hour = sample("1.2.840.12", "SCHEDULED", "2026-01-01");
+        next_hour.sps_start_datetime = Some("20261116130000+0100".to_string());
+        s.insert(&next_hour).expect("insert next hour");
+
+        let f = StoreFilter {
+            sps_start_datetime: Some("2026111612+0100"),
+            ..Default::default()
+        };
+        let (hits, _) = s.search(&f).expect("search");
+        assert_eq!(hits.len(), 1, "12:30 +0100 is inside `2026111612+0100`");
+        assert_eq!(hits[0].workitem_uid, "1.2.840.11");
+    }
+
+    /// The range splitter keeps the batch-11 guard behavior on every form.
+    ///
+    /// A negative offset is ONE instant (the `-` is the zone sign), a full
+    /// datetime pair is a range, and a trailing dash is an open upper end.
+    /// The new leading-dash arm must not disturb any of these.
+    #[test]
+    fn split_dt_range_reads_every_endpoint_form() {
+        assert_eq!(split_dt_range("-20261116"), ("", Some("20261116")));
+        assert_eq!(
+            split_dt_range("20261115120000-0500"),
+            ("20261115120000-0500", None)
+        );
+        assert_eq!(
+            split_dt_range("20261115120000-20261116"),
+            ("20261115120000", Some("20261116"))
+        );
+        assert_eq!(split_dt_range("20261116-"), ("20261116", Some("")));
+    }
+
+    /// A negative offset suffix is valid after EVERY DT precision, not only a
+    /// full `YYYYMMDDHHMMSS`.
+    ///
+    /// PS3.5 6.2: the offset suffix is not a component, so a trailing-null
+    /// date-time may carry one (`offsetSuffixNotAComponent`). The old guard
+    /// fired only at byte index >= 14, so `20261116-0500` (day precision) and
+    /// `2026111612-0100` (hour precision) were mis-split as ranges and a
+    /// conformant query answered an empty worklist. The offset RANGE
+    /// (-1200..+1400) is what keeps `2026-2027` a year range: `-2027` is not
+    /// an offset.
+    #[test]
+    fn a_negative_offset_follows_every_precision_but_a_year_range_stays_a_range() {
+        assert_eq!(split_dt_range("20261116-0500"), ("20261116-0500", None));
+        assert_eq!(split_dt_range("2026111612-0100"), ("2026111612-0100", None));
+        assert_eq!(split_dt_range("2026-2027"), ("2026", Some("2027")));
+    }
+
+    /// A day-precision query with a negative offset matches a stored instant
+    /// inside that day's period in the same zone.
+    #[test]
+    fn a_day_precision_negative_offset_query_matches_its_period() {
+        let s = store();
+        let mut rec = sample("1.2.840.20", "SCHEDULED", "2026-01-01");
+        rec.sps_start_datetime = Some("20261116120000-0500".to_string());
+        s.insert(&rec).expect("insert");
+
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261116-0500"),
+            ..Default::default()
+        };
+        let (hits, _) = s.search(&f).expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "noon on the 16th -0500 is inside the day `20261116-0500`"
+        );
+        assert_eq!(hits[0].workitem_uid, "1.2.840.20");
+    }
+
+    /// Fractional seconds must be retained: a value at `.900000` is OUTSIDE a
+    /// range `.100000-...200000` and INSIDE a whole-second single value.
+    ///
+    /// Dropping the fraction reduced all three to the whole second, so the
+    /// stored value matched a range it sits outside (a false positive).
+    #[test]
+    fn a_fractional_second_is_retained_in_range_matching() {
+        let s = store();
+        let mut rec = sample("1.2.840.21", "SCHEDULED", "2026-01-01");
+        rec.sps_start_datetime = Some("20261116120000.900000+0000".to_string());
+        s.insert(&rec).expect("insert");
+
+        // The range .100000..200000 excludes .900000.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261116120000.100000+0000-20261116120000.200000+0000"),
+            ..Default::default()
+        };
+        assert!(
+            s.search(&f).expect("range").0.is_empty(),
+            ".900000 is outside .100000-.200000"
+        );
+
+        // A whole-second single value covers the whole second, so .900000 is
+        // inside `20261116120000`.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261116120000"),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.search(&f).expect("single").0.len(),
+            1,
+            ".900000 is inside the whole second `20261116120000`"
+        );
+    }
+
+    /// A configured default offset applies ONLY to offset-free DT values.
+    ///
+    /// The `[]` arm of `parse_dt` is the one place "no zone" is decided: a
+    /// full-precision value with an explicit `&ZZXX` keeps its own offset,
+    /// while an offset-free value is compared in the configured local frame
+    /// (default +0000 = UTC).
+    #[test]
+    fn a_configured_default_offset_applies_to_offset_free_values() {
+        // Stored noon +0100 is 11:00 UTC.
+        let rec = WorkItemRecord {
+            sps_start_datetime: Some("20261115120000+0100".to_string()),
+            ..Default::default()
+        };
+
+        // Offset-free 12:00 in the +0100 local frame == 12:00+0100 stored.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115120000-20261115120000"),
+            default_offset_secs: 3600,
+            ..Default::default()
+        };
+        assert!(
+            matches_filter(&rec, &f),
+            "offset-free 12:00 in +0100 is the stored instant"
+        );
+
+        // 11:00 local +0100 = 10:00 UTC, which is NOT the stored 11:00 UTC.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115110000"),
+            default_offset_secs: 3600,
+            ..Default::default()
+        };
+        assert!(!matches_filter(&rec, &f), "11:00+0100 != 11:00 UTC stored");
+
+        // The shipped default (0 = UTC) preserves the existing behaviour: an
+        // offset-free 11:00 range matches the stored 11:00 UTC.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115110000-20261115110000"),
+            ..Default::default()
+        };
+        assert!(
+            matches_filter(&rec, &f),
+            "UTC remains the default local frame"
+        );
+    }
+
+    /// Two read-modify-write cycles on one record must not lose an update.
+    ///
+    /// The Transaction UID does not change on a successful update (PS3.18
+    /// Table 11.6-1), so comparing only against it lets two cycles that read
+    /// the SAME state both pass and the second overwrite the first. The
+    /// revision makes the loser visible as a conflict instead.
+    #[test]
+    fn a_concurrent_update_cannot_silently_overwrite_another() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = WorkItemStore::new(dir.path().join("items"));
+
+        let base = WorkItemRecord {
+            workitem_uid: "1.2.840.1.5".to_string(),
+            workflow_state: "SCHEDULED".to_string(),
+            transaction_uid: Some("T-1".to_string()),
+            step_label: Some("start".to_string()),
+            ..Default::default()
+        };
+        s.insert(&base).expect("insert");
+
+        // Bring the record past its initial revision so the stale read below
+        // carries a real one - the state every real caller is in after the
+        // first update.
+        let seeded = s
+            .find_by_uid(&base.workitem_uid)
+            .expect("find")
+            .expect("present");
+        let mut seed = seeded;
+        seed.step_label = Some("seed".to_string());
+        s.cas_update(&seed, Some("T-1"), Some(seed.revision))
+            .expect("seed update");
+
+        // Both writers now read the SAME record - this is the interleaving.
+        let read_a = s
+            .find_by_uid(&base.workitem_uid)
+            .expect("find")
+            .expect("present");
+        let read_b = s
+            .find_by_uid(&base.workitem_uid)
+            .expect("find")
+            .expect("present");
+        assert_eq!(read_a.revision, read_b.revision, "both read one state");
+
+        // The first cycle merges its change and writes.
+        let mut a = read_a;
+        a.step_label = Some("first-change".to_string());
+        s.cas_update(&a, Some("T-1"), Some(a.revision))
+            .expect("first update wins");
+
+        // The second cycle holds the SAME transaction UID, so the UID check
+        // passes; its revision is now stale, which is what must stop it.
+        let mut b = read_b;
+        b.step_label = Some("second-change".to_string());
+        let err = s.cas_update(&b, Some("T-1"), Some(b.revision)).unwrap_err();
+        assert!(
+            matches!(err, StoreError::CasConflict(_)),
+            "a stale read must be reported as a conflict, got {err:?}"
+        );
+
+        // The first writer's change survived.
+        let after = s
+            .find_by_uid(&base.workitem_uid)
+            .expect("find")
+            .expect("present");
+        assert_eq!(
+            after.step_label.as_deref(),
+            Some("first-change"),
+            "the first change must not be lost"
+        );
+        assert!(after.revision > 0, "a write bumps the revision");
+    }
+
+    /// Revision 0 is an observation, not the absence of one.
+    ///
+    /// A freshly created record is at revision 0, so two callers that both read
+    /// it present revision 0. While the check skipped zero, both passed and the
+    /// second overwrote the first with no conflict - exactly the lost update
+    /// the revision exists to prevent. No seed update here: this is the state a
+    /// caller reaches by reading a record that has never been modified.
+    #[test]
+    fn a_revision_zero_read_is_still_a_precondition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = WorkItemStore::new(dir.path().join("items"));
+
+        let base = WorkItemRecord {
+            workitem_uid: "1.2.840.1.6".to_string(),
+            workflow_state: "SCHEDULED".to_string(),
+            transaction_uid: Some("T-0".to_string()),
+            step_label: Some("start".to_string()),
+            ..Default::default()
+        };
+        s.insert(&base).expect("insert");
+
+        let read_a = s
+            .find_by_uid(&base.workitem_uid)
+            .expect("find")
+            .expect("present");
+        let read_b = read_a.clone();
+        assert_eq!(read_a.revision, 0, "a created record is at revision 0");
+
+        let mut a = read_a;
+        a.step_label = Some("a".to_string());
+        s.cas_update(&a, Some("T-0"), Some(0))
+            .expect("the first revision-0 write applies");
+
+        let mut b = read_b;
+        b.step_label = Some("b".to_string());
+        let err = s
+            .cas_update(&b, Some("T-0"), Some(0))
+            .expect_err("the second revision-0 write must lose");
+        assert!(
+            matches!(err, StoreError::CasConflict(_)),
+            "a stale revision-0 read must conflict, got {err:?}"
+        );
+
+        let after = s
+            .find_by_uid(&base.workitem_uid)
+            .expect("find")
+            .expect("present");
+        assert_eq!(after.step_label.as_deref(), Some("a"), "the first wins");
+    }
+
+    /// The unconditional write path stays available and stays explicit.
+    ///
+    /// Callers that never read a record (the create path) still need to write
+    /// without a precondition; naming that in the API keeps revision 0 free to
+    /// mean "I observed revision 0".
+    #[test]
+    fn upsert_unconditional_ignores_the_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = WorkItemStore::new(dir.path().join("items"));
+
+        let base = WorkItemRecord {
+            workitem_uid: "1.2.840.1.7".to_string(),
+            workflow_state: "SCHEDULED".to_string(),
+            ..Default::default()
+        };
+        s.insert(&base).expect("insert");
+
+        let mut w = base.clone();
+        w.step_label = Some("blind".to_string());
+        s.upsert_unconditional(&w).expect("unconditional write");
+
+        let after = s
+            .find_by_uid(&base.workitem_uid)
+            .expect("find")
+            .expect("present");
+        assert_eq!(after.step_label.as_deref(), Some("blind"));
+        assert_eq!(after.revision, 1, "the write still bumps the revision");
+    }
+
+    /// A committed write flushes the data to the medium BEFORE it is published.
+    ///
+    /// Observed on the barrier counter, because `sync_all` leaves no byte trace
+    /// a re-read can see. Both public mutation paths are covered: `insert`
+    /// (create-if-absent) and `cas_update` (rename).
+    #[test]
+    fn a_committed_write_flushes_before_it_publishes() {
+        let s = store();
+        let rec = sample("1.2.3", "SCHEDULED", "2026-01-01");
+
+        let before = syncs_observed();
+        s.insert(&rec).expect("insert");
+        assert!(
+            syncs_observed() > before,
+            "a committed insert has to flush the record to the medium"
+        );
+
+        let mut updated = rec.clone();
+        updated.workflow_state = "IN PROGRESS".to_string();
+        let tuid = rec.transaction_uid.clone().expect("tuid");
+        let before = syncs_observed();
+        s.cas_update(&updated, Some(&tuid), Some(rec.revision))
+            .expect("cas update");
+        assert!(
+            syncs_observed() > before,
+            "a committed update has to flush the record to the medium"
+        );
+    }
+
+    /// The directory entry that names a record is flushed too (Unix-only).
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_write_also_flushes_the_directory_entry() {
+        let s = store();
+        let rec = sample("1.2.4", "SCHEDULED", "2026-01-01");
+        let before = syncs_observed();
+        s.insert(&rec).expect("insert");
+        assert!(
+            syncs_observed() >= before + 2,
+            "data barrier + directory barrier: expected at least 2, observed {}",
+            syncs_observed() - before
+        );
+    }
+
+    /// A successful delete persists the directory entry that named the record
+    /// (Unix-only), so a crash after `remove_file` cannot restore the
+    /// workitem. Observed on the barrier counter, the same proof the insert
+    /// paths use.
+    #[cfg(unix)]
+    #[test]
+    fn a_delete_persists_the_directory_entry() {
+        let s = store();
+        let rec = sample("1.2.4.1", "SCHEDULED", "2026-01-01");
+        s.insert(&rec).expect("insert");
+
+        let before = syncs_observed();
+        assert!(s.delete("1.2.4.1").expect("delete"));
+        assert!(
+            syncs_observed() > before,
+            "a successful delete must flush the directory entry"
+        );
+    }
+
+    /// A barrier failure on the delete path is an error, not a stored
+    /// "deleted" - the record was removed but its NAME may not survive a
+    /// crash, so the caller must not be told the delete is durable. Reverting
+    /// the added barrier makes `delete` return Ok(true) and this test fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_delete_with_a_failing_barrier_is_an_error_not_a_success() {
+        let s = store();
+        let rec = sample("1.2.4.2", "SCHEDULED", "2026-01-01");
+        s.insert(&rec).expect("insert");
+
+        crate::durable::fail_next_barrier_for_test(s.root());
+        let err = s.delete("1.2.4.2").unwrap_err();
+        assert!(matches!(err, StoreError::Io(_)), "got {err:?}");
+        assert!(
+            !s.path_for("1.2.4.2").expect("path").exists(),
+            "the file was removed; the delete reported the barrier failure"
+        );
+    }
+
+    /// A failed flush is a failed write, not a silent success.
+    #[test]
+    fn a_write_that_cannot_be_flushed_is_an_error_not_a_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A DIRECTORY at the write path: opening it for writing fails, so
+        // nothing is written and nothing can be linked.
+        let blocked = dir.path().join("blocked.tmp");
+        std::fs::create_dir_all(&blocked).expect("blocking directory");
+        let err = write_claimed(&blocked, b"payload").expect_err("must not succeed");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::IsADirectory
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Other
+            ) || err.kind() != io::ErrorKind::NotFound,
+            "the failure has to surface as an I/O error, got {err:?}"
+        );
+    }
+
+    /// A failed directory barrier is an Io error, never a stored verdict -
+    /// on the Ok arm AND on the CasConflict arm (the same fix the commitment
+    /// store carries).
+    ///
+    /// The install order is temp-sync, hard_link, remove temp, THEN dir
+    /// barrier. A barrier failure after the hard_link leaves the record at its
+    /// target; a retry finds the target occupied and used to answer
+    /// CasConflict WITHOUT re-running the barrier. The seam fails the NEXT
+    /// barrier on the store root (workitems/), so the Ok arm surfaces Io and
+    /// the CasConflict arm surfaces Io too. Reverting the CasConflict-arm
+    /// barrier makes the second insert answer CasConflict (the seam is never
+    /// consumed).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_barrier_is_io_on_both_the_ok_and_cas_arms() {
+        let s = store();
+        let rec = sample("1.2.95", "SCHEDULED", "2026-01-01");
+
+        // Ok arm: the link lands, then the barrier fails -> Io, target stays.
+        crate::durable::fail_next_barrier_for_test(s.root());
+        let err = s.insert(&rec).unwrap_err();
+        assert!(matches!(err, StoreError::Io(_)), "got {err:?}");
+        assert!(
+            s.path_for(&rec.workitem_uid).expect("path").exists(),
+            "the link landed before the barrier failed"
+        );
+
+        // CasConflict arm: the occupied target with the next barrier failing
+        // must surface Io, not a silent CasConflict.
+        crate::durable::fail_next_barrier_for_test(s.root());
+        let err = s.insert(&rec).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Io(_)),
+            "a failing barrier on the conflict path is Io, got {err:?}"
+        );
+
+        // Healthy barrier: the occupied target is a CasConflict and the stored
+        // record is left untouched.
+        let first = s
+            .find_by_uid(&rec.workitem_uid)
+            .expect("find")
+            .expect("present");
+        assert!(matches!(s.insert(&rec), Err(StoreError::CasConflict(_))));
+        let after = s
+            .find_by_uid(&rec.workitem_uid)
+            .expect("find")
+            .expect("present");
+        assert_eq!(
+            after, first,
+            "a refused conflict must not replace the record"
+        );
     }
 }

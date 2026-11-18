@@ -80,13 +80,21 @@ pub const READINESS_READY: &str = "READY";
 /// Keyed by STUDY UID rather than workitem UID: the debounce is a property of
 /// the ingest, and the workitem UID is derived from the study anyway.
 ///
+/// Each entry also carries a GENERATION counter, bumped on every `arm`. It
+/// exists so a promotion can detect a study that received instances while it
+/// was being flipped: `promote` captures the generation before flipping and
+/// compares it afterwards. The deadline alone is not enough - `take_due`
+/// REMOVES the entry, so a study re-armed in the window has a deadline again
+/// only until some other actor takes it due; the generation is the monotonic
+/// fact that a re-arm happened at all.
+///
 /// `Clone` shares the ONE registry rather than copying it: the map sits behind
 /// an `Arc`, so a cloned handle arms and drains the same pending set. A deep
 /// copy would give each holder its own timer and a study could then be
 /// promoted twice.
 #[derive(Clone, Default)]
 pub struct Readiness {
-    pending: Arc<Mutex<HashMap<String, Instant>>>,
+    pending: Arc<Mutex<HashMap<String, (Instant, u64)>>>,
 }
 
 impl Readiness {
@@ -113,7 +121,11 @@ impl Readiness {
     pub fn arm(&self, study_instance_uid: &str, now: Instant) {
         let deadline = now + READINESS_DEBOUNCE;
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        pending.insert(study_instance_uid.to_string(), deadline);
+        let entry = pending
+            .entry(study_instance_uid.to_string())
+            .or_insert((deadline, 0));
+        entry.0 = deadline;
+        entry.1 = entry.1.wrapping_add(1);
     }
 
     /// The instant a study becomes READY, if it is still waiting.
@@ -126,7 +138,23 @@ impl Readiness {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(study_instance_uid)
-            .copied()
+            .map(|(deadline, _)| *deadline)
+    }
+
+    /// How many times `arm` has been called for a study (0 when absent).
+    ///
+    /// A monotonic fact about the ingest, separate from the deadline: the
+    /// deadline can be consumed by [`take_due`], but the generation only grows
+    /// until the entry is dropped. `promote` uses it to detect a re-STOW that
+    /// landed while the study was being flipped.
+    #[must_use]
+    pub fn generation(&self, study_instance_uid: &str) -> u64 {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(study_instance_uid)
+            .map(|(_, generation)| *generation)
+            .unwrap_or(0)
     }
 
     /// Remove every study whose deadline has passed, returning them.
@@ -137,7 +165,7 @@ impl Readiness {
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         let due: Vec<String> = pending
             .iter()
-            .filter(|(_, deadline)| **deadline <= now)
+            .filter(|(_, (deadline, _))| *deadline <= now)
             .map(|(uid, _)| uid.clone())
             .collect();
         for uid in &due {
@@ -188,10 +216,14 @@ pub enum Promotion {
 /// answer is [`Promotion::NothingToPromote`], not `Ready` - the sweeper must
 /// stop retrying a study it can no longer influence.
 ///
-/// The event is published AFTER the record is durably READY, so a performer
-/// woken by it cannot race the flip and see INCOMPLETE. A claim that arrives
-/// before the flip is refused by the performer's own INCOMPLETE guard, which
-/// is the standard's arrangement rather than a gap.
+/// The event is published LAST: every workitem is flipped first, then the
+/// study's generation is re-checked. If it moved (a re-STOW arrived while the
+/// flips were being written) the freshly flipped workitems are demoted back to
+/// INCOMPLETE and NOTHING is published - the whole point of the readiness
+/// debounce is that a performer must not be offered a study the sender has
+/// since extended. A claim that arrives before the flip is refused by the
+/// performer's own INCOMPLETE guard, which is the standard's arrangement
+/// rather than a gap.
 pub fn promote(state: &AppState, study_instance_uid: &str) -> Promotion {
     let store: WorkItemStore = super::ups_pure::workitem_store(state);
     // ONE study can carry SEVERAL workitems - one per catalog entry that
@@ -218,10 +250,29 @@ pub fn promote(state: &AppState, study_instance_uid: &str) -> Promotion {
         return Promotion::NothingToPromote;
     }
 
+    // Capture the generation BEFORE any flip: a re-STOW that arrives while the
+    // flips below are being written calls `arm`, which bumps it. That is how
+    // the interleaving is detected. The deadline is deliberately NOT checked
+    // here: `promote` is also called directly (the tests drive it that way),
+    // where a still-armed study has a deadline and yet must promote - only the
+    // generation distinguishes "a re-arm landed mid-flip" from "this study was
+    // never taken due".
+    let generation_before = state.readiness.generation(study_instance_uid);
+
+    // Test seam: lets a concurrency test park a promotion between the
+    // generation capture above and the flips below, so a re-STOW lands in the
+    // exact window the generation counter exists to detect. A no-op in
+    // production (the seam is disarmed until a test arms it for this study).
+    readiness_test_hooks::promote_pause_point(study_instance_uid);
+
     let mut any_ready = false;
     let mut any_store_error = false;
+    // (workitem_uid, record) for every workitem this pass just flipped. The
+    // announcement happens only after the generation re-check below, so a
+    // study extended mid-promotion is never announced.
+    let mut flipped: Vec<(String, clarus_core::ups::WorkItemRecord)> = Vec::new();
     for workitem_uid in &uids {
-        match promote_one(state, &store, workitem_uid) {
+        match promote_one(&store, workitem_uid, &mut flipped) {
             Promotion::Ready => any_ready = true,
             Promotion::NothingToPromote => {}
             Promotion::StoreError => any_store_error = true,
@@ -232,6 +283,48 @@ pub fn promote(state: &AppState, study_instance_uid: &str) -> Promotion {
         // were, and the sweep must come back for the rest.
         return Promotion::StoreError;
     }
+
+    // The study received instances while it was being promoted: the
+    // generation moved, so a re-STOW armed in the window. Demote every
+    // workitem just flipped and publish NOTHING - a performer must not be
+    // woken for an input the sender has since extended.
+    if state.readiness.generation(study_instance_uid) != generation_before {
+        for (workitem_uid, mut record) in flipped {
+            record.input_readiness = Some(READINESS_INCOMPLETE.to_string());
+            record.updated_at = Some(super::ups_pure::now_stamp());
+            if let Err(error) = store.cas_update(&record, None, None) {
+                crate::clog_warn!(
+                    workitem_uid = %workitem_uid,
+                    error = %error,
+                    "readiness: cannot write the INCOMPLETE demotion"
+                );
+            }
+        }
+        return Promotion::NothingToPromote;
+    }
+
+    // Announce last: the offer goes out only once the study is known to be
+    // settled. The envelope is the same one the create path used to publish.
+    for (workitem_uid, record) in &flipped {
+        crate::clog_info!(
+            workitem_uid = %workitem_uid,
+            "CAD workitem input is READY; the study has settled"
+        );
+        state.ups_events.notify_created(
+            workitem_uid,
+            super::ups::event_bus::FilterRouting::from_record(record),
+        );
+        // The SAME envelope the create path publishes, and now the same
+        // FILTER: the code travels with the label, so a subscription filtered
+        // on the scheduled code is answered here exactly as it would be on the
+        // create path. Passing only the label would silently drop a
+        // code-filtered subscriber from every generated workitem.
+        crate::push::push_to_subscribers_with_values(
+            workitem_uid,
+            &crate::push::FilterValues::from_record(record),
+        );
+    }
+
     if any_ready {
         return Promotion::Ready;
     }
@@ -282,11 +375,14 @@ pub(crate) fn workitem_uids_for_study(
     Ok(uids)
 }
 
-/// Flip ONE workitem to READY and publish its offer.
-///
-/// The per-workitem half of [`promote`]; the study-level function finds the
-/// study's workitems and calls this for each.
-fn promote_one(state: &AppState, store: &WorkItemStore, workitem_uid: &str) -> Promotion {
+/// Flip ONE workitem to READY. The announcement happens later, in [`promote`],
+/// after the study's generation is re-checked - so this function only writes
+/// the record and records the flip for the caller to publish.
+fn promote_one(
+    store: &WorkItemStore,
+    workitem_uid: &str,
+    flipped: &mut Vec<(String, clarus_core::ups::WorkItemRecord)>,
+) -> Promotion {
     let existing = match store.find_by_uid(workitem_uid) {
         Ok(Some(record)) => record,
         // No workitem: the study was never made durable into one, or an
@@ -321,7 +417,7 @@ fn promote_one(state: &AppState, store: &WorkItemStore, workitem_uid: &str) -> P
     // `None` for the expected transaction UID: this is a readiness flip, not
     // a state transition, and no performer can hold the workitem (it is
     // still SCHEDULED, which is exactly what no-performer-held means).
-    if let Err(error) = store.cas_update(&record, None) {
+    if let Err(error) = store.cas_update(&record, None, None) {
         crate::clog_warn!(
             workitem_uid = %workitem_uid,
             error = %error,
@@ -330,30 +426,7 @@ fn promote_one(state: &AppState, store: &WorkItemStore, workitem_uid: &str) -> P
         return Promotion::StoreError;
     }
 
-    crate::clog_info!(
-        workitem_uid = %workitem_uid,
-        "CAD workitem input is READY; the study has settled"
-    );
-    // The SAME envelope the create path used to publish, from the same sink,
-    // so the SSE fan-out and every subscribed Notification Connection see one
-    // shape. This is now the ONLY place a generated workitem is announced,
-    // which is what keeps a performer from being woken before the study is
-    // whole. The filter keys travel with it too: a channel subscriber
-    // narrowed by Procedure Step Label or Scheduled Workitem Code is answered
-    // here exactly as it would be on the create path.
-    state.ups_events.notify_created(
-        workitem_uid,
-        super::ups::event_bus::FilterRouting::from_record(&record),
-    );
-    // The SAME envelope the create path publishes, and now the same FILTER:
-    // the code travels with the label, so a subscription filtered on the
-    // scheduled code is answered here exactly as it would be on the create
-    // path. Passing only the label would silently drop a code-filtered
-    // subscriber from every generated workitem.
-    crate::push::push_to_subscribers_with_values(
-        workitem_uid,
-        &crate::push::FilterValues::from_record(&record),
-    );
+    flipped.push((workitem_uid.to_string(), record));
     Promotion::Ready
 }
 
@@ -424,6 +497,26 @@ mod tests {
         let mut due = registry.take_due(now);
         due.sort();
         due
+    }
+
+    /// `arm` increments the generation each time it runs: it is the monotonic
+    /// fact a promotion compares to detect a re-STOW that landed mid-flip,
+    /// which the deadline alone cannot prove (take_due consumes the deadline).
+    #[test]
+    fn arm_increments_the_generation_and_an_absent_study_is_zero() {
+        let registry = Readiness::new();
+        assert_eq!(registry.generation("1.2.3"), 0, "absent -> zero");
+
+        let t0 = Instant::now();
+        registry.arm("1.2.3", t0);
+        assert_eq!(registry.generation("1.2.3"), 1, "first arm -> 1");
+
+        registry.arm("1.2.3", t0 + Duration::from_secs(1));
+        assert_eq!(registry.generation("1.2.3"), 2, "second arm -> 2");
+
+        // A DIFFERENT study's arm does not move this one's generation.
+        registry.arm("4.5.6", t0);
+        assert_eq!(registry.generation("1.2.3"), 2);
     }
 
     /// A study is due at its own deadline and not one tick before it.
@@ -559,5 +652,99 @@ mod tests {
         // And it will come due again, so the retry is real rather than a
         // registry entry nothing will ever select.
         assert_eq!(due_at(&registry, next), vec!["1.2.3"]);
+    }
+}
+
+// -- Test seam (concurrency hook) -------------------------------------------
+
+/// A one-shot pause an integration test can place between [`promote`]'s
+/// generation capture and its flip, FOR ONE NAMED STUDY.
+///
+/// [`promote`] calls [`promote_pause_point`] after it has captured the study's
+/// generation and before it flips any workitem. When a test arms the pause for
+/// that study, a promotion parks there, which lets the test STOW another
+/// instance - and thereby call `arm`, bumping the generation - in the exact
+/// window the generation counter exists to detect. A sequential test cannot
+/// reach that window because `sweep_once` runs `take_due` and `promote` back to
+/// back.
+///
+/// Keyed by study UID, not a bare flag: the seam is PROCESS-GLOBAL, and a
+/// parallel test promoting a different study must not consume this test's
+/// armed pause.
+///
+/// Exposed as a public seam (not `#[cfg(test)]`) because an integration test
+/// links the library in its normal build, the same convention the `*_for_test`
+/// seams follow.
+pub mod readiness_test_hooks {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    struct Pause {
+        /// The study UID a pause is armed for, if any.
+        armed: Option<String>,
+        /// A promotion of the armed study is parked at the seam.
+        paused: bool,
+    }
+
+    static PAUSE: OnceLock<(Mutex<Pause>, Condvar)> = OnceLock::new();
+
+    fn pause() -> &'static (Mutex<Pause>, Condvar) {
+        PAUSE.get_or_init(|| {
+            (
+                Mutex::new(Pause {
+                    armed: None,
+                    paused: false,
+                }),
+                Condvar::new(),
+            )
+        })
+    }
+
+    /// Arm a one-shot pause for the next promotion of `study_instance_uid`.
+    pub fn arm_promote_pause(study_instance_uid: &str) {
+        let (lock, cv) = pause();
+        let mut p = lock.lock().unwrap_or_else(|e| e.into_inner());
+        p.armed = Some(study_instance_uid.to_string());
+        p.paused = false;
+        cv.notify_all();
+    }
+
+    /// Block until a promotion of the armed study has reached the pause point.
+    pub fn wait_until_promote_paused() {
+        let (lock, cv) = pause();
+        let mut p = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !p.paused {
+            let (guard, _timeout) = cv
+                .wait_timeout(p, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            p = guard;
+            if std::time::Instant::now() > deadline {
+                panic!("readiness test hook: a promotion never reached the pause point");
+            }
+        }
+    }
+
+    /// Release the parked promotion.
+    pub fn release_promote_pause() {
+        let (lock, cv) = pause();
+        let mut p = lock.lock().unwrap_or_else(|e| e.into_inner());
+        p.paused = false;
+        cv.notify_all();
+    }
+
+    /// The seam itself: park when a pause is armed for THIS study, otherwise
+    /// return at once.
+    pub fn promote_pause_point(study_instance_uid: &str) {
+        let (lock, cv) = pause();
+        let mut p = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if p.armed.as_deref() != Some(study_instance_uid) {
+            return;
+        }
+        p.armed = None;
+        p.paused = true;
+        cv.notify_all();
+        while p.paused {
+            p = cv.wait(p).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }

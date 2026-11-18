@@ -28,10 +28,17 @@ where
     (before == after, result)
 }
 
+// One #[test] owns the process-wide TestAllocator: libtest runs separate
+// #[test] fns on PARALLEL threads, so two fns sharing `ALLOC` can land one's
+// reset()/set_enabled() inside the other's measured window and mask
+// allocations (a nondeterministic, vacuum gate). Running both windows on a
+// single thread keeps each `allocate_env` window authoritative (same pattern
+// as ap101_conn.rs and ap101_frame_list.rs).
 #[test]
-fn request_line_and_fifteen_headers_alloc_zero() {
-    // One request line + 15 headers in a single byte buffer. `MAX_HEADERS` is
-    // 16 (conn.rs:13), so 15 leaves room for the terminating blank line.
+fn http_parse_paths_are_allocation_free() {
+    // Window 1: one request line + 15 headers in a single byte buffer.
+    // `MAX_HEADERS` is 16 (conn.rs:13), so 15 leaves room for the terminating
+    // blank line.
     let mut buf = Vec::new();
     buf.extend_from_slice(b"GET /dicomweb/studies?limit=2 HTTP/1.1\r\n");
     buf.extend_from_slice(b"Host: 127.0.0.1\r\n");
@@ -74,11 +81,8 @@ fn request_line_and_fifteen_headers_alloc_zero() {
         zero_alloc,
         "HTTP parse (request line + 15 headers) must be zero-allocation"
     );
-}
 
-#[test]
-fn framing_smuggling_gates_alloc_zero() {
-    // The singleton-header gates (repeat Content-Length, repeat
+    // Window 2: the singleton-header gates (repeat Content-Length, repeat
     // Transfer-Encoding, CL+TE together) run on every request that carries a
     // framing header, so they must not allocate. The seen-flags are a `u8`
     // bitfield; this pins that.

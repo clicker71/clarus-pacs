@@ -117,12 +117,15 @@ pub fn find_recent_patients(
     let mut by_patient: HashMap<String, Acc> = HashMap::new();
     for entry in dir {
         let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
-        let path = entry.path();
+        let fname = entry.file_name().to_string_lossy().into_owned();
         // Only `*.manifest` files participate.
-        if path.extension().and_then(|e| e.to_str()) != Some("manifest") {
+        let Some(stem) = fname.strip_suffix(".manifest") else {
             continue;
-        }
-        let study = match crate::manifest::read_manifest_study_only(&path) {
+        };
+        let Some(published) = crate::manifest::PublishedManifest::new(manifests_dir, stem) else {
+            continue;
+        };
+        let study = match crate::manifest::read_manifest_study_only_published(&published) {
             Ok(s) => s,
             // A manifest that will not decode is SKIPPED, not fatal. The
             // patient list is a browse view over the whole archive, and one

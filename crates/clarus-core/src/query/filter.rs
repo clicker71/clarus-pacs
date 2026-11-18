@@ -91,6 +91,13 @@ pub mod tag {
     pub const PROTOCOL_NAME: u32 = 0x0018_1030;
     pub const INSTANCE_NUMBER: u32 = 0x0020_0013;
     pub const LATERALITY: u32 = 0x0020_0060;
+    /// ImageType (0008,0008) - the multi-valued value 3 that flags a
+    /// localizer. Read by the thumbnail routes to avoid picking a scout image
+    /// as a series/study preview.
+    pub const IMAGE_TYPE: u32 = 0x0008_0008;
+    /// NumberOfFrames (0028,0008) - IS, present only for multi-frame
+    /// instances. Read by the thumbnail routes to pick a representative frame.
+    pub const NUMBER_OF_FRAMES: u32 = 0x0028_0008;
 
     // -- Captured derived-object references -------------------------------
     //
@@ -365,13 +372,16 @@ impl QueryFilter {
             m.insert(tag::RESPONSIBLE_PERSON, self.name_predicate(v));
         }
         if let Some(v) = self.study_instance_uid.as_deref() {
-            m.insert(tag::STUDY_INSTANCE_UID, Predicate::Glob(v));
+            // A UID value may be a LIST (Table 10.6.1-5 single-valued key with
+            // a comma-separated value): membership, not a glob, or `1.2.1,1.2.2`
+            // is compared as one literal pattern and matches nothing.
+            m.insert(tag::STUDY_INSTANCE_UID, Predicate::CommaList(v));
         }
         if let Some(v) = self.study_id.as_deref() {
             m.insert(tag::STUDY_ID, Predicate::Glob(v));
         }
         if let Some(v) = self.study_time.as_deref() {
-            m.insert(tag::STUDY_TIME, Predicate::Glob(v));
+            m.insert(tag::STUDY_TIME, Predicate::TmRange(v));
         }
         // 08.09: PatientBirthDate accepts a range like StudyDate. The stored
         // value is a numeric `YYYYMMDD` UInt (push_date, manifest.rs), so the
@@ -395,7 +405,7 @@ impl QueryFilter {
         // separately by `modalities_in_study_match` via
         // `match_study_attrs[_prebuilt]`.
         if let Some(v) = self.series_instance_uid.as_deref() {
-            m.insert(tag::SERIES_INSTANCE_UID, Predicate::Glob(v));
+            m.insert(tag::SERIES_INSTANCE_UID, Predicate::CommaList(v));
         }
         if let Some(v) = self.series_number.as_deref() {
             m.insert(tag::SERIES_NUMBER, Predicate::Glob(v));
@@ -446,6 +456,11 @@ pub enum Predicate<'a> {
     CommaList(&'a str),
     /// Inclusive numeric season-date range `[from, to]` (`YYYYMMDD` as u64).
     DateRange(Option<&'a str>, Option<&'a str>),
+    /// TM range (`HHMMSS[.ffffff]`, `lo-hi`, `lo-`, `-hi`) via the shared
+    /// [`crate::query::range::tm_range_matches`] - StudyTime (0008,0030) is a
+    /// required TM matching key (PS3.18 Table 10.6.1-5) and must support
+    /// PS3.4 C.2.2.2.5 range matching, which a hyphen-literal glob does not.
+    TmRange(&'a str),
 }
 
 /// Whether a manifest attribute value satisfies an expected predicate.
@@ -514,6 +529,7 @@ fn predicate_matches(pred: Predicate<'_>, have: &AttrValue) -> bool {
                 (None, None) => true,
             }
         }
+        Predicate::TmRange(pat) => crate::query::range::tm_range_matches(have, pat),
     }
 }
 
@@ -558,7 +574,13 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
 
 /// Whether any comma-separated element of `pat` equals `text` exactly.
 fn comma_list_match(pat: &str, text: &str) -> bool {
-    pat.split(',').any(|e| e == text)
+    // Members are TRIMMED, matching `comma_list_intersects` below and
+    // `series::uid_list_contains`. Without it a query written as
+    // `studyInstanceUid=1.2.1, 1.2.2` had its second member compared with a
+    // leading space: the scanner accepted both candidates and this predicate
+    // then silently rejected one. One trim rule, stated once, so the three
+    // callers cannot drift apart again.
+    pat.split(',').any(|e| e.trim() == text)
 }
 
 /// Whether ANY comma-separated element of `pat` also appears among the
@@ -684,6 +706,33 @@ mod tests {
         };
         assert!(f.matches(&attrs(&[(tag::STUDY_DATE, AttrValue::UInt(20260802))])));
         assert!(!f.matches(&attrs(&[(tag::STUDY_DATE, AttrValue::UInt(20251231))])));
+    }
+
+    /// StudyTime (0008,0030) is a required TM matching key and must support
+    /// PS3.4 C.2.2.2.5 range matching: `lo-hi` inclusive on both ends, `lo-`
+    /// and `-hi` open, exact form as a single instant. A stored value outside
+    /// the range does not match.
+    #[test]
+    fn study_time_tm_range_matching() {
+        let have = |t: &str| attrs(&[(tag::STUDY_TIME, AttrValue::Text(t.into()))]);
+        let q = |pat: &str| QueryFilter {
+            study_time: Some(pat.into()),
+            ..Default::default()
+        };
+        // Closed range, inclusive both ends.
+        assert!(q("090000-110000").matches(&have("100000")));
+        assert!(q("090000-110000").matches(&have("090000")));
+        assert!(q("090000-110000").matches(&have("110000")));
+        assert!(!q("090000-110000").matches(&have("085959")));
+        // Open ends.
+        assert!(q("090000-").matches(&have("120000")));
+        assert!(q("-110000").matches(&have("100000")));
+        assert!(!q("090000-").matches(&have("080000")));
+        // Exact form.
+        assert!(q("100000").matches(&have("100000")));
+        assert!(!q("100000").matches(&have("100001")));
+        // A stored value outside the range must not match.
+        assert!(!q("090000-110000").matches(&have("120000")));
     }
 
     /// 08.09: PatientBirthDate range over the stored UInt - inclusive bounds
@@ -917,13 +966,23 @@ mod tests {
     }
 
     #[test]
-    fn u64_predicate_glob() {
+    fn study_time_is_a_tm_range_not_a_u64_glob() {
+        // StudyTime (0008,0030) is VR TM - always stored as Text - and now
+        // matches by the shared TM range predicate, not a glob over a numeric
+        // render. A non-Text (UInt) stored value is not a TM and never matches.
         let f = QueryFilter {
-            study_time: Some("12*".into()),
+            study_time: Some("120000-130000".into()),
             ..Default::default()
         };
-        assert!(f.matches(&attrs(&[(tag::STUDY_TIME, AttrValue::UInt(123456))])));
-        assert!(!f.matches(&attrs(&[(tag::STUDY_TIME, AttrValue::UInt(90000))])));
+        assert!(f.matches(&attrs(&[(
+            tag::STUDY_TIME,
+            AttrValue::Text("123000".into())
+        )])));
+        assert!(!f.matches(&attrs(&[(
+            tag::STUDY_TIME,
+            AttrValue::Text("090000".into())
+        )])));
+        assert!(!f.matches(&attrs(&[(tag::STUDY_TIME, AttrValue::UInt(123456))])));
     }
 
     #[test]

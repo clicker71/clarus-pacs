@@ -12,7 +12,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::Path;
 use std::sync::Arc;
 
 use clarus_core::manifest::{InstanceRecord, Manifest, ManifestReadError};
@@ -81,7 +80,15 @@ pub fn cas_hex_key(inst: &InstanceRecord) -> String {
 /// corrupt file.
 /// The branch stays on the MISS path (the cache stores only successful
 /// decodes), so the corruption signal is never masked.
-pub fn load_manifest(manifests_dir: &Path, study_uid: &str) -> Result<Arc<Manifest>, WadoError> {
+///
+/// `manifests_dir` is the audited [`clarus_core::manifest::TrustedManifestDir`]
+/// (obtained from `AppState::trusted_manifest_dir`): the cache entry point
+/// accepts only that type, so an arbitrary path cannot be routed into the
+/// mmap readers.
+pub fn load_manifest(
+    manifests_dir: &clarus_core::manifest::TrustedManifestDir,
+    study_uid: &str,
+) -> Result<Arc<Manifest>, WadoError> {
     match clarus_core::manifest_cache::get_or_load(manifests_dir, study_uid) {
         Ok(m) => Ok(m),
         Err(ManifestReadError::Io(_)) => Err(WadoError::NotFound(study_uid.to_string())),
@@ -94,7 +101,7 @@ pub fn load_manifest(manifests_dir: &Path, study_uid: &str) -> Result<Arc<Manife
             // does not spam the log on every WADO hit.
             crate::metrics::MANIFEST_CORRUPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::metrics::MANIFEST_DEGRADED.store(1, std::sync::atomic::Ordering::Relaxed);
-            let manifest_path = manifests_dir.join(format!("{study_uid}.manifest"));
+            let manifest_path = manifests_dir.path().join(format!("{study_uid}.manifest"));
             if crate::clog::rate_limited_allow(study_uid.as_bytes()) {
                 crate::clog_warn!(
                     study_uid,
@@ -141,6 +148,48 @@ pub fn attr_text_from(attrs: &[(u32, clarus_core::manifest::AttrValue)], tag: u3
 /// The text value of a DICOM attribute on an instance, by tag.
 pub fn attr_text(inst: &InstanceRecord, tag: u32) -> Option<&str> {
     attr_text_from(&inst.attrs, tag)
+}
+
+/// The multi-valued values of a CS attribute on an instance, by tag.
+///
+/// `ImageType` (0008,0008) is stored as an array because the element is
+/// multi-valued. A record written by an older build has no entry, and a
+/// scalar entry is read as a single value: both answer "no value 3", which is
+/// the pre-existing behaviour for an instance that never declared one.
+pub fn attr_list(inst: &InstanceRecord, tag: u32) -> Vec<&str> {
+    attrs_to_list(&inst.attrs, tag)
+}
+
+/// [`attr_list`] over a bare attribute list.
+pub fn attrs_to_list(attrs: &[(u32, clarus_core::manifest::AttrValue)], tag: u32) -> Vec<&str> {
+    use clarus_core::manifest::AttrValue;
+    attrs
+        .iter()
+        .find_map(|(t, v)| {
+            if *t != tag {
+                return None;
+            }
+            match v {
+                AttrValue::Array(items) => Some(
+                    items
+                        .iter()
+                        .filter_map(|i| match i {
+                            AttrValue::Text(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                AttrValue::Text(s) => Some(vec![s.as_str()]),
+                _ => None,
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// NumberOfFrames (0028,0008) of an instance: `None` when absent, which the
+/// thumbnail routes read as a single-frame instance.
+pub fn attr_frames(inst: &InstanceRecord) -> Option<u32> {
+    attr_text(inst, clarus_core::query::tag::NUMBER_OF_FRAMES).and_then(|s| s.trim().parse().ok())
 }
 
 // -- native (serde-free) bulk-data-URI injection ----------
@@ -567,8 +616,48 @@ mod tests {
         )
         .expect("write corrupt manifest");
 
+        // The trusted-dir voucher is only reachable through the audited
+        // `AppState` boundary (this module is `forbid(unsafe_code)`), so build
+        // a state whose configured manifest dir is the tempdir.
+        let manifest_dir = dir.path().to_path_buf();
+        let idx_dir = dir.path().join("idx");
+        std::fs::create_dir_all(&idx_dir).expect("idx dir");
+        let storage_dir = dir.path().join("cas");
+        std::fs::create_dir_all(&storage_dir).expect("cas dir");
+        let mut config = crate::config::Config::test_default();
+        config.storage_dir = storage_dir.to_string_lossy().to_string();
+        config.btree.manifest_dir = manifest_dir.to_string_lossy().to_string();
+        config.btree.idx_dir = idx_dir.to_string_lossy().to_string();
+        let state = crate::state::AppState {
+            cas: clarus_adapters::storage::ContentAddressedStorage::new(storage_dir)
+                .expect("open cas"),
+            codec_registry: clarus_adapters::codec::CodecRegistry::default(),
+            ups_events: crate::sse_fanout::DualEventSink::new(),
+            start_time: std::time::Instant::now(),
+            metrics_ring: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::VecDeque::new(),
+            )),
+            log_buffer: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::VecDeque::new(),
+            )),
+            maintenance: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::state::MaintenanceState::default(),
+            )),
+            #[cfg(feature = "s3")]
+            s3: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cold_cas: None,
+            shadow: crate::shadow::ShadowTier::new(idx_dir.clone()),
+            study_scanner: clarus_core::query::StudyScanner::new(manifest_dir, idx_dir),
+            config,
+            workitems_dir: dir.path().join("workitems"),
+            commitments_dir: dir.path().join("commitments"),
+            transcode_pool: crate::state::TranscodePool::new(4),
+            readiness: crate::handlers::readiness::Readiness::new(),
+        };
+        let trusted = state.trusted_manifest_dir();
+
         let before = crate::metrics::MANIFEST_CORRUPT.load(std::sync::atomic::Ordering::Relaxed);
-        let r = load_manifest(dir.path(), study_uid);
+        let r = load_manifest(&trusted, study_uid);
         assert!(r.is_err(), "corrupt manifest must fail to load");
         let after = crate::metrics::MANIFEST_CORRUPT.load(std::sync::atomic::Ordering::Relaxed);
         assert!(

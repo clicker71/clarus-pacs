@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -196,13 +197,13 @@ fn verify_cas_file(path: &Path) -> VerifyResult {
         None => return VerifyResult::ReadError,
     };
 
-    let data = match read_with_retry(path) {
-        ReadOutcome::Data(d) => d,
+    let digest = match hash_file_with_retry(path) {
+        ReadOutcome::Verified(d) => d,
         ReadOutcome::Gone => return VerifyResult::Gone,
         ReadOutcome::Error => return VerifyResult::ReadError,
     };
 
-    let hash = clarus_adapters::hex_encode(&clarus_core::hash::cas_hash_one(&data));
+    let hash = clarus_adapters::hex_encode(&digest);
     if hash == expected {
         VerifyResult::Ok
     } else {
@@ -210,28 +211,36 @@ fn verify_cas_file(path: &Path) -> VerifyResult {
     }
 }
 
-/// Result of attempting to read a CAS file.
+/// Result of attempting to hash a CAS file.
 enum ReadOutcome {
-    Data(Vec<u8>),
+    /// The content digest of the file (computed incrementally, never via a
+    /// whole-file buffer).
+    Verified([u8; 32]),
     /// The file is gone (NotFound after one retry) - the erase-window case.
     Gone,
     /// Some other read failure.
     Error,
 }
 
-/// Read a file, retrying once on any transient/NotFound failure. A file that
-/// still cannot be opened after the retry is reported as `Gone` only when it
-/// really does not exist; other failures are `Error`.
-fn read_with_retry(path: &Path) -> ReadOutcome {
-    let first = std::fs::read(path);
-    match first {
-        Ok(d) => ReadOutcome::Data(d),
+/// Hash a file incrementally, retrying the OPEN once on any transient/NotFound
+/// failure. A file that still cannot be opened after the retry is reported as
+/// `Gone` only when it really does not exist; other failures are `Error`.
+///
+/// 1611 #7: the audit runs on a background thread, and one WSI instance can be
+/// as large as `max_instance_size_mb` (config.rs:1548). Reading the whole blob
+/// into a `Vec` there allocates that much on the audit thread - an abort, not a
+/// degraded service. The hash is therefore folded over 64 KiB stack-buffer
+/// reads; the digest is unchanged (BLAKE3 is incremental through the facade).
+fn hash_file_with_retry(path: &Path) -> ReadOutcome {
+    match hash_file_incremental(path) {
+        Ok(d) => ReadOutcome::Verified(d),
         Err(first_err) => {
             // One short retry: the file may have been mid-rename or the audit
-            // is racing the erase-window.
+            // is racing the erase-window. Only the OPEN is retried; a hash run
+            // that already opened the file reports its own error.
             std::thread::sleep(std::time::Duration::from_millis(10));
-            match std::fs::read(path) {
-                Ok(d) => ReadOutcome::Data(d),
+            match hash_file_incremental(path) {
+                Ok(d) => ReadOutcome::Verified(d),
                 Err(_) if first_err.kind() == std::io::ErrorKind::NotFound => ReadOutcome::Gone,
                 Err(e) => {
                     crate::clog_warn!(path = %path.display(), error = %e, "CAS audit: read failure");
@@ -240,6 +249,57 @@ fn read_with_retry(path: &Path) -> ReadOutcome {
             }
         }
     }
+}
+
+/// Bounded-chunk size for the audit hash loop. 64 KiB keeps the stack buffer
+/// small while amortising the per-read syscall cost; the exact size is not part
+/// of any wire contract, only the digest is.
+const AUDIT_HASH_CHUNK: usize = 64 * 1024;
+
+/// Test seam: records the chunking discipline of [`hash_file_incremental`] so
+/// a test can prove the audit path never hands the hasher a whole-file buffer.
+#[cfg(test)]
+mod hash_seam {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub static LARGEST_UPDATE: AtomicUsize = AtomicUsize::new(0);
+    pub static UPDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    pub fn record(n: usize) {
+        UPDATE_CALLS.fetch_add(1, Ordering::Relaxed);
+        let mut prev = LARGEST_UPDATE.load(Ordering::Relaxed);
+        while n > prev {
+            match LARGEST_UPDATE.compare_exchange_weak(
+                prev,
+                n,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
+        }
+    }
+    pub fn reset() {
+        LARGEST_UPDATE.store(0, Ordering::Relaxed);
+        UPDATE_CALLS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Stream `path` through a BLAKE3 hasher in bounded chunks, returning the
+/// 32-byte digest that addresses CAS. Never buffers the whole file.
+fn hash_file_incremental(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = clarus_core::hash::cas_hasher();
+    let mut buf = [0u8; AUDIT_HASH_CHUNK];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        clarus_core::hash::CasHasher::update(&mut hasher, &buf[..n]);
+        #[cfg(test)]
+        hash_seam::record(n);
+    }
+    Ok(clarus_core::hash::CasHasher::finalize(hasher))
 }
 
 fn set_status(state: &RwLock<CasAuditState>, status: String) {
@@ -382,6 +442,41 @@ mod tests {
         // Delete it; the retry path must report Gone, not an error.
         std::fs::remove_file(&f).expect("remove");
         assert!(matches!(verify_cas_file(&f), VerifyResult::Gone));
+    }
+
+    /// 1611 #7: a large instance must be hashed in bounded chunks, never as a
+    /// single whole-file buffer. A 64 MiB sparse file whose name is its own
+    /// digest verifies Ok while the seam proves many small updates.
+    #[test]
+    fn large_file_hashes_in_bounded_chunks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("big.bin");
+        let f = std::fs::File::create(&seed).expect("create");
+        f.set_len(64 * 1024 * 1024).expect("sparse set_len"); // 64 MiB of zeros
+        drop(f);
+
+        // The filename is the digest of the (zero-filled) content. Compute it
+        // streaming: never materialise the 64 MiB as one buffer.
+        let zeros = [0u8; 64 * 1024];
+        let mut hasher = clarus_core::hash::cas_hasher();
+        for _ in 0..1024 {
+            clarus_core::hash::CasHasher::update(&mut hasher, &zeros);
+        }
+        let digest = clarus_core::hash::CasHasher::finalize(hasher);
+        let name = clarus_adapters::hex_encode(&digest);
+        let path = tmp.path().join(format!("{name}.dcm"));
+        std::fs::rename(&seed, &path).expect("rename");
+
+        hash_seam::reset();
+        assert!(matches!(verify_cas_file(&path), VerifyResult::Ok));
+        assert!(
+            hash_seam::LARGEST_UPDATE.load(std::sync::atomic::Ordering::Relaxed) <= 64 * 1024,
+            "the hasher must never receive a whole-file buffer"
+        );
+        assert!(
+            hash_seam::UPDATE_CALLS.load(std::sync::atomic::Ordering::Relaxed) > 1,
+            "a 64 MiB file must be hashed in many bounded chunks"
+        );
     }
 
     #[test]

@@ -104,8 +104,8 @@ fn refuse_if_hidden_from_store(
     sop_instance_uid: &str,
     sop_class_uid: &str,
 ) -> Option<InstanceOutcome> {
-    let manifest_dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
-    let reason = clarus_core::stow::hidden_reason_of(&manifest_dir, study_uid, sop_instance_uid);
+    let trusted = state.trusted_manifest_dir();
+    let reason = clarus_core::stow::hidden_reason_of(&trusted, study_uid, sop_instance_uid);
     // 113037 patient safety / 113038 incorrect MWL: no standard un-reject, and
     // the standard forbids re-accepting them.
     if reason != 113_037 && reason != 113_038 {
@@ -335,13 +335,17 @@ pub struct ManifestBatch {
     /// SOP Instance UIDs whose study manifest a mid-request flush could not
     /// write.
     ///
+    /// SOP Class / Instance UID pairs whose study manifest a mid-request flush
+    /// could not write.
+    ///
     /// They must survive [`Self::clear`] for the same reason as
     /// `flushed_studies`: the failed instance was already counted as accepted
     /// when it entered the batch, and the response is built from the
     /// accumulator AFTER the last flush. Reporting it here lets the caller move
     /// it into FailedSOPSequence (reason 272) instead of claiming a store the
-    /// archive cannot serve back.
-    manifest_failed: Vec<String>,
+    /// archive cannot serve back. The class travels with the instance so the
+    /// failed entry can carry both UIDs (PS3.18 10.5.2).
+    manifest_failed: Vec<(String, String)>,
 }
 
 /// The study-level facts kept for a study a mid-request flush already wrote.
@@ -368,11 +372,12 @@ impl ManifestBatch {
         self.bytes = 0;
     }
 
-    /// Take the UIDs of instances a mid-request flush could not commit.
+    /// Take the `(sop_class_uid, sop_instance_uid)` pairs of instances a
+    /// mid-request flush could not commit.
     ///
     /// Draining rather than borrowing keeps a second flush from reporting the
     /// same instance twice - the caller records each one exactly once.
-    pub fn take_manifest_failed(&mut self) -> Vec<String> {
+    pub fn take_manifest_failed(&mut self) -> Vec<(String, String)> {
         std::mem::take(&mut self.manifest_failed)
     }
 
@@ -650,6 +655,8 @@ fn instance_series_model(
         referenced_series_uids: meta.referenced_series_uids.clone(),
         referenced_sop_instance_uids: meta.referenced_sop_instance_uids.clone(),
         frames,
+        number_of_frames: meta.number_of_frames,
+        image_type: meta.image_type.clone(),
     };
     clarus_core::stow::SeriesModel {
         series_instance_uid: meta.series_instance_uid.clone(),
@@ -809,9 +816,9 @@ fn batch_add(
 ///
 /// The shadow-tier scanner is NOT told about a study that failed: its index
 /// would then advertise instances no manifest backs.
-pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) -> Vec<String> {
+pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) -> Vec<(String, String)> {
     let manifest_dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
-    let mut failed: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
     for (study_uid, study) in &batch.studies {
         // Rebuild fresh attrs so `write_study_manifest_full` stamps the final
         // merged counts (RAM-only) after merging all accumulated series.
@@ -833,7 +840,12 @@ pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) -> Vec<String> 
                     .series
                     .iter()
                     .flat_map(|series| series.instances.iter())
-                    .map(|instance| instance.sop_instance_uid.clone()),
+                    .map(|instance| {
+                        (
+                            instance.sop_class_uid.clone().unwrap_or_default(),
+                            instance.sop_instance_uid.clone(),
+                        )
+                    }),
             );
         } else {
             state.study_scanner.on_study_committed(study_uid, &attrs);
@@ -1292,9 +1304,15 @@ fn ingest_tempfile(
     // instead, on the sanitized buffer, where the offsets are already resolved.
     let will_sanitize = sanitize_hidden_phi(&meta, &coerce);
     if !will_sanitize && embeddable_transfer_syntax(&meta) {
-        let patient_bytes = coerced_patient_elements(&coerce, &meta);
-        if !patient_bytes.is_empty() {
-            splice_patient_elements_in_file(temp_path, &patient_bytes, &meta, &sop_instance_uid)?;
+        let pn = coerced_patient_name_element(&coerce, &meta);
+        let pid = coerced_patient_id_element(&coerce, &meta);
+        if pn.is_some() || pid.is_some() {
+            splice_patient_elements_in_file(
+                temp_path,
+                pn.as_deref(),
+                pid.as_deref(),
+                &sop_instance_uid,
+            )?;
         }
     }
 
@@ -1462,9 +1480,9 @@ fn decide_known_sop(
         // 01.09 erase gap: deleted study, stale append-only row.
         return inserted();
     }
-    let m = match clarus_core::manifest::read_manifest(&path) {
-        Ok(m) => m,
-        Err(_) => {
+    let m = match state.read_server_manifest(owner_study) {
+        Some(Ok(m)) => m,
+        _ => {
             // Exists but unreadable: degraded study - preserve the no-op.
             crate::clog_warn!(
                 sop_instance_uid = sop,
@@ -1803,32 +1821,50 @@ fn embeddable_transfer_syntax(meta: &InstanceMeta) -> bool {
     )
 }
 
-/// The generated-patient elements this instance must carry, or empty when the
-/// coercion generated no patient identity.
+/// The generated (0010,0010) PatientName element, or `None` when FR-001 did
+/// not generate the name during THIS ingest. Only a generated field may be
+/// spliced: a field the source already carried is already in the dataset at
+/// its sorted position, and writing it again would duplicate the tag.
 ///
 /// FR-001 fills an empty PatientID/PatientName in the MANIFEST. Writing the
 /// value ONLY there left the stored blob without `(0010,0020)`/`(0010,0010)`,
 /// so QIDO found the instance and WADO-RS `/metadata` - which reads the blob -
 /// did not: the bridge (FR-001a) writes the generated value into the dataset
 /// AND records the COERCE audit, and this server had lost the first half.
-fn coerced_patient_elements(coerce: &CoerceReport, meta: &InstanceMeta) -> Vec<u8> {
-    let patient_coerced = coerce
+fn coerced_patient_name_element(coerce: &CoerceReport, meta: &InstanceMeta) -> Option<Vec<u8>> {
+    if coerce
         .generated
         .iter()
-        .any(|&(g, e)| (g, e) == (0x0010, 0x0010) || (g, e) == (0x0010, 0x0020));
-    if !patient_coerced {
-        return Vec::new();
+        .any(|&(g, e)| (g, e) == (0x0010, 0x0010))
+    {
+        crate::validation::build_coerced_patient_name_element(&meta.patient_name)
+    } else {
+        None
     }
-    crate::validation::build_coerced_patient_elements(&meta.patient_name, &meta.patient_id)
 }
 
-/// Splice `elements` into the dataset header, immediately before PixelData.
+/// The generated (0010,0020) PatientID element, or `None` when FR-001 did not
+/// generate the ID during THIS ingest. See [`coerced_patient_name_element`]
+/// for why only a generated field may be spliced.
+fn coerced_patient_id_element(coerce: &CoerceReport, meta: &InstanceMeta) -> Option<Vec<u8>> {
+    if coerce
+        .generated
+        .iter()
+        .any(|&(g, e)| (g, e) == (0x0010, 0x0020))
+    {
+        crate::validation::build_coerced_patient_id_element(&meta.patient_id)
+    } else {
+        None
+    }
+}
+
+/// Splice the generated patient elements into `src` at their sorted position.
 ///
-/// Position comes from the parse walk (`InstanceMeta::pixel_data_offset`), never
-/// from a byte search: pixel data whose bytes happen to spell the tag must not
-/// move the seam. A file with no PixelData has no header worth splicing (the
-/// attributes would land after the last element of an empty dataset), so the
-/// bytes are returned unchanged.
+/// Each element REPLACES the tag when it is already present and is otherwise
+/// INSERTED before the first element with a larger tag (PS3.5 7.1 ascending
+/// tag order), never simply before PixelData: after groups 0020/0028 the
+/// dataset would no longer walk. The seam comes from the element walk
+/// ([`crate::validation::patient_element_splices`]), not from a byte search.
 ///
 /// The transfer syntax rule is the SAME one the audit embed follows
 /// ([`embeddable_transfer_syntax`], explicit VR only): under Implicit VR LE the
@@ -1836,17 +1872,56 @@ fn coerced_patient_elements(coerce: &CoerceReport, meta: &InstanceMeta) -> Vec<u
 /// byte-swaps every length, so either insertion corrupts the dataset. Those
 /// instances keep the manifest-only coercion (audit-log change), which is what
 /// they had before.
-fn splice_before_pixel_data(src: &[u8], elements: &[u8], offset: Option<u64>) -> Vec<u8> {
-    if elements.is_empty() {
+fn splice_patient_elements(src: &[u8], pn: Option<&[u8]>, pid: Option<&[u8]>) -> Vec<u8> {
+    let splices = crate::validation::patient_element_splices(src);
+    let edits = patient_edits(splices, pn, pid);
+    apply_edits(src, &edits)
+}
+
+/// The `(offset, replace_len, bytes)` edits for the generated patient elements,
+/// in ascending tag (and therefore offset) order.
+///
+/// Two edits can share a seam - both tags absent insert before the same larger
+/// element, or PatientName inserts in front of an existing PatientID - so
+/// equal-offset edits are merged, keeping the bytes in tag order.
+fn patient_edits(
+    splices: crate::validation::PatientElementSplices,
+    pn: Option<&[u8]>,
+    pid: Option<&[u8]>,
+) -> Vec<(usize, usize, Vec<u8>)> {
+    let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::with_capacity(2);
+    if let (Some(s), Some(b)) = (splices.patient_name, pn) {
+        edits.push((s.offset, s.replace_len, b.to_vec()));
+    }
+    if let (Some(s), Some(b)) = (splices.patient_id, pid) {
+        edits.push((s.offset, s.replace_len, b.to_vec()));
+    }
+    if edits.len() == 2 && edits[0].0 == edits[1].0 {
+        let mut merged = edits[0].2.clone();
+        merged.extend_from_slice(&edits[1].2);
+        edits[0].2 = merged;
+        edits[0].1 += edits[1].1;
+        edits.truncate(1);
+    }
+    edits
+}
+
+/// Rewrite `src` with the edits applied; `edits` are `(offset, replace_len,
+/// bytes)` in ascending offset order, and `src` must contain every seam.
+fn apply_edits(src: &[u8], edits: &[(usize, usize, Vec<u8>)]) -> Vec<u8> {
+    if edits.is_empty() {
         return src.to_vec();
     }
-    let Some(at) = offset.map(|o| o as usize).filter(|&o| o <= src.len()) else {
-        return src.to_vec();
-    };
-    let mut out = Vec::with_capacity(src.len() + elements.len());
-    out.extend_from_slice(&src[..at]);
-    out.extend_from_slice(elements);
-    out.extend_from_slice(&src[at..]);
+    let new_total: usize = edits.iter().map(|e| e.2.len()).sum();
+    let old_total: usize = edits.iter().map(|e| e.1).sum();
+    let mut out = Vec::with_capacity(src.len() + new_total - old_total);
+    let mut pos = 0usize;
+    for (offset, replace_len, bytes) in edits {
+        out.extend_from_slice(&src[pos..*offset]);
+        out.extend_from_slice(bytes);
+        pos = offset + replace_len;
+    }
+    out.extend_from_slice(&src[pos..]);
     out
 }
 
@@ -1863,36 +1938,68 @@ impl Drop for RemoveOnDrop<'_> {
     }
 }
 
-/// Splice `elements` in front of PixelData in the file at `temp_path`.
+/// Read the file header up to (and including) the PixelData tag, with a
+/// growing window bounded at 64 MiB.
 ///
-/// Rewrites the temp file in place (write the prefix, the elements, then the
-/// rest streamed through a fixed buffer) so a multi-gigabyte instance is never
-/// held in memory: only the header prefix and a 64 KiB window are ever resident.
+/// A header larger than that is not a header; refusing is better than an
+/// unbounded read. `None` when no PixelData is found - the caller then leaves
+/// the file untouched.
+fn read_header_to_pixels(path: &Path) -> Option<Vec<u8>> {
+    use clarus_ports::dicom::DicomParser;
+    let len = std::fs::metadata(path).ok()?.len() as usize;
+    let mut window = 8 * 1024 * 1024usize;
+    loop {
+        let probe = window.min(len);
+        let header = read_dicom_header(path, probe).ok()?;
+        if let Ok(meta) = DicomRsParser.extract_metadata(&header)
+            && meta.pixel_data_offset.is_some()
+        {
+            return Some(header);
+        }
+        if probe == len || window >= 64 * 1024 * 1024 {
+            return None;
+        }
+        window *= 2;
+    }
+}
+
+/// Splice the generated patient elements into the file at `temp_path`, at
+/// their sorted positions.
+///
+/// Rewrites the temp file in place (edited header prefix, then the pixel-data
+/// tail streamed through a spill file) so a multi-gigabyte instance is never
+/// held in memory: only the header prefix and the spill tail are ever resident.
 fn splice_patient_elements_in_file(
     temp_path: &Path,
-    elements: &[u8],
-    meta: &InstanceMeta,
+    pn: Option<&[u8]>,
+    pid: Option<&[u8]>,
     sop_instance_uid: &str,
 ) -> Result<(), StowError> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
-    // The metadata parse reads only `max_part_header` bytes, so a header larger
-    // than that window reports no PixelData offset. Re-parse a wider window
-    // rather than give up: the coercion is a rare path, and losing the patient
-    // identity from the blob is the bug being fixed.
-    let at: u64 = match meta.pixel_data_offset {
-        Some(at) => at,
-        None => match pixel_data_offset_from_file(temp_path) {
-            Some(at) => at,
-            None => {
-                crate::clog_warn!(
-                    sop_instance_uid,
-                    "coerced patient elements not written: no PixelData found in the file"
-                );
-                return Ok(());
-            }
-        },
+    if pn.is_none() && pid.is_none() {
+        // Nothing generated: do not touch the file.
+        return Ok(());
+    }
+    let Some(header) = read_header_to_pixels(temp_path) else {
+        crate::clog_warn!(
+            sop_instance_uid,
+            "coerced patient elements not written: no PixelData found in the file"
+        );
+        return Ok(());
     };
+    let edits = patient_edits(crate::validation::patient_element_splices(&header), pn, pid);
+    if edits.is_empty() {
+        return Ok(());
+    }
+
+    let first_offset = edits[0].0;
+    let last_end = edits
+        .iter()
+        .map(|e| e.0 + e.1)
+        .max()
+        .unwrap_or(first_offset);
+
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1913,14 +2020,27 @@ fn splice_patient_elements_in_file(
             sop_instance_uid,
         )
     })?;
-    if at > len {
+    if last_end > len as usize {
         return Ok(());
     }
+
+    // The edited region is a header prefix (bounded by the header walk above),
+    // so it is read whole; the multi-gigabyte tail is spilled.
+    let mut segment = vec![0u8; last_end];
+    file.read_exact(&mut segment).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to read the header prefix for the patient embed: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+
     // Move the pixel-data tail aside into a scratch file, then rewrite the
-    // original as header + elements + tail. The scratch file keeps the peak
-    // memory at one buffer regardless of instance size. It lives beside the
-    // part (same volume, so no cross-device copy) and is removed on every
-    // exit path by the guard below.
+    // original as edited prefix + tail. The scratch file keeps the peak memory
+    // at one buffer regardless of instance size. It lives beside the part
+    // (same volume, so no cross-device copy) and is removed on every exit path
+    // by the guard below.
     let spill_path = temp_path.with_extension("pixspill");
     // Read+write, not `File::create`: the spill is written with the tail and
     // then READ BACK to restore it, and a write-only handle cannot be read.
@@ -1939,7 +2059,7 @@ fn splice_patient_elements_in_file(
             )
         })?;
     let _spill_guard = RemoveOnDrop(&spill_path);
-    file.seek(SeekFrom::Start(at)).map_err(|e| {
+    file.seek(SeekFrom::Start(last_end as u64)).map_err(|e| {
         stow_error_with_sop(
             500,
             format!("Failed to seek the pixel data: {e}"),
@@ -1947,7 +2067,7 @@ fn splice_patient_elements_in_file(
             sop_instance_uid,
         )
     })?;
-    std::io::copy(&mut (&mut file).take(len - at), &mut tail).map_err(|e| {
+    std::io::copy(&mut (&mut file).take(len - last_end as u64), &mut tail).map_err(|e| {
         stow_error_with_sop(
             500,
             format!("Failed to spill the pixel data: {e}"),
@@ -1963,24 +2083,26 @@ fn splice_patient_elements_in_file(
             sop_instance_uid,
         )
     })?;
-    // Truncate at the seam and write elements + tail.
-    file.set_len(at).map_err(|e| {
+
+    // Rewrite the file as the edited prefix + the spilled tail.
+    let edited = apply_edits(&segment, &edits);
+    file.set_len(0).map_err(|e| {
         stow_error_with_sop(
             500,
-            format!("Failed to truncate at the pixel data: {e}"),
+            format!("Failed to truncate the part for the patient embed: {e}"),
             None,
             sop_instance_uid,
         )
     })?;
-    file.seek(SeekFrom::Start(at)).map_err(|e| {
+    file.seek(SeekFrom::Start(0)).map_err(|e| {
         stow_error_with_sop(
             500,
-            format!("Failed to seek the insertion point: {e}"),
+            format!("Failed to seek the part start for the patient embed: {e}"),
             None,
             sop_instance_uid,
         )
     })?;
-    file.write_all(elements).map_err(|e| {
+    file.write_all(&edited).map_err(|e| {
         stow_error_with_sop(
             500,
             format!("Failed to write the patient elements: {e}"),
@@ -2126,14 +2248,10 @@ fn materialize_update_from_file(
             modifier,
             &state.config.resolved_modifying_system(),
         );
-        // FR-001b: the generated PatientID/PatientName must reach the BLOB, not
-        // only the manifest - QIDO read the manifest and WADO-RS /metadata read
-        // the blob, so the two disagreed. They go BEFORE PixelData (the metadata
-        // walk stops there); the audit embed stays on the tail.
-        let patient_bytes = coerced_patient_elements(coerce, meta);
-        if !patient_bytes.is_empty() {
-            splice_patient_elements_in_file(temp_path, &patient_bytes, meta, &sop_instance_uid)?;
-        }
+        // The generated patient elements were already spliced in
+        // `ingest_tempfile` (before the hash and the insert/update decision);
+        // only the (0400,0561) audit embed is appended here. A second splice
+        // at the now-stale pixel-data offset would duplicate them.
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(temp_path)
@@ -2240,6 +2358,24 @@ fn commit_updated_manifest(
             state
                 .study_scanner
                 .on_study_committed(&study_instance_uid, &attrs);
+        }
+        Err(clarus_core::stow::manifest::StudyManifestError::RejectedForStore {
+            sop_uid,
+            reason,
+        }) => {
+            crate::clog_warn!(
+                sop_instance_uid = %sop_uid,
+                study_uid = %study_instance_uid,
+                reason = reason,
+                "STOW refused: instance is hidden by an IOCM rejection that forbids re-acceptance"
+            );
+            return Ok(InstanceOutcome::Failed {
+                sop_class_uid: Some(sop_class_uid),
+                sop_instance_uid: Some(sop_uid),
+                reason: format!(
+                    "Instance is hidden by an IOCM rejection note (reason {reason}) that forbids re-acceptance"
+                ),
+            });
         }
         Err(e) => {
             crate::clog_warn!(
@@ -2399,8 +2535,9 @@ fn materialize_update(
         // append the audit sequence. Doing it in this order keeps the patient
         // attributes inside the header the metadata reader walks, while the
         // (0400,0561) audit stays on the tail where it is already written.
-        let patient_bytes = coerced_patient_elements(coerce, meta);
-        owned = splice_before_pixel_data(&owned, &patient_bytes, meta.pixel_data_offset);
+        let pn = coerced_patient_name_element(coerce, meta);
+        let pid = coerced_patient_id_element(coerce, meta);
+        owned = splice_patient_elements(&owned, pn.as_deref(), pid.as_deref());
         owned.extend_from_slice(&audit_bytes);
     }
     let new_blake3 = crate::shadow::blake3_of(&owned);
@@ -2463,6 +2600,7 @@ fn materialize_update(
         new_blake3,
         &meta.modality,
         &study_instance_uid,
+        &series_instance_uid,
         &sop_instance_uid,
     ) {
         crate::clog_warn!(
@@ -2536,11 +2674,9 @@ fn map_insert_tempfile(
                 // PixelData position, which the excision never moves (the
                 // excised spans all precede it).
                 let sanitized = if embeddable_transfer_syntax(meta) {
-                    splice_before_pixel_data(
-                        &sanitized,
-                        &coerced_patient_elements(coerce, meta),
-                        meta.pixel_data_offset,
-                    )
+                    let pn = coerced_patient_name_element(coerce, meta);
+                    let pid = coerced_patient_id_element(coerce, meta);
+                    splice_patient_elements(&sanitized, pn.as_deref(), pid.as_deref())
                 } else {
                     sanitized
                 };
@@ -2575,11 +2711,13 @@ fn map_insert_tempfile(
             } else {
                 (*blake3, size, None)
             };
-            if let Err(e) =
-                state
-                    .shadow
-                    .dual_write(stored_blake3, &meta.modality, &study_instance_uid, &si)
-            {
+            if let Err(e) = state.shadow.dual_write(
+                stored_blake3,
+                &meta.modality,
+                &study_instance_uid,
+                &series_instance_uid,
+                &si,
+            ) {
                 crate::clog_warn!(
                     error = %e,
                     sop_instance_uid = %si,
@@ -2808,33 +2946,6 @@ fn read_dicom_header(path: &Path, max_header: usize) -> Result<Vec<u8>, DicomErr
     Ok(buf)
 }
 
-/// Locate PixelData in a file whose header exceeded the STOW parse window.
-///
-/// The parser is not asked to walk a whole multi-gigabyte file for one offset:
-/// it is handed progressively larger PREFIXES until the pixel tag appears. The
-/// offset it reports is already relative to the file start, and the size keeps
-/// doubling only while the header genuinely has not ended, so a normal instance
-/// answers on the first or second probe. Bounded at 64 MiB - a header larger
-/// than that is not a header, and refusing is better than an unbounded read.
-fn pixel_data_offset_from_file(path: &Path) -> Option<u64> {
-    use clarus_ports::dicom::DicomParser;
-    let len = std::fs::metadata(path).ok()?.len() as usize;
-    let mut window = 8 * 1024 * 1024usize;
-    loop {
-        let probe = window.min(len);
-        let header = read_dicom_header(path, probe).ok()?;
-        if let Ok(meta) = clarus_adapters::dicom_rs::DicomRsParser.extract_metadata(&header)
-            && let Some(at) = meta.pixel_data_offset
-        {
-            return Some(at);
-        }
-        if probe == len || window >= 64 * 1024 * 1024 {
-            return None;
-        }
-        window *= 2;
-    }
-}
-
 /// Counts how many times the STOW path falls back to a FULL file re-read to
 /// compute the content hash (`blake3_of_file`). The folded `CasWrite` digest
 /// means the common case must keep this at ZERO for the request that just
@@ -2940,13 +3051,13 @@ fn validate_and_coerce(meta: &mut InstanceMeta) -> Result<CoerceReport, String> 
 
 /// StudyInstanceUID fallback when PatientID is empty too.
 fn generate_study_uid_without_patient(meta: &InstanceMeta) -> String {
-    let digest = clarus_core::stow::fallback_study_uid_key(
+    let uid_key = clarus_core::stow::fallback_study_uid_key(
         meta.study_date.as_deref(),
         meta.study_time.as_deref(),
         meta.accession_number.as_deref(),
         &meta.modality,
     );
-    format!("2.25.{digest}")
+    format!("2.25.{uid_key}")
 }
 
 // -- Hex / ENOSPC helpers ------------------------------------------------
@@ -3636,7 +3747,10 @@ mod iocm_anyclass_tests {
     fn force_hidden(state: &AppState, reason: u32) {
         let dir = PathBuf::from(&state.config.btree.manifest_dir);
         let path = clarus_core::stow::manifest_path(&dir, STUDY);
-        let mut manifest = clarus_core::manifest::read_manifest(&path).expect("read");
+        let mut manifest = state
+            .read_server_manifest(STUDY)
+            .expect("published manifest path")
+            .expect("read");
         manifest.series[0].instances[0].rejection_reason = reason;
         std::fs::write(&path, manifest.encode().expect("encode")).expect("rewrite");
     }
@@ -3691,14 +3805,14 @@ mod iocm_anyclass_tests {
         // test pass that never needed the hide to land.
         state
             .shadow
-            .dual_write([0u8; 32], "CT", STUDY, INSTANCE)
+            .dual_write([0u8; 32], "CT", STUDY, SERIES, INSTANCE)
             .expect("seed sop_owner");
     }
 
     /// The stored reason for the seeded instance.
     fn stored_reason(state: &AppState) -> u32 {
-        let dir = PathBuf::from(&state.config.btree.manifest_dir);
-        clarus_core::stow::hidden_reason_of(&dir, STUDY, INSTANCE)
+        let trusted = state.trusted_manifest_dir();
+        clarus_core::stow::hidden_reason_of(&trusted, STUDY, INSTANCE)
     }
 
     /// With `anyclass_enable = false` (the default) the AnyClass hide is NOT
@@ -3729,22 +3843,37 @@ mod iocm_anyclass_tests {
     }
 
     /// A mid-request flush that could not write the manifest must hand the
-    /// affected UIDs to the response builder exactly once.
+    /// affected `(class, instance)` pairs to the response builder exactly once.
     ///
-    /// `clear()` wipes the pending write set, so a UID parked on the batch is
+    /// `clear()` wipes the pending write set, so a pair parked on the batch is
     /// the ONLY remaining evidence that the instance is not retrievable. Two
     /// flushes in one request must not report the same instance twice, hence
     /// the drain semantics.
     #[test]
     fn a_flush_reports_its_manifest_failures_once() {
         let mut batch = super::ManifestBatch::default();
-        batch.manifest_failed.push("1.2.3.4.5.6.7.1".to_string());
-        batch.manifest_failed.push("1.2.3.4.5.6.7.2".to_string());
+        batch.manifest_failed.push((
+            "1.2.840.10008.5.1.4.1.1.2".to_string(),
+            "1.2.3.4.5.6.7.1".to_string(),
+        ));
+        batch.manifest_failed.push((
+            "1.2.840.10008.5.1.4.1.1.2".to_string(),
+            "1.2.3.4.5.6.7.2".to_string(),
+        ));
 
         let first = batch.take_manifest_failed();
         assert_eq!(
             first,
-            vec!["1.2.3.4.5.6.7.1".to_string(), "1.2.3.4.5.6.7.2".to_string()],
+            vec![
+                (
+                    "1.2.840.10008.5.1.4.1.1.2".to_string(),
+                    "1.2.3.4.5.6.7.1".to_string()
+                ),
+                (
+                    "1.2.840.10008.5.1.4.1.1.2".to_string(),
+                    "1.2.3.4.5.6.7.2".to_string()
+                ),
+            ],
             "every instance the flush could not commit is reported"
         );
         assert!(
@@ -3758,13 +3887,19 @@ mod iocm_anyclass_tests {
     #[test]
     fn clearing_a_batch_keeps_the_manifest_failures() {
         let mut batch = super::ManifestBatch::default();
-        batch.manifest_failed.push("1.2.3.4.5.6.7.1".to_string());
+        batch.manifest_failed.push((
+            "1.2.840.10008.5.1.4.1.1.2".to_string(),
+            "1.2.3.4.5.6.7.1".to_string(),
+        ));
 
         batch.clear();
 
         assert_eq!(
             batch.take_manifest_failed(),
-            vec!["1.2.3.4.5.6.7.1".to_string()],
+            vec![(
+                "1.2.840.10008.5.1.4.1.1.2".to_string(),
+                "1.2.3.4.5.6.7.1".to_string()
+            )],
             "an instance the archive cannot serve back stays reported as failed"
         );
     }

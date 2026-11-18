@@ -602,7 +602,7 @@ fn classify(
             String::new(),
             1u64,
         ),
-        "wado_rendered" => (
+        "wado_rendered" | "wado_frame_rendered" => (
             "R",
             "110103",
             uid(0),

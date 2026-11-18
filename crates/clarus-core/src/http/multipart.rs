@@ -172,7 +172,7 @@ impl<R: Read> MultipartParser<R> {
                         ));
                     }
                     match self.find_delimiter(&self.buf[..n]) {
-                        Some((end_idx, closing)) => {
+                        Some((end_idx, closing, pad)) => {
                             if end_idx == 0 {
                                 // Delimiter at the very start: no data to emit.
                                 if closing {
@@ -181,15 +181,18 @@ impl<R: Read> MultipartParser<R> {
                                 }
                                 self.state = State::PartHead;
                                 self.hdr.clear();
-                                self.consume_tail_into(n, self.delim.len());
+                                self.consume_tail_into(n, self.delim.len() + pad);
                                 continue;
                             }
                             // Emit the data before the delimiter; defer the
                             // delimiter action to the next call. Keep whatever
                             // follows the delimiter (boundary CRLF + next part
                             // headers) in the hold window. For a closing
-                            // delimiter the trailing bytes are irrelevant.
-                            self.consume_tail_into(n, end_idx + self.delim.len());
+                            // delimiter the trailing bytes are irrelevant. The
+                            // transport padding is skipped here too, or it
+                            // would become the start of the next part's
+                            // headers.
+                            self.consume_tail_into(n, end_idx + self.delim.len() + pad);
                             self.pending = if closing {
                                 Pending::Closing
                             } else {
@@ -198,10 +201,15 @@ impl<R: Read> MultipartParser<R> {
                             return Ok(MultipartEvent::Data(&self.buf[..end_idx]));
                         }
                         None => {
-                            // Hold back the delimiter plus its 2-byte closing/
-                            // separator lookahead so a boundary that straddles
-                            // a read boundary is never split or misclassified.
-                            let carry = self.delim.len() + 2;
+                            // No delimiter resolved in this window. Hold back
+                            // from the last byte that could still START one,
+                            // together with whatever transport padding already
+                            // followed it: RFC 2046 Section 5.1.1 allows any
+                            // amount of linear whitespace between the boundary
+                            // text and the CRLF, so a fixed `delim.len() + 2`
+                            // carry dropped padding that crossed the read and
+                            // left the parts fused.
+                            let carry = self.unresolved_delimiter_carry(&self.buf[..n]);
                             let emit = n.saturating_sub(carry);
                             if emit > 0 {
                                 self.stash_hold(n, carry);
@@ -215,7 +223,20 @@ impl<R: Read> MultipartParser<R> {
                                     "multipart: EOF before closing delimiter",
                                 ));
                             }
-                            self.stash_hold(n, carry);
+                            // The whole (short) window is still a live
+                            // candidate. That is normal while the window is
+                            // shorter than the lookahead (a one-byte reader,
+                            // before the head has arrived); it is only a real
+                            // stall once the window is FULL, because then no
+                            // read can add the bytes that would resolve it.
+                            if n < self.buf.len() {
+                                self.stash_hold(n, carry);
+                                continue;
+                            }
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "multipart: boundary candidate exceeds the read buffer",
+                            ));
                         }
                     }
                 }
@@ -227,22 +248,76 @@ impl<R: Read> MultipartParser<R> {
     /// so scanning always makes forward progress. Returns the number of bytes
     /// available (0 only when there is nothing left and no new body data).
     fn fill(&mut self) -> io::Result<usize> {
-        let mut used = 0usize;
-        if !self.hold.is_empty() {
-            let n = self.hold.len().min(self.buf.len());
-            self.buf[..n].copy_from_slice(&self.hold[..n]);
-            self.hold.drain(..n);
-            used = n;
+        // Stage the held tail WITHOUT draining it: the drain is the commit
+        // point and must not run before the body read has a definite outcome.
+        // Draining first lost a boundary split across two reads when the
+        // second read failed recoverably (Interrupted/WouldBlock/TimedOut):
+        // the next fill saw an empty hold and overwrote the staged bytes.
+        let staged = self.hold.len().min(self.buf.len());
+        if staged > 0 {
+            self.buf[..staged].copy_from_slice(&self.hold[..staged]);
         }
-        if used < self.buf.len() && !self.eof {
-            let n = self.body.read(&mut self.buf[used..])?;
+        let mut used = staged;
+        if staged < self.buf.len() && !self.eof {
+            // `Interrupted` is a retry signal, not a failure (the kernel was
+            // woken by a signal before delivering anything), so retry it in
+            // place. WouldBlock/TimedOut surface to the caller with `hold`
+            // still intact, so the retry re-stages the same tail.
+            let n = loop {
+                match self.body.read(&mut self.buf[staged..]) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            };
             if n == 0 {
                 self.eof = true;
             } else {
                 used += n;
             }
         }
+        self.hold.drain(..staged);
         Ok(used)
+    }
+
+    /// How many trailing bytes of `buf` must survive the next read.
+    ///
+    /// Two things can still turn into a delimiter: a partial one that begins in
+    /// the final `delim.len() - 1` bytes, and a COMPLETE boundary whose CRLF
+    /// has not arrived yet. In the second case the transport padding after the
+    /// boundary text belongs to the delimiter - RFC 2046 Section 5.1.1 allows
+    /// any amount - so it must be held too. Skipping that left a fixed two-byte
+    /// lookahead, which emitted the padding as body and fused the parts.
+    ///
+    /// A candidate whose suffix is already known-INVALID (`--boundaryX...`,
+    /// suffix neither `--` nor `\r\n`) can never become a delimiter, so it is
+    /// never retained: retaining it pinned the carry to the whole window and
+    /// forced a full rescan on every one-byte read until the window filled.
+    fn unresolved_delimiter_carry(&self, buf: &[u8]) -> usize {
+        let len = buf.len();
+        // A delimiter needs its `--`, its boundary text, and at least the two
+        // bytes that decide closing `--` vs the separator CRLF.
+        let lookahead = self.delim.len().saturating_add(2);
+        let mut carry = len.min(lookahead);
+        for i in 0..len {
+            if !buf[i..].starts_with(&self.delim) {
+                continue;
+            }
+            let after = i + self.delim.len();
+            let pad = Self::transport_padding_len(buf, after);
+            let bstart = after + pad;
+            // A rejected suffix (`--boundaryX...`) is body, not a delimiter,
+            // so it must not pin the window open.
+            let decidable = buf.len() >= bstart + 2;
+            let rejectable = decidable
+                && !buf[bstart..].starts_with(b"--")
+                && !buf[bstart..].starts_with(b"\r\n");
+            if rejectable {
+                continue;
+            }
+            carry = carry.max(len - i);
+        }
+        carry
     }
 
     /// Keep the last `keep` bytes of `self.buf[..n]` in the hold window so a
@@ -267,12 +342,23 @@ impl<R: Read> MultipartParser<R> {
     }
 
     /// Find the first `--boundary` (preamble variant, no CRLF prefix).
+    ///
+    /// RFC 2046 Section 5.1.1 defines a delimiter as a line that STARTS with
+    /// `--boundary`, so the preamble's own text is allowed to contain the
+    /// boundary bytes anywhere except at a line start. Matching them mid-line
+    /// split a preamble of, say, `note--b` into a spurious empty part and
+    /// shifted every following part by one.
     fn find_first_boundary(&self, buf: &[u8]) -> Option<usize> {
         // delim = \r\n -- boundary ; the boundary text is delim[4..].
         let boundary = &self.delim[4..];
         let mut i = 0usize;
         while i + 2 + boundary.len() <= buf.len() {
-            if &buf[i..i + 2] == b"--" && &buf[i + 2..i + 2 + boundary.len()] == boundary {
+            // Only input start or right after CRLF is a line start.
+            let at_line_start = i == 0 || (i >= 2 && &buf[i - 2..i] == b"\r\n");
+            if at_line_start
+                && &buf[i..i + 2] == b"--"
+                && &buf[i + 2..i + 2 + boundary.len()] == boundary
+            {
                 return Some(i);
             }
             i += 1;
@@ -280,14 +366,40 @@ impl<R: Read> MultipartParser<R> {
         None
     }
 
+    /// Length of the transport padding that may follow a boundary.
+    ///
+    /// RFC 2046 Section 5.1.1 allows linear whitespace after the boundary
+    /// text and before the terminating CRLF. Without skipping it a separator
+    /// written as `\r\n--b \t\r\n` was not recognised, and the two parts
+    /// around it fused into one.
+    fn transport_padding_len(buf: &[u8], from: usize) -> usize {
+        let mut n = 0usize;
+        while let Some(b) = buf.get(from + n) {
+            if *b == b' ' || *b == b'\t' {
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        n
+    }
+
     /// Find the full delimiter in `buf` (line-start `\r\n--boundary`).
-    /// Returns `(index_of_CR, closing)`. `closing` true when `--boundary--`.
+    /// Returns `(index_of_CR, closing, padding)`. `closing` true when
+    /// `--boundary--`; `padding` is the transport whitespace after the
+    /// boundary text.
     ///
     /// A match is only reported when enough lookahead is available to decide
     /// between a closing `--` and a part-separating CRLF. Without it (the
     /// delimiter at the very end of the buffer) we defer: the caller's hold
     /// window re-examines it once more bytes arrive.
-    fn find_delimiter(&self, buf: &[u8]) -> Option<(usize, bool)> {
+    ///
+    /// Transport padding (spaces/tabs) is permitted between the boundary text
+    /// and whatever follows it (RFC 2046 Section 5.1.1), so it is skipped
+    /// before that decision rather than being read as body content. Its LENGTH
+    /// is returned so the caller can skip those bytes too when it resumes at
+    /// the next part's headers.
+    fn find_delimiter(&self, buf: &[u8]) -> Option<(usize, bool, usize)> {
         let d = &self.delim[..];
         if buf.len() < d.len() {
             return None;
@@ -295,12 +407,15 @@ impl<R: Read> MultipartParser<R> {
         let mut i = 0usize;
         while i + d.len() <= buf.len() {
             if &buf[i..i + d.len()] == d {
-                let bstart = i + d.len();
+                let pad = Self::transport_padding_len(buf, i + d.len());
+                let bstart = i + d.len() + pad;
                 // Need at least 2 bytes of lookahead to judge closing `--`
                 // vs. the separator CRLF.
                 if buf.len() < bstart + 2 {
                     // Defer: we cannot tell yet. The caller keeps the window
-                    // and re-examines it when more bytes arrive.
+                    // and re-examines it when more bytes arrive; the padding
+                    // already seen is reported separately by
+                    // `deferred_delimiter_span` so it is not emitted as body.
                     return None;
                 }
                 let closing = buf[bstart..].starts_with(b"--");
@@ -309,7 +424,7 @@ impl<R: Read> MultipartParser<R> {
                 // begin with the boundary prefix).
                 let sep = buf[bstart..].starts_with(b"\r\n");
                 if closing || sep {
-                    return Some((i, closing));
+                    return Some((i, closing, pad));
                 }
                 // A boundary-prefixed run INSIDE the body: keep scanning. This
                 // used to `return None`, which told the caller the delimiter
@@ -518,12 +633,196 @@ mod tests {
         assert_eq!(out[0].1, b"ABCD");
     }
 
+    /// Boundary bytes mid-line in the preamble are NOT a delimiter.
+    ///
+    /// RFC 2046 Section 5.1.1 defines a delimiter as a line STARTING with
+    /// `--boundary`, which is exactly what lets a preamble carry arbitrary
+    /// text. A mid-line match makes the preamble's REMAINDER the first part's
+    /// header block, so the parse starts from the wrong offset and the parts
+    /// that follow are reached with the wrong headers - which is how a real
+    /// preamble (`This is a multi-part message--b in the middle`) turned into
+    /// an extra part followed by a truncated one.
+    #[test]
+    fn a_boundary_in_the_middle_of_a_preamble_line_is_not_a_delimiter() {
+        // `--b` appears mid-line here; the real first boundary is the next line.
+        let body = b"preamble--b\r\n--b\r\nContent-Type: application/dicom\r\n\r\nAAAA\r\n--b\r\nContent-Type: application/dicom\r\n\r\nBBBB\r\n--b--\r\n";
+        let out = collect(body, b"b");
+        assert_eq!(
+            out.len(),
+            2,
+            "both real parts must be parsed, with no spurious one"
+        );
+        assert_eq!(out[0].1, b"AAAA");
+        assert_eq!(out[1].1, b"BBBB");
+    }
+
+    /// Transport padding after a boundary must still split the parts.
+    ///
+    /// RFC 2046 Section 5.1.1 permits linear whitespace between the boundary
+    /// text and the terminating CRLF. A separator written as `\r\n--b \t\r\n`
+    /// was not recognised, so the two parts fused into one.
+    #[test]
+    fn a_padded_delimiter_still_splits_parts() {
+        // Transport padding is not limited to two bytes (RFC 2046 Section
+        // 5.1.1 allows any amount of linear whitespace). Driving the parse
+        // through a one-byte reader makes the hold window matter: the padding
+        // crosses a read boundary, so a fixed 2-byte carry loses it.
+        let body = b"--b\r\nContent-Type: application/dicom\r\n\r\nAAAA\r\n--b \t  \t  \r\nContent-Type: application/dicom\r\n\r\nBBBB\r\n--b--\r\n";
+        let out = collect_reader(ByteReader(body), b"b");
+        assert_eq!(out.len(), 2, "a padded separator is still a separator");
+        assert_eq!(out[0].1, b"AAAA");
+        assert_eq!(out[1].1, b"BBBB", "the second part must not fuse");
+    }
+
+    #[test]
+    fn a_whole_body_read_also_splits_on_long_padding() {
+        let body = b"--b\r\nContent-Type: application/dicom\r\n\r\nAAAA\r\n--b    \r\nContent-Type: application/dicom\r\n\r\nBBBB\r\n--b--\r\n";
+        let out = collect(body, b"b");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].1, b"BBBB");
+    }
+
     #[test]
     fn boundary_split_across_reads() {
         let full = b"--b\r\nContent-Type: application/dicom\r\n\r\nDATA\r\n--b--\r\n";
         let out = collect_reader(ByteReader(full), b"b");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1, b"DATA");
+    }
+
+    /// A one-byte source that returns `WouldBlock` once on its `block_at`-th
+    /// read call, then resumes. Forces the hold window to matter: the blocked
+    /// read is always a `fill` whose `hold` is non-empty (a one-byte reader
+    /// stashes a tail after every fill).
+    struct FlakyReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        block_at: usize,
+        calls: usize,
+        blocked: bool,
+    }
+    impl Read for FlakyReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == self.block_at && !self.blocked {
+                self.blocked = true;
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            if self.pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    /// A recoverable error must not lose the hold window.
+    ///
+    /// `fill` used to copy the held tail into `buf` and DRAIN it before
+    /// reading from the body, so a `WouldBlock` on the read left an empty hold
+    /// and the next call overwrote the staged bytes. A boundary that straddled
+    /// the two reads was then lost and the parts fused. The hold window exists
+    /// precisely to catch a split boundary - losing it defeats the window.
+    #[test]
+    fn a_recoverable_error_does_not_lose_the_hold_window() {
+        let body = b"--b\r\nContent-Type: application/dicom\r\n\r\nAAAABBBB\r\n--b\r\nContent-Type: application/octet-stream\r\n\r\nCCCC\r\n--b--\r\n";
+
+        let mut p = MultipartParser::new(
+            FlakyReader {
+                data: body,
+                pos: 0,
+                block_at: 45,
+                calls: 0,
+                blocked: false,
+            },
+            b"b",
+        )
+        .expect("parser");
+
+        let mut out = Vec::new();
+        let mut cur: Option<PartHeader> = None;
+        let mut data = Vec::new();
+        loop {
+            match p.next_event() {
+                // WouldBlock is recoverable: the caller retries the SAME
+                // parser, so the hold window must have survived the error.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("unexpected error: {e}"),
+                Ok(MultipartEvent::Part(h)) => {
+                    if let Some(prev) = cur.take() {
+                        out.push((prev.content_type().to_vec(), std::mem::take(&mut data)));
+                    }
+                    cur = Some(h);
+                }
+                Ok(MultipartEvent::Data(d)) => data.extend_from_slice(d),
+                Ok(MultipartEvent::End) => break,
+            }
+        }
+        if let Some(prev) = cur.take() {
+            out.push((prev.content_type().to_vec(), std::mem::take(&mut data)));
+        }
+
+        assert_eq!(out.len(), 2, "a recoverable error must not fuse the parts");
+        assert_eq!(out[0].1, b"AAAABBBB");
+        assert_eq!(out[1].1, b"CCCC");
+    }
+
+    /// A5(a): padding longer than the read buffer must not hang the parser.
+    ///
+    /// The window can fill with a single delimiter candidate whose padding has
+    /// not ended yet. Retaining all of it left `fill` with no room, so the
+    /// event loop spun forever on untrusted input. The parser now either
+    /// parses or reports the size limit - it must RETURN either way.
+    #[test]
+    fn padding_longer_than_the_read_buffer_does_not_hang() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--b\r\nContent-Type: application/dicom\r\n\r\nAAAA\r\n--b");
+        body.extend_from_slice(&vec![b' '; READ_BUF + 64]);
+        body.extend_from_slice(b"\r\nContent-Type: application/dicom\r\n\r\nBBBB\r\n--b--\r\n");
+
+        // A bounded number of events: a hang would never return at all, and an
+        // infinite `Data` stream would trip the cap.
+        let mut p = MultipartParser::new(&body[..], b"b").expect("parser");
+        let mut events = 0usize;
+        let outcome = loop {
+            events += 1;
+            assert!(events < 100_000, "the parser must terminate");
+            match p.next_event() {
+                Ok(MultipartEvent::End) => break Ok(()),
+                Ok(_) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        if let Err(e) = outcome {
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidData,
+                "a stall must surface as a defined size limit, got {e}"
+            );
+        }
+    }
+
+    /// A5(b): a rejected `--boundaryX` prefix must not pin the window open.
+    ///
+    /// Its suffix is already known-invalid, so it is body - but keeping it
+    /// made the carry equal the whole window, `emit` zero, and the loop spin
+    /// before the later REAL delimiter could be reached.
+    #[test]
+    fn a_rejected_boundary_prefix_does_not_stall_the_parser() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--b\r\nContent-Type: application/dicom\r\n\r\n");
+        // A boundary-looking run with an invalid suffix, then more than one
+        // buffer of body, then the real separator.
+        body.extend_from_slice(b"\r\n--bX");
+        body.extend_from_slice(&vec![b'z'; READ_BUF + 128]);
+        body.extend_from_slice(
+            b"\r\n--b\r\nContent-Type: application/dicom\r\n\r\nBBBB\r\n--b--\r\n",
+        );
+
+        let out = collect_reader(ByteReader(&body), b"b");
+        assert_eq!(out.len(), 2, "the later real delimiter must still be found");
+        assert_eq!(out[1].1, b"BBBB");
     }
 
     #[test]
@@ -606,5 +905,38 @@ mod tests {
         assert_eq!(out[0].1, b"A");
         assert_eq!(out[1].1, b"B");
         assert_eq!(out[1].0, b"application/octet-stream");
+    }
+
+    /// A boundary-looking run whose suffix is already known-invalid
+    /// (`--boundaryX...`) is body, not a delimiter, so the carry window must
+    /// not retain it. The generous guard kept it, returning a carry equal to
+    /// the whole buffer and forcing a rescan per byte until the window filled.
+    #[test]
+    fn a_rejected_candidate_is_not_retained_in_the_carry_window() {
+        let p = MultipartParser::new(&b""[..], b"boundary").expect("parser");
+        let buf = b"\r\n--boundaryXrest";
+        let carry = p.unresolved_delimiter_carry(buf);
+        assert!(
+            carry < buf.len(),
+            "a rejectable candidate is body and must not pin the window; carry={carry}, len={}",
+            buf.len()
+        );
+    }
+
+    /// A rejected candidate must not pin the window, so a later real
+    /// delimiter is still reached through a one-byte reader (the shape that
+    /// made the generous path rescan the whole window per byte).
+    #[test]
+    fn a_rejected_candidate_still_reaches_the_later_delimiter() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--b\r\nContent-Type: application/dicom\r\n\r\n");
+        body.extend_from_slice(b"\r\n--bX");
+        body.extend_from_slice(&vec![b'z'; READ_BUF + 128]);
+        body.extend_from_slice(
+            b"\r\n--b\r\nContent-Type: application/dicom\r\n\r\nBBBB\r\n--b--\r\n",
+        );
+        let out = collect_reader(ByteReader(&body), b"b");
+        assert_eq!(out.len(), 2, "the later real delimiter must still be found");
+        assert_eq!(out[1].1, b"BBBB");
     }
 }

@@ -229,10 +229,10 @@ impl DicomParser for DicomRsParser {
                     meta.patient_id_issuer = opt_str(val, cs).filter(|s| !s.is_empty());
                 }
                 tags::PATIENT_BIRTH_DATE => {
-                    meta.patient_birth_date = opt_str(val, cs);
+                    meta.patient_birth_date = opt_str_keep_empty(val, cs);
                 }
                 tags::PATIENT_SEX => {
-                    meta.patient_sex = opt_str(val, cs);
+                    meta.patient_sex = opt_str_keep_empty(val, cs);
                 }
                 tags::RESPONSIBLE_PERSON => {
                     // PN (0010,2297); empty/absent value stored as None (the
@@ -251,10 +251,10 @@ impl DicomParser for DicomRsParser {
                     meta.study_description = opt_str(val, cs);
                 }
                 tags::ACCESSION_NUMBER => {
-                    meta.accession_number = opt_str(val, cs);
+                    meta.accession_number = opt_str_keep_empty(val, cs);
                 }
                 tags::REFERRING_PHYSICIAN => {
-                    meta.referring_physician = opt_str(val, cs);
+                    meta.referring_physician = opt_str_keep_empty(val, cs);
                 }
                 tags::INSTITUTION_NAME => {
                     meta.institution_name = opt_str(val, cs);
@@ -336,6 +336,16 @@ impl DicomParser for DicomRsParser {
                 }
                 tags::COLUMNS => {
                     meta.cols = opt_u16(val);
+                }
+                tags::NUMBER_OF_FRAMES => {
+                    // IS: ASCII digits, so it parses as text. A non-numeric or
+                    // absent value leaves `None`, which the thumbnail routes
+                    // read as "single frame" - the behaviour that predates the
+                    // capture.
+                    meta.number_of_frames = opt_str(val, cs).and_then(|s| s.trim().parse().ok());
+                }
+                tags::IMAGE_TYPE => {
+                    meta.image_type = opt_cs_list(val, cs);
                 }
                 tags::TRANSFER_SYNTAX_UID => {
                     // (0002,0010) - meta-header tag, always ASCII
@@ -2459,8 +2469,44 @@ fn opt_str(value: &[u8], charset: Option<&str>) -> Option<String> {
     Some(decode_dicom_string(trimmed, charset))
 }
 
+/// Like [`opt_str`], but a PRESENT attribute of zero Value Length is kept as
+/// `Some("")` instead of collapsed to `None`.
+///
+/// PS3.18 F.2.5 makes "present but empty" a distinct statement from "absent":
+/// the JSON renderer states the former as `{"vr":"VR"}` and the latter by
+/// omitting the key. Collapsing both to `None` at parse time erased the
+/// distinction before QIDO could state it, so the four identity attributes the
+/// owner verified (AccessionNumber, ReferringPhysicianName, PatientBirthDate,
+/// PatientSex) go through this helper while the remaining search keys keep the
+/// omit-empty discipline.
+fn opt_str_keep_empty(value: &[u8], charset: Option<&str>) -> Option<String> {
+    let trimmed = trim_trailing(value);
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    Some(decode_dicom_string(trimmed, charset))
+}
+
 fn bytes_to_opt_string(value: &[u8], charset: Option<&str>) -> Option<String> {
     opt_str(value, charset)
+}
+
+/// Split a multi-valued CS element into its backslash-separated values.
+///
+/// PS3.5 Section 6.4 separates the values of a multi-valued element with `\`,
+/// and a value may not itself contain that byte for the CS VR, so a plain
+/// split is exact. Trailing padding is trimmed from the whole element first:
+/// it belongs to the last value only, and trimming afterwards would keep an
+/// empty final value.
+fn opt_cs_list(value: &[u8], charset: Option<&str>) -> Vec<String> {
+    let trimmed = trim_trailing(value);
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    trimmed
+        .split(|b| *b == b'\\')
+        .map(|part| decode_dicom_string(trim_trailing(part), charset))
+        .collect()
 }
 
 /// Parsed components of a DICOM PersonName (PS3.5 Section 6.2.1).
@@ -2811,11 +2857,14 @@ impl DicomRsParser {
 
             let mut value = Vec::new();
             if !Self::write_element_json_native(&mut value, val, vr, cs, syntax, 0)? {
-                // Zero-length scalar value: omit the attribute entirely.
-                // Emitting `"Value":[]` makes dicom-microscopy-viewer produce
-                // an empty array, which crashes viewers that expect a string
-                // or number (e.g. Slim's date/name parsers).
-                continue;
+                // PS3.18 F.2.5: a present attribute of zero Value Length is
+                // preserved as an attribute object carrying NO Value /
+                // BulkDataURI / InlineBinary member - `{"vr":"VR"}`. Omitting
+                // the key asserted the attribute was ABSENT, which is a
+                // different statement from "present and empty".
+                value.extend_from_slice(b"{\"vr\":\"");
+                value.extend_from_slice(vr.as_bytes());
+                value.extend_from_slice(b"\"}");
             }
             let mut tagged = Vec::with_capacity(value.len() + 8);
             tagged.push(b'"');
@@ -2932,7 +2981,15 @@ impl DicomRsParser {
                         v.push(b',');
                     }
                     first = false;
-                    push_json_str_native(&mut v, p);
+                    if p.is_empty() {
+                        // PS3.18 F.2.5: an empty value INSIDE a multi-valued
+                        // attribute is a null array element, not an empty
+                        // string - `""` asserts one value exists and that it
+                        // is the empty string, a different statement.
+                        v.extend_from_slice(b"null");
+                    } else {
+                        push_json_str_native(&mut v, p);
+                    }
                 }
                 v.push(b']');
                 write_tag_value_object_native(out, vr, &v);
@@ -4647,7 +4704,54 @@ mod tests {
         assert!(s.contains("\"vr\":\"PN\""), "PN vr: {s}");
     }
 
-    // -- native (serde-free) renderer byte-parity ----------
+    /// PS3.18 F.2.5: a present attribute of zero Value Length is preserved as
+    /// an attribute object with NO Value member, and a multi-valued attribute
+    /// with an empty component renders that component as `null`.
+    #[test]
+    fn empty_attributes_render_as_vr_only_objects() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0008, 0x0050, b"SH", b"") // AccessionNumber, present + empty
+            .add_element(0x0008, 0x0090, b"PN", b"") // ReferringPhysicianName, present + empty
+            .add_element(0x0010, 0x0030, b"DA", b"") // PatientBirthDate, present + empty
+            .add_element(0x0010, 0x0040, b"CS", b"") // PatientSex, present + empty
+            .add_element(0x0010, 0x0010, b"PN", b"EMPTY^TEST") // populated control
+            .build();
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(s.contains("\"00080050\":{\"vr\":\"SH\"}"), "{s}");
+        assert!(s.contains("\"00080090\":{\"vr\":\"PN\"}"), "{s}");
+        assert!(s.contains("\"00100030\":{\"vr\":\"DA\"}"), "{s}");
+        assert!(s.contains("\"00100040\":{\"vr\":\"CS\"}"), "{s}");
+        // The populated control still renders its Value array.
+        assert!(s.contains("\"Alphabetic\":\"EMPTY^TEST\""), "{s}");
+        // A genuinely absent tag stays absent.
+        assert!(
+            !s.contains("00100020"),
+            "absent PatientID must stay absent: {s}"
+        );
+    }
+
+    /// PS3.18 F.2.5: an empty component INSIDE a multi-valued attribute is a
+    /// null array element, not an empty string.
+    #[test]
+    fn a_multi_valued_string_with_an_empty_component_renders_null() {
+        // "bar\\foo" with TWO backslashes = ["bar", "", "foo"].
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0008, 0x0008, b"CS", b"bar\\\\foo")
+            .build();
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            s.contains("\"00080008\":{\"Value\":[\"bar\",null,\"foo\"],\"vr\":\"CS\"}"),
+            "{s}"
+        );
+    }
 
     /// Workspace-relative directory holding the committed real DICOM corpus
     /// (`tests/**/*.dcm`, 104 files at capture time).

@@ -29,6 +29,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Which PersonName attribute an n-gram belongs to.
 ///
@@ -112,11 +113,52 @@ pub fn fuzzy_normalize(name: &str) -> String {
         .collect()
 }
 
+/// Number of striped locks. 64 is a compromise: enough that unrelated
+/// n-gram/day files rarely collide, few enough that the table is 64 `Arc`s.
+const NGRAM_LOCK_STRIPES: usize = 64;
+
+/// Process-wide striped locks, one per `hash(kind, ngram, day) % 64`.
+///
+/// A fixed table (not a per-file map) because the job is to serialise the
+/// repair-then-append of ONE file, and a fixed table does that without
+/// growing unboundedly with the number of keys ever seen. Same shape as the
+/// UPS store's `uid_lock`. The table is preallocated on first use; looking up
+/// a stripe and taking the mutex allocates nothing.
+pub fn ngram_lock(kind: NameKind, ngram: &str, day: &str) -> Arc<Mutex<()>> {
+    static STRIPES: OnceLock<Vec<Arc<Mutex<()>>>> = OnceLock::new();
+    let stripes = STRIPES.get_or_init(|| {
+        (0..NGRAM_LOCK_STRIPES)
+            .map(|_| Arc::new(Mutex::new(())))
+            .collect()
+    });
+    // FNV-1a over the (kind, ngram, day) identity; the same cheap mix the UPS
+    // store uses. The distribution only has to beat "every key in one stripe".
+    let mut h: u32 = 0x811c_9dc5;
+    h ^= kind as u32;
+    h = h.wrapping_mul(0x0100_0193);
+    for &b in ngram.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    for &b in day.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    Arc::clone(&stripes[(h as usize) % NGRAM_LOCK_STRIPES])
+}
+
 /// Open (or create) the append-only handle for one n-gram / day `.idx`.
 ///
 /// `ngram` is a hex key from [`name_ngrams`]; it is a pure hex string (2 chars
 /// per byte) so it never contains a path separator. The empty n-gram is
 /// rejected because it would collide with the root bucket.
+///
+/// The torn tail is repaired BEFORE the handle is handed out. Rows here are
+/// `study_uid\n`, so a crash mid-append - or an ENOSPC that wrote a prefix -
+/// leaves an unterminated suffix; appending onto it would fuse the old
+/// fragment and the new UID into one row that names no study. This writer
+/// already opens a fresh handle per append, so the repair needs no extra
+/// coordination with a held handle: nothing else in this process holds one.
 fn open_appender(dir: &Path, kind: NameKind, ngram: &str, day: &str) -> io::Result<File> {
     if ngram.is_empty() {
         return Err(io::Error::new(
@@ -128,6 +170,9 @@ fn open_appender(dir: &Path, kind: NameKind, ngram: &str, day: &str) -> io::Resu
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Repair runs before the handle exists, so the truncate cannot race a
+    // write this process is still making on this path.
+    super::sop_owner::repair_torn_newline_tail(&path)?;
     OpenOptions::new().create(true).append(true).open(&path)
 }
 
@@ -149,6 +194,14 @@ pub fn append(
     study_uid: &str,
     day: &str,
 ) -> io::Result<()> {
+    // Hold the file's stripe across repair + append: two concurrent appends
+    // for the same n-gram/day could both see a torn tail, compute the same
+    // truncation point, and have the second repair cut off the first's freshly
+    // appended row. One stripe serialises the whole read-modify-append.
+    let stripe = ngram_lock(kind, ngram, day);
+    let _guard = stripe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut file = open_appender(dir, kind, ngram, day)?;
     // ONE write. Writing the uid and the newline separately opened the window
     // this file's whole format depends on being closed: two appenders could
@@ -296,9 +349,111 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// A torn suffix must be repaired before the next UID is appended.
+    ///
+    /// A crash (or an ENOSPC that wrote a prefix) leaves an unterminated
+    /// fragment. Appending onto it fuses the fragment and the new UID into one
+    /// row, and the reader returns that concatenation as a study UID that
+    /// exists nowhere.
+    #[test]
+    fn a_torn_suffix_is_repaired_before_the_next_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = "20260811";
+        append(dir.path(), NameKind::Patient, "abcd", "1.2.3", day).expect("seed");
+        let path = file_path(dir.path(), NameKind::Patient, "abcd", day);
+        // An unterminated suffix is on disk before the next append runs.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            f.write_all(b"1.2.").expect("torn write");
+        }
+
+        append(dir.path(), NameKind::Patient, "abcd", "9.8.7", day).expect("append");
+
+        let uids = read_study_uids(dir.path(), NameKind::Patient, "abcd", day).expect("read");
+        assert_eq!(
+            uids,
+            vec!["1.2.3".to_string(), "9.8.7".to_string()],
+            "the fragment must not be fused onto the new UID"
+        );
+    }
+
     #[test]
     fn empty_ngram_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(append(dir.path(), NameKind::Patient, "", "1.2.3", "20260811").is_err());
+    }
+
+    /// Concurrent appends for the SAME n-gram/day must serialize repair+append:
+    /// the final file holds exactly the seed row plus one row per writer, every
+    /// row newline-terminated - no lost row, no fused row.
+    ///
+    /// The fixture is a torn file with a LARGE unterminated tail: both writers
+    /// read the whole tail during repair, which widens the window in which one
+    /// writer's truncate can land after the other's append. Without the stripe
+    /// lock that interleaving drops a row (see the falsification note).
+    #[test]
+    fn concurrent_appends_never_lose_or_fuse_rows() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kind = NameKind::Patient;
+        let gram = "d0b8d0b2d0b0";
+        let day = "20240115";
+        let path = file_path(dir.path(), kind, gram, day);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+
+        // One complete seed row + a large unterminated tail (no trailing `\n`).
+        let torn_tail = vec![b'x'; 8192];
+        let mut seed = b"seed\n".to_vec();
+        seed.extend_from_slice(&torn_tail);
+
+        const WRITERS: usize = 8;
+        const ITERATIONS: usize = 40;
+
+        for _ in 0..ITERATIONS {
+            std::fs::write(&path, &seed).expect("seed torn");
+            let barrier = Arc::new(Barrier::new(WRITERS));
+            let mut handles = Vec::new();
+            for i in 0..WRITERS {
+                let dir = dir.path().to_path_buf();
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    append(&dir, kind, gram, &format!("2.25.{i}"), day).expect("append");
+                }));
+            }
+            for h in handles {
+                h.join().expect("join");
+            }
+
+            // A serialized run keeps the seed row, drops the torn tail, and
+            // appends exactly one row per writer, all newline-terminated.
+            let data = std::fs::read(&path).expect("read");
+            assert_eq!(
+                data.last(),
+                Some(&b'\n'),
+                "the file must end with a newline-terminated row"
+            );
+            let mut rows: Vec<String> = String::from_utf8(data)
+                .expect("utf8")
+                .split('\n')
+                .filter(|r| !r.is_empty())
+                .map(str::to_string)
+                .collect();
+            rows.sort();
+            let mut expected: Vec<String> = (0..WRITERS)
+                .map(|i| format!("2.25.{i}"))
+                .chain(std::iter::once("seed".to_string()))
+                .collect();
+            expected.sort();
+            assert_eq!(
+                rows, expected,
+                "every appended row must survive, none fused or duplicated"
+            );
+        }
     }
 }

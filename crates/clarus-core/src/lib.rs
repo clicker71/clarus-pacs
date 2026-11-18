@@ -38,6 +38,7 @@
 pub mod auth;
 pub mod cbor;
 pub mod commitment;
+mod durable;
 pub mod ffi;
 pub mod hash;
 pub mod http;

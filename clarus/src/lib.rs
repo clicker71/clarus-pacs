@@ -33,6 +33,7 @@ pub mod migration_worker;
 pub mod push;
 pub mod rebuild_worker;
 pub mod route_classify;
+pub mod series_owner;
 pub mod serve;
 pub mod shadow;
 pub mod sse_fanout;

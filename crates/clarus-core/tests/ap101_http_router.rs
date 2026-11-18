@@ -149,3 +149,30 @@ fn qa_root_matches_flagged_and_alloc_zero() {
         "QA root matching must be zero-allocation (borrowed segment swap)"
     );
 }
+
+/// A doubled slash is rejected before the method dispatch: `windows(2)` is a
+/// pure byte scan over the borrowed path, so the 400 path is zero-allocation.
+#[test]
+fn doubled_slash_rejection_alloc_zero() {
+    let (zero_alloc, ()) = allocate_env(|| {
+        // DELETE /dicomweb/workitems//1.2.3 must not collapse onto the UID.
+        assert!(matches!(
+            match_route(Method::Delete, b"/dicomweb/workitems//1.2.3"),
+            RouterOutcome::BadUid
+        ));
+        assert!(matches!(
+            match_route(Method::Get, b"/dicomweb/studies//series"),
+            RouterOutcome::BadUid
+        ));
+        // A single trailing slash is not a doubled slash: it still routes.
+        assert!(matches!(
+            match_route(Method::Get, b"/dicomweb/"),
+            RouterOutcome::Match(_)
+        ));
+    });
+
+    assert!(
+        zero_alloc,
+        "doubled-slash rejection must be zero-allocation"
+    );
+}

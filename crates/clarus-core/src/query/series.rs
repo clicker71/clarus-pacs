@@ -32,6 +32,13 @@ use crate::manifest::{AttrValue, InstanceRecord, Manifest, SeriesRecord};
 pub struct SeriesFilter {
     /// SeriesInstanceUID (0020,000E) - exact match.
     pub series_instance_uid: Option<String>,
+    /// SeriesNumber (0020,0011) - glob over the numeric render, the same
+    /// semantics as [`InstanceFilter::instance_number`].
+    ///
+    /// PS3.18 Table 10.6.1-5 lists SeriesNumber as a Series-level matching key.
+    /// It was previously a sort key only, so `SeriesNumber=2` returned every
+    /// series in the study.
+    pub series_number: Option<String>,
     /// Modality (0008,0060) - comma-separated list, any element exact.
     pub modality: Option<String>,
     /// SeriesDate (0008,0021) - exact match.
@@ -254,9 +261,16 @@ pub fn search_all_instances<'a>(
     // study route uses, so both routes agree on what a key means.
     let study_expected = study_filter.map(|f| f.build_expected());
     for manifest in manifests {
+        // `match_study_attrs_prebuilt` rather than `matches_prebuilt`: the
+        // expected map covers the attribute keys, but ModalitiesInStudy and
+        // OtherPatientIDs are matched by their own SET comparisons (their
+        // stored value lives in a dedicated field / a multi-valued key), so a
+        // gate that consults only the map ignores them. The previous gate also
+        // skipped the predicate entirely when the map was empty, which meant
+        // `?ModalitiesInStudy=CT` on the global `/instances` route returned
+        // every study's instances - strictly wider than the ask.
         if let (Some(sf), Some(expected)) = (study_filter, study_expected.as_ref())
-            && !expected.is_empty()
-            && !sf.matches_prebuilt(&manifest.study.attrs, expected)
+            && !crate::query::filter::match_study_attrs_prebuilt(sf, manifest, expected)
         {
             continue;
         }
@@ -312,6 +326,7 @@ impl SeriesFilter {
             || self.pps_start_time.is_some()
             || self.scheduled_procedure_step_id.is_some()
             || self.requested_procedure_id.is_some()
+            || self.series_number.is_some()
     }
 
     /// Whether a series' attribute vector satisfies the filter (allocation-free).
@@ -337,13 +352,13 @@ impl InstanceFilter {
     /// InstanceNumber as a glob over the decimal render (Table
     /// 10.6.1-5). A filter with no key matches every instance.
     pub fn matches(&self, attrs: &[(u32, AttrValue)]) -> bool {
-        if let Some(uid) = self.sop_instance_uid.as_deref()
-            && text_attr(attrs, crate::query::tag::SOP_INSTANCE_UID) != Some(uid)
+        if let Some(uids) = self.sop_instance_uid.as_deref()
+            && !uid_list_contains(uids, text_attr(attrs, crate::query::tag::SOP_INSTANCE_UID))
         {
             return false;
         }
         if let Some(cls) = self.sop_class_uid.as_deref()
-            && text_attr(attrs, crate::query::tag::SOP_CLASS_UID) != Some(cls)
+            && !uid_list_contains(cls, text_attr(attrs, crate::query::tag::SOP_CLASS_UID))
         {
             return false;
         }
@@ -356,10 +371,32 @@ impl InstanceFilter {
     }
 }
 
+/// Whether `have` is one member of a comma-separated UID list.
+///
+/// A UID key is single-valued in Table 10.6.1-5, but the value itself may be a
+/// list: `sopInstanceUid=1.2.3,1.2.4` asks for the union of those instances.
+/// Comparing the whole string against one stored UID matched neither member, so
+/// a legal list query returned nothing. A missing list or a missing attribute
+/// does not match.
+fn uid_list_contains(list: &str, have: Option<&str>) -> bool {
+    match have {
+        Some(have) => list.split(',').any(|member| member.trim() == have),
+        None => false,
+    }
+}
+
 /// Whether a series' attribute vector satisfies the filter (allocation-free).
 fn series_matches(filter: &SeriesFilter, attrs: &[(u32, AttrValue)]) -> bool {
-    if let Some(uid) = filter.series_instance_uid.as_deref()
-        && text_attr(attrs, crate::query::tag::SERIES_INSTANCE_UID) != Some(uid)
+    if let Some(uids) = filter.series_instance_uid.as_deref()
+        && !uid_list_contains(
+            uids,
+            text_attr(attrs, crate::query::tag::SERIES_INSTANCE_UID),
+        )
+    {
+        return false;
+    }
+    if let Some(num) = filter.series_number.as_deref()
+        && !series_number_matches(attrs, num)
     {
         return false;
     }
@@ -441,13 +478,18 @@ fn series_matches(filter: &SeriesFilter, attrs: &[(u32, AttrValue)]) -> bool {
     // (0040,0009, 0040,1001) - PS3.18 Table 10.6.1-5 types both as REQUIRED
     // series matching attributes - and match exactly, since they are SH
     // identifiers rather than patterns.
+    // PPS Start Date/Time are REQUIRED series matching keys (PS3.18 Table
+    // 10.6.1-5) and must support PS3.4 C.2.2.2.5 range matching, so they go
+    // through the shared DA/TM range predicates rather than the exact/LIKE
+    // helpers. SeriesDate/SeriesTime are NOT in that table and keep their
+    // exact/LIKE semantics above.
     if let Some(d) = filter.pps_start_date.as_deref()
-        && !date_attr_equals(attrs, crate::query::tag::PPS_START_DATE, d)
+        && !date_attr_range(attrs, crate::query::tag::PPS_START_DATE, d)
     {
         return false;
     }
     if let Some(t) = filter.pps_start_time.as_deref()
-        && !text_attr_like(attrs, crate::query::tag::PPS_START_TIME, t)
+        && !time_attr_range(attrs, crate::query::tag::PPS_START_TIME, t)
     {
         return false;
     }
@@ -528,8 +570,22 @@ fn numeric_attr(attrs: &[(u32, AttrValue)], tag: u32) -> Option<u64> {
 /// the mirror of the study-level SeriesNumber `Predicate::Glob` matching
 /// (Table 10.6.1-5). No heap: the render buffer is on the stack.
 fn instance_number_matches(attrs: &[(u32, AttrValue)], pat: &str) -> bool {
+    number_matches(attrs, crate::query::tag::INSTANCE_NUMBER, pat)
+}
+
+/// Whether the series number attribute (0020,0011) glob-matches `pat`.
+///
+/// The same number semantics as [`instance_number_matches`]: PS3.18 Table
+/// 10.6.1-5 puts SeriesNumber in the Series-level matching set, so it has to
+/// filter, not only sort.
+fn series_number_matches(attrs: &[(u32, AttrValue)], pat: &str) -> bool {
+    number_matches(attrs, crate::query::tag::SERIES_NUMBER, pat)
+}
+
+/// Glob matching for a numeric attribute, in either stored form.
+fn number_matches(attrs: &[(u32, AttrValue)], tag: u32, pat: &str) -> bool {
     for (t, v) in attrs {
-        if *t != crate::query::tag::INSTANCE_NUMBER {
+        if *t != tag {
             continue;
         }
         return match v {
@@ -585,6 +641,35 @@ fn text_attr_like(attrs: &[(u32, AttrValue)], tag: u32, pat: &str) -> bool {
 fn pn_attr_like_ci(attrs: &[(u32, AttrValue)], tag: u32, pat: &str) -> bool {
     match text_attr(attrs, tag) {
         Some(have) => glob_match_bytes(&pat.to_lowercase(), &have.to_lowercase()),
+        None => false,
+    }
+}
+
+/// The stored value of attribute `tag`, if any (either form).
+///
+/// The DA/TM range predicates read the RAW `AttrValue` (a date is `UInt`,
+/// a time is `Text`), unlike [`text_attr`] which only sees `Text`.
+fn attr(attrs: &[(u32, AttrValue)], tag: u32) -> Option<&AttrValue> {
+    attrs.iter().find_map(|(t, v)| (*t == tag).then_some(v))
+}
+
+/// Whether the DA attribute `tag` falls inside the range pattern `pat`
+/// (PS3.4 C.2.2.2.5: inclusive, either bound allowed absent). Delegates to
+/// the shared [`crate::query::range::da_range_matches`], which reads the
+/// stored `UInt`/`Text` and compares against the pattern.
+fn date_attr_range(attrs: &[(u32, AttrValue)], tag: u32, pat: &str) -> bool {
+    match attr(attrs, tag) {
+        Some(have) => crate::query::range::da_range_matches(have, pat),
+        None => false,
+    }
+}
+
+/// Whether the TM attribute `tag` falls inside the range pattern `pat` - the
+/// TM sibling of [`date_attr_range`] via
+/// [`crate::query::range::tm_range_matches`].
+fn time_attr_range(attrs: &[(u32, AttrValue)], tag: u32, pat: &str) -> bool {
+    match attr(attrs, tag) {
+        Some(have) => crate::query::range::tm_range_matches(have, pat),
         None => false,
     }
 }
@@ -910,6 +995,7 @@ mod tests {
                 pps_start_time: None,
                 scheduled_procedure_step_id: None,
                 requested_procedure_id: None,
+                series_number: None,
                 pn_case_insensitive: false,
             },
             &mut out,
@@ -1131,8 +1217,9 @@ mod tests {
     }
 
     // Table 10.6.1-5: PerformedProcedureStepStartDate (0040,0244) and
-    // ...StartTime (0040,0245) are SERIES matching keys - exact on the DA,
-    // LIKE on the TM, mirroring SeriesDate/SeriesTime.
+    // ...StartTime (0040,0245) are SERIES matching keys - DA/TM RANGE matching
+    // (PS3.4 C.2.2.2.5), the shared predicates, not SeriesDate/SeriesTime's
+    // exact/LIKE semantics.
     #[test]
     fn pps_series_matching_keys_filter_series() {
         // Two series carry PPS date/time; a third carries none.
@@ -1166,7 +1253,7 @@ mod tests {
             &mut out,
         );
         assert_eq!(uids(&out), vec!["A", "B"]);
-        // Different date -> nothing (exact, not prefix).
+        // Different date -> nothing (exact form is a single-day range).
         let mut out = Vec::new();
         search_series(
             &m,
@@ -1177,12 +1264,12 @@ mod tests {
             &mut out,
         );
         assert!(out.is_empty());
-        // Time LIKE `104*` -> A only.
+        // Time range `104000-110000` -> A only (B is 113000).
         let mut out = Vec::new();
         search_series(
             &m,
             &SeriesFilter {
-                pps_start_time: Some("104*".into()),
+                pps_start_time: Some("104000-110000".into()),
                 ..Default::default()
             },
             &mut out,
@@ -1194,12 +1281,115 @@ mod tests {
             &m,
             &SeriesFilter {
                 pps_start_date: Some("20260802".into()),
-                pps_start_time: Some("11*".into()),
+                pps_start_time: Some("110000-120000".into()),
                 ..Default::default()
             },
             &mut out,
         );
         assert_eq!(uids(&out), vec!["B"]);
+    }
+
+    /// PS3.4 C.2.2.2.5: pps_start_date (DA) and pps_start_time (TM) are
+    /// required series matching keys and must match the RANGE form inclusively
+    /// with open ends - not the exact/LIKE comparison SeriesDate/SeriesTime keep.
+    #[test]
+    fn pps_start_date_and_time_range_matching() {
+        fn with_pps(uid: &str, pps_date: Option<u64>, pps_time: Option<&str>) -> SeriesRecord {
+            let mut s = series(uid, Some("1"), Some("Chest"), None);
+            if let Some(d) = pps_date {
+                s.attrs.push((tag::PPS_START_DATE, AttrValue::UInt(d)));
+            }
+            if let Some(t) = pps_time {
+                s.attrs
+                    .push((tag::PPS_START_TIME, AttrValue::Text(t.into())));
+            }
+            s.attrs.sort_by_key(|(t, _)| *t);
+            s
+        }
+        let m = manifest_with(vec![
+            with_pps("A", Some(20260815), Some("100000")),
+            with_pps("B", Some(20260820), Some("110000")),
+            with_pps("C", Some(20260901), Some("090000")),
+            with_pps("D", None, None),
+        ]);
+        let search = |f: SeriesFilter| {
+            let mut out = Vec::new();
+            search_series(&m, &f, &mut out);
+            uids(&out)
+        };
+        // DA closed range, inclusive: 20260815..20260820 in range.
+        assert_eq!(
+            search(SeriesFilter {
+                pps_start_date: Some("20260801-20260831".into()),
+                ..Default::default()
+            }),
+            vec!["A", "B"]
+        );
+        // DA open upper bound -> A and B.
+        assert_eq!(
+            search(SeriesFilter {
+                pps_start_date: Some("20260815-".into()),
+                ..Default::default()
+            }),
+            vec!["A", "B", "C"]
+        );
+        // DA open lower bound -> A only (B is after the upper end).
+        assert_eq!(
+            search(SeriesFilter {
+                pps_start_date: Some("-20260815".into()),
+                ..Default::default()
+            }),
+            vec!["A"]
+        );
+        // DA exact form still works.
+        assert_eq!(
+            search(SeriesFilter {
+                pps_start_date: Some("20260820".into()),
+                ..Default::default()
+            }),
+            vec!["B"]
+        );
+        // TM closed range, inclusive.
+        assert_eq!(
+            search(SeriesFilter {
+                pps_start_time: Some("090000-110000".into()),
+                ..Default::default()
+            }),
+            vec!["A", "B", "C"]
+        );
+        // TM open upper bound.
+        assert_eq!(
+            search(SeriesFilter {
+                pps_start_time: Some("100000-".into()),
+                ..Default::default()
+            }),
+            vec!["A", "B"]
+        );
+        // TM open lower bound.
+        assert_eq!(
+            search(SeriesFilter {
+                pps_start_time: Some("-100000".into()),
+                ..Default::default()
+            }),
+            vec!["A", "C"]
+        );
+        // TM exact form.
+        assert_eq!(
+            search(SeriesFilter {
+                pps_start_time: Some("110000".into()),
+                ..Default::default()
+            }),
+            vec!["B"]
+        );
+        // SeriesDate/SeriesTime are unchanged: exact DA / LIKE TM semantics.
+        assert_eq!(
+            search(SeriesFilter {
+                series_date: Some("20260815-20260820".into()),
+                ..Default::default()
+            }),
+            Vec::<&str>::new(),
+            "series_date is NOT a range key - a hyphen literal matches nothing"
+        );
     }
 
     #[test]
@@ -1246,6 +1436,30 @@ mod tests {
         assert!(found);
         assert_eq!(out.len(), 1);
         assert_eq!(text_attr(&out[0].attrs, tag::SOP_INSTANCE_UID), Some("B"));
+    }
+
+    // PS3.4 C.2.2.2.2: SOPClassUID supports List of UID Matching - each UID in
+    // the list may generate a match, so a comma list must not be compared as
+    // one string.
+    #[test]
+    fn search_instances_sop_class_uid_list_filter() {
+        let mut s = series("S", None, None, None);
+        s.instances = vec![instance_full("A", "1.2.840.10008.5.1.4.1.1.2", None)];
+        let m = manifest_with(vec![s]);
+        let mut out = Vec::new();
+        let found = search_instances(
+            &m,
+            "S",
+            &InstanceFilter {
+                sop_class_uid: Some("1.2.840.10008.5.1.4.1.1.2,1.2.840.10008.5.1.4.1.1.4".into()),
+                ..Default::default()
+            },
+            &mut out,
+            false,
+        );
+        assert!(found);
+        assert_eq!(out.len(), 1, "a CT instance matches the two-member list");
+        assert_eq!(text_attr(&out[0].attrs, tag::SOP_INSTANCE_UID), Some("A"));
     }
 
     // Table 10.6.1-5: InstanceNumber is a matching key in BOTH stored
@@ -1685,6 +1899,61 @@ mod tests {
         );
     }
 
+    /// ModalitiesInStudy narrows the GLOBAL instance scan.
+    ///
+    /// The global `/instances` route accepts Study IE keys (PS3.18 10.6.1.2.1).
+    /// ModalitiesInStudy (0008,0061) is matched by its own set comparison
+    /// against a dedicated field, not through the expected-attribute map, and
+    /// the predicate used to be skipped entirely when that map was empty - so
+    /// `?ModalitiesInStudy=CT` answered with every study's instances.
+    #[test]
+    fn modalities_in_study_narrows_the_global_instance_scan() {
+        let mk = |study_uid: &str, modalities: &str| Manifest {
+            sys: SysHeader {
+                version: 1,
+                storage_tier: TIER_HOT,
+                total_pixel_bytes: 0,
+                arrived_at: 0,
+            },
+            study: StudyQido {
+                // Deliberately NO (0008,0061) inside `attrs`: the value lives
+                // in the dedicated field, which is what the bug ignored.
+                attrs: vec![(tag::STUDY_INSTANCE_UID, AttrValue::Text(study_uid.into()))],
+                modalities_in_study: Some(modalities.to_string()),
+                ..Default::default()
+            },
+            series: vec![series(study_uid, Some("1"), None, None)],
+        };
+        let mut ct = mk("1.2.840.8.1", "CT");
+        ct.series[0].instances = vec![instance_with_flag("1.2.840.8.1.1", Some("1"), false)];
+        let mut mr = mk("1.2.840.8.2", "MR");
+        mr.series[0].instances = vec![instance_with_flag("1.2.840.8.2.1", Some("1"), false)];
+        let manifests = [ct, mr];
+
+        let filter = crate::query::filter::QueryFilter {
+            modalities_in_study: Some("CT".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        search_all_instances(
+            &manifests,
+            &InstanceFilter::default(),
+            &SeriesFilter::default(),
+            Some(&filter),
+            &mut out,
+            false,
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "?ModalitiesInStudy=CT must not answer with the MR study's instances"
+        );
+        assert_eq!(
+            text_attr(&out[0].instance.attrs, tag::SOP_INSTANCE_UID),
+            Some("1.2.840.8.1.1")
+        );
+    }
+
     /// Global instance QIDO hides sequestered instances, and the study/series
     /// levels are NOT filtered (a rejected AI result must not hide its study).
     #[test]
@@ -1723,5 +1992,81 @@ mod tests {
         let mut sout = Vec::new();
         search_series(&m, &SeriesFilter::default(), &mut sout);
         assert_eq!(sout.len(), 1, "the series itself stays visible");
+    }
+
+    /// H4: a UID list matches every member, at both collectors.
+    ///
+    /// A UID key is single-valued in Table 10.6.1-5, but its value may be a
+    /// comma-separated list. Comparing the whole string against one stored UID
+    /// made `sopInstanceUid=1.2.3,1.2.4` match nothing.
+    #[test]
+    fn a_uid_list_matches_every_member() {
+        let inst_of = |uid: &str| InstanceRecord {
+            attrs: vec![(tag::SOP_INSTANCE_UID, AttrValue::Text(uid.into()))],
+            transfer_syntax: String::new(),
+            storage_tier: TIER_HOT,
+            rejection_reason: crate::manifest::NOT_REJECTED_REASON,
+            blake3: [0u8; 32],
+            file_size: 0,
+            frames: Vec::new(),
+        };
+        let s = SeriesRecord {
+            attrs: vec![(tag::SERIES_INSTANCE_UID, AttrValue::Text("1.2.3".into()))],
+            instances: vec![inst_of("1.2.3.1"), inst_of("1.2.3.2"), inst_of("1.2.3.3")],
+        };
+
+        // Instance collector: both named instances match, the third does not.
+        let inst = InstanceFilter {
+            sop_instance_uid: Some("1.2.3.1,1.2.3.2".into()),
+            ..Default::default()
+        };
+        let matched: Vec<_> = s
+            .instances
+            .iter()
+            .filter(|i| inst.matches(&i.attrs))
+            .collect();
+        assert_eq!(matched.len(), 2, "both list members must match");
+
+        // Series collector: membership on the series UID.
+        let by_list = SeriesFilter {
+            series_instance_uid: Some("9.9.9,1.2.3".into()),
+            ..Default::default()
+        };
+        let by_other = SeriesFilter {
+            series_instance_uid: Some("9.9.9,8.8.8".into()),
+            ..Default::default()
+        };
+        assert!(by_list.matches(&s.attrs), "the stored UID is in the list");
+        assert!(
+            !by_other.matches(&s.attrs),
+            "a list without the stored UID must not match"
+        );
+    }
+
+    /// H6: `SeriesNumber` filters, it does not only sort.
+    ///
+    /// PS3.18 Table 10.6.1-5 lists SeriesNumber as a Series-level matching key.
+    /// Without it `SeriesNumber=2` returned every series in the study.
+    #[test]
+    fn a_series_number_filters_the_series() {
+        let m = manifest_with(vec![
+            series("1.2.840.1.2.1", Some("1"), Some("First"), None),
+            series("1.2.840.1.2.2", Some("2"), Some("Second"), None),
+        ]);
+        let filter = SeriesFilter {
+            series_number: Some("2".into()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        search_series(&m, &filter, &mut out);
+        assert_eq!(uids(&out), vec!["1.2.840.1.2.2"], "only series 2 matches");
+
+        // An unmatched number yields nothing rather than everything.
+        let none = SeriesFilter {
+            series_number: Some("7".into()),
+            ..Default::default()
+        };
+        search_series(&m, &none, &mut out);
+        assert!(out.is_empty(), "no series carries number 7");
     }
 }

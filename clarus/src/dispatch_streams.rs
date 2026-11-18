@@ -566,13 +566,16 @@ fn serve_single_object(
     // aggregator keeps its one-time expected from the last success).
     ctx.wado_series_expected = expected.or(ctx.wado_series_expected);
 
-    // PS3.18 8.7.3: an Implicit VR Little Endian instance shall not be served
-    // over Web Services, so this path cannot stream the stored bytes as they
-    // are. The dataset is re-encoded to Explicit VR (headers only; the values,
-    // including a Surface Segmentation's mesh data, are untouched), which is a
-    // buffered answer - the cost is inherent to the correctness of the reply,
-    // and `sendfile_response` below stays the path for every other syntax.
-    if oref.transfer_syntax == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE {
+    // PS3.18 8.7.3: an Implicit VR Little Endian or an Explicit VR Big Endian
+    // instance shall not be served over Web Services, so this path cannot
+    // stream the stored bytes as they are. The dataset is re-encoded to
+    // Explicit VR LE (headers only; the values, including a Surface
+    // Segmentation's mesh data, are untouched), which is a buffered answer -
+    // the cost is inherent to the correctness of the reply, and
+    // `sendfile_response` below stays the path for every other syntax.
+    if oref.transfer_syntax == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE
+        || oref.transfer_syntax == clarus_adapters::codec::ts_uid::EXPLICIT_VR_BE
+    {
         let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
             Ok(b) => b,
             Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
@@ -912,13 +915,15 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         Err(e) => return wado_err_response(ctx, e),
     };
     ctx.wado_series_expected = expected.or(ctx.wado_series_expected);
-    // PS3.18 8.7.3 forbids serving Implicit VR LE over Web Services, and the
-    // part header below names the syntax its bytes are in - so an Implicit VR
-    // instance cannot go down the streaming path: `sendfile_response` would
-    // put the stored bytes behind a header that must not describe them. The
-    // re-encoded dataset is assembled as one buffer and served through the
-    // same framing the buffered path used before F3.
-    if oref.transfer_syntax == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE {
+    // PS3.18 8.7.3 forbids serving Implicit VR LE or Explicit VR Big Endian
+    // over Web Services, and the part header below names the syntax its bytes
+    // are in - so either instance cannot go down the streaming path:
+    // `sendfile_response` would put the stored bytes behind a header that must
+    // not describe them. The re-encoded dataset is assembled as one buffer and
+    // served through the same framing the buffered path used before F3.
+    if oref.transfer_syntax == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE
+        || oref.transfer_syntax == clarus_adapters::codec::ts_uid::EXPLICIT_VR_BE
+    {
         let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
             Ok(b) => b,
             Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
@@ -2384,7 +2389,8 @@ pub(crate) fn h_wado_series_thumbnail(ctx: &mut RequestContext<'_>) -> io::Resul
         Ok(_) => return wado_err_response(ctx, WadoError::NotFound("series".to_string())),
         Err(e) => return wado_err_response(ctx, e),
     };
-    let first = &plans[0];
+    let (idx, frame) = crate::handlers::wado_pure::representative_plan(&plans);
+    let first = &plans[idx];
     // Same guard as the instance path: the representative instance is read
     // whole to render the preview, so an oversized one is refused before the
     // read rather than after it.
@@ -2395,9 +2401,10 @@ pub(crate) fn h_wado_series_thumbnail(ctx: &mut RequestContext<'_>) -> io::Resul
         Ok(b) => b,
         Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(first.sha256.clone())),
     };
-    let resp = match crate::handlers::wado_pure::render_thumbnail_from_bytes_any(
+    let resp = match crate::handlers::wado_pure::render_representative_thumbnail_any(
         &bytes,
         &first.sop_uid,
+        frame,
         target,
         &ctx.state.codec_registry,
         &ctx.state.transcode_pool,
@@ -2410,7 +2417,8 @@ pub(crate) fn h_wado_series_thumbnail(ctx: &mut RequestContext<'_>) -> io::Resul
 }
 
 /// C2 (B3 all-or-none, PS3.18 10.4.1.1.4): `GET .../studies/{study}/thumbnail` -
-/// thumbnail of the study's representative instance (first plan of the study).
+/// thumbnail of the study's representative instance (first non-localizer plan
+/// of the study).
 /// Same `_any` path as instance/series; uncompressed -> 200, compressed ->
 /// transcode decode (see `_any`).
 pub(crate) fn h_wado_study_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result<()> {
@@ -2425,7 +2433,8 @@ pub(crate) fn h_wado_study_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result
             Ok(_) => return wado_err_response(ctx, WadoError::NotFound("study".to_string())),
             Err(e) => return wado_err_response(ctx, e),
         };
-    let first = &plans[0];
+    let (idx, frame) = crate::handlers::wado_pure::representative_plan(&plans);
+    let first = &plans[idx];
     // Same guard as the instance path (see `guard_instance_size`).
     if let Err(e) = guard_instance_size(ctx, first.file_size) {
         return wado_err_response(ctx, e);
@@ -2434,9 +2443,10 @@ pub(crate) fn h_wado_study_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result
         Ok(b) => b,
         Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(first.sha256.clone())),
     };
-    let resp = match crate::handlers::wado_pure::render_thumbnail_from_bytes_any(
+    let resp = match crate::handlers::wado_pure::render_representative_thumbnail_any(
         &bytes,
         &first.sop_uid,
+        frame,
         target,
         &ctx.state.codec_registry,
         &ctx.state.transcode_pool,
@@ -2536,6 +2546,160 @@ pub(crate) fn h_wado_frame_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result
     write_wado_resp(ctx, &resp)
 }
 
+/// 1411: `GET .../instances/{sop}/frames/{n}/rendered` - the frame-level
+/// Rendered Resource (PS3.18 10.4.1.2). Renders ONE frame at NATIVE size
+/// (no `viewport` -> native, never the 64x64 thumbnail box), with the same
+/// Accept set as the instance `/rendered`: `image/jpeg` (default, grayscale),
+/// `image/png` (RGB + grayscale), `image/gif` (grayscale). A compressed
+/// source is served as `image/jpeg` through the codec registry (transcode
+/// build); PNG/GIF from compressed -> 406 (not wired, same as the instance
+/// route).
+///
+/// Frame extraction is the same bounded head + chunk splice as the frame
+/// thumbnail (`h_wado_frame_thumbnail`), so a multi-GB WSI is never read
+/// whole.
+pub(crate) fn h_wado_frame_rendered(ctx: &mut RequestContext<'_>) -> io::Result<()> {
+    use clarus_adapters::dicom_rs::DicomRsParser;
+
+    // STEP 1: negotiate Accept (shared with instance `/rendered`).
+    let accept = match rendered_accept(ctx.accept()) {
+        Ok(a) => a,
+        Err(e) => return wado_err_response(ctx, e),
+    };
+    // Frame index is the penultimate segment (`.../frames/{n}/rendered`); the
+    // router validates it is digits but does not capture it. Same re-parse as
+    // the frame thumbnail.
+    let path = std::str::from_utf8(ctx.head.path).unwrap_or("");
+    let frame = path.rsplit('/').nth(1).unwrap_or("").to_string();
+
+    // STEP 2: locate the instance.
+    let (oref, _expected) = match crate::handlers::wado_pure::locate_object(
+        ctx.state,
+        ctx.uid(0),
+        Some(ctx.uid(1)),
+        ctx.uid(2),
+        ctx.route.qa,
+    ) {
+        Ok(v) => v,
+        Err(e) => return wado_err_response(ctx, e),
+    };
+
+    // STEP 3: bounded frame extraction - the same head + chunk splice as the
+    // frame thumbnail, so a multi-GB WSI never reaches `read_to_end`.
+    let max_frame_bytes = ctx.state.config.max_frame_bytes;
+    let frame_number: Option<u32> = frame.parse().ok();
+    let chunk = frame_number.and_then(|n| oref.frames.iter().find(|f| f.number == n));
+    let large = oref.file_size > max_frame_bytes;
+    let bytes = match chunk {
+        Some(f) if large => {
+            let head = match read_cas_head(
+                ctx.state,
+                &oref.sha256,
+                oref.storage_tier,
+                ctx.state.config.max_part_header,
+            ) {
+                Ok(b) => b,
+                Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+            };
+            let chunk_bytes = match read_cas_range(
+                ctx.state,
+                &oref.sha256,
+                oref.storage_tier,
+                f.offset,
+                f.compressed_len,
+            ) {
+                Ok(b) => b,
+                Err(_) => return wado_err_response(ctx, WadoError::RangeNotSatisfiable),
+            };
+            match clarus_adapters::dicom_rs::frame::splice_frame_into_head(&head, &chunk_bytes) {
+                Some(buf) => buf,
+                None => return wado_err_response(ctx, WadoError::RangeNotSatisfiable),
+            }
+        }
+        _ => {
+            // A multi-GB instance with no usable chunk must never reach
+            // `read_to_end`; a legacy/single-frame blob is small and fine.
+            if large && chunk.is_none() {
+                return wado_err_response(ctx, WadoError::RangeNotSatisfiable);
+            }
+            match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
+                Ok(b) => b,
+                Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+            }
+        }
+    };
+
+    // STEP 4: geometry from the bounded buffer, then the instance `/rendered`
+    // guards (minus the multi-frame rejection - one frame is the whole point).
+    let parser = DicomRsParser;
+    let rows = head_u16(&parser, &bytes, (0x0028, 0x0010)).unwrap_or(0) as u32;
+    let cols = head_u16(&parser, &bytes, (0x0028, 0x0011)).unwrap_or(0) as u32;
+    let spp = head_u16(&parser, &bytes, (0x0028, 0x0002)).unwrap_or(1);
+    let bits_allocated = head_u16(&parser, &bytes, (0x0028, 0x0100)).unwrap_or(8) as u32;
+    let planar_config = head_u16(&parser, &bytes, (0x0028, 0x0006)).unwrap_or(0);
+
+    let compressed_ts = is_compressed_transfer_syntax_str(&oref.transfer_syntax);
+    if compressed_ts && (accept == RenderedAccept::Png || accept == RenderedAccept::Gif) {
+        return wado_err_response(
+            ctx,
+            WadoError::NotAcceptable("rendered PNG/GIF from compressed not wired".to_string()),
+        );
+    }
+    if spp != 1 && spp != 3 {
+        return wado_err_response(
+            ctx,
+            WadoError::NotAcceptable(format!("rendered samples-per-pixel {spp} unsupported")),
+        );
+    }
+    let is_rgb = spp == 3;
+    if is_rgb && (accept == RenderedAccept::Jpeg || accept == RenderedAccept::Gif) {
+        return wado_err_response(
+            ctx,
+            WadoError::NotAcceptable("rendered RGB requires Accept: image/png".to_string()),
+        );
+    }
+    if is_rgb && (bits_allocated != 8 || planar_config != 0) {
+        return wado_err_response(
+            ctx,
+            WadoError::NotAcceptable(
+                "rendered RGB requires 8-bit interleaved (PlanarConfiguration 0)".to_string(),
+            ),
+        );
+    }
+    if rows == 0 || cols == 0 {
+        return wado_err_response(
+            ctx,
+            WadoError::Internal(format!("Invalid dimensions: {rows}x{cols}")),
+        );
+    }
+
+    // STEP 5: size - native when no `viewport` (NOT the 64x64 thumbnail box).
+    let target = match rendered_viewport(ctx, (cols, rows)) {
+        Ok(t) => t,
+        Err(e) => return wado_err_response(ctx, e),
+    };
+
+    let format = match accept {
+        RenderedAccept::Png => crate::handlers::wado_pure::FrameRenderFormat::Png,
+        RenderedAccept::Gif => crate::handlers::wado_pure::FrameRenderFormat::Gif,
+        RenderedAccept::Jpeg => crate::handlers::wado_pure::FrameRenderFormat::Jpeg,
+    };
+    let resp = match crate::handlers::wado_pure::render_frame_rendered_any(
+        &bytes,
+        ctx.uid(2),
+        &frame,
+        format,
+        target,
+        &ctx.state.codec_registry,
+        &ctx.state.transcode_pool,
+        ctx.state.config.transcode.max_megapixels,
+    ) {
+        Ok(r) => r,
+        Err(e) => return wado_err_response(ctx, e),
+    };
+    write_wado_resp(ctx, &resp)
+}
+
 /// `GET .../instances/{sop}/frames/{frame}` - a single pixel frame.
 /// Decode one stored frame fragment to raw Explicit VR LE samples.
 ///
@@ -2603,21 +2767,25 @@ fn transcode_one_frame(
     )
 }
 
-pub(crate) fn h_wado_frame(ctx: &mut RequestContext<'_>) -> io::Result<()> {
-    // The router captures study/series/sop but not the frame index (it only
-    // validates the frame is digits); re-parse it from the path tail.
-    let frame = path_tail_segment(ctx);
-    // Expected is irrelevant here (a frame extract is not a series slice).
-    let (oref, _expected) = match crate::handlers::wado_pure::locate_object(
-        ctx.state,
-        ctx.uid(0),
-        Some(ctx.uid(1)),
-        ctx.uid(2),
-        ctx.route.qa,
-    ) {
-        Ok(v) => v,
-        Err(e) => return wado_err_response(ctx, e),
-    };
+/// Produce the pixel bytes of ONE frame, labelled with the syntax they are in.
+///
+/// This is the whole per-frame pipeline: locate the instance, read the
+/// manifest's byte range for that frame (falling back to a bounded whole-blob
+/// extract for instances stored before the chunk table existed), transcode to
+/// Explicit VR LE when the client asked for it, and - for Explicit VR Big
+/// Endian sources - swap the samples so the part label is true (PS3.18 8.7.3).
+///
+/// Shared by the single-frame and the list paths so the two cannot drift: a
+/// frame served as part 1 of `frames/1,2` is byte-identical to the same frame
+/// served alone.
+///
+/// Returns `(bytes, declared_ts)` where `declared_ts` is the transfer syntax
+/// the CALLER must put in the part's `Content-Type`.
+fn frame_part_body(
+    ctx: &mut RequestContext<'_>,
+    oref: &crate::handlers::wado_pure::ObjectRef,
+    frame: &str,
+) -> Result<(Vec<u8>, String), WadoError> {
     // Frame-chunk serve: when the manifest carries a per-frame byte range,
     // read ONLY that range. This is the ap101 fix for the tile route - a tile
     // from a multi-GB WSI costs one bounded read instead of a whole-blob Vec
@@ -2650,34 +2818,25 @@ pub(crate) fn h_wado_frame(ctx: &mut RequestContext<'_>) -> io::Result<()> {
                 // fall back rather than serve a truncated tile - but only
                 // while the whole blob is small enough to hold.
                 if too_large_to_fallback() {
-                    return wado_err_response(ctx, WadoError::RangeNotSatisfiable);
+                    return Err(WadoError::RangeNotSatisfiable);
                 }
                 match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
-                    Ok(b) => match crate::handlers::wado_pure::extract_frame(&b, &frame) {
-                        Ok(r) => r.body,
-                        Err(e) => return wado_err_response(ctx, e),
-                    },
+                    Ok(b) => crate::handlers::wado_pure::extract_frame(&b, frame)?.body,
                     Err(_) => {
-                        return wado_err_response(
-                            ctx,
-                            WadoError::FileNotFound(oref.sha256.clone()),
-                        );
+                        return Err(WadoError::FileNotFound(oref.sha256.clone()));
                     }
                 }
             }
         },
         None => {
             if too_large_to_fallback() {
-                return wado_err_response(ctx, WadoError::RangeNotSatisfiable);
+                return Err(WadoError::RangeNotSatisfiable);
             }
             let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
                 Ok(b) => b,
-                Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+                Err(_) => return Err(WadoError::FileNotFound(oref.sha256.clone())),
             };
-            match crate::handlers::wado_pure::extract_frame(&bytes, &frame) {
-                Ok(r) => r.body,
-                Err(e) => return wado_err_response(ctx, e),
-            }
+            crate::handlers::wado_pure::extract_frame(&bytes, frame)?.body
         }
     };
     // Per-tile decode (W22). A client that asks for Explicit VR LE while the
@@ -2709,54 +2868,251 @@ pub(crate) fn h_wado_frame(ctx: &mut RequestContext<'_>) -> io::Result<()> {
                 // `None`: no decoder, already uncompressed, or a colour tile.
                 // Serve the stored bytes under their own syntax.
                 Ok(None) => {}
-                Err(e) => return wado_err_response(ctx, e),
+                Err(e) => return Err(e),
             }
         }
         (frame_bytes, served_ts)
     };
     #[cfg(not(feature = "transcode"))]
     let (frame_bytes, served_ts) = (frame_bytes, oref.transfer_syntax.clone());
-    // PS3.18 10.4.4: the frames resource answers `multipart/related;
+    // PS3.18 8.7.3: the frames resource answers `multipart/related;
     // type="application/octet-stream"` with ONE part per requested frame.
     // OHIF's dicomweb-client decodes the frames response as multipart
     // unconditionally, so a bare octet-stream body breaks every image load
     // ("Response message has no multipart mime header").
     //
-    // a frame part MUST name its real media AND
-    // its stored transfer syntax. The cornerstone3D/dicomweb-client loader
-    // resolves the transfer syntax ONLY from the part Content-Type
-    // (getTransferSyntaxForContentType): a bare octet-stream with no
-    // `transfer-syntax=` parameter collapsed every compressed frame to
-    // Implicit VR LE and decoded it as uncompressed garbage. The stored
-    // syntax comes from the manifest reference (`oref.transfer_syntax`) - no
-    // per-frame parse - and `frame_part_media_type` maps it to the PS3.18
-    // media type. The `transfer-syntax=` parameter is always appended so a
-    // fallback octet-stream stays decodable for exotic-but-codec-backed
-    // syntaxes.
-    let stored_ts = served_ts.as_str();
-    let media = frame_part_media_type(stored_ts);
-    let boundary = single_part_boundary();
-    let mut body = Vec::with_capacity(frame_bytes.len() + 256);
-    body.extend_from_slice(
-        format!("--{boundary}\r\nContent-Type: {media}; transfer-syntax={stored_ts}\r\n\r\n")
-            .as_bytes(),
-    );
-    body.extend_from_slice(&frame_bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    // The part MUST name the media and the transfer syntax the bytes are in.
+    // The cornerstone3D/dicomweb-client loader resolves the transfer syntax
+    // ONLY from the part Content-Type (getTransferSyntaxForContentType): a
+    // bare octet-stream with no `transfer-syntax=` parameter collapsed every
+    // compressed frame to Implicit VR LE and decoded it as uncompressed
+    // garbage. The syntax comes from the manifest reference
+    // (`oref.transfer_syntax`) - no per-frame parse - and
+    // `frame_part_media_type` maps it to the PS3.18 media type. The
+    // `transfer-syntax=` parameter is always appended so a fallback
+    // octet-stream stays decodable for exotic-but-codec-backed syntaxes.
+    let served_ts = served_ts.as_str();
+    let mut frame_bytes = frame_bytes;
+    // PS3.18 8.7.3 bans Implicit VR LE and Explicit VR Big Endian in the same
+    // sentence, and the ban is not scoped to images, so a frame part may
+    // declare neither. For Implicit VR the samples are already little-endian
+    // and nothing else is needed (see below). For Big Endian the part's bytes
+    // ARE the samples, so the samples have to be swapped before the label is
+    // true - a re-label alone would hand a conformant header to a client that
+    // then paints byte-reversed values.
+    //
+    // The PixelData VR decides which case applies, not BitsAllocated: OB is a
+    // byte stream (byte-order independent), OW is 16-bit words whose byte
+    // order follows the transfer syntax, and DICOM permits BitsAllocated=8
+    // with an OW PixelData (two 8-bit samples packed per word). The VR is
+    // read from the bounded head - `wado_pure::extract_u16` reads little
+    // endian only and would answer a byte-reversed number for exactly the
+    // source under test. The head is read ONLY on the Big Endian path, so
+    // every other syntax keeps the streaming behaviour it had.
+    let evrbe_declared = served_ts == clarus_adapters::codec::ts_uid::EXPLICIT_VR_BE;
+    if evrbe_declared {
+        let head = match read_cas_head(
+            ctx.state,
+            &oref.sha256,
+            oref.storage_tier,
+            ctx.state.config.max_part_header,
+        ) {
+            Ok(head) => head,
+            Err(_) => return Err(WadoError::FileNotFound(oref.sha256.clone())),
+        };
+        // No BitsAllocated means the instance cannot be described truthfully:
+        // serving it as EVRBE would violate 8.7.3 and serving it as EVRLE
+        // would be a guess about the sample width. 406 is the honest answer.
+        let Some(bits_allocated) =
+            clarus_adapters::bit_depth::extract_first_us(&head, (0x0028, 0x0100))
+        else {
+            return Err(WadoError::NotAcceptable(
+                "Cannot declare a syntax for this Explicit VR Big Endian instance: \
+                     BitsAllocated is unreadable"
+                    .to_string(),
+            ));
+        };
+        let pixel_ow = match clarus_adapters::bit_depth::pixel_data_vr(&head) {
+            Some(vr) => vr == *b"OW",
+            // PixelData's header is outside the bounded head: fall back to
+            // the sample width, which PS3.5 pairs with OW for >8-bit samples.
+            None => bits_allocated > 8,
+        };
+        // A frame is a whole number of samples, so an odd byte count means the
+        // bytes and the header disagree; swapping the even prefix would serve a
+        // half-converted tile under a conformant label.
+        if pixel_ow && !frame_bytes.len().is_multiple_of(2) {
+            return Err(WadoError::NotAcceptable(
+                "Cannot re-label this Explicit VR Big Endian frame as little endian: \
+                     its byte count is not a whole number of 16-bit words"
+                    .to_string(),
+            ));
+        }
+        if pixel_ow {
+            // In-place over the buffer the frame path already allocated: no
+            // new allocation, and the samples keep their values exactly.
+            clarus_adapters::codec::explicit_vr_be::swap_bytes_16(&mut frame_bytes);
+        }
+    }
+    // PS3.18 8.7.3: "The Implicit VR Little Endian (1.2.840.10008.1.2) ...
+    // shall not be used with Web Services." The frames resource is a Web
+    // Service, so a part may never declare Implicit VR LE - the instance
+    // route already guarantees this by re-encoding to Explicit VR (see
+    // `maybe_transcode`). A frame part needs no re-encode: it is raw
+    // uncompressed pixel samples, byte-identical between the two encoding
+    // forms because neither writes element headers into a frame. Declaring
+    // EVRLE is therefore the whole fix, and it names the syntax the part's
+    // bytes actually are.
+    //
+    // Big Endian is in the same sentence, but there the samples have already
+    // been swapped above, so the bytes really are little endian and EVRLE is
+    // the truth for them too.
+    let declared_ts: String =
+        if served_ts == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE || evrbe_declared {
+            clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE.to_string()
+        } else {
+            served_ts.to_string()
+        };
+    Ok((frame_bytes, declared_ts))
+}
+
+pub(crate) fn h_wado_frame(ctx: &mut RequestContext<'_>) -> io::Result<()> {
+    // The router captures study/series/sop but not the frame value (it only
+    // validates the shape); re-read it from the path tail.
+    let spec = path_tail_segment(ctx);
+    // Expected is irrelevant here (a frame extract is not a series slice).
+    let (oref, _expected) = match crate::handlers::wado_pure::locate_object(
+        ctx.state,
+        ctx.uid(0),
+        Some(ctx.uid(1)),
+        ctx.uid(2),
+        ctx.route.qa,
+    ) {
+        Ok(v) => v,
+        Err(e) => return wado_err_response(ctx, e),
+    };
+    // Single frame is the hot path and stays allocation-free in its parse: a
+    // value with no comma is one number, exactly as before this resource
+    // accepted lists.
+    if !spec.contains(',') {
+        let (frame_bytes, declared_ts) = match frame_part_body(ctx, &oref, &spec) {
+            Ok(v) => v,
+            Err(e) => return wado_err_response(ctx, e),
+        };
+        let media = frame_part_media_type(&declared_ts);
+        let boundary = single_part_boundary();
+        let mut body = Vec::with_capacity(frame_bytes.len() + 256);
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Type: {media}; transfer-syntax={declared_ts}\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(&frame_bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ct = format!(
+            "multipart/related; type=\"application/octet-stream\"; boundary=\"{boundary}\""
+        );
+        let ka = ctx.keep_alive == KeepAlive::On;
+        clarus_core::http::response::build_head(
+            &mut ctx.conn.header,
+            200,
+            reason_phrase(200),
+            Some(ct.as_bytes()),
+            Some(body.len() as u64),
+            ka,
+            &[],
+        );
+        ctx.conn.write_head_configured()?;
+        return ctx.conn.write_all_configured(&body);
+    }
+    serve_frame_list(ctx, &oref, &spec)
+}
+
+/// Answer `frames/{a},{b},...` with one part per frame, in request order.
+///
+/// PS3.18 8.7.3.3 models multi-frame bulk data as "one [representation] for
+/// each Frame" and 10.4.3.1 requires the payload to contain "representations
+/// for all of the Target Resource(s)" - so the answer is all-or-none: every
+/// requested frame is resolved BEFORE the head is written, and one
+/// out-of-range frame makes the whole request a 404 rather than a short body.
+///
+/// The body is streamed with chunked framing (the same discipline as
+/// `serve_multipart_chunked`): frames are read and written one at a time, so a
+/// long list costs one frame of RAM, not one list of frames.
+fn serve_frame_list(
+    ctx: &mut RequestContext<'_>,
+    oref: &crate::handlers::wado_pure::ObjectRef,
+    spec: &str,
+) -> io::Result<()> {
+    let Some(frames) = parse_frame_list(spec, ctx.state.config.max_frames_per_instance as usize)
+    else {
+        return wado_err_response(ctx, WadoError::InvalidUid(spec.to_string()));
+    };
+    // All-or-none (PS3.18 10.4.3.1): every requested frame must exist BEFORE
+    // the head is written, so `frames/1,9` on a 3-frame instance is a 404 and
+    // never a one-part 200.
+    //
+    // With a frame table the manifest answers directly. Without one the
+    // instance predates the table, and the only range authority is the parser:
+    // check the whole list against ONE bounded blob read here rather than
+    // letting the loop discover the problem after the head is on the wire.
+    if oref.frames.is_empty() {
+        let bytes = if oref.file_size > ctx.state.config.max_frame_bytes {
+            // Same bound as the single-frame path: no whole-blob read of a
+            // multi-GB instance, and no honest way to answer either.
+            return wado_err_response(ctx, WadoError::RangeNotSatisfiable);
+        } else {
+            match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
+                Ok(b) => b,
+                Err(_) => {
+                    return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256.clone()));
+                }
+            }
+        };
+        for n in &frames {
+            if let Err(e) = crate::handlers::wado_pure::extract_frame(&bytes, &n.to_string()) {
+                return wado_err_response(ctx, e);
+            }
+        }
+    } else {
+        for n in &frames {
+            if !oref.frames.iter().any(|f| f.number == *n) {
+                return wado_err_response(ctx, WadoError::NotFound(spec.to_string()));
+            }
+        }
+    }
+
+    // A per-response boundary: the single-part constant is fine for one part,
+    // but two concurrent list responses must not share a delimiter.
+    let boundary = clarus_adapters::boundary_id();
+    let ka = ctx.keep_alive == KeepAlive::On;
     let ct =
         format!("multipart/related; type=\"application/octet-stream\"; boundary=\"{boundary}\"");
-    let ka = ctx.keep_alive == KeepAlive::On;
-    clarus_core::http::response::build_head(
-        &mut ctx.conn.header,
-        200,
-        reason_phrase(200),
-        Some(ct.as_bytes()),
-        Some(body.len() as u64),
-        ka,
-        &[],
-    );
-    ctx.conn.write_head_configured()?;
-    ctx.conn.write_all_configured(&body)
+    ctx.conn.chunked_start(200, "OK", ct.as_bytes(), ka)?;
+    for (i, n) in frames.iter().enumerate() {
+        let (frame_bytes, declared_ts) = match frame_part_body(ctx, oref, &n.to_string()) {
+            Ok(v) => v,
+            Err(e) => {
+                // The head is already on the wire, so a status line is no
+                // longer possible; the pool was saturated or the blob went
+                // away mid-response. Close the body honestly by ending the
+                // chunked stream - the client sees a short (invalid) part
+                // rather than a hang.
+                crate::clog_warn!(frame = %n, error = %e, "Frame list aborted mid-body");
+                ctx.conn.chunked_end()?;
+                return Ok(());
+            }
+        };
+        let media = frame_part_media_type(&declared_ts);
+        let delimiter = if i == 0 { "--" } else { "\r\n--" };
+        let part_head = format!(
+            "{delimiter}{boundary}\r\nContent-Type: {media}; transfer-syntax={declared_ts}\r\n\r\n"
+        );
+        ctx.conn.chunked_data(part_head.as_bytes())?;
+        ctx.conn.chunked_data(&frame_bytes)?;
+    }
+    let closing = format!("\r\n--{boundary}--\r\n");
+    ctx.conn.chunked_data(closing.as_bytes())?;
+    ctx.conn.chunked_end()
 }
 
 /// PS3.18 frame media type for a stored transfer syntax (the table that
@@ -2786,6 +3142,53 @@ fn frame_part_media_type(ts: &str) -> &'static str {
         // always present, so the loader can still pick a codec.
         _ => "application/octet-stream",
     }
+}
+
+/// Parse the `{frames}` URI-template value into 1-based frame numbers.
+///
+/// PS3.18 10.4.1.1.6 spells the slot `{frames}` - a single URI-template
+/// variable (7.2.3) - and 8.7.3.3 models multi-frame bulk data as one
+/// representation per Frame, so the value may name a SET of frames. The
+/// standard defines no grammar for that set, so the comma form every
+/// implementation shares (dcm4chee, Orthanc, dicomweb-client) is what this
+/// server accepts; ranges are absent by design (an `A-B` expansion is
+/// attacker-chosen cardinality materialised at request time).
+///
+/// Order is preserved exactly: part N of the multipart body must answer
+/// element N of the request (a client indexes its frames by position), so the
+/// list is never sorted and duplicates are served as many times as asked.
+///
+/// Returns the frame numbers, or `None` if the value is structurally invalid.
+/// The count is bounded by `max_frames_per_instance`: a request must not be
+/// able to name more frames than an instance can hold.
+fn parse_frame_list(spec: &str, max_frames: usize) -> Option<Vec<u32>> {
+    if spec.is_empty() {
+        return None;
+    }
+    // A comma list cannot be longer than the cap; counting separators first
+    // rejects an over-long request before allocating anything for it.
+    let elements = spec.bytes().filter(|&b| b == b',').count() + 1;
+    if elements > max_frames {
+        return None;
+    }
+    let mut out = Vec::with_capacity(elements);
+    for part in spec.split(',') {
+        // Digits only: a sign, a space or an exponent is a malformed URI, not
+        // a frame reference. `0` parses - it is WELL FORMED but not a Target
+        // Resource (frames are 1-based), and the difference matters: the
+        // grammar gate answers 400 for garbage, while a well-formed reference
+        // to a frame that does not exist is a 404 (PS3.18 10.4.3.1).
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        match part.parse::<u32>() {
+            Ok(n) => out.push(n),
+            // Beyond u32: no instance can hold it, so the bounded check below
+            // reports it as a missing frame rather than a parse failure.
+            Err(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Return the last path segment (`.../frames/{n}` -> `{n}`; `bulkdata/{tag}` -> tag).
@@ -3147,22 +3550,9 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
         // counted as stored.
         let mut manifest_failed = crate::handlers::stow_pure::commit_manifests(ctx.state, &batch);
         manifest_failed.extend(batch.take_manifest_failed());
-        for sop_instance_uid in &manifest_failed {
+        for (sop_class_uid, sop_instance_uid) in &manifest_failed {
             let reason = "Failed to write the study manifest for this instance".to_string();
-            let failed = InstanceOutcome::Failed {
-                sop_class_uid: None,
-                sop_instance_uid: Some(sop_instance_uid.clone()),
-                reason: reason.clone(),
-            };
-            accum.record(
-                &failed,
-                None,
-                Some(build_failed_sop_entry(
-                    None,
-                    Some(sop_instance_uid.as_str()),
-                    &reason,
-                )),
-            );
+            accum.demote_to_failed(sop_instance_uid, sop_class_uid, &reason);
         }
         // P2 durability: sync the written manifests before the 200/202 leaves.
         crate::handlers::stow_pure::sync_batch_manifests(ctx.state, &batch);
@@ -3250,8 +3640,13 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
     // A body whose Content-Type is neither `application/dicom` (handled above)
     // nor `multipart/related` is an unsupported media type, not a malformed
     // request: PS3.18 10.5.3-1 lists 415 for exactly this case.
+    // PS3.18 10.5.3-1: a Content-Type the origin does not support is a 415.
+    // Compare the BASE media type through the same helper the single-part
+    // branch uses, not a raw prefix test: `multipart/related-invalid` is a
+    // different media type and must not fall through to the multipart parser,
+    // while `multipart/related` with any parameter set stays accepted.
     let ct_str = String::from_utf8_lossy(content_type);
-    if !ct_str.to_ascii_lowercase().starts_with("multipart/related") {
+    if !content_type_is(ct_trimmed, "multipart/related") {
         let body = b"{\"error\":\"Unsupported Media Type: expected multipart/related or application/dicom\",\"status\":415}".to_vec();
         return write_resp(ctx.conn, 415, JSON_CT, &body, ka);
     }
@@ -3572,22 +3967,9 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
         all.extend(batch.take_manifest_failed());
         all
     };
-    for sop_instance_uid in &manifest_failed {
+    for (sop_class_uid, sop_instance_uid) in &manifest_failed {
         let reason = "Failed to write the study manifest for this instance".to_string();
-        let failed = InstanceOutcome::Failed {
-            sop_class_uid: None,
-            sop_instance_uid: Some(sop_instance_uid.clone()),
-            reason: reason.clone(),
-        };
-        accum.record(
-            &failed,
-            None,
-            Some(build_failed_sop_entry(
-                None,
-                Some(sop_instance_uid.as_str()),
-                &reason,
-            )),
-        );
+        accum.demote_to_failed(sop_instance_uid, sop_class_uid, &reason);
     }
     // P2 durability: sync the written manifests before the 200/202 leaves.
     crate::handlers::stow_pure::sync_batch_manifests(ctx.state, &batch);
@@ -4472,6 +4854,49 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
 
+    // -- D4: frame lists -------------------------------------------------
+
+    /// The list parser is bounded BEFORE it allocates: a request naming more
+    /// frames than the instance cap is refused while `out` is still empty.
+    #[test]
+    fn a_list_over_the_cap_is_refused_before_allocating() {
+        // 10 elements against a cap of 3: the separator count alone decides.
+        assert!(parse_frame_list("1,2,3,4,5,6,7,8,9,10", 3).is_none());
+        assert!(
+            parse_frame_list("1,2,3", 3).is_some(),
+            "the cap is inclusive"
+        );
+        assert!(parse_frame_list("1,2,3,4", 3).is_none());
+    }
+
+    #[test]
+    fn a_frame_list_preserves_request_order_and_duplicates() {
+        assert_eq!(parse_frame_list("2,1", 100), Some(vec![2, 1]));
+        assert_eq!(parse_frame_list("1,1", 100), Some(vec![1, 1]));
+        assert_eq!(parse_frame_list("3,1,2", 100), Some(vec![3, 1, 2]));
+    }
+
+    #[test]
+    fn a_zero_frame_is_well_formed_but_the_handler_reports_it_missing() {
+        // 1-based addressing: `0` parses (400 would be wrong - the URI is
+        // well formed), and the missing-frame answer comes from the resource
+        // lookup, which is a 404.
+        assert_eq!(parse_frame_list("0", 100), Some(vec![0]));
+        assert_eq!(parse_frame_list("0,1", 100), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn garbage_is_rejected_by_the_parser() {
+        for bad in [
+            "", ",", "1,", ",1", "1,,2", "1-2", "a", "1;2", " 1", "1 ", "+1",
+        ] {
+            assert!(
+                parse_frame_list(bad, 100).is_none(),
+                "{bad:?} must not parse"
+            );
+        }
+    }
+
     /// Build a connected `(server_conn, client_stream)` loopback pair.
     fn conn_pair() -> (Conn, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4757,6 +5182,8 @@ mod tests {
                 kind: PartKind::StreamAsIs,
                 series_uid: String::new(),
                 with_content_location: false,
+                image_type: Vec::new(),
+                number_of_frames: None,
             },
             PartPlan {
                 sha256: h2,
@@ -4768,6 +5195,8 @@ mod tests {
                 kind: PartKind::StreamAsIs,
                 series_uid: String::new(),
                 with_content_location: false,
+                image_type: Vec::new(),
+                number_of_frames: None,
             },
         ];
 

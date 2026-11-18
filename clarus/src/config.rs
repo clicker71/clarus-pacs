@@ -189,6 +189,15 @@ pub struct UpsConfig {
     ///
     /// Default 24. Range 0..=8760 (one year).
     pub deletion_lock_ttl: u64,
+    /// Default UTC offset (seconds) applied at COMPARISON time to a
+    /// ScheduledProcedureStepStartDateTime value that carries no `&ZZXX`
+    /// offset.
+    ///
+    /// An offset-free DT is local time (PS3.5 6.2), so the server compares it
+    /// in the deployment's local frame; +0000 (UTC) is the shipped default.
+    /// Only offset-free values use it: a full-precision value with an explicit
+    /// offset keeps its own, and stored data is never rewritten.
+    pub local_utc_offset_secs: i64,
     /// The site's workitem code vocabulary, keyed by study Modality.
     ///
     /// A closed site vocabulary: Modality (0008,0060, type 1, read from the
@@ -293,6 +302,9 @@ impl UpsConfig {
     pub const DEFAULT_DELETION_LOCK_TTL_HOURS: u64 = 24;
     /// Upper bound of `deletion_lock_ttl` (inclusive; 0 = locks ignored).
     pub const MAX_DELETION_LOCK_TTL_HOURS: u64 = 8760;
+    /// Shipped default for `local_utc_offset`: +0000 = UTC. Offset-free DT
+    /// values are compared in this frame (PS3.5 6.2).
+    pub const DEFAULT_LOCAL_UTC_OFFSET_SECS: i64 = 0;
     /// The shipped default code table: the owner's demo vocabulary.
     ///
     /// DX -> CXR-AI, CT -> CT-ORGAN-SEG, everything else -> the
@@ -551,6 +563,7 @@ impl Default for UpsConfig {
             push_attempts: 3,
             final_state_retention_days: Self::DEFAULT_FINAL_STATE_RETENTION_DAYS,
             deletion_lock_ttl: Self::DEFAULT_DELETION_LOCK_TTL_HOURS,
+            local_utc_offset_secs: Self::DEFAULT_LOCAL_UTC_OFFSET_SECS,
             workitem_codes: Self::DEFAULT_WORKITEM_CODES
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -1018,6 +1031,54 @@ pub fn parse_size(s: &str, min: u64, max: u64) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// Parse a DICOM UTC offset string `[+-]HHMM` into signed seconds.
+///
+/// PS3.5 6.2 Note 2 bounds the offset to -1200..+1400 and forbids `-0000`
+/// (standard/ps3.5/dt-vr.json `offsetRangeMinus1200ToPlus1400`): a negative
+/// sign must name a real west-of-UTC zone, so `-0000` is refused rather than
+/// silently read as UTC. The minutes must be a real minute (<= 59). Validated,
+/// not clamped: a typo is a startup error, not a silent wrong zone.
+pub fn parse_utc_offset(s: &str) -> Result<i64, String> {
+    let err = || {
+        format!(
+            "clarus.conf [ups] local_utc_offset: {s:?} is not a UTC offset (+HHMM/-HHMM in -1200..+1400)"
+        )
+    };
+    let b = s.as_bytes();
+    let (sign, digits) = match b.split_first() {
+        Some(pair) => pair,
+        None => return Err(err()),
+    };
+    let positive = match sign {
+        b'+' => true,
+        b'-' => false,
+        _ => return Err(err()),
+    };
+    // Exactly four digits must follow the sign, all ASCII - `+9` and
+    // `+05:00` are both spelling errors, not zones.
+    if digits.len() != 4 || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(err());
+    }
+    // All four bytes are ASCII digits (checked above), so the byte arithmetic
+    // cannot underflow and no separate parse can fail.
+    let hours = i64::from(digits[0] - b'0') * 10 + i64::from(digits[1] - b'0');
+    let minutes = i64::from(digits[2] - b'0') * 10 + i64::from(digits[3] - b'0');
+    if minutes > 59 {
+        return Err(err());
+    }
+    let magnitude = hours * 100 + minutes;
+    let in_range = if positive {
+        magnitude <= 1400
+    } else {
+        (1..=1200).contains(&magnitude)
+    };
+    if !in_range {
+        return Err(err());
+    }
+    let secs = hours * 3600 + minutes * 60;
+    Ok(if positive { secs } else { -secs })
+}
+
 /// Render a byte count canonically with a `k`/`m` suffix where it divides
 /// evenly, else as bare bytes (used by `-t` output).
 pub fn size_canonical(bytes: u64) -> String {
@@ -1027,6 +1088,15 @@ pub fn size_canonical(bytes: u64) -> String {
         }
     }
     bytes.to_string()
+}
+
+/// Render an offset in seconds canonically as `+HHMM`/`-HHMM` (used by `-t`).
+pub fn utc_offset_canonical(secs: i64) -> String {
+    let abs_minutes = secs.unsigned_abs() / 60;
+    let hh = abs_minutes / 60;
+    let mm = abs_minutes % 60;
+    let sign = if secs >= 0 { '+' } else { '-' };
+    format!("{sign}{hh:02}{mm:02}")
 }
 
 // -- nginx-style config parser (0 KB - std only) --------------------
@@ -1151,6 +1221,7 @@ fn is_known_key(section: &str, key: &str) -> bool {
         "push_attempts",
         "final_state_retention_days",
         "deletion_lock_ttl",
+        "local_utc_offset",
         "ai_station_aet",
         "non_task_modalities",
     ];
@@ -2251,6 +2322,14 @@ impl Config {
                         UpsConfig::MAX_DELETION_LOCK_TTL_HOURS
                     ));
                 }
+                // Offset-free DT values are compared in the deployment's local
+                // frame (PS3.5 6.2); this is that frame. Validated, not
+                // clamped, like the other [ups] numerics: an offset the parser
+                // cannot read is a startup error, not a silent UTC.
+                let local_utc_offset_secs: i64 = match p.get("ups", "local_utc_offset") {
+                    Some(raw) => parse_utc_offset(raw.trim())?,
+                    None => UpsConfig::DEFAULT_LOCAL_UTC_OFFSET_SECS,
+                };
                 // The code table is a MODALITY -> Code Value(s) map. It is
                 // read as a whole section because its keys are data; each key
                 // is validated as a DICOM CS token at parse time (see
@@ -2506,6 +2585,7 @@ impl Config {
                     push_attempts,
                     final_state_retention_days,
                     deletion_lock_ttl,
+                    local_utc_offset_secs,
                     workitem_codes,
                     workitem_code_fallback,
                     non_task_modalities,
@@ -4111,6 +4191,13 @@ port = 8024
         let c = parse_and_load("[ups]\ndefault_limit = 500").expect("custom parse");
         assert_eq!(c.ups.default_limit, 500);
 
+        // The new local_utc_offset key coexists with default_limit in one
+        // [ups] section.
+        let c = parse_and_load("[ups]\ndefault_limit = 500\nlocal_utc_offset = +0100")
+            .expect("combined parse");
+        assert_eq!(c.ups.default_limit, 500);
+        assert_eq!(c.ups.local_utc_offset_secs, 3600);
+
         // Unknown key in [ups] -> rejected (allowlist).
         let err = parse_and_load("[ups]\nbogus_key = 1").unwrap_err();
         assert!(err.contains("unknown"), "got: {err}");
@@ -4161,6 +4248,73 @@ port = 8024
             err.contains("final_state_retention_days"),
             "the key must be named: {err}"
         );
+    }
+
+    /// `[ups] local_utc_offset` parses (absent -> +0000, in-range explicit
+    /// honoured, `-0000` and out-of-range/malformed forms refused - validated,
+    /// not clamped, so a typo is a startup error rather than a silent UTC).
+    #[test]
+    fn test_config_ups_local_utc_offset() {
+        let parse_and_load = |body: &str| -> Result<Config, String> {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let conf = dir.path().join("clarus.conf");
+            std::fs::write(
+                &conf,
+                format!(
+                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
+                ),
+            )
+            .expect("write conf");
+            Config::from_file(&conf)
+        };
+
+        // Absent -> the shipped default (+0000 = UTC).
+        let c = parse_and_load("").expect("default parse");
+        assert_eq!(c.ups.local_utc_offset_secs, 0);
+        assert_eq!(
+            c.ups.local_utc_offset_secs,
+            UpsConfig::DEFAULT_LOCAL_UTC_OFFSET_SECS
+        );
+
+        // In-range values are honoured exactly.
+        assert_eq!(
+            parse_and_load("[ups]\nlocal_utc_offset = +0500")
+                .expect("+0500")
+                .ups
+                .local_utc_offset_secs,
+            18000
+        );
+        assert_eq!(
+            parse_and_load("[ups]\nlocal_utc_offset = +1400")
+                .expect("+1400")
+                .ups
+                .local_utc_offset_secs,
+            50400
+        );
+        assert_eq!(
+            parse_and_load("[ups]\nlocal_utc_offset = -1200")
+                .expect("-1200")
+                .ups
+                .local_utc_offset_secs,
+            -43200
+        );
+        assert_eq!(
+            parse_and_load("[ups]\nlocal_utc_offset = -0001")
+                .expect("-0001")
+                .ups
+                .local_utc_offset_secs,
+            -60
+        );
+
+        // Refused: -0000 (PS3.5 6.2 Note 2), out of range, minutes >= 60,
+        // and malformed forms. Each error names the key.
+        for bad in ["-0000", "-1300", "+1500", "+1460", "0930", "+9", "+05:00"] {
+            let err = parse_and_load(&format!("[ups]\nlocal_utc_offset = {bad}")).unwrap_err();
+            assert!(
+                err.contains("local_utc_offset"),
+                "the key must be named for {bad}: {err}"
+            );
+        }
     }
 
     /// `[ups] task_producer` parses (absent -> false, explicit true/false

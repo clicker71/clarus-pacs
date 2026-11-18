@@ -1,7 +1,7 @@
 # DICOMweb interoperability: Clarus vs dcm4chee-arc
 
 Clarus PACS compared against [dcm4chee-arc](https://github.com/dcm4chee/dcm4chee-arc)
-5.35.2, measured 2026-10-01, updated 2026-10-14. Every claim is reproduced by the universal test
+5.35.2, measured 2026-10-01, updated 2026-11-14. Every claim is reproduced by the universal test
 tool in this repository, [`tools/dicomweb_interop.py`](tools/dicomweb_interop.py):
 the same DICOM corpus is seeded to both servers, then identical requests are
 sent to each and the answers are shown side by side.
@@ -26,39 +26,77 @@ both), `--patient-name`/`--variants` (fuzzy queries), `--sop-class`/
 - dcm4chee-arc 5.35.2 (Docker `dcm4che/dcm4chee-arc-psql:5.35.2`), device
   `dcm4chee-arc`, AE title `DCM4CHEE`. UPS-RS is disabled by default and was
   enabled by adding `dcmWebServiceClass: UPS_RS` to the Web Application LDAP
-  entry. Fuzzy algorithm = LDAP attribute
-  `dcmFuzzyAlgorithmClass: org.dcm4che3.soundex.ESoundex`.
+  entry (this change survives `docker restart` but NOT a full `docker compose
+  down`/`up` - re-apply it after every clean reset). Fuzzy algorithm = LDAP
+  attribute `dcmFuzzyAlgorithmClass: org.dcm4che3.soundex.ESoundex`.
 - Clarus on `127.0.0.1:8024`, DICOMweb base `/dicomweb`.
 - Corpus: the same set of DICOM files STOWed to both servers (synthetic CT
   series plus CBCT; contains Latin-named and Cyrillic-named patients, so the
   fuzzy contrast covers both scripts).
 
-## PS3.18 conformance (2026-10-14, PS3.18 2026d)
+## PS3.18 conformance (2026-11-14, PS3.18 2026d)
 
-Measured on the same host, PS3.18 2026d, with a 32-assert gate of MANDATORY
-PS3.18 facts run as a black box against each origin: Clarus 32/32,
-dcm4chee-arc 13/32; a black-box red-team pass over the same surface found no
-remaining non-conformance in Clarus. One table for the whole comparison; the
-Conformant column names the origin that follows the standard for that row:
+Measured on the same host, PS3.18 2026d, with the 32-assert gate of the
+project's PS3.18 conformance sweep (a source-tree test binary) -
+31 black-box asserts over the MANDATORY PS3.18 facts plus one local
+standard-edition pin. Clarus runs in-process (offline mode); dcm4chee-arc
+runs as a black-box client against a CLEAN stack (empty storage) with UPS-RS
+enabled on the `DCM4CHEE` AE:
 
-| Check | PS3.18 anchor | Clarus | dcm4chee-arc | Conformant |
-|---|---|---|---|---|
-| Capabilities | 8.9 | WADL | 404 (no transaction) | Clarus |
-| QIDO limit=0 | 8.3.4.4.1 | 200 + empty result | 400 | Clarus |
-| QIDO truncated page | 8.3.4.4.1 | Warning 299 | no Warning | Clarus |
-| QIDO legal matching key (0008,0090) | 10.6.1-5 | accepted | 400 | Clarus |
-| Thumbnail default media type | 8.7.4-1 | image/jpeg | image/png | Clarus |
-| STOW single-part application/dicom | 8.7.3.1 | 200 | 415 | Clarus |
-| Rendered resource | 10.4.3.3.3 | rendering | rendering | both |
-| Storage Commitment | 13 | yes | 404 | Clarus |
-| MWL | 14 | yes | 404 | Clarus |
-| MPPS | 15 | yes | 404 | Clarus |
+- **Clarus 32/32; dcm4chee-arc 12/32** (11 black-box + the edition pin).
+- The earlier 13/32 for dcm4chee was a dirty-storage artifact: `e5` (UPS
+  search) passed only because workitems from a previous session were still
+  stored; on a clean reset it answers 204 on an empty search, which 11.9
+  rejects (it requires 200).
+
+`✓` = passes, `✗` = fails with dcm4chee's observed answer:
+
+| Check | PS3.18 anchor | Clarus | dcm4chee-arc |
+|---|---|---|---|
+| **A. Capabilities** - OPTIONS base -> WADL | 8.9 / Annex H | ✓ | ✗ 404 |
+| **B. QIDO** answers 200 + `application/dicom+json` | 8.3.3 | ✓ | ✓ |
+| **B. QIDO** non-uint `limit`/`offset` -> 400 | 8.3.4.4 | ✓ | ✓ |
+| **B. QIDO** `limit=0` -> 200 empty array | 8.3.4.4.1 | ✓ | ✗ 400 |
+| **B. QIDO** truncated page -> Warning 299 wording | 8.3.4.4.1 | ✓ | ✗ no Warning |
+| **B. QIDO** required matching key (0008,0090) accepted | 10.6.1-5 | ✓ | ✗ 400 |
+| **C. WADO** study/series/instance retrieve -> 200 | 10.4.3.3.1 | ✓ | ✓ |
+| **C. WADO** metadata at all three levels | 10.4.1.1.2 | ✓ | ✓ |
+| **C. WADO** frames in range and beyond | 10.4.3 | ✓ | ✓ |
+| **C. WADO** rendered instance is MANDATORY | 8.7.4 | ✓ | ✓ |
+| **C. WADO** thumbnail default media type `image/jpeg` | 8.7.4-1 | ✓ | ✗ image/png |
+| **C. WADO** bulkdata PixelData 200/404 | 10.4.1 | ✓ | ✓ |
+| **C. WADO** retrieve status never 416 | 10.4.3.3 | ✓ | ✓ |
+| **D. STOW** root store -> 200 (not 201) | 10.5.3 | ✓ | ✗ 415 |
+| **D. STOW** study-scoped store: match 200, mismatch 409 | 10.5.1.1 / 10.5.3.1 | ✓ | ✗ 415 |
+| **D. STOW** single-part `application/dicom` -> 200 | 10.5.1.4 | ✓ | ✗ 415 |
+| **D. STOW** multipart/related store -> 200 | 10.5 | ✓ | ✓ |
+| **D. STOW** non-DICOM Content-Type refused | 10.5.3-1 | ✓ | ✓ |
+| **D. STOW** store status in {200,202,400,409,415} | 10.5.3 | ✓ | ✓ |
+| **E. UPS** create -> 201 + Location | 11.4 | ✓ | ✗ 400 |
+| **E. UPS** retrieve workitem -> 200 | 11.5 | ✓ | ✗ 404 |
+| **E. UPS** update -> 200/202 | 11.6 | ✓ | ✗ 405 |
+| **E. UPS** change state (PUT) -> 200 | 11.7 | ✓ | ✗ 400 (missing requester) |
+| **E. UPS** search -> 200 | 11.9 | ✓ | ✗ 204 (empty) |
+| **E. UPS** cancel -> 202 | 11.8 | ✓ | ✗ 400 |
+| **E. UPS** subscribe -> 200/201 | 11.10 | ✓ | ✗ 403 |
+| **F. MWL** search -> 200 | 14 | ✓ | ✗ 404 |
+| **G. MPPS** create -> 200/201 | 15 | ✓ | ✗ 404 |
+| **H. Commitment** commit existing instance -> 200 | 13 | ✓ | ✗ 404 |
+| **H. Commitment** commit missing instance -> 200 | 13 | ✓ | ✗ 404 |
+| **H. Commitment** commitment result retrievable | 13 | ✓ | ✗ 404 |
+| standard fact files pin the current edition (local, not a server assert) | - | ✓ | ✓ |
 
 Notes:
 
-- dcm4chee-arc strictness, not non-conformances: UPS-RS Create validates the
-  full CC.2.5-3 Create IOD (an empty 400 on a minimal body) and state/cancel
-  requires `?requester=` (PS3.18 11.7.2.1-1 makes it optional).
+- dcm4chee-arc's three STOW `415`s (root, study-scoped, single-part) are one
+  root cause: it accepts only `multipart/related` and rejects the single-part
+  `application/dicom` form, although PS3.18 8.7.3.1 makes single-part
+  MANDATORY.
+- dcm4chee-arc accepts the full Task-Requester Create (see the UPS-RS section
+  below), yet answers 400 to the sweep's CC.2.5-3 type-1 Create body - its
+  Create validation is stricter than CC.2.5-3's mandatory set (not yet
+  root-caused). State/cancel requires `?requester=` (PS3.18 11.7.2.1-1 makes
+  it optional); subscribe answers 403.
 - The Storage Commitment / MWL / MPPS "404" for dcm4chee-arc means "not on the
   standard DICOMweb resources": it serves commitment over DIMSE and MWL/MPPS
   via proprietary endpoints - see the sections below.
@@ -178,39 +216,51 @@ query in a non-Latin script returns every non-Latin patient in the archive
 Unicode-aware Levenshtein-1 does not exhibit this. This is a search-quality
 defect with a privacy implication, not an access-control bypass.
 
-## Throughput (container-vs-container, measured 2026-10-07)
+## Throughput (container-vs-container, measured 2026-10-07, re-measured 2026-11-14)
 
 Host: VMware VM, 6 vCPU (2 sockets × 3 cores, Intel Xeon E5-2690 v4 @ 2.60 GHz), 32 GB RAM,
 storage = two VMware virtual disks on HDD (SAS). Both servers in Docker on
-the same host, loopback, identical corpus (631 files / 514 MB / 2 studies /
-4 series), each started from empty storage. Measured with
-[`tools/ab_test.py`](tools/ab_test.py) (STOW-RS upload, then WADO-RS read).
-Both serve the objects from their own local storage - there is no
-DICOMweb-to-DIMSE hop on either side, so this is apples-to-apples.
+the same host, loopback, identical corpus, each started from empty storage.
+Measured with [`tools/ab_test.py`](tools/ab_test.py) (STOW-RS upload, then
+WADO-RS read). Both serve the objects from their own local storage - there
+is no DICOMweb-to-DIMSE hop on either side, so this is apples-to-apples.
+The 2026-10-07 pass used 631 files / 514 MB / 2 studies / 4 series; the
+2026-11-14 pass used the same CBCT subset alone (626 files / 491 MB / 1 study
+/ 1 series) - the ratios are unaffected.
 
 | Phase | Clarus | dcm4chee-arc |
 |---|---|---|
-| STOW-RS write | 32.1 MB/s | 19.6 MB/s |
-| WADO-RS read, sequential (series) | 54.1 MB/s | 50.2 MB/s |
-| WADO-RS read, parallel (631 instances, adaptive window) | 50.3 MB/s (window 5, 16.2 ms/instance) | 26.0 MB/s (window 7, 31.4 ms/instance) |
+| STOW-RS write | 32.5 MB/s (window 11) | 24.8 MB/s (window 7) |
+| WADO-RS read, sequential (series) | 73.3 MB/s | 67.7 MB/s |
+| WADO-RS read, parallel (626 instances, adaptive window) | 46.1 MB/s (window 4, 17.1 ms/instance) | 33.1 MB/s (window 10, 23.6 ms/instance) |
 
-A single bulk series read is I/O-bound and lands on the same ~50 MB/s ceiling
-for both. The gap appears on many small parallel requests: Clarus holds the
-ceiling (16.2 ms/instance) while dcm4chee-arc drops to 31.4 ms/instance,
-consistent with a heavier per-request lookup path (PostgreSQL/LDAP) at
-instance granularity.
+A single bulk series read is I/O-bound and lands on the same ceiling for
+both - and that ceiling is this machine's HDD + Docker loopback, which
+drifted between the two passes (~50 MB/s on 2026-10-07, ~68-73 MB/s on
+2026-11-14) as the VM's disk contention changed. Both servers moved together,
+which is the signature of a machine-state change, not a code change (0.3.2
+touched only the STOW body-write granularity). The stable signal is the gap:
+
+- STOW-RS write: Clarus ~1.3x faster. The 0.3.2 1 MiB write does not move
+  this corpus - many 0.75 MB slices are per-instance-overhead bound, not
+  body-write bound (the changelog's +28% was on a single 824 MiB instance).
+- WADO-RS read, parallel: Clarus holds ~17 ms/instance (per-request overhead)
+  while dcm4chee-arc drops to ~24 ms/instance, consistent with a heavier
+  per-request lookup path (PostgreSQL/LDAP) at instance granularity.
 
 Where the wall is (and is not):
 
-- The ~50 MB/s read ceiling is **this machine's HDD + Docker Desktop
-  loopback** (VM NAT bridge), not the server. Both servers hit the same wall,
-  which is why sequential bulk reads are parity.
+- The read ceiling is **this machine's HDD + Docker Desktop loopback** (VM
+  NAT bridge), not the server - and it drifts with the VM's disk contention
+  (measured ~50 MB/s on 2026-10-07, ~68-73 MB/s on 2026-11-14). Both servers
+  hit the same wall, which is why sequential bulk reads are parity.
 - On NVMe the same Clarus WADO path is far faster: 344-428 MB/s cold and
   ~1.1 GB/s warm, and 602 MiB/s in a release-profile bench run (measured
   2026-08-26).
 - The field Raspberry Pi 5 (Cortex-A76, 2 GB RAM, NVMe over PCIe 2.0 x1)
-  measures far higher on the same WADO path: warm ~990 MB/s single stream,
-  4.0 GB/s four-stream aggregate; cold 244-356 MB/s single, ~896 MB/s
-  aggregate (2026-09-01, bare-metal native build, loopback curl, 636 MB
-  corpus). So the field box is NVMe-bound, not HDD-bound as in this VM.
+  measures far higher on the same WADO path (2026-09-01, bare-metal native
+  build, loopback curl, 636 MB corpus): warm ~990 MB/s single stream and
+  4.0 GB/s four-stream aggregate - RAM-bandwidth and Linux page-cache bound;
+  cold 244-356 MB/s single stream - NVMe / PCIe 2.0 x1 bound. So the field
+  box is page-cache/NVMe bound, not HDD-bound as in this VM.
 

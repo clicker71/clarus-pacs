@@ -39,16 +39,57 @@ impl std::fmt::Display for GenerationError {
 
 impl std::error::Error for GenerationError {}
 
-/// BLAKE3 digest over a joined key, returned as a 32-byte array.
+/// BLAKE3 digest over a list of components, joined unambiguously.
+///
+/// The components are concatenated with a `|` separator, but the separator is
+/// only unambiguous if a `|` INSIDE a component cannot be mistaken for one.
+/// PatientID (0010,0020) and AccessionNumber (0008,0050) are LO and may
+/// contain `|`, and nothing on the read path filters them, so a plain join
+/// made `("A|B", "C", ..)` and `("A", "B|C", ..)` hash to the SAME digest -
+/// which becomes the StudyInstanceUID and therefore merges two unrelated
+/// studies into one.
+///
+/// [`escape_component`] removes that: a component holding neither `|` nor `\`
+/// is emitted verbatim (so every digest already written stays byte-identical),
+/// and any other component is prefixed with 0x01 (SOH, not a legal value byte
+/// in these VRs) and has its `|` and `\` backslash-escaped. The encoding is
+/// injective: the marker can never begin a verbatim component, so a marked
+/// component cannot be confused with a plain one.
 fn blake3_of(parts: &[&str]) -> [u8; 32] {
     let mut h = Blake3CasHasher::new();
+    let mut buf: Vec<u8> = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
             h.update(b"|");
         }
-        h.update(part.as_bytes());
+        buf.clear();
+        escape_component(part, &mut buf);
+        h.update(&buf);
     }
     h.finalize()
+}
+
+/// Append `part` to `out` in the unambiguous form [`blake3_of`] hashes.
+///
+/// Verbatim when the component holds neither separator, which is the case for
+/// every UID this function has ever produced; marked and escaped otherwise.
+fn escape_component(part: &str, out: &mut Vec<u8>) {
+    let needs_escape = part.as_bytes().iter().any(|&b| b == b'|' || b == b'\\');
+    if !needs_escape {
+        out.extend_from_slice(part.as_bytes());
+        return;
+    }
+    // SOH marks an encoded component. It cannot begin a verbatim one: a
+    // component is escaped precisely when it contains a separator, and the
+    // marker is written only in that case - so the two forms are disjoint even
+    // if the value itself starts with SOH.
+    out.push(0x01);
+    for &b in part.as_bytes() {
+        if b == b'|' || b == b'\\' {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
 }
 
 /// Lowercase hex encoding of a byte slice (32 bytes -> 64 chars).
@@ -64,10 +105,12 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Generate a deterministic StudyInstanceUID (0020,000D) when empty.
 ///
-/// The UID is `"2.25."` + a decimal integer (ISO 9834-3 OID / UUID-as-URN
-/// style root, `"2.25"` is the arc for UUID-based OIDs). The decimal is the
-/// first 8 bytes of the BLAKE3 of the joined search inputs, read as a u64 -
-/// a large, unique, but fully deterministic number.
+/// The UID is `"2.25."` + the decimal representation of a full 128-bit UUID
+/// (ISO 9834-3 OID root `2.25`; PS3.5 B.2: the decimal of a 128-bit UUID, up
+/// to 39 digits with leading zeros suppressed). The UUID is derived from the
+/// BLAKE3 of the joined search inputs - a large, unique, fully deterministic
+/// number - with the RFC 4122 version and variant bits set so it is a valid
+/// UUID, not merely a 128-bit integer.
 pub fn generate_study_instance_uid(
     patient_id: &str,
     study_date: Option<&str>,
@@ -85,13 +128,7 @@ pub fn generate_study_instance_uid(
         accession.unwrap_or(""),
         modality,
     ]);
-    // First 8 bytes as a big-endian u64 -> decimal string. Clearing the top bit
-    // keeps the value within the positive 64-bit range so the decimal never
-    // exceeds the OID ceiling of 2^63-1.
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&digest[..8]);
-    let n = u64::from_be_bytes(b) & 0x7fff_ffff_ffff_ffff;
-    Ok(format!("2.25.{n}"))
+    Ok(format!("2.25.{}", uuid_u128_from_digest(&digest)))
 }
 
 /// Generate a deterministic PatientID (0010,0020) when empty.
@@ -120,25 +157,36 @@ pub fn generate_patient_name(study_instance_uid: &str) -> Result<String, Generat
 
 /// Fallback StudyInstanceUID key when PatientID is empty too.
 ///
-/// Returns the `u64` decimal body (already masked positive) that the server
-/// turns into `2.25.{decimal}`. BLAKE3 over StudyDate|StudyTime|Accession|
-/// Modality - deterministic within the study, same outer shape as the
-/// PatientID-anchored path.
+/// Returns the 128-bit UUID integer the server turns into `2.25.{decimal}`.
+/// BLAKE3 over StudyDate|StudyTime|Accession|Modality - deterministic within
+/// the study, same outer shape as the PatientID-anchored path. The version and
+/// variant bits are set, so the integer is a valid RFC 4122 UUID.
 pub fn fallback_study_uid_key(
     study_date: Option<&str>,
     study_time: Option<&str>,
     accession: Option<&str>,
     modality: &str,
-) -> u64 {
+) -> u128 {
     let digest = blake3_of(&[
         study_date.unwrap_or(""),
         study_time.unwrap_or(""),
         accession.unwrap_or(""),
         modality,
     ]);
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(b) & 0x7fff_ffff_ffff_ffff
+    uuid_u128_from_digest(&digest)
+}
+
+/// Derive a 128-bit RFC 4122 UUID integer from the first 16 BLAKE3 bytes.
+///
+/// PS3.5 B.2: a `2.25.` UID is the decimal of a 128-bit UUID. A bare hash
+/// prefix is neither 128 bits nor a UUID, so the version nibble (byte 6) and
+/// the variant bits (byte 8) are set per RFC 4122 - version 4, variant 10.
+fn uuid_u128_from_digest(digest: &[u8; 32]) -> u128 {
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    b[6] = (b[6] & 0x0F) | 0x40; // version 4 (RFC 4122 4.1.3)
+    b[8] = (b[8] & 0x3F) | 0x80; // variant 10 (RFC 4122 4.1.1)
+    u128::from_be_bytes(b)
 }
 
 #[cfg(test)]
@@ -156,6 +204,23 @@ mod tests {
         assert_eq!(a, b, "deterministic");
         assert!(a.starts_with("2.25."), "ISO 9834-3 OID root: {a}");
         assert!(!a.is_empty());
+        // PS3.5 B.2: the decimal of a 128-bit UUID has up to 39 digits. A
+        // 63-bit hash derived at most 19 digits; >19 pins the 128-bit width.
+        let decimal = a.strip_prefix("2.25.").expect("root present");
+        assert!(
+            decimal.len() > 19,
+            "the 2.25 body must be a 128-bit decimal (>19 digits): {a}"
+        );
+        assert!(decimal.len() <= 39, "128-bit decimal is at most 39 digits");
+    }
+
+    #[test]
+    fn fallback_study_uid_key_is_128_bit_and_deterministic() {
+        let a = fallback_study_uid_key(Some("20240115"), Some("120000"), Some("A1"), "CT");
+        let b = fallback_study_uid_key(Some("20240115"), Some("120000"), Some("A1"), "CT");
+        assert_eq!(a, b, "deterministic");
+        // The decimal of the 128-bit value must exceed 19 digits.
+        assert!(a.to_string().len() > 19, "128-bit decimal: {a}");
     }
 
     #[test]
@@ -192,5 +257,47 @@ mod tests {
         assert!(generate_study_instance_uid("", None, None, None, "CT").is_err());
         assert!(generate_patient_id("").is_err());
         assert!(generate_patient_name("").is_err());
+    }
+
+    #[test]
+    fn a_separator_inside_a_component_cannot_imitate_a_boundary() {
+        // PatientID "A|B" + Accession "C" must not hash like PatientID "A" +
+        // Accession "B|C": both used to spell the same joined byte string.
+        let left = generate_study_instance_uid("A|B", Some("20240115"), None, Some("C"), "CT")
+            .expect("left");
+        let right = generate_study_instance_uid("A", Some("20240115"), None, Some("B|C"), "CT")
+            .expect("right");
+        assert_ne!(left, right, "delimiter collision merged two studies");
+    }
+
+    #[test]
+    fn a_backslash_component_cannot_imitate_the_escape() {
+        // The escape byte is only trustworthy if the escape character itself is
+        // escaped: "A\\|B" must not decode to the same bytes as "A|B".
+        let with_slash = blake3_of(&["A\\|B"]);
+        let plain = blake3_of(&["A|B"]);
+        assert_ne!(with_slash, plain);
+    }
+
+    #[test]
+    fn components_without_separators_hash_exactly_as_before() {
+        // Compatibility pin: every UID already written was derived from a plain
+        // join, so a component pair with no separator must land on the same
+        // digest the old code produced. The literal below was read out of the
+        // pre-change implementation; if escaping ever starts marking plain
+        // components this fails and existing studies would be re-keyed.
+        let digest = blake3_of(&["P1", "20240115", "120000", "A1", "CT"]);
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&digest[..8]);
+        let n = u64::from_be_bytes(b) & 0x7fff_ffff_ffff_ffff;
+        assert_eq!(n, 4_097_947_227_879_186_042);
+    }
+
+    #[test]
+    fn empty_components_stay_distinct_from_separators() {
+        // Nothing else pins that an empty slot is not silently dropped: with an
+        // unescaped join, ("", "A") and ("|A", "") both spell "|A".
+        assert_ne!(blake3_of(&["", "A"]), blake3_of(&["|A", ""]));
+        assert_ne!(blake3_of(&["A", ""]), blake3_of(&["A|"]));
     }
 }

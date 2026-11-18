@@ -230,7 +230,15 @@ fn safe_stem(uid: &str) -> String {
     let mut out = String::with_capacity(uid.len());
     let bytes = uid.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
-        let passthrough = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_');
+        // Uppercase letters are encoded, not passed through. A case-insensitive
+        // volume treats `SPS-A.cbor` and `sps-a.cbor` as ONE file, so two SPS
+        // identifiers differing only in case would overwrite each other - the
+        // second `put_sps` silently destroying the first. Digits, dots and
+        // lowercase letters are what every DICOM UID and every generated SPS
+        // identifier uses, so encoding the uppercase half leaves existing
+        // files untouched while making the mapping injective on such volumes.
+        let passthrough =
+            (b.is_ascii_alphanumeric() && !b.is_ascii_uppercase()) || matches!(b, b'-' | b'_');
         // `.` passes through UNCHANGED so every existing DICOM-UID file keeps
         // its current name - re-encoding it would rename the whole store for a
         // conformance fix. The one case that must not survive is a `..` run,
@@ -252,25 +260,29 @@ fn safe_stem(uid: &str) -> String {
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // `create_dir_all` does not persist the NAME of the directories it
+        // creates, so a first write would otherwise flush the record and its
+        // immediate parent while `workflow/` and `mwl/` could still vanish from
+        // THEIR parents on a crash. Persist the newly created name chain.
+        crate::durable::sync_new_root_name(parent)?;
     }
-    let mut tmp = path.as_os_str().to_owned();
-    // Unique per write: a fixed `{uid}.cbor.tmp` is one buffer shared by every
-    // concurrent `put_*` of the same record, so their bytes interleaved and
-    // whichever renamed last published a spliced record.
-    tmp.push(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let tmp = PathBuf::from(tmp);
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    let tmp = claim_temp_sibling(path)?;
+    if let Err(e) = write_claimed(&tmp, bytes) {
         // Never leave a half-written sibling behind: the reader skips `.tmp`
         // names, but the next writer would have to clean it up.
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
     match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // The data is durable; persist the directory entry that names it
+            // too, or a crash can lose the NAME while the bytes are on the
+            // medium. Unix-only by necessity: Windows cannot open a directory
+            // for `FlushFileBuffers`. A failed dir-sync is a failed write.
+            #[cfg(unix)]
+            sync_parent_entry(path)?;
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(WorkflowStoreError::Io(e))
@@ -288,23 +300,28 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> {
 fn write_if_absent(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        crate::durable::sync_new_root_name(parent)?;
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let tmp = PathBuf::from(tmp);
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    let tmp = claim_temp_sibling(path)?;
+    if let Err(e) = write_claimed(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     match linked {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(unix)]
+            sync_parent_entry(path)?;
+            Ok(())
+        }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // The link landed but its NAME was never made durable (see the
+            // commitment store's identical arm): before answering Duplicate,
+            // persist the directory entry so a retry cannot be told "already
+            // stored" for a name the next crash removes.
+            #[cfg(unix)]
+            sync_parent_entry(path)?;
             Err(WorkflowStoreError::Duplicate(stem_of(path)))
         }
         Err(e) => Err(WorkflowStoreError::Io(e)),
@@ -319,10 +336,87 @@ fn stem_of(path: &Path) -> String {
         .to_string()
 }
 
+/// Reserve a temp sibling for `path` that no other writer can have selected.
+///
+/// The name carries pid + a process-wide counter, which makes a collision
+/// RARE but not impossible: PID namespaces let two containers share a pid, and
+/// the counter restarts at 0 after a restart, so two writers can compute the
+/// same name. `std::fs::write` would then open that name and REPLACE its
+/// contents - one writer would publish the other's bytes. `create_new` turns
+/// the collision into an error, and the retry moves to the next sequence.
+fn claim_temp_sibling(path: &Path) -> Result<PathBuf, WorkflowStoreError> {
+    // Bounded: each collision consumes a fresh sequence, so this only runs
+    // long on a pathological directory and must not spin forever.
+    const ATTEMPTS: usize = 64;
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let tmp = PathBuf::from(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            // The handle is dropped so the rename/hard_link below sees a
+            // closed file (Windows will not link a file open for writing).
+            Ok(_) => return Ok(tmp),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(WorkflowStoreError::Io(e)),
+        }
+    }
+    Err(WorkflowStoreError::Io(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AlreadyExists, "no free temp name")
+    })))
+}
+
+/// Fill a temp file that [`claim_temp_sibling`] already created exclusively.
+///
+/// The bytes are flushed (`sync_all`) BEFORE the caller links/renames the file
+/// into place, so a successful publish means the data is on the medium rather
+/// than merely scheduled to be: an N-CREATE / MPPS write that answered success
+/// while the bytes sat in the page cache could be empty after a crash, and the
+/// retry would then hit `Duplicate` with the performed step lost. That is the
+/// same barrier order the commitment store uses.
+fn write_claimed(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.write_all(bytes)?;
+    crate::durable::sync_barrier(&f)
+}
+
+/// Flush the directory entry that names `path` (Unix-only).
+///
+/// A rename/hard_link updates the parent directory's entry for `path`; that
+/// entry must be flushed too or a crash can lose the NAME while the data is
+/// durable. Unix-only because Windows cannot open a directory for
+/// `FlushFileBuffers` (the same boundary the commitment store states).
+#[cfg(unix)]
+fn sync_parent_entry(path: &Path) -> Result<(), WorkflowStoreError> {
+    let parent = match crate::durable::parent_entry_dir(path) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    crate::durable::sync_dir_entry(parent).map_err(WorkflowStoreError::Io)
+}
+
 /// Remove a file, reporting whether it existed.
 fn delete_file(path: &Path) -> Result<bool, WorkflowStoreError> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            // The name is gone; persist the directory entry that named it too,
+            // or a crash after this delete can restore the MWL/MPPS record.
+            // Same barrier the write paths apply after rename/hard_link;
+            // barrier failure propagates, open failure is swallowed by the
+            // helper (see durable.rs policy).
+            #[cfg(unix)]
+            sync_parent_entry(path)?;
+            Ok(true)
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(WorkflowStoreError::Io(e)),
     }
@@ -364,6 +458,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable::syncs_observed;
     use crate::workflow::record::{MppsRecord, SpsRecord};
 
     fn sps(uid: &str) -> SpsRecord {
@@ -393,6 +488,51 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Leak the TempDir path: the store outlives this scope in the tests.
         WorkflowStore::new(dir.keep().join("workflow"))
+    }
+
+    /// An occupied temp name must be SKIPPED, never overwritten.
+    ///
+    /// pid + counter makes a collision rare, not impossible: PID namespaces let
+    /// two containers share a pid, and the counter restarts at 0 after a
+    /// restart. `std::fs::write` on a shared name replaces its contents, so a
+    /// workflow record could carry another container's bytes.
+    #[test]
+    fn an_occupied_temp_name_is_skipped_not_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("workflow");
+        std::fs::create_dir_all(&root).expect("root");
+        let target = root.join("1.2.3.99.cbor");
+
+        let probe = claim_temp_sibling(&target).expect("probe");
+        let seq_of = |p: &Path| -> u64 {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.rsplit('.').next())
+                .and_then(|n| n.parse().ok())
+                .expect("temp name carries its sequence")
+        };
+        let base = seq_of(&probe);
+        std::fs::write(&probe, b"other writer's bytes").expect("occupy");
+
+        const WINDOW: u64 = 32;
+        for k in 1..=WINDOW {
+            let mut name = target.as_os_str().to_owned();
+            name.push(format!(".{}.{}.tmp", std::process::id(), base + k));
+            std::fs::write(PathBuf::from(name), b"other writer's bytes").expect("occupy");
+        }
+
+        let fresh = claim_temp_sibling(&target).expect("a free name must be found");
+        assert!(
+            seq_of(&fresh) > base + WINDOW,
+            "every occupied name must be skipped, got seq {} in window {base}..={}",
+            seq_of(&fresh),
+            base + WINDOW
+        );
+        assert_eq!(
+            std::fs::read(&probe).expect("occupied still readable"),
+            b"other writer's bytes",
+            "an occupied temp must not be truncated"
+        );
     }
 
     #[test]
@@ -554,5 +694,246 @@ mod tests {
         let s = store();
         assert!(s.all_sps().expect("scan").is_empty());
         assert!(s.all_mpps().expect("scan").is_empty());
+    }
+
+    /// Two SPS identifiers differing only in case must not share a file.
+    ///
+    /// On a case-insensitive volume (the default on Windows and macOS)
+    /// `SPS-A.cbor` and `sps-a.cbor` are the SAME file, so the second install
+    /// would overwrite the first and the workflow would lose a scheduled
+    /// procedure step without any error. Comparing the two PATHS cannot catch
+    /// that - they differ as strings on this volume - so the property is stated
+    /// where it actually lives: the encoded stem must contain no uppercase
+    /// letter, which is what makes the mapping injective across case folding.
+    #[test]
+    fn two_sps_identifiers_differing_only_in_case_do_not_collide() {
+        let s = store();
+        for uid in ["SPS-A", "sps-a", "SPSA", "SpsA"] {
+            let stem = s
+                .sps_path(uid)
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .expect("stem")
+                .to_string();
+            assert!(
+                !stem.chars().any(|c| c.is_ascii_uppercase()),
+                "a stem must survive case folding unchanged, got {stem} for {uid}"
+            );
+        }
+        // Two identifiers that differ ONLY in case fold to different stems,
+        // so a case-insensitive lookup cannot confuse them.
+        let upper = s.sps_path("SPS-A");
+        let lower = s.sps_path("sps-a");
+        assert_ne!(upper, lower);
+        assert_ne!(
+            upper.to_string_lossy().to_ascii_lowercase(),
+            lower.to_string_lossy().to_ascii_lowercase(),
+            "the stems must differ even after case folding"
+        );
+    }
+
+    /// A plain DICOM UID keeps its exact file name.
+    ///
+    /// The case fix must not rename the whole store: existing SPS records are
+    /// named after their UID, which is digits and dots only.
+    #[test]
+    fn a_dicom_uid_keeps_its_plain_stem() {
+        assert_eq!(safe_stem("1.2.840.113857.1.1"), "1.2.840.113857.1.1");
+        assert_eq!(safe_stem("1.2.3"), "1.2.3");
+    }
+
+    /// A committed write flushes the data to the medium BEFORE it is published
+    /// and leaves no temp sibling behind.
+    ///
+    /// The flush is observed on the barrier counter: `sync_all` leaves no byte
+    /// trace a re-read can see, so deleting the call would keep the file
+    /// contents correct while the count stays flat - the silent regression
+    /// this pins. Both publish shapes (`rename` and `hard_link`) are covered.
+    #[test]
+    fn a_write_flushes_before_it_publishes_and_leaves_no_temp_file() {
+        let s = store();
+        let bytes = sps("1.2.3").encode().expect("encode");
+
+        let before = syncs_observed();
+        write_atomic(&s.sps_path("1.2.3"), &bytes).expect("atomic write");
+        assert!(
+            syncs_observed() > before,
+            "a committed atomic write has to flush the record to the medium"
+        );
+
+        let before = syncs_observed();
+        write_if_absent(&s.sps_path("1.2.4"), &bytes).expect("absent write");
+        assert!(
+            syncs_observed() > before,
+            "a committed create-if-absent has to flush the record to the medium"
+        );
+
+        let leftovers: Vec<String> = std::fs::read_dir(s.mwl_dir())
+            .expect("read mwl dir")
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file may survive a committed write, found {leftovers:?}"
+        );
+    }
+
+    /// The directory entry that names a record is flushed too (Unix-only).
+    ///
+    /// A rename/hard_link updates the parent directory's entry; without the
+    /// follow-up `sync_all` on the directory a crash can lose the NAME while
+    /// the data is durable. The counter distinguishes the data barrier from
+    /// the directory barrier.
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_write_also_flushes_the_directory_entry() {
+        let s = store();
+        let bytes = sps("1.2.5").encode().expect("encode");
+
+        let before = syncs_observed();
+        write_atomic(&s.sps_path("1.2.5"), &bytes).expect("atomic write");
+        assert!(
+            syncs_observed() >= before + 2,
+            "data barrier + directory barrier: expected at least 2, observed {}",
+            syncs_observed() - before
+        );
+    }
+
+    /// A first write into a fresh tree flushes the NAME chain of the
+    /// directories `create_dir_all` just made, not only the record's own
+    /// directory entry (Unix-only).
+    ///
+    /// `create_dir_all` persists the entries INSIDE a directory but not the
+    /// directory's own name in its parent. Flushing only the record's parent
+    /// leaves `workflow/` and `mwl/` unpersisted in THEIR parents, so a crash
+    /// can lose a successful first write even though the record bytes were
+    /// synced. The ancestor walk is observable on the barrier counter.
+    #[cfg(unix)]
+    #[test]
+    fn a_first_write_flushes_the_new_directory_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = WorkflowStore::new(dir.path().join("a").join("b").join("workflow"));
+        let before = syncs_observed();
+        s.insert_sps(&sps("1.2.6")).expect("insert");
+        let after = syncs_observed();
+        // data barrier + record-parent barrier + at least two ancestor levels
+        // (workflow/ in b, b in a) that only the name-chain walk persists.
+        assert!(
+            after >= before + 4,
+            "a first write must flush the created directory names: observed {}",
+            after - before
+        );
+    }
+
+    /// A failed flush is a failed write, not a silent success.
+    ///
+    /// `write_claimed` must report the I/O error so the publish path removes
+    /// the temp and returns it, never answers `Ok` for a record the next boot
+    /// may not find. The failure is injected by pointing the write at a
+    /// directory, so no platform knob is involved.
+    #[test]
+    fn a_write_that_cannot_be_flushed_is_an_error_not_a_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A DIRECTORY at the write path: opening it for writing fails, so
+        // nothing is written and nothing can be linked.
+        let blocked = dir.path().join("blocked.tmp");
+        std::fs::create_dir_all(&blocked).expect("blocking directory");
+        let err = write_claimed(&blocked, b"payload").expect_err("must not succeed");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::IsADirectory
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Other
+            ) || err.kind() != io::ErrorKind::NotFound,
+            "the failure has to surface as an I/O error, got {err:?}"
+        );
+    }
+
+    /// A failed directory barrier is an Io error, never a stored verdict -
+    /// on the Ok arm AND on the Duplicate arm (the same fix the commitment
+    /// store carries).
+    ///
+    /// The install order is temp-sync, hard_link, remove temp, THEN dir
+    /// barrier. A barrier failure after the hard_link leaves the record at its
+    /// target; a retry finds the target occupied and used to answer Duplicate
+    /// WITHOUT re-running the barrier. The seam fails the NEXT barrier on the
+    /// record's parent directory (mwl/), so the Ok arm surfaces Io and the
+    /// Duplicate arm surfaces Io too. Reverting the Duplicate-arm barrier makes
+    /// the second insert answer Duplicate (the seam is never consumed).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_barrier_is_io_on_both_the_ok_and_duplicate_arms() {
+        let s = store();
+        let rec = sps("1.2.3.94");
+
+        // Ok arm: the link lands, then the barrier fails -> Io, target stays.
+        crate::durable::fail_next_barrier_for_test(&s.mwl_dir());
+        let err = s.insert_sps(&rec).unwrap_err();
+        assert!(matches!(err, WorkflowStoreError::Io(_)), "got {err:?}");
+        assert!(
+            s.sps_path(&rec.sps_uid).exists(),
+            "the link landed before the barrier failed"
+        );
+
+        // Duplicate arm: the occupied target with the next barrier failing
+        // must surface Io, not a silent Duplicate.
+        crate::durable::fail_next_barrier_for_test(&s.mwl_dir());
+        let err = s.insert_sps(&rec).unwrap_err();
+        assert!(
+            matches!(err, WorkflowStoreError::Io(_)),
+            "a failing barrier on the conflict path is Io, got {err:?}"
+        );
+
+        // Healthy barrier: the occupied target is a Duplicate and the stored
+        // record is left untouched.
+        let first = s.find_sps(&rec.sps_uid).expect("find").expect("present");
+        assert!(matches!(
+            s.insert_sps(&rec),
+            Err(WorkflowStoreError::Duplicate(_))
+        ));
+        let after = s.find_sps(&rec.sps_uid).expect("find").expect("present");
+        assert_eq!(
+            after, first,
+            "a refused duplicate must not replace the record"
+        );
+    }
+
+    /// A successful delete persists the directory entry that named the record
+    /// (Unix-only), so a crash after `remove_file` cannot restore the SPS.
+    /// Observed on the barrier counter, the same proof the write paths use.
+    #[cfg(unix)]
+    #[test]
+    fn a_delete_persists_the_directory_entry() {
+        let s = store();
+        s.insert_sps(&sps("1.2.3.7")).expect("insert");
+
+        let before = syncs_observed();
+        assert!(s.delete_sps("1.2.3.7").expect("delete"));
+        assert!(
+            syncs_observed() > before,
+            "a successful delete must flush the directory entry"
+        );
+    }
+
+    /// A barrier failure on the delete path is an error, not a stored
+    /// "deleted". Reverting the added barrier makes `delete_sps` return
+    /// Ok(true) and this test fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_delete_with_a_failing_barrier_is_an_error_not_a_success() {
+        let s = store();
+        let rec = sps("1.2.3.8");
+        s.insert_sps(&rec).expect("insert");
+
+        crate::durable::fail_next_barrier_for_test(&s.mwl_dir());
+        let err = s.delete_sps("1.2.3.8").unwrap_err();
+        assert!(matches!(err, WorkflowStoreError::Io(_)), "got {err:?}");
+        assert!(
+            !s.sps_path("1.2.3.8").exists(),
+            "the file was removed; the delete reported the barrier failure"
+        );
     }
 }

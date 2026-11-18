@@ -171,19 +171,31 @@ fn resolved_is_loopback(
     client: &clarus_core::http::auth::Identity,
     peer: &std::net::SocketAddr,
 ) -> bool {
-    let eff = clarus_core::http::auth::effective_ip(client);
-    if eff.is_empty() {
-        // LocalViewer / MissingIdentity: the address that matters is the peer.
-        // Canonicalised for the same reason as `peer_is_trusted`: a dual-stack
-        // socket reports a loopback IPv4 client as `::ffff:127.0.0.1`, which
-        // `is_loopback()` reports false for.
-        return peer.ip().to_canonical().is_loopback();
+    use clarus_core::http::auth::Identity;
+
+    match client {
+        // Only the embedded viewer / local tools get the peer fallback: they
+        // send no identity headers at all, so the socket peer IS the address
+        // that matters. Canonicalised for the same reason as `peer_is_trusted`:
+        // a dual-stack socket reports a loopback IPv4 client as `::ffff:127.0.0.1`,
+        // which `is_loopback()` reports false for.
+        Identity::LocalViewer => peer.ip().to_canonical().is_loopback(),
+        // Every other identity has a resolved address; an empty one means "no
+        // evidence about the network" - never "this is localhost" - so
+        // `MissingIdentity` (trusted proxy that shipped headers but no user)
+        // is denied rather than silently admitted.
+        _ => {
+            let eff = clarus_core::http::auth::effective_ip(client);
+            if eff.is_empty() {
+                return false;
+            }
+            std::str::from_utf8(eff)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.to_canonical().is_loopback())
+                .unwrap_or(false)
+        }
     }
-    std::str::from_utf8(eff)
-        .ok()
-        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        .map(|a| a.to_canonical().is_loopback())
-        .unwrap_or(false)
 }
 
 /// Is `ip` inside one of the configured networks?
@@ -1099,10 +1111,9 @@ mod tests {
             &sock("10.0.0.5"),
             &nets
         ));
-        // The pre-existing rule is unchanged, though: `admin_cidrs` is an
-        // ADDITION to localhost, so the local machine stays allowed and the
-        // default configuration keeps behaving exactly as before.
-        assert!(admin_allowed(
+        // An empty resolved IP means "no evidence about the network", not
+        // "this is localhost": a loopback peer cannot admit MissingIdentity.
+        assert!(!admin_allowed(
             &Identity::MissingIdentity,
             &sock("127.0.0.1"),
             &nets

@@ -188,8 +188,30 @@ impl DailyIndexSet {
     /// Closes every mutable appender, records the old day as immutable, and
     /// clears the writers so the next access reopens against the new day.
     /// Returns `true` if a rollover happened.
+    ///
+    /// A BACKWARD move is refused - to ANY earlier day, not only one already
+    /// recorded in `immutable`. `new_day` comes from the wall clock, so an NTP
+    /// correction (or a manual clock change) can hand back an earlier date.
+    /// Such a day is historical: its appenders were closed and the read path
+    /// (`idx/preload.rs`) may hold an mmap over its files, so reopening it
+    /// would append to a file another reader has mapped and the mapping would
+    /// never see the new rows. Checking `immutable` alone misses the days a
+    /// forward jump SKIPPED - a jump from the 15th to the 17th marks only the
+    /// 15th, and the 16th would then pass the membership test while being just
+    /// as historical.
+    ///
+    /// Staying on the current day costs at most a day's rows landing under the
+    /// wrong key; writing a historical day corrupts the set the rollover exists
+    /// to protect. Day keys are `YYYYMMDD` byte strings, so their lexicographic
+    /// order IS chronological order.
     pub fn rollover_if_needed(&mut self, new_day: date::DayKey) -> bool {
         if new_day == self.day {
+            return false;
+        }
+        if new_day < self.day {
+            return false;
+        }
+        if self.immutable.contains(&new_day) {
             return false;
         }
         // Drop all open handles for the old day - on Windows a rename (or the
@@ -329,6 +351,37 @@ mod tests {
         assert!(!set.rollover_if_needed(*b"20240116"));
     }
 
+    /// A backward clock move must not reopen a day already made immutable.
+    ///
+    /// `new_day` comes from the wall clock, so an NTP correction can hand back
+    /// yesterday. That day is in `immutable`: its appenders were closed on the
+    /// original rollover and the read path may hold a mapping over its files.
+    /// Reopening it would append to a file another reader has mapped, and the
+    /// mapping would never see the new rows.
+    #[test]
+    fn a_backward_rollover_does_not_reopen_an_immutable_day() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut set = DailyIndexSet::new(dir.path().to_path_buf(), *b"20240115");
+
+        assert!(set.rollover_if_needed(*b"20240116"));
+        assert_eq!(set.current_day(), b"20240116");
+
+        // Clock correction back to the day that is already immutable.
+        assert!(
+            !set.rollover_if_needed(*b"20240115"),
+            "an immutable day must not be reopened"
+        );
+        assert_eq!(
+            set.current_day(),
+            b"20240116",
+            "the active day stays monotonic"
+        );
+
+        // A forward move to a day never seen still rolls over.
+        assert!(set.rollover_if_needed(*b"20240117"));
+        assert_eq!(set.current_day(), b"20240117");
+    }
+
     #[test]
     fn post_rollover_writes_go_to_new_day() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -375,5 +428,35 @@ mod tests {
             blob[0] = i as u8;
             append_date_row(set, &now, blob).expect("append");
         }
+    }
+
+    /// A backward move to a SKIPPED day is still backward.
+    ///
+    /// The `immutable` set only records the day that was LEFT. A forward jump
+    /// from the 15th to the 17th therefore marks the 15th and leaves the 16th
+    /// unrecorded - but the 16th is just as historical, and reopening it would
+    /// append to a file the mmap read path may hold. The ordering check is what
+    /// catches it.
+    #[test]
+    fn a_backward_rollover_to_a_skipped_day_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut set = DailyIndexSet::new(dir.path().to_path_buf(), *b"20240115");
+
+        // Jump forward over the 16th.
+        assert!(set.rollover_if_needed(*b"20240117"));
+        assert_eq!(set.current_day(), b"20240117");
+        // The 16th was never rolled over, so it is NOT in `immutable`.
+        assert!(!set.immutable_days().contains(b"20240116"));
+
+        // It is still earlier than the active day, so it must be refused.
+        assert!(
+            !set.rollover_if_needed(*b"20240116"),
+            "a day before the active day must not be reopened"
+        );
+        assert_eq!(set.current_day(), b"20240117");
+
+        // A day after the active one still rolls forward.
+        assert!(set.rollover_if_needed(*b"20240118"));
+        assert_eq!(set.current_day(), b"20240118");
     }
 }

@@ -208,7 +208,12 @@ impl DicomCodec for BigEndianCodec {
 ///
 /// For BitsAllocated=8: data is byte-order independent (OB).
 /// For BitsAllocated=16: each 16-bit sample needs byte-swap.
-fn swap_bytes_16(data: &mut [u8]) {
+///
+/// Public so the frames route can re-label a stored Big Endian instance's
+/// pixel part as Explicit VR LE: the part carries the samples and no element
+/// header, so the swap is the whole conversion and a second implementation of
+/// it would be one more place to get the direction wrong.
+pub fn swap_bytes_16(data: &mut [u8]) {
     for chunk in data.as_chunks_mut::<2>().0 {
         chunk.swap(0, 1);
     }

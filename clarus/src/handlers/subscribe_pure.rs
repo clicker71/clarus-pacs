@@ -301,6 +301,19 @@ pub fn subscribe_scoped(
         WorklistFilter::default()
     };
 
+    // PS3.18 11.10.1.2 Table 11.10.1-2 types `filter` as C: required when the
+    // Target Resource is the Filtered Worklist. An EMPTY filter on that
+    // resource is not leniency - it registers a subscription that matches every
+    // workitem while the subscriber believes it is filtered, so it is refused
+    // instead of silently widened. The unfiltered resource (34.5) and the
+    // workitem-scoped template stay legal without a filter.
+    if filtered && filter.is_empty() {
+        return bad_request(
+            "filter is required on the Filtered Worklist Subscription resource \
+             (PS3.18 11.10.1.2: Required when the Target Resource is the Filtered Worklist)",
+        );
+    }
+
     subscriptions().subscribe(Subscription {
         subscriber: subscriber.to_string(),
         endpoint,
@@ -1511,21 +1524,51 @@ mod tests {
         );
     }
 
+    /// PS3.18 11.10.1.2 types `filter` as C: required when the Target Resource
+    /// is the Filtered Worklist. An empty filter OBJECT on the filtered
+    /// resource is therefore a 400, not an unfiltered subscription that
+    /// matches every workitem. This inverts the old assertion that made the
+    /// defect survive.
     #[test]
-    fn empty_filter_matches_everything() {
+    fn an_empty_filter_on_the_filtered_resource_is_refused() {
         let r = subscribe(
             "EMPTY",
             &body_json("{\"endpoint\":\"http://127.0.0.1:8124/ups\",\"filter\":{}}"),
             true,
             "",
         );
-        assert_eq!(r.status, 201);
+        assert_eq!(
+            r.status, 400,
+            "an empty filter must be refused on the filtered resource"
+        );
         let text = String::from_utf8(r.body).unwrap();
         assert!(
-            !text.contains("\"filter\""),
-            "no filter means match all: {text}"
+            text.contains("filter") && text.contains("PS3.18 11.10.1.2"),
+            "the message must name the required parameter and the section: {text}"
         );
-        subscriptions().unsubscribe("EMPTY");
+        assert!(
+            !subscriptions().unsubscribe("EMPTY"),
+            "the refused call may not register a subscriber"
+        );
+    }
+
+    /// The filtered resource with NO filter at all - neither a `filter` query
+    /// parameter nor a `filter` body member - is the same refusal: an empty
+    /// filter registers a subscription matching every workitem, which is the
+    /// exact unfiltered subscription the filtered resource exists to avoid.
+    #[test]
+    fn a_filtered_subscription_without_a_filter_is_refused() {
+        let r = subscribe("NOFILT", &body_json("{}"), true, "");
+        assert_eq!(
+            r.status, 400,
+            "the filtered resource must refuse an absent filter"
+        );
+        let text = String::from_utf8(r.body).unwrap();
+        assert!(text.contains("filter"), "message must name filter: {text}");
+        assert!(
+            !subscriptions().unsubscribe("NOFILT"),
+            "the refused call may not register a subscriber"
+        );
     }
 
     /// PS3.18 11.10 types the Subscribe request payload as "none": a body
@@ -1728,13 +1771,20 @@ mod tests {
         // worklist (34.5.1) and a workitem-scoped subscription; the
         // `filtered` flag is the only difference the parser sees, so both
         // values of it must yield a lock - asserted rather than assumed.
+        // The filtered resource requires a filter (PS3.18 11.10.1.2), so
+        // that arm carries one; the deletionlock parse is orthogonal to it.
         for filtered in [false, true] {
             let subscriber = if filtered { "LOCKF" } else { "LOCKP" };
+            let query = if filtered {
+                "deletionlock=true&filter=00741204=CAD"
+            } else {
+                "deletionlock=true"
+            };
             let r = subscribe(
                 subscriber,
                 &body_json("{\"endpoint\":\"http://127.0.0.1:8124/ups\"}"),
                 filtered,
-                "deletionlock=true",
+                query,
             );
             assert_eq!(r.status, 201, "filtered={filtered}");
             assert!(

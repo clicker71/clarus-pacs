@@ -674,11 +674,56 @@ fn subscription_accepts(
         let Some(want) = slot(subscription) else {
             continue;
         };
-        if values.get(*key) != Some(want.as_str()) {
-            return false;
+        match values.get(*key) {
+            Some(actual) if value_matches(want.as_str(), actual) => {}
+            // A `None` in `values` stays a NON-match, unchanged: the
+            // subscription asked for workitems carrying that value, and an
+            // unknown value is not demonstrably it.
+            _ => return false,
         }
     }
     true
+}
+
+/// C-FIND wildcard match over ASCII bytes (PS3.4 C.2.2.2: `*` matches zero or
+/// more characters, `?` matches exactly one). A pattern with no wildcard is an
+/// exact string comparison - the overwhelming majority of filters - so the
+/// fast path never enters the backtracking loop.
+///
+/// Byte-oriented on purpose: the DICOM default character repertoire is ASCII,
+/// and a byte match cannot split a multi-byte code point. Iterative with a
+/// single backtracking star position (no recursion, no allocation), so the
+/// `subscription_accepts` noalloc gate stays green.
+fn value_matches(pattern: &str, actual: &str) -> bool {
+    let p = pattern.as_bytes();
+    let a = actual.as_bytes();
+    if !p.iter().any(|&b| b == b'*' || b == b'?') {
+        return pattern == actual;
+    }
+    let mut pi = 0usize;
+    let mut ai = 0usize;
+    let mut star: Option<usize> = None;
+    let mut star_match = 0usize;
+    while ai < a.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == a[ai]) {
+            pi += 1;
+            ai += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            star_match = ai;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_match += 1;
+            ai = star_match;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Enqueue one push, counting a queue overflow as a drop.
@@ -1124,6 +1169,66 @@ mod tests {
             vec!["ALL".to_string(), "CAD_ONLY".to_string()]
         );
         assert_eq!(names("OTHER"), vec!["ALL".to_string()]);
+    }
+
+    /// PS3.4 C.2.2.2: a filter VALUE may carry `*` (zero or more) and `?`
+    /// (exactly one), so a subscriber that namespaces its tasks with a common
+    /// prefix can subscribe to its own namespace.
+    #[test]
+    fn value_matches_wildcards() {
+        assert!(value_matches("TEST_*", "TEST_123"));
+        assert!(!value_matches("TEST_*", "OTHER_123"));
+        assert!(value_matches("*", ""));
+        assert!(value_matches("*", "anything"));
+        assert!(value_matches("TEST_?23", "TEST_123"));
+        assert!(!value_matches("TEST_?23", "TEST_23"));
+        assert!(value_matches("A*B*C", "AxxByyC"));
+        assert!(!value_matches("A*B*C", "AxxC"));
+        // No wildcard -> exact comparison, even when the value itself carries
+        // `_` and `.`.
+        assert!(value_matches("TEST_123", "TEST_123"));
+        assert!(!value_matches("TEST_123", "TEST_1234"));
+        assert!(value_matches("A_1.2", "A_1.2"));
+        // A pathological pattern terminates and answers, never spins.
+        assert!(value_matches("****", "..."));
+        assert!(!value_matches("*a*a*a*a*a*a*b", "aaaaaaa"));
+    }
+
+    /// A wildcard subscription is a REAL filter end-to-end through the
+    /// registry: the prefix matches its own namespace and nothing else.
+    #[test]
+    fn a_wildcard_filter_matches_its_own_namespace() {
+        let reg = SubscriptionRegistry::default();
+        let mut sub = Subscription::unfiltered("WILD", Some("http://127.0.0.1:1/ups"));
+        sub.step_label = Some("TEST_*".into());
+        reg.subscribe(sub);
+        assert!(
+            reg.accepts_for("WILD", "1.2.3", &fv("TEST_123", None)),
+            "TEST_* must match TEST_123"
+        );
+        assert!(
+            !reg.accepts_for("WILD", "1.2.3", &fv("OTHER_123", None)),
+            "TEST_* must not match OTHER_123"
+        );
+    }
+
+    /// An EXACT filter stays exact: `TEST_123` accepts `TEST_123` and rejects
+    /// `TEST_1234` - the wildcard change must not turn exact filters into
+    /// prefix matches.
+    #[test]
+    fn an_exact_filter_stays_exact() {
+        let reg = SubscriptionRegistry::default();
+        let mut sub = Subscription::unfiltered("EXACT", Some("http://127.0.0.1:1/ups"));
+        sub.step_label = Some("TEST_123".into());
+        reg.subscribe(sub);
+        assert!(
+            reg.accepts_for("EXACT", "1.2.3", &fv("TEST_123", None)),
+            "an exact filter accepts its own value"
+        );
+        assert!(
+            !reg.accepts_for("EXACT", "1.2.3", &fv("TEST_1234", None)),
+            "an exact filter must not become a prefix match"
+        );
     }
 
     /// A code-filtered subscription is answered from the code the fan-out

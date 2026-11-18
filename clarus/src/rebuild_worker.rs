@@ -564,6 +564,8 @@ fn commit_one_instance(
         // instance written before the table existed gains it on rebuild,
         // exactly like the other re-derivable capture fields.
         frames: crate::handlers::stow_pure::frame_records(dicom_bytes),
+        number_of_frames: meta.number_of_frames,
+        image_type: meta.image_type.clone(),
     };
     let series = [clarus_core::stow::SeriesModel {
         series_instance_uid,

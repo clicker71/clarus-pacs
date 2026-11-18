@@ -30,6 +30,21 @@ pub struct ReferencedItem {
     /// from what the client sent (a coerced Type 2 field, or an in-place
     /// update).
     pub coerced: bool,
+    /// Which accepted outcome produced this item, so a demotion can decrement
+    /// the matching counter instead of only `accepted`.
+    pub kind: ReferencedKind,
+}
+
+/// The accepted outcome kind behind a [`ReferencedItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReferencedKind {
+    /// A fresh store ([`InstanceOutcome::Stored`]).
+    #[default]
+    Stored,
+    /// An exact duplicate ([`InstanceOutcome::Idempotent`]).
+    Idempotent,
+    /// An in-place replacement ([`InstanceOutcome::Updated`]).
+    Updated,
 }
 
 /// One rejected instance, as the response must describe it.
@@ -205,8 +220,15 @@ impl StowAccum {
                 study_instance_uid,
                 series_instance_uid,
                 ..
-            }
-            | InstanceOutcome::Idempotent {
+            } => self.referenced_items.push(ReferencedItem {
+                sop_class_uid: sop_class_uid.clone(),
+                sop_instance_uid: sop_instance_uid.clone(),
+                study_instance_uid: study_instance_uid.clone(),
+                series_instance_uid: series_instance_uid.clone(),
+                coerced: false,
+                kind: ReferencedKind::Stored,
+            }),
+            InstanceOutcome::Idempotent {
                 sop_class_uid,
                 sop_instance_uid,
                 study_instance_uid,
@@ -218,6 +240,7 @@ impl StowAccum {
                 study_instance_uid: study_instance_uid.clone(),
                 series_instance_uid: series_instance_uid.clone(),
                 coerced: false,
+                kind: ReferencedKind::Idempotent,
             }),
             InstanceOutcome::Updated {
                 sop_class_uid,
@@ -233,6 +256,7 @@ impl StowAccum {
                 // An in-place update is always a warning: the archive no longer
                 // holds exactly what the client sent.
                 coerced: true,
+                kind: ReferencedKind::Updated,
             }),
             InstanceOutcome::Conflict {
                 sop_class_uid,
@@ -265,6 +289,64 @@ impl StowAccum {
         if let Some(last) = self.referenced_items.last_mut() {
             last.coerced = true;
         }
+    }
+
+    /// Move an accepted instance into FailedSOPSequence after its study
+    /// manifest write failed (P1 group commit).
+    ///
+    /// Returns `true` when the instance was found among the accepted sequences
+    /// and demoted (its ReferencedSOP entry removed, the accepted counter and
+    /// the matching kind counter decremented). Returns `false` when it was
+    /// already recorded as a failure. Either way a failed entry carrying BOTH
+    /// UIDs is pushed, so the client can resend the specific instance
+    /// (PS3.18 10.5.2) - the pre-fix shape carried neither UID and left the
+    /// same SOP in both sequences.
+    pub fn demote_to_failed(
+        &mut self,
+        sop_instance_uid: &str,
+        sop_class_uid: &str,
+        reason: &str,
+    ) -> bool {
+        let idx = self
+            .referenced_items
+            .iter()
+            .position(|it| it.sop_instance_uid == sop_instance_uid);
+        if let Some(idx) = idx {
+            let item = self.referenced_items.remove(idx);
+            // The pre-rendered JSON entries mirror the structured items one to
+            // one, so the same index removes the matching ReferencedSOP entry.
+            if idx < self.referenced_sops.len() {
+                self.referenced_sops.remove(idx);
+            }
+            self.accepted = self.accepted.saturating_sub(1);
+            match item.kind {
+                ReferencedKind::Stored => {
+                    if item.coerced {
+                        self.warned = self.warned.saturating_sub(1);
+                    }
+                }
+                ReferencedKind::Idempotent => {
+                    self.idempotent = self.idempotent.saturating_sub(1);
+                }
+                ReferencedKind::Updated => {
+                    self.updated = self.updated.saturating_sub(1);
+                    self.warned = self.warned.saturating_sub(1);
+                }
+            }
+        }
+        self.failed = self.failed.saturating_add(1);
+        self.failed_items.push(FailedItem {
+            error_comment: Some(reason.to_string()),
+            sop_class_uid: Some(sop_class_uid.to_string()),
+            sop_instance_uid: Some(sop_instance_uid.to_string()),
+            failure_reason: 272,
+        });
+        self.failed_sops.push(build_failed_sop_entry(
+            Some(sop_class_uid),
+            Some(sop_instance_uid),
+            reason,
+        ));
+        idx.is_some()
     }
 
     /// Returns true if any instance was accepted.

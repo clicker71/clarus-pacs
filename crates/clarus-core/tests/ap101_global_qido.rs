@@ -85,7 +85,7 @@ fn global_qido_scan_is_allocation_free_and_sorted() {
     let manifests = [m_a, m_b]; // [A, B] - already ascending; A holds "Head".
 
     // -- Global series scan: warm once, then measure steady state --
-    let mut sout: Vec<&clarus_core::manifest::SeriesRecord> = Vec::new();
+    let mut sout: Vec<clarus_core::query::GlobalSeries<'_>> = Vec::new();
     ALLOC.set_enabled(false);
     search_all_series(&manifests, &SeriesFilter::default(), &mut sout);
     ALLOC.set_enabled(true);
@@ -93,7 +93,7 @@ fn global_qido_scan_is_allocation_free_and_sorted() {
         search_all_series(&manifests, &SeriesFilter::default(), &mut sout);
         sout.len()
     });
-    let first = series_uid_of(sout[0]); // outside the window (clones in fixture)
+    let first = series_uid_of(sout[0].series); // outside the window (clones in fixture)
     assert!(
         zero_alloc,
         "search_all_series (steady state) must not allocate"
@@ -106,7 +106,7 @@ fn global_qido_scan_is_allocation_free_and_sorted() {
     );
 
     // -- Global series scan with a filter: only matching series survive --
-    let mut fout: Vec<&clarus_core::manifest::SeriesRecord> = Vec::new();
+    let mut fout: Vec<clarus_core::query::GlobalSeries<'_>> = Vec::new();
     let f = SeriesFilter {
         modality: Some("MR".into()),
         ..Default::default()
@@ -195,6 +195,9 @@ fn global_qido_scan_is_allocation_free_and_sorted() {
     assert_eq!(iout[0].study_uid, "1.2.840.1.7");
     assert_eq!(iout[0].series_uid, "1.2.840.1.1", "A's series UID");
     assert_eq!(iout[1].series_uid, "1.2.840.1.2", "B's series UID");
+    // The series scan threads the same borrowed study UID per row.
+    assert_eq!(sout[0].study_uid, "1.2.840.1.7");
+    assert_eq!(sout[1].study_uid, "1.2.840.1.7");
 }
 
 /// Extract the SeriesInstanceUID text of a series record (test helper).

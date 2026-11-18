@@ -530,6 +530,8 @@ fn tag_pass(filt: &Option<TagFilter>, tag: u32) -> bool {
 /// `SpecificCharacterSet` (0008,0005) is ALWAYS emitted first (owner 07.09,
 /// Zero allocation; caller-owned buffer.
 /// `includefield` filters the emitted tags; `None` emits them all.
+/// (0020,000D) StudyInstanceUID is injected from `study_uid` when known
+/// (always-on serving attr, ascending before (0020,000E)).
 pub fn write_series_json(
     buf: &mut [u8],
     series: &SeriesRecord,
@@ -653,6 +655,22 @@ pub fn write_series_json(
         && tag_pass(&filt, 0x0018_1030)
     {
         emit_written_str(&mut out, &mut wrote, 0x0018_1030, "LO", s)?;
+    }
+    // (0020,000D) StudyInstanceUID - UI, injected from the study context when
+    // known (dwv reads it exactly like OHIF does on the instance path below).
+    // Always-on serving attr like SpecificCharacterSet/InstanceAvailability:
+    // NOT in MANDATORY_SERIES (consumes no includefield slot), and a
+    // restrictive includefield cannot filter it out. Ascends before (0020,000E).
+    if let Some(st) = study_uid
+        && !st.is_empty()
+    {
+        emit_written_str(
+            &mut out,
+            &mut wrote,
+            0x0020_000D,
+            vr_for_tag(tag::STUDY_INSTANCE_UID),
+            st,
+        )?;
     }
     // (0020,000E) SeriesInstanceUID - UI (always present).
     if let Some(s) = series_text(&series.attrs, tag::SERIES_INSTANCE_UID)
@@ -2037,6 +2055,113 @@ mod tests {
         assert!(si.contains(
             "\"00081190\":{\"Value\":[\"http://qido.test/dicomweb/studies/1.2.840.1.1/series/1.2.840.1.2/instances/1.2.840.1.3\"],\"vr\":\"UR\"}"
         ));
+    }
+
+    // (0020,000D) StudyInstanceUID is injected from the study context into the
+    // series row (dwv reads it unguarded; OHIF reads it on every level), in
+    // ascending order before (0020,000E).
+    #[test]
+    fn series_json_emits_study_uid_from_context() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![(0x0020_000E, AttrValue::Text("1.2.840.1.2".into()))],
+            instances: Vec::new(),
+        };
+        let mut out = [0u8; 1024];
+        let n =
+            write_series_json(&mut out, &series, None, None, Some("1.2.840.1.1")).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        let pos_d = got
+            .find("\"0020000D\":{\"Value\":[\"1.2.840.1.1\"],\"vr\":\"UI\"}")
+            .expect("StudyInstanceUID emitted");
+        let pos_e = got.find("\"0020000E\"").expect("SeriesInstanceUID emitted");
+        assert!(pos_d < pos_e, "0020000D must ascend before 0020000E: {got}");
+    }
+
+    // Without a study context the series row has no (0020,000D) - the value is
+    // injected, never invented.
+    #[test]
+    fn series_json_omits_study_uid_without_context() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![(0x0020_000E, AttrValue::Text("1.2.840.1.2".into()))],
+            instances: Vec::new(),
+        };
+        let mut out = [0u8; 1024];
+        let n = write_series_json(&mut out, &series, None, None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(!got.contains("0020000D"), "no context -> omitted: {got}");
+    }
+
+    // (0020,000D) is an always-on serving attr at the series level, so a
+    // restrictive includefield cannot filter it out - the OHIF failure mode
+    // the MANDATORY_STUDY doc comment documents.
+    #[test]
+    fn series_json_study_uid_survives_restrictive_includefield() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![(0x0020_000E, AttrValue::Text("1.2.840.1.2".into()))],
+            instances: Vec::new(),
+        };
+        for filt in [Some("00080060"), Some("0020000D"), Some("all")] {
+            let mut out = [0u8; 1024];
+            let n = write_series_json(&mut out, &series, filt, None, Some("1.2.840.1.1"))
+                .expect("fits");
+            let got = String::from_utf8(out[..n].to_vec()).unwrap();
+            assert!(
+                got.contains("\"0020000D\":{\"Value\":[\"1.2.840.1.1\"],\"vr\":\"UI\"}"),
+                "StudyInstanceUID must survive includefield={filt:?}: {got}"
+            );
+        }
+    }
+
+    // The XML mirror emits the same injected (0020,000D), and omits it without
+    // the study context.
+    #[test]
+    fn series_xml_emits_study_uid_from_context() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![(0x0020_000E, AttrValue::Text("1.2.840.1.2".into()))],
+            instances: Vec::new(),
+        };
+        let mut out = [0u8; 1024];
+        let n = crate::query::xml::write_series_attrs(
+            &mut out,
+            &series,
+            None,
+            None,
+            Some("1.2.840.1.1"),
+        )
+        .expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            got.contains(
+                "<DicomAttribute tag=\"0020000D\" vr=\"UI\" keyword=\"\"><Value number=\"1\">1.2.840.1.1</Value></DicomAttribute>"
+            ),
+            "XML must emit the complete StudyInstanceUID element: {got}"
+        );
+
+        let n2 = crate::query::xml::write_series_attrs(&mut out, &series, None, None, None)
+            .expect("fits");
+        let got2 = String::from_utf8(out[..n2].to_vec()).unwrap();
+        assert!(
+            !got2.contains("0020000D"),
+            "XML without context must omit StudyInstanceUID: {got2}"
+        );
+    }
+
+    // Byte-exact full document for the minimal series with a study context:
+    // key order 00080005 (SCS), 00080056 (IA), 0020000D (new), 0020000E,
+    // 00201209.
+    #[test]
+    fn series_json_minimal_document_byte_exact() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![(0x0020_000E, AttrValue::Text("1.2.840.1.2".into()))],
+            instances: Vec::new(),
+        };
+        let mut out = [0u8; 1024];
+        let n =
+            write_series_json(&mut out, &series, None, None, Some("1.2.840.1.1")).expect("fits");
+        assert_eq!(
+            &out[..n],
+            b"{\"00080005\":{\"Value\":[\"ISO_IR 192\"],\"vr\":\"CS\"},\"00080056\":{\"Value\":[\"ONLINE\"],\"vr\":\"CS\"},\"0020000D\":{\"Value\":[\"1.2.840.1.1\"],\"vr\":\"UI\"},\"0020000E\":{\"Value\":[\"1.2.840.1.2\"],\"vr\":\"UI\"},\"00201209\":{\"Value\":[0],\"vr\":\"IS\"}}"
+        );
     }
 
     /// A legal maximum identity must fit the URL scratch.

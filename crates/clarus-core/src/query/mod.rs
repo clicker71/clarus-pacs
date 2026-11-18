@@ -52,8 +52,8 @@ pub use filter::{
 pub use patients::{PatientRow, find_recent_patients};
 pub use scan::{StudyScanner, StudySearchError, StudySearchResult};
 pub use series::{
-    GlobalInstance, InstanceFilter, SeriesFilter, search_all_instances, search_all_series,
-    search_instances, search_series,
+    GlobalInstance, GlobalSeries, InstanceFilter, SeriesFilter, search_all_instances,
+    search_all_series, search_instances, search_series,
 };
 // The allocation-free glob the manifest matchers walk. Re-exported so a
 // benchmark can reach the SAME function the hot path uses - `filter::glob_match`

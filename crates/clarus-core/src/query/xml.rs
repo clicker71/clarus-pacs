@@ -765,7 +765,8 @@ pub fn write_patient_xml_into(out: &mut Vec<u8>, p: &crate::query::json::Patient
 /// order, `SeriesNumber` (0020,0011) as a number, and
 /// `NumberOfSeriesRelatedInstances` (0020,1209) from `series.instances.len()`.
 /// `SpecificCharacterSet` (0008,0005) is ALWAYS emitted first (owner 07.09,
-///
+/// (0020,000D) StudyInstanceUID is injected from `study_uid` when known
+/// (always-on serving attr, ascending before (0020,000E)).
 pub fn write_series_attrs(
     buf: &mut [u8],
     series: &SeriesRecord,
@@ -860,6 +861,18 @@ pub fn write_series_attrs(
         && tag_pass(&filt, 0x0018_1030)
     {
         write_attr_elem(&mut out, 0x0018_1030, &AttrValue::Text(s.to_string()), "LO")?;
+    }
+    // (0020,000D) StudyInstanceUID - UI, injected from the study context (see
+    // write_series_json). Always-on serving attr, not in MANDATORY_SERIES.
+    if let Some(st) = study_uid
+        && !st.is_empty()
+    {
+        write_attr_elem(
+            &mut out,
+            0x0020_000D,
+            &AttrValue::Text(st.to_string()),
+            crate::query::json::vr_for_tag(crate::query::tag::STUDY_INSTANCE_UID),
+        )?;
     }
     // (0020,000E) SeriesInstanceUID - UI (always present).
     if let Some(s) = series_text(&series.attrs, crate::query::tag::SERIES_INSTANCE_UID)

@@ -137,9 +137,14 @@ pub const TAG_CONCEPT_CODE_SEQUENCE: &str = "0040A168";
 /// (0040,A120) DateTime, the carriage of a DATETIME value (PS3.3 Table 10-2).
 pub const TAG_DATETIME_VALUE: &str = "0040A120";
 
-/// (0040,4021) Input Information Sequence - the standard's only route from a
-/// workitem to the study it operates on (PS3.4 CC.2.5-3).
+/// (0040,4021) Input Information Sequence - the instance-level input
+/// carriage (PS3.3 Table 10-3b: its item requires a Referenced SOP Sequence).
 pub const TAG_INPUT_INFORMATION_SEQUENCE: &str = "00404021";
+
+/// (0040,A370) Referenced Request Sequence - the standard's own carriage for
+/// the study a UPS step relates to: PS3.4 CC.2.5-3 makes its Study Instance
+/// UID (0020,000D) Type 1, so it is read FIRST.
+pub const TAG_REFERENCED_REQUEST_SEQUENCE: &str = "0040A370";
 
 /// (0074,1204) Procedure Step Label - a matching key a filtered
 /// subscription can name (PS3.18 11.11). UPS has no Modality attribute,
@@ -524,14 +529,24 @@ pub fn performer_code_values(value: &Json) -> Vec<String> {
     .collect()
 }
 
-/// The input study UID: the first item's (0020,000D) inside (0040,4021).
+/// The input study UID. Read from (0040,A370) Referenced Request Sequence
+/// first (its Study Instance UID is Type 1 there, PS3.4 CC.2.5-3), then from
+/// (0040,4021) Input Information Sequence as the fallback a requester-created
+/// workitem may use.
 ///
 /// Returns `None` when the workitem names no study, which is the caller's
 /// signal to cancel rather than to look up a study that was never named.
 #[must_use]
 pub fn input_study_uid(value: &Json) -> Option<String> {
-    let first = value.attribute_item(TAG_INPUT_INFORMATION_SEQUENCE)?;
-    first.attribute(TAG_STUDY_INSTANCE_UID).map(str::to_string)
+    if let Some(study) = value
+        .attribute_item(TAG_REFERENCED_REQUEST_SEQUENCE)
+        .and_then(|item| item.attribute(TAG_STUDY_INSTANCE_UID).map(str::to_string))
+    {
+        return Some(study);
+    }
+    value
+        .attribute_item(TAG_INPUT_INFORMATION_SEQUENCE)
+        .and_then(|item| item.attribute(TAG_STUDY_INSTANCE_UID).map(str::to_string))
 }
 
 /// What a call returned when it did not succeed. The status is kept so
@@ -2233,9 +2248,9 @@ mod tests {
     }
 
     #[test]
-    fn a_workitem_without_the_input_sequence_names_no_study() {
-        // The sequence is the only route to the study, so without it there
-        // is nothing for the worker to look up - it cancels instead of
+    fn a_workitem_without_any_study_sequence_names_no_study() {
+        // Neither (0040,A370) nor (0040,4021) is present, so there is
+        // nothing for the worker to look up - it cancels instead of
         // searching for a study the workitem never named.
         let document =
             json::parse(br#"{"00080018":{"Value":["1.2.3"]},"00741000":{"Value":["SCHEDULED"]}}"#)
@@ -2243,6 +2258,20 @@ mod tests {
         let item = WorkItem::from_json(&document).expect("workitem");
         assert_eq!(item.uid, "1.2.3");
         assert_eq!(item.study_instance_uid, None);
+    }
+
+    #[test]
+    fn a_workitem_reads_the_study_from_the_referenced_request_sequence() {
+        // The standard's own carriage: PS3.4 CC.2.5-3 makes the Study
+        // Instance UID inside (0040,A370) Type 1, so it is read first.
+        let document = json::parse(
+            br#"{"00080018":{"Value":["1.2.3"]},
+                 "00741000":{"Value":["SCHEDULED"]},
+                 "0040A370":{"vr":"SQ","Value":[{"0020000D":{"Value":["9.9.9"]}}]}}"#,
+        )
+        .expect("parses");
+        let item = WorkItem::from_json(&document).expect("workitem");
+        assert_eq!(item.study_instance_uid.as_deref(), Some("9.9.9"));
     }
 
     #[test]

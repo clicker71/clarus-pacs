@@ -2,6 +2,34 @@
 
 All notable changes to Clarus PACS are documented here.
 
+## [0.3.4-beta] — 2026-11-18
+
+### Fixed
+
+- **clinfer reads the UPS input study from Referenced Request Sequence
+  (0040,A370).** A conformant Unified Procedure Step carries the study it
+  relates to in Referenced Request Sequence (PS3.4 CC.2.5-3, Type 1); clinfer
+  previously read only Input Information Sequence (0040,4021), so workitems
+  whose study rode in (0040,A370) were cancelled with "no rule matched". The
+  input study is now read from (0040,A370) first, with (0040,4021) as a
+  fallback.
+
+### Conformance
+
+- **Series-level QIDO returns the Study Instance UID.** The JSON and XML
+  series writers now inject (0020,000D) from the study context on both the
+  scoped (`/studies/{study}/series`) and global (`/series`) routes, and an
+  explicit `includefield=0020000D` is no longer silently ignored. The Study
+  UID is not a Table 10.6.3-4 Series return key, so it is emitted as an
+  always-on serving attribute rather than consuming an includefield slot.
+  Clients that read it unguarded (dwv) no longer crash on a conformant server.
+
+### Demo
+
+- **cxr10 chest X-ray detector demo** (`docker-compose.cxr10-demo.yml`):
+  containerised clinfer with the OpenVINO ChestX-Det10 model writes GSPS
+  presentation-state boxes over the demo chest radiographs.
+
 ## [0.3.3-beta] — 2026-11-18
 
 ### UPS-RS / Task Manager interoperability

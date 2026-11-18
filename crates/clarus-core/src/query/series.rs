@@ -198,6 +198,18 @@ pub struct GlobalInstance<'a> {
     pub series_uid: &'a str,
 }
 
+/// One series matched by a **top-level** (global) series QIDO scan, with the
+/// owning Study Instance UID **borrowed** from the decoded manifest so the
+/// renderer can inject it without cloning (ap101). Mirrors [`GlobalInstance`]
+/// for the `/series` surface.
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalSeries<'a> {
+    /// The matched series record (borrowed from `manifests`).
+    pub series: &'a SeriesRecord,
+    /// The study's StudyInstanceUID (0020,000D), borrowed from the manifest.
+    pub study_uid: &'a str,
+}
+
 /// Collect all series across **every** manifest in `manifests` that satisfy
 /// `filter` (no study scope), globally sorted by `SeriesInstanceUID` ASC.
 ///
@@ -208,27 +220,32 @@ pub struct GlobalInstance<'a> {
 /// for the request) and paginates the returned borrowed slice in place, so
 /// `offset` pages are deterministic (a stable global UID order).
 ///
-/// Borrow-only: `out` holds `&SeriesRecord` references, not clones; the sort
-/// keys are borrowed `&str` views of the SeriesInstanceUID attrs, so matching
-/// and sorting allocate nothing at steady state.
+/// Borrow-only: `out` holds `GlobalSeries` references (no UID/attr clones);
+/// the sort keys are borrowed `&str` views of the SeriesInstanceUID attrs, so
+/// matching and sorting allocate nothing at steady state.
 pub fn search_all_series<'a>(
     manifests: &'a [Manifest],
     filter: &SeriesFilter,
-    out: &mut Vec<&'a SeriesRecord>,
+    out: &mut Vec<GlobalSeries<'a>>,
 ) {
     out.clear();
     for manifest in manifests {
+        let study_uid =
+            text_attr(&manifest.study.attrs, crate::query::tag::STUDY_INSTANCE_UID).unwrap_or("");
         for s in &manifest.series {
             if filter.matches(&s.attrs) {
-                out.push(s);
+                out.push(GlobalSeries {
+                    series: s,
+                    study_uid,
+                });
             }
         }
     }
     // Global deterministic order: SeriesInstanceUID ASC (the offset-pagination
     // contract for the top-level route - no numeric secondary key).
     out.sort_unstable_by(|a, b| {
-        let au = text_attr(&a.attrs, crate::query::tag::SERIES_INSTANCE_UID).unwrap_or("");
-        let bu = text_attr(&b.attrs, crate::query::tag::SERIES_INSTANCE_UID).unwrap_or("");
+        let au = text_attr(&a.series.attrs, crate::query::tag::SERIES_INSTANCE_UID).unwrap_or("");
+        let bu = text_attr(&b.series.attrs, crate::query::tag::SERIES_INSTANCE_UID).unwrap_or("");
         au.cmp(bu)
     });
 }
@@ -2068,5 +2085,45 @@ mod tests {
         };
         search_series(&m, &none, &mut out);
         assert!(out.is_empty(), "no series carries number 7");
+    }
+
+    /// The global series scan threads each manifest's study UID into its rows
+    /// so the renderer can inject (0020,000D) without a clone. Distinct
+    /// studies must carry distinct borrowed UIDs across the merged result.
+    #[test]
+    fn search_all_series_threads_study_uid() {
+        let mk = |study_uid: &str, series_uid: &str| Manifest {
+            sys: SysHeader {
+                version: 1,
+                storage_tier: TIER_HOT,
+                total_pixel_bytes: 0,
+                arrived_at: 0,
+            },
+            study: StudyQido {
+                attrs: vec![(tag::STUDY_INSTANCE_UID, AttrValue::Text(study_uid.into()))],
+                ..Default::default()
+            },
+            series: vec![series(series_uid, Some("1"), None, None)],
+        };
+        let a = mk("1.2.840.7.1", "1.2.840.7.1.1");
+        let b = mk("1.2.840.7.2", "1.2.840.7.2.1");
+        // Unsorted input: the scan must sort, moving each study UID with its
+        // series. 7.2.x is fed first; 7.1.x must win the global sort.
+        let manifests = [b, a];
+
+        let mut out: Vec<GlobalSeries<'_>> = Vec::new();
+        search_all_series(&manifests, &SeriesFilter::default(), &mut out);
+        assert_eq!(out.len(), 2, "one series per manifest");
+        // Globally sorted by SeriesInstanceUID ASC: 7.1.1 then 7.2.1.
+        assert_eq!(out[0].study_uid, "1.2.840.7.1");
+        assert_eq!(out[1].study_uid, "1.2.840.7.2");
+        assert_eq!(
+            text_attr(&out[0].series.attrs, tag::SERIES_INSTANCE_UID),
+            Some("1.2.840.7.1.1")
+        );
+        assert_eq!(
+            text_attr(&out[1].series.attrs, tag::SERIES_INSTANCE_UID),
+            Some("1.2.840.7.2.1")
+        );
     }
 }

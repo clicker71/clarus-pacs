@@ -1544,26 +1544,26 @@ fn series_filter_from(query: &QidoQuery, state: &AppState) -> clarus_core::query
 }
 
 /// Stream a paginated series page (shared by the scoped and global series
-/// routes). `study_uid` is `Some` for the scoped route (the UID is injected
-/// into each row) and `None` for the global route. `remaining` is the PS3.18
-/// 8.3.4.4.1 count computed by the caller from the route's own limit contract.
+/// routes). Each row carries its own study UID (`Some` on every surface - the
+/// study context is known on both), injected as (0020,000D) and used for the
+/// study-scoped RetrieveURL. `remaining` is the PS3.18 8.3.4.4.1 count
+/// computed by the caller from the route's own limit contract.
 fn render_series_page(
-    page: &[&clarus_core::manifest::SeriesRecord],
+    page: &[(&clarus_core::manifest::SeriesRecord, Option<&str>)],
     query: &QidoQuery,
-    study_uid: Option<&str>,
     content_type: &'static str,
     retrieve_base: Option<&str>,
     remaining: Option<u64>,
 ) -> QidoResp {
     if let Some(xml) = btree_xml(
         page,
-        |scratch, s| {
+        |scratch, (series, study_uid)| {
             clarus_core::query::xml::write_series_attrs(
                 scratch,
-                s,
+                series,
                 query.includefield.as_deref(),
                 retrieve_base,
-                study_uid,
+                *study_uid,
             )
         },
         content_type,
@@ -1576,7 +1576,7 @@ fn render_series_page(
     let mut body = Vec::with_capacity(page.len() * 256 + 2);
     body.push(b'[');
     let mut scratch = [0u8; 4096];
-    for (i, series) in page.iter().enumerate() {
+    for (i, (series, study_uid)) in page.iter().enumerate() {
         if i > 0 {
             body.push(b',');
         }
@@ -1585,7 +1585,7 @@ fn render_series_page(
             series,
             query.includefield.as_deref(),
             retrieve_base,
-            study_uid,
+            *study_uid,
         ) {
             Ok(n) => body.extend_from_slice(&scratch[..n]),
             Err(_) => return btree_internal_error(),
@@ -1705,21 +1705,19 @@ fn btree_series_search(
     let limit = resolve_enumeration_limit(query);
     let take_n = limit.map(|l| l as usize).unwrap_or(usize::MAX);
     let total = out.len();
-    let page: Vec<_> = out.into_iter().skip(offset).take(take_n).collect();
+    let page: Vec<_> = out
+        .into_iter()
+        .skip(offset)
+        .take(take_n)
+        .map(|s| (s, Some(study_uid)))
+        .collect();
     let remaining = qido_remaining(total, query.offset, page.len() as u64);
 
     // addendum: series XML carries the captured series attributes plus
     // NumberOfSeriesRelatedInstances (0020,1209) from instances.len(). It
     // always-emits SpecificCharacterSet (0008,0005) (owner 07.09, reverses
     // then the series block. Byte-exact with series.xml.
-    render_series_page(
-        &page,
-        query,
-        Some(study_uid),
-        content_type,
-        retrieve_base,
-        remaining,
-    )
+    render_series_page(&page, query, content_type, retrieve_base, remaining)
 }
 
 /// The B-tree instance search, streaming `write_instance_json`.
@@ -2460,12 +2458,14 @@ pub fn qido_series_global(
         let start = offset.min(out.len());
         let page = &out[start..];
         let page_len = page.len().min(take_n);
-        let page = &page[..page_len];
+        let page: Vec<_> = page[..page_len]
+            .iter()
+            .map(|s| (*s, Some(study_uid.as_str())))
+            .collect();
         let remaining = qido_remaining(total, query.offset, page_len as u64);
         return Ok(render_series_page(
-            page,
+            &page,
             &query,
-            None,
             content_type,
             retrieve_base,
             remaining,
@@ -2486,22 +2486,26 @@ pub fn qido_series_global(
         return Ok(empty_json());
     }
 
-    let mut out: Vec<&clarus_core::manifest::SeriesRecord> = Vec::new();
+    let mut out: Vec<clarus_core::query::GlobalSeries<'_>> = Vec::new();
     clarus_core::query::search_all_series(&manifests, &filter, &mut out);
 
     // Deterministic pagination over the globally-sorted slice (offset then
-    // limit) - no re-ordering, no per-page drift between offset pages.
+    // limit) - no re-ordering, no per-page drift between offset pages. Each
+    // row keeps its own borrowed study UID so (0020,000D) is injected without
+    // a clone.
     let total = out.len();
     let start = offset.min(out.len());
     let page = &out[start..];
     let page_len = page.len().min(take_n);
-    let page = &page[..page_len];
+    let page: Vec<_> = page[..page_len]
+        .iter()
+        .map(|gs| (gs.series, Some(gs.study_uid)))
+        .collect();
     let remaining = qido_remaining(total, query.offset, page_len as u64);
 
     Ok(render_series_page(
-        page,
+        &page,
         &query,
-        None,
         content_type,
         retrieve_base,
         remaining,

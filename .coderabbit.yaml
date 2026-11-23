@@ -1,0 +1,58 @@
+# CodeRabbit review configuration for Clarus PACS (public repository).
+# Keeps reviewers aligned with the project's hard constraints so a
+# contributor cannot silently break the no-unsafe / no-new-deps rules.
+
+language: "en"
+
+reviews:
+  profile: assertive
+
+  path_instructions:
+    - path: "clarus/**"
+      instructions: |
+        Rust server (crate name `clarus`). Hard constraints:
+        - `unsafe` is forbidden except the two audited mmap call sites in
+          crates/clarus-core (manifest read + idx preload). Flag any new
+          `unsafe` block as a blocker unless it is one of those two.
+        - No new dependencies without an explicit justification.
+        - DICOM facts (UIDs, status codes, VRs, attribute types, PS3.18 HTTP
+          codes) must be sourced from the DICOM standard (PS3.x sections),
+          never hardcoded from memory; cite the section when not obvious.
+        - Watch for: silent error swallow defaulting to an optimistic "ok";
+          substring/contains used as semantic parsing; boolean coercion of
+          untrusted strings; `as` casts that can wrap or truncate; hardcoded
+          VR or endianness; empty/zero-length read treated as done; leak on
+          early return; PHI masking that misses a case; vacuous tests;
+          case-sensitivity where the protocol is case-insensitive.
+
+    - path: "crates/**"
+      instructions: |
+        Shared crates (clarus-core and friends). Same hard constraints as
+        clarus/: `unsafe` forbidden except the two audited mmap call sites,
+        no new dependencies without justification, DICOM facts from the
+        standard (PS3.x), no hardcoded VR or endianness, no silent error
+        swallow.
+
+    - path: "clinfer/**"
+      instructions: |
+        Rust Task Performer sidecar (clinfer). Same Rust constraints as the
+        server: no `unsafe`, no new dependencies, DICOM facts from the
+        standard. It runs inference as a separate process and must never
+        import clarus server internals; flag any such coupling.
+
+    - path: "clbridge/**"
+      instructions: |
+        Python DICOM bridge (pynetdicom). Hard constraints:
+        - Python stdlib + pynetdicom only; no new third-party dependencies,
+          no async runtime.
+        - DIMSE facts (status codes, PDU grammar, association behaviour)
+          must follow PS3.7/PS3.8, not be hardcoded from memory.
+        - Every fix carries a falsifiable test (fails before, passes after);
+          a test that can never fail is a defect.
+        - Silent error swallow and optimistic defaults are defects; an
+          outbox/retry path must record what it did, not claim success.
+
+tone_instructions: |
+  Be concise, direct, and constructive. Prioritize conformance, memory
+  safety, and data integrity over style. State findings as specific
+  file:line evidence, not general advice.

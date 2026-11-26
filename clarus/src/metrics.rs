@@ -80,6 +80,16 @@ pub(crate) static TRANSCODE_PEAK: AlignedU64 = AlignedU64(AtomicU64::new(0));
 // event is < 1 s, an instantaneous gauge sample is useless). The
 // anonymous/identified ratio is derived in Prometheus.
 pub(crate) static ACCESS_AUDIT_DROPPED: AlignedU64 = AlignedU64(AtomicU64::new(0));
+/// Batches the journal ACCEPTED and then could not persist.
+///
+/// Distinct from [`ACCESS_AUDIT_DROPPED`] on purpose: that counter is a
+/// documented, bounded-loss design decision (ring full), while this one is a
+/// failure - the record was taken and lost. An operator alerting on evidence
+/// loss needs the difference, and conflating them hid unwritable-journal
+/// outages behind a number that looked like ordinary backpressure.
+pub(crate) static ACCESS_AUDIT_WRITE_FAILED: AlignedU64 = AlignedU64(AtomicU64::new(0));
+/// Bytes in the batches counted by [`ACCESS_AUDIT_WRITE_FAILED`].
+pub(crate) static ACCESS_AUDIT_WRITE_FAILED_BYTES: AlignedU64 = AlignedU64(AtomicU64::new(0));
 pub(crate) static ACCESS_ANONYMOUS_TOTAL: AlignedU64 = AlignedU64(AtomicU64::new(0));
 pub(crate) static ACCESS_IDENTIFIED_TOTAL: AlignedU64 = AlignedU64(AtomicU64::new(0));
 /// Shadow journal events the ring had to evict to make room.
@@ -192,12 +202,26 @@ pub static ORPHANS_PENDING: AtomicU64 = AtomicU64::new(0);
 // scrape time, so no in-process rate math and no window bookkeeping exists
 // here (Rob Pike: no speed hack until the bottleneck is measured).
 //
-// STORAGE_READ_BYTES counts bytes handed to a WADO body writer;
+// STORAGE_READ_BYTES counts bytes actually READ out of a stored object;
 // STORAGE_WRITE_BYTES counts bytes the cold-migration copy pushed to the cold
 // CAS. CAS_WRITE_BYTES counts bytes persisted into the hot CAS by STOW.
 pub static STORAGE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static STORAGE_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static CAS_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Account `n` bytes actually read out of a stored object.
+///
+/// Callers pass the byte count of the READ, never the size of the object: a
+/// bounded 4 MiB metadata head of a 4 GiB instance is 4 MiB of traffic. Booking
+/// the file size at open time reported the whole object for every prefix read
+/// and even for reads that were then refused by a budget check.
+#[inline]
+pub fn count_storage_read(n: u64) {
+    if n == 0 {
+        return;
+    }
+    STORAGE_READ_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
 
 // -- 0810: CAS integrity audit outcome (gauges) ------------------------
 // Set by the CAS audit walker (`cas_audit_worker`) when a run completes, and
@@ -279,6 +303,39 @@ pub fn record_stow_duplicate() {
 // not the AI-result subset. Restricting the denominator to AI-result classes
 // would over-count human reports (Comprehensive SR 88.33 is also a report)
 // and so report a rejection rate against a population that does not exist.
+/// The four standard rejection-note reason codes, in one place.
+///
+/// Both the rejection and the restoration tables were literal copies of the
+/// same four `(code, label)` pairs, so an edit to one could leave the two
+/// disagreeing while both still looked plausible. The codes and meanings come
+/// from `standard/ps3.3/rejection-note-reasons.json` (PS3.16 CID 7010 / IHE
+/// RAD TF-2 4.66); the `standard_codes` test asserts every row against it.
+pub mod rejection_reasons {
+    /// Rejected for Quality Reasons.
+    pub const QUALITY: u32 = 113_001;
+    /// Rejected for Patient Safety Reasons.
+    pub const PATIENT_SAFETY: u32 = 113_037;
+    /// Incorrect Modality Worklist Entry.
+    pub const INCORRECT_MWL: u32 = 113_038;
+    /// Data Retention Policy Expired.
+    pub const RETENTION_EXPIRED: u32 = 113_039;
+
+    /// The standard reasons in numeric order, which is the order the metric
+    /// families are emitted in.
+    pub const ALL: [u32; 4] = [QUALITY, PATIENT_SAFETY, INCORRECT_MWL, RETENTION_EXPIRED];
+
+    /// The upper-case label for `code`, or empty when it is not standard.
+    pub const fn label(code: u32) -> &'static str {
+        match code {
+            QUALITY => "113001",
+            PATIENT_SAFETY => "113037",
+            INCORRECT_MWL => "113038",
+            RETENTION_EXPIRED => "113039",
+            _ => "",
+        }
+    }
+}
+
 pub(crate) static REJECTED_INSTANCES_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INSTANCES_STORED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Per-reason split of [`REJECTED_INSTANCES_TOTAL`].
@@ -289,10 +346,26 @@ pub(crate) static INSTANCES_STORED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// The labels are the four standard codes; an unlisted code still lands in
 /// the unlabelled total, so the two never disagree downward.
 pub(crate) static REJECTED_BY_REASON: [(u32, &str, AtomicU64); 4] = [
-    (113_001, "113001", AtomicU64::new(0)),
-    (113_037, "113037", AtomicU64::new(0)),
-    (113_038, "113038", AtomicU64::new(0)),
-    (113_039, "113039", AtomicU64::new(0)),
+    (
+        rejection_reasons::QUALITY,
+        rejection_reasons::label(rejection_reasons::QUALITY),
+        AtomicU64::new(0),
+    ),
+    (
+        rejection_reasons::PATIENT_SAFETY,
+        rejection_reasons::label(rejection_reasons::PATIENT_SAFETY),
+        AtomicU64::new(0),
+    ),
+    (
+        rejection_reasons::INCORRECT_MWL,
+        rejection_reasons::label(rejection_reasons::INCORRECT_MWL),
+        AtomicU64::new(0),
+    ),
+    (
+        rejection_reasons::RETENTION_EXPIRED,
+        rejection_reasons::label(rejection_reasons::RETENTION_EXPIRED),
+        AtomicU64::new(0),
+    ),
 ];
 
 /// Metrics: IOCM AnyClass rejection notes whose hiding power was ignored
@@ -335,10 +408,26 @@ pub fn record_rejected_instances(reason: u32, count: u64) {
 /// fact that the instance WAS once hidden, and make the two series
 /// impossible to reconcile after a restart.
 pub(crate) static RESTORED_BY_REASON: [(u32, &str, AtomicU64); 4] = [
-    (113_001, "113001", AtomicU64::new(0)),
-    (113_037, "113037", AtomicU64::new(0)),
-    (113_038, "113038", AtomicU64::new(0)),
-    (113_039, "113039", AtomicU64::new(0)),
+    (
+        rejection_reasons::QUALITY,
+        rejection_reasons::label(rejection_reasons::QUALITY),
+        AtomicU64::new(0),
+    ),
+    (
+        rejection_reasons::PATIENT_SAFETY,
+        rejection_reasons::label(rejection_reasons::PATIENT_SAFETY),
+        AtomicU64::new(0),
+    ),
+    (
+        rejection_reasons::INCORRECT_MWL,
+        rejection_reasons::label(rejection_reasons::INCORRECT_MWL),
+        AtomicU64::new(0),
+    ),
+    (
+        rejection_reasons::RETENTION_EXPIRED,
+        rejection_reasons::label(rejection_reasons::RETENTION_EXPIRED),
+        AtomicU64::new(0),
+    ),
 ];
 
 /// Metrics: record instances whose rejection was cleared by an admin restore.
@@ -388,13 +477,24 @@ mod iocm_rate_tests {
         record_rejected_instances,
     };
     use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, OnceLock};
 
     // These measure the increment the helper performs, not a value delta across
     // an HTTP request: the counters are process-global and the STOW tests run
     // concurrently, so only the helper's own contract is observable here.
+    //
+    // A before/after delta is still not safe on its own - a sibling test calling
+    // the same helper between the two loads inflates the difference and the
+    // assertion fails on a busy run. Serialise the readers so the delta window
+    // has no other writer.
+    fn counters_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn the_rejection_counter_adds_the_flip_count() {
+        let _guard = counters_lock().lock().unwrap_or_else(|e| e.into_inner());
         let before = REJECTED_INSTANCES_TOTAL.load(Ordering::Relaxed);
         record_rejected_instances(113_001, 3);
         assert_eq!(REJECTED_INSTANCES_TOTAL.load(Ordering::Relaxed) - before, 3);
@@ -404,6 +504,7 @@ mod iocm_rate_tests {
     fn a_zero_flip_count_is_not_recorded() {
         // A repeated rejection flips nothing; counting it would inflate the
         // rate with references that changed no state.
+        let _guard = counters_lock().lock().unwrap_or_else(|e| e.into_inner());
         let before = REJECTED_INSTANCES_TOTAL.load(Ordering::Relaxed);
         record_rejected_instances(113_001, 0);
         assert_eq!(REJECTED_INSTANCES_TOTAL.load(Ordering::Relaxed), before);
@@ -413,6 +514,7 @@ mod iocm_rate_tests {
     fn the_rejection_counter_splits_by_reason() {
         // Both halves move together: the labelled series is the breakdown of
         // the total, so they must never disagree.
+        let _guard = counters_lock().lock().unwrap_or_else(|e| e.into_inner());
         let total_before = REJECTED_INSTANCES_TOTAL.load(Ordering::Relaxed);
         let b038 = REJECTED_BY_REASON
             .iter()
@@ -433,6 +535,7 @@ mod iocm_rate_tests {
     fn an_unlisted_reason_still_moves_the_total() {
         // The total is the primary series; an unknown code must not vanish
         // from it just because it has no label yet.
+        let _guard = counters_lock().lock().unwrap_or_else(|e| e.into_inner());
         let before = REJECTED_INSTANCES_TOTAL.load(Ordering::Relaxed);
         record_rejected_instances(123_456, 1);
         assert_eq!(REJECTED_INSTANCES_TOTAL.load(Ordering::Relaxed) - before, 1);
@@ -440,6 +543,7 @@ mod iocm_rate_tests {
 
     #[test]
     fn the_ignored_counter_adds_only_positive_counts() {
+        let _guard = counters_lock().lock().unwrap_or_else(|e| e.into_inner());
         let before = IOCM_ANYCLASS_IGNORED_TOTAL.load(Ordering::Relaxed);
         record_iocm_anyclass_ignored(0);
         assert_eq!(IOCM_ANYCLASS_IGNORED_TOTAL.load(Ordering::Relaxed), before);
@@ -452,6 +556,7 @@ mod iocm_rate_tests {
 
     #[test]
     fn the_stored_counter_adds_the_new_instance_count() {
+        let _guard = counters_lock().lock().unwrap_or_else(|e| e.into_inner());
         let before = INSTANCES_STORED_TOTAL.load(Ordering::Relaxed);
         record_instances_stored(5);
         assert_eq!(INSTANCES_STORED_TOTAL.load(Ordering::Relaxed) - before, 5);
@@ -603,8 +708,22 @@ pub static WS_CHANNEL_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Notification connections opened since start.
 pub static WS_CHANNELS_OPENED: AtomicU64 = AtomicU64::new(0);
 
-/// Event Reports successfully queued onto a channel (RAD-87).
+/// Event Reports written to a notification socket and counted once (RAD-87).
+///
+/// This is the DELIVERY count: it moves in `ws_channel_loop` immediately after
+/// the frame is accepted by the socket, so an event the peer lost before the
+/// write never lands here. [`WS_EVENTS_QUEUED`] is the separate signal for
+/// "the publisher handed it to a channel".
 pub static WS_EVENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+
+/// Event Reports accepted into a channel's queue (RAD-87).
+///
+/// Queued is not delivered: the per-channel queue is bounded and the peer may
+/// disconnect before the writer drains it. Kept separate from
+/// [`WS_EVENTS_DELIVERED`] so the difference between the two is the in-flight
+/// and lost count, which is the only way an operator can see a subscriber that
+/// stopped reading.
+pub static WS_EVENTS_QUEUED: AtomicU64 = AtomicU64::new(0);
 
 // -- lazy erase pending tombstones -------------------------------
 
@@ -988,6 +1107,51 @@ fn walk_dir(
 mod tests {
     use super::*;
     use crate::route_classify::RouteId;
+
+    /// The rejection-reason table is the one from `standard/`, and both metric
+    /// families use the SAME rows.
+    ///
+    /// The two tables used to be independent literal copies of the four codes.
+    /// Editing one and not the other left `rejected_by_reason` and
+    /// `restored_by_reason` describing different populations while both still
+    /// parsed - and the hidden-instance count is their difference. The codes
+    /// are checked against the curated reference rather than against memory.
+    #[test]
+    fn the_rejection_reasons_are_the_standard_codes() {
+        const STD: &str = include_str!("../../standard/ps3.3/rejection-note-reasons.json");
+        let compact: String = STD.chars().filter(|c| !c.is_whitespace()).collect();
+
+        for code in rejection_reasons::ALL {
+            let label = rejection_reasons::label(code);
+            assert_eq!(
+                label,
+                code.to_string(),
+                "the metric label must be the decimal code"
+            );
+            let row = format!("\"code\":\"{label}\"");
+            assert!(
+                compact.contains(&row),
+                "{code} must be a standard rejection-note reason"
+            );
+        }
+        // Exactly the four standard reasons, no more: a fifth row would be a
+        // private code sneaking into a standard-backed table.
+        assert_eq!(rejection_reasons::ALL.len(), 4);
+        assert_eq!(
+            rejection_reasons::label(123_456),
+            "",
+            "unknown is unlabelled"
+        );
+
+        // The two tables must agree row for row.
+        for (i, (code, label, _)) in REJECTED_BY_REASON.iter().enumerate() {
+            assert_eq!(
+                (*code, *label),
+                (RESTORED_BY_REASON[i].0, RESTORED_BY_REASON[i].1),
+                "row {i} differs between the rejection and restoration tables"
+            );
+        }
+    }
 
     #[test]
     fn test_status_class() {

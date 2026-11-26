@@ -106,9 +106,11 @@ class CommitJob:
     """One N-ACTION Storage Commitment batch awaiting resolution."""
 
     __slots__ = (
+        "abandon_pending",
         "abandoned",
         "abandoned_at",
         "calling_ae",
+        "cleanup_pending",
         "deadline",
         "frozen_verdict",
         "host",
@@ -119,6 +121,7 @@ class CommitJob:
         "sops",
         "tx_uid",
         "verdict_persisted",
+        "verify_cursor",
     )
 
     def __init__(self, tx_uid, calling_ae, host, port, sops, deadline):
@@ -152,6 +155,23 @@ class CommitJob:
         self.abandoned = False
         # R10: when the row became abandoned (retention reference point).
         self.abandoned_at = 0.0
+        # Where the verification walk resumes. `pending` is a SET, so `list()`
+        # over it is not a stable order: a batch whose head never confirms
+        # re-probed the same SOPs every tick and the tail never got a turn.
+        # The cursor is the uid the next tick starts AT; it wraps to the head
+        # once the sorted order is exhausted, so an unconfirmed SOP is retried
+        # after every pending entry has had one.
+        self.verify_cursor = None
+        # The ABANDONED state has not reached the row yet (the write raised).
+        # The job is out of the working set but must not be eligible for
+        # retention: a restart would reload the row as ACTIVE and send the
+        # verdict the bridge already gave up on.
+        self.abandon_pending = False
+        # The verdict WAS delivered and the row delete failed. Kept out of the
+        # working set (it must never be reported again) and retried from the
+        # cleanup list, so a restart does not re-send a verdict the modality
+        # already received.
+        self.cleanup_pending = False
 
 
 class CommitTracker:
@@ -201,6 +221,11 @@ class CommitTracker:
         # them in `_jobs` made `pending_count()` grow for every dead peer.
         # Bounded by `purge_abandoned`.
         self._abandoned = {}
+        # Delivered batches whose row delete failed, and batches whose
+        # abandonment write failed. Kept out of `_jobs` because they must never
+        # be reported again - only their ROW needs another attempt.
+        self._cleanup = {}
+        self._abandon_pending = {}
         self._lock = threading.Lock()
         self._stop = shutdown if shutdown is not None else threading.Event()
         self._now = now  # injectable clock for tests
@@ -233,7 +258,9 @@ class CommitTracker:
                 "  deadline REAL NOT NULL,"
                 "  frozen TEXT,"  # JSON [ok, failed, event_type] or NULL
                 "  abandoned INTEGER NOT NULL DEFAULT 0,"
-                "  abandoned_at REAL NOT NULL DEFAULT 0"
+                "  abandoned_at REAL NOT NULL DEFAULT 0,"
+                "  report_attempts INTEGER NOT NULL DEFAULT 0,"
+                "  cleanup_pending INTEGER NOT NULL DEFAULT 0"
                 ")"
             )
             conn.commit()
@@ -246,6 +273,13 @@ class CommitTracker:
             ("frozen", "TEXT"),
             ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
             ("abandoned_at", "REAL NOT NULL DEFAULT 0"),
+            # Without the attempt count a restart handed a dead peer a fresh
+            # MAX_REPORT_ATTEMPTS budget, on the single commit worker.
+            ("report_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            # A delivered verdict whose row delete failed has to stay
+            # findable, or a restart re-sends a report the modality already
+            # received.
+            ("cleanup_pending", "INTEGER NOT NULL DEFAULT 0"),
         ):
             try:
                 with self._db.locked() as conn:
@@ -268,10 +302,11 @@ class CommitTracker:
         """
         restored = 0
         abandoned = 0
+        cleaned = 0
         with self._db.locked() as conn:
             rows = conn.execute(
                 "SELECT tx_uid, calling_ae, host, port, sops, pending, deadline,"
-                " frozen, abandoned, abandoned_at"
+                " frozen, abandoned, abandoned_at, report_attempts, cleanup_pending"
                 " FROM commit_jobs"
             ).fetchall()
         for (
@@ -285,6 +320,8 @@ class CommitTracker:
             frozen,
             abandoned_flag,
             abandoned_at,
+            report_attempts,
+            cleanup_flag,
         ) in rows:
             try:
                 sop_pairs = [_pair(item) for item in json.loads(sops)]
@@ -304,6 +341,15 @@ class CommitTracker:
                 # one that may contradict what the SCM was told.
                 job.frozen_verdict = _verdict_from_json(frozen)
                 job.verdict_persisted = job.frozen_verdict is not None
+                if cleanup_flag:
+                    # The verdict was DELIVERED and only the row delete failed.
+                    # Reloading it as active re-sent a report the modality
+                    # already acknowledged; the row is a cleanup chore, not a
+                    # commitment, so it goes straight to the retry list.
+                    job.cleanup_pending = True
+                    self._cleanup[job.tx_uid] = job
+                    cleaned += 1
+                    continue
                 if abandoned_flag:
                     # R10: an abandoned row stays abandoned. Reloading it as
                     # active would grant the dead peer another MAX_REPORT_ATTEMPTS
@@ -314,6 +360,9 @@ class CommitTracker:
                     # R10: the retention clock travels with the row; without
                     # it a reloaded batch read as age 0 and was never purged.
                     job.abandoned_at = float(abandoned_at or 0.0)
+                    job.report_attempts = max(
+                        int(report_attempts or 0), MAX_REPORT_ATTEMPTS
+                    )
                     self._abandoned[tx_uid] = job
                     abandoned += 1
                     continue
@@ -328,6 +377,10 @@ class CommitTracker:
                 )
                 continue
             self._jobs[tx_uid] = job
+            # The attempt count survives the restart. Restoring it as zero gave
+            # an unavailable peer a fresh MAX_REPORT_ATTEMPTS budget at every
+            # restart of an otherwise healthy bridge.
+            job.report_attempts = max(0, int(report_attempts or 0))
             restored += 1
         if restored:
             logging.warning(
@@ -340,6 +393,12 @@ class CommitTracker:
                 "[COMMIT] %d recovered batch(es) were already abandoned - their "
                 "verdicts can no longer be delivered and are kept for inspection",
                 abandoned,
+            )
+        if cleaned:
+            logging.warning(
+                "[COMMIT] %d recovered batch(es) were delivered but their row "
+                "delete failed - retrying the delete, NOT the report",
+                cleaned,
             )
 
     def purge_abandoned(self, max_age_sec=ABANDONED_RETENTION_SEC, now=None):
@@ -356,6 +415,12 @@ class CommitTracker:
         cutoff = (self._now() if now is None else now) - max_age_sec
         removed = 0
         with self._lock:
+            # A job whose abandonment write never landed is NOT in `_abandoned`
+            # and its row still says active. If it were swept by age here the
+            # verdict's only remaining trace would be gone while a restart
+            # could still re-deliver it, so it is excluded by construction:
+            # only `_abandoned` entries are candidates, and `_retry_settled_rows`
+            # moves a job there once the write succeeds.
             stale = [
                 tx
                 for tx, job in self._abandoned.items()
@@ -399,8 +464,9 @@ class CommitTracker:
             conn.execute(
                 "INSERT OR REPLACE INTO commit_jobs"
                 " (tx_uid, calling_ae, host, port, sops, pending, deadline,"
-                "  frozen, abandoned, abandoned_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  frozen, abandoned, abandoned_at, report_attempts,"
+                "  cleanup_pending)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job.tx_uid,
                     job.calling_ae,
@@ -420,6 +486,8 @@ class CommitTracker:
                     ),
                     1 if job.abandoned else 0,
                     float(getattr(job, "abandoned_at", 0.0)),
+                    int(job.report_attempts),
+                    1 if job.cleanup_pending else 0,
                 ),
             )
             conn.commit()
@@ -473,6 +541,18 @@ class CommitTracker:
                     f"Transaction UID {tx_uid} is already active - the SCU "
                     "must use a new UID for a new request"
                 )
+            # A settled batch's row write is still PENDING (its DELETE or its
+            # abandonment UPDATE failed and is retried by `_retry_settled_rows`).
+            # Accepting a registration now would let that retry land on top of
+            # the new row: the abandonment would overwrite an accepted
+            # transaction, or the cleanup DELETE would erase it, and a restart
+            # then lost the commitment the SCU had been told about. The UID is
+            # still owned by the old batch until its row write succeeds.
+            if tx_uid in self._abandon_pending or tx_uid in self._cleanup:
+                raise ValueError(
+                    f"Transaction UID {tx_uid} is still owned by a settled "
+                    "batch whose row write has not completed - retry later"
+                )
             self._persist(job)
             self._jobs[tx_uid] = job
 
@@ -508,6 +588,11 @@ class CommitTracker:
         R10: `abandoned_at` is stamped here, because this is the instant the
         row becomes eligible for retention - the job's own deadline may be days
         older than the moment the report budget finally ran out.
+
+        Returns True when the row now says "abandoned". A False return means an
+        ACTIVE row survived the give-up, which a restart would reload as a
+        commitment still to deliver - so the caller must keep the job in the
+        write-retry list rather than treat it as parked.
         """
         job.abandoned_at = self._now()
         try:
@@ -515,10 +600,13 @@ class CommitTracker:
         except Exception as e:
             logging.error(
                 "[COMMIT] tx=%s: undelivered verdict could not be recorded "
-                "(%s) - the row may be stale",
+                "(%s) - the row stays active and the write is retried without "
+                "another report",
                 job.tx_uid,
                 e,
             )
+            return False
+        return True
 
     def _resolve(self, job):
         """Send one N-EVENT-REPORT for the batch.
@@ -571,10 +659,152 @@ class CommitTracker:
             pass
         return True
 
+    def _verify_walk(self, job, verify_deadline):
+        """Probe `job.pending` from the resume cursor, within the budget.
+
+        PS3.4 J.3.3.1 makes the report the result, so a SOP the walk never
+        reached is reported as unconfirmed - "not stored" - which is a claim
+        the bridge has no evidence for. `pending` is a SET, so `list()` over it
+        is not a stable order and re-walking it from the start each tick
+        examined the same head forever whenever those SOPs did not confirm.
+
+        The walk therefore resumes at the cursor and wraps once: every pending
+        SOP gets a turn before any of them gets a second one.
+        """
+        ordered = sorted(job.pending)
+        if not ordered:
+            return
+        start = 0
+        if job.verify_cursor is not None:
+            # The next tick resumes AFTER the cursor, not at it: re-probing the
+            # boundary SOP costs one round trip per tick for nothing.
+            #
+            # The cursor is the FULL `(sop_class, sop_uid)` pair, i.e. the same
+            # key this list is sorted by. Resuming by UID alone lost every row
+            # the UID ordering disagreed with: with the budget consumed by
+            # (A, 9), no UID greater than "9" was found, the walk restarted at
+            # (A, 9) on every tick, and (B, 1) and (B, 2) were never probed
+            # before the deadline - so they were reported "not stored" without
+            # the bridge ever having asked.
+            for index, item in enumerate(ordered):
+                if item > job.verify_cursor:
+                    start = index
+                    break
+            else:
+                # Past the tail: wrap to the head, which is what retries the
+                # SOPs examined on earlier ticks.
+                start = 0
+        for offset in range(len(ordered)):
+            sop_item = ordered[(start + offset) % len(ordered)]
+            if self._now() >= verify_deadline:
+                logging.info(
+                    "[COMMIT] tx=%s: verification budget reached (%d left "
+                    "unverified) - resolving with what is known",
+                    job.tx_uid,
+                    len(job.pending),
+                )
+                break
+            # The cursor advances BEFORE the probe, so a probe that fails at
+            # the tail does not make the next tick start there again.
+            job.verify_cursor = sop_item
+            sop_class, sop_uid = sop_item
+            try:
+                confirmed = self._verify(sop_class, sop_uid)
+            except Exception as e:
+                logging.warning("[COMMIT] verify %s error: %s", sop_uid, e)
+                continue
+            if not confirmed:
+                continue
+            # A probe can start inside the window and observe the instance only
+            # AFTER it. Counting that as a confirmation tells the modality a
+            # SOP is committed when the batch's own deadline said otherwise -
+            # so the result is only applied if it arrived in time.
+            if self._now() > job.deadline and job.deadline <= verify_deadline:
+                logging.info(
+                    "[COMMIT] tx=%s: confirmation of %s arrived after the "
+                    "deadline - not counted",
+                    job.tx_uid,
+                    sop_uid,
+                )
+                continue
+            job.pending.discard(sop_item)
+        # A cursor past the last uid wraps on the next tick by the `for/else`
+        # above; clearing it here would restart mid-set instead.
+        if not job.pending:
+            job.verify_cursor = None
+
+    def _retry_settled_rows(self):
+        """Retry only the ROW writes for batches whose verdict is settled.
+
+        `_park_undelivered` and `_forget` both run after the job left `_jobs`,
+        and both can fail. Losing either left an ACTIVE row behind, which a
+        restart reloaded as a commitment still to deliver - so the modality was
+        sent the same verdict again, or one the bridge had already given up on.
+        """
+        with self._lock:
+            pending_abandon = list(self._abandon_pending.items())
+            pending_cleanup = list(self._cleanup.items())
+        for tx_uid, job in pending_abandon:
+            # The ownership test and the write are ONE locked step. Testing
+            # ownership outside the lock let `register()` accept the same UID
+            # between the two, and the retry's `_persist(job)` then replaced the
+            # NEW row with the old batch's abandoned one - the freshly accepted
+            # transaction was silently turned into an abandonment, and the SCU
+            # never received the verdict for the request it had just sent.
+            # `register()` refuses a UID that is still in `_abandon_pending`, so
+            # holding the lock across both is sufficient.
+            with self._lock:
+                try:
+                    # The report is NOT re-sent: only the row write is retried.
+                    self._persist(job)
+                except Exception as e:
+                    logging.error(
+                        "[COMMIT] tx=%s: abandonment still not recorded (%s) - "
+                        "the row stays active for now",
+                        tx_uid,
+                        e,
+                    )
+                    continue
+                self._abandon_pending.pop(tx_uid, None)
+                self._abandoned[tx_uid] = job
+            logging.error("[COMMIT] tx=%s: abandonment recorded on a retry", tx_uid)
+        for tx_uid, job in pending_cleanup:
+            # Ownership and the DELETE are ONE locked step. Checking the owner
+            # and releasing the lock let a `register()` for the same UID
+            # persist a NEW row in between, and the retry then deleted it - a
+            # restart lost an accepted transaction the SCU had already been
+            # told about. `register()` refuses a UID that is still in
+            # `_cleanup`, so holding the lock across both is sufficient.
+            with self._lock:
+                if tx_uid in self._jobs:
+                    self._cleanup.pop(tx_uid, None)
+                    logging.info(
+                        "[COMMIT] tx=%s was re-registered - dropping the "
+                        "pending row delete",
+                        tx_uid,
+                    )
+                    continue
+                try:
+                    self._forget(tx_uid)
+                except Exception as e:
+                    logging.error(
+                        "[COMMIT] tx=%s: row still not deleted (%s) - retried "
+                        "next tick, verdict NOT re-sent",
+                        tx_uid,
+                        e,
+                    )
+                    continue
+            with self._lock:
+                self._cleanup.pop(tx_uid, None)
+
     def _tick(self):
+        # Rows whose verdict is already settled: a delivered report whose row
+        # delete failed, and an abandonment that never reached the store. Both
+        # are OUT of `_jobs` (they must never be reported again), so they need
+        # this separate pass or nothing retries their write.
+        self._retry_settled_rows()
         with self._lock:
             jobs = list(self._jobs.values())
-        now = self._now()
         for job in jobs:
             # Verification is bounded: each `_verify` may be a network round
             # trip to the origin, and an unbounded walk over a large batch held
@@ -589,23 +819,13 @@ class CommitTracker:
             # `verify_budget_sec` of origin round trips per tick on the single
             # commit worker, for an answer nothing may use any more.
             verify_deadline = min(job.deadline, self._now() + self._verify_budget_sec)
-            to_verify = [] if job.frozen_verdict is not None else list(job.pending)
-            for sop_item in to_verify:
-                if self._now() >= verify_deadline:
-                    logging.info(
-                        "[COMMIT] tx=%s: verification budget reached (%d left "
-                        "unverified) - resolving with what is known",
-                        job.tx_uid,
-                        len(job.pending),
-                    )
-                    break
-                sop_class, sop_uid = sop_item
-                try:
-                    if self._verify(sop_class, sop_uid):
-                        job.pending.discard(sop_item)
-                except Exception as e:
-                    logging.warning("[COMMIT] verify %s error: %s", sop_uid, e)
-            if not job.pending or now >= job.deadline:
+            if job.frozen_verdict is None:
+                self._verify_walk(job, verify_deadline)
+            # The deadline test reads a FRESH clock. `now` captured at the top
+            # of the tick predates every report this tick sent, so a batch due
+            # while an earlier (slow) report was in flight looked expired here
+            # and was resolved as "everything unconfirmed" without a probe.
+            if not job.pending or self._now() >= job.deadline:
                 # CC3: the verdict is FROZEN on the first attempt. The report
                 # must describe the batch as it stood when the outcome was
                 # decided: recomputing it per attempt let a later successful
@@ -647,6 +867,27 @@ class CommitTracker:
                 # Retire the job only once its verdict was actually delivered:
                 # dropping it after a failed N-EVENT-REPORT lost the outcome
                 # the modality was waiting for.
+                #
+                # The attempt limit is enforced BEFORE `_resolve`, not after.
+                # `_reload()` can restore an active row whose persisted
+                # `report_attempts` already reached the limit - the process may
+                # have stopped between persisting attempt five and persisting
+                # the abandonment - and `_tick` used to send one more report
+                # before noticing. A row that has already spent its budget goes
+                # straight to the abandonment transition instead.
+                if job.report_attempts >= MAX_REPORT_ATTEMPTS:
+                    with self._lock:
+                        still_ours = self._jobs.get(job.tx_uid) is job
+                        if still_ours:
+                            del self._jobs[job.tx_uid]
+                            self._abandon_pending[job.tx_uid] = job
+                    logging.error(
+                        "[COMMIT] tx=%s: report attempt limit (%d) already "
+                        "spent - abandoning without another report",
+                        job.tx_uid,
+                        MAX_REPORT_ATTEMPTS,
+                    )
+                    continue
                 if self._resolve(job):
                     # R7/R9: the ownership test, the in-memory removal and the
                     # row delete are ONE locked transition. Releasing the lock
@@ -662,17 +903,31 @@ class CommitTracker:
                             # already delivered, and aborting the tick leaves
                             # the row behind, so the next restart reloads the
                             # batch and sends a SECOND report for a verdict
-                            # the modality already received.
+                            # the modality already received. The delete is
+                            # therefore retried from `_cleanup`, which carries
+                            # a flag on the row so a restart resumes it too.
                             try:
                                 self._forget(job.tx_uid)
                             except Exception as e:
+                                job.cleanup_pending = True
+                                self._cleanup[job.tx_uid] = job
                                 logging.error(
                                     "[COMMIT] tx=%s: verdict delivered but the "
-                                    "row could not be deleted (%s) - a restart "
-                                    "may re-send it once",
+                                    "row could not be deleted (%s) - the delete "
+                                    "is retried, the report is NOT re-sent",
                                     job.tx_uid,
                                     e,
                                 )
+                                try:
+                                    self._persist(job)
+                                except Exception as pe:
+                                    logging.error(
+                                        "[COMMIT] tx=%s: cleanup state not "
+                                        "recorded (%s) - a restart may re-send "
+                                        "the report once",
+                                        job.tx_uid,
+                                        pe,
+                                    )
                     if not still_ours:
                         # Re-registered while the report was in flight: the
                         # NEW job and its row belong to the new request.
@@ -686,6 +941,19 @@ class CommitTracker:
                         continue
                 else:
                     job.report_attempts += 1
+                    # The count is durable as it grows. Without it a restart
+                    # restored zero and handed an unavailable peer a FRESH
+                    # MAX_REPORT_ATTEMPTS budget at every restart.
+                    if self._db is not None:
+                        try:
+                            self._persist(job)
+                        except Exception as e:
+                            logging.error(
+                                "[COMMIT] tx=%s: attempt count not persisted "
+                                "(%s) - a restart resets the budget",
+                                job.tx_uid,
+                                e,
+                            )
                     if job.report_attempts >= MAX_REPORT_ATTEMPTS:
                         # The modality will never hear this verdict: retire
                         # the batch and say so at ERROR level. Keeping it
@@ -717,8 +985,17 @@ class CommitTracker:
                             if still_ours:
                                 job.abandoned = True
                                 del self._jobs[job.tx_uid]
-                                self._park_undelivered(job)
-                                self._abandoned[job.tx_uid] = job
+                                # The write can fail (disk full, locked store).
+                                # The job is already out of the working set, so
+                                # a failed write used to leave an ACTIVE row
+                                # that a restart re-delivered and that
+                                # `purge_abandoned` would never collect. It is
+                                # parked for a WRITE-ONLY retry instead.
+                                if not self._park_undelivered(job):
+                                    job.abandon_pending = True
+                                    self._abandon_pending[job.tx_uid] = job
+                                else:
+                                    self._abandoned[job.tx_uid] = job
                         if not still_ours:
                             # Re-registered while the verdict was being
                             # abandoned: the NEW job and its row belong to the
@@ -793,6 +1070,15 @@ class CommitTracker:
         """Undelivered batches kept for inspection (R10). Never ticked."""
         with self._lock:
             return len(self._abandoned)
+
+    def settled_write_count(self):
+        """Settled batches whose ROW write is still outstanding.
+
+        A delivered-but-undeleted row and an abandonment that never reached the
+        store. Both are retried without another N-EVENT-REPORT.
+        """
+        with self._lock:
+            return len(self._cleanup) + len(self._abandon_pending)
 
     def close(self):
         self._stop.set()

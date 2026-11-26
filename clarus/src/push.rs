@@ -99,6 +99,21 @@ pub struct Subscription {
     /// own state machine: "AE Unsubscribes from Specific UPS: Go to Not
     /// Subscribed" (Table CC.2.3-2).
     pub deletion_lock_at: Option<u64>,
+    /// Workitems a scoped DELETE removed from an otherwise global scope.
+    ///
+    /// PS3.18 11.10.1.1 lets a subscriber end the subscription for ONE
+    /// workitem. When the AE holds only a Worklist (global) subscription there
+    /// is no per-workitem entry to drop, so the workitem is recorded here and
+    /// the global scope keeps delivering everything else. Empty for a
+    /// per-workitem subscription, which is removed outright instead.
+    pub excluded_workitems: Vec<String>,
+    /// Workitems this subscription has been ATTACHED to.
+    ///
+    /// PS3.4 CC.2.3.3 uses the filter to establish a workitem subscription and
+    /// then reports every state change of that workitem to it. Membership is
+    /// recorded once, on first qualification, so a report whose new values no
+    /// longer match the filter still reaches the subscriber.
+    pub member_workitems: Vec<String>,
     /// Restrict this subscription to ONE workitem (PS3.18 11.10.1.1's
     /// Workitem Subscription template).
     ///
@@ -155,6 +170,8 @@ impl Subscription {
             code_value: None,
             code_scheme: None,
             deletion_lock_at: None,
+            excluded_workitems: Vec::new(),
+            member_workitems: Vec::new(),
             workitem_uid: None,
             study_uid: None,
             patient_id: None,
@@ -410,11 +427,43 @@ impl SubscriptionRegistry {
         // Same case-insensitive identity as `subscribe`: a DELETE that does
         // not drop the entry `subscribe` would have replaced leaves a
         // subscription the requester believes it removed.
-        subs.retain(|s| {
-            !(s.subscriber.eq_ignore_ascii_case(subscriber)
-                && workitem_uid.is_none_or(|w| s.workitem_uid.as_deref() == Some(w)))
+        //
+        // PS3.18 11.10.1.1: a DELETE scoped to one workitem ends THAT
+        // workitem's subscription. Removing only a matching per-workitem entry
+        // was not enough: an AE holding just a Worklist (global) subscription
+        // has no such entry, so the DELETE removed nothing and the global
+        // subscription kept delivering that workitem's events. The scope is
+        // therefore recorded as an exclusion on the entry that would otherwise
+        // still match - the global subscription loses this one workitem and
+        // keeps every other.
+        let mut excluded = false;
+        subs.retain_mut(|s| {
+            if !s.subscriber.eq_ignore_ascii_case(subscriber) {
+                return true;
+            }
+            match workitem_uid {
+                // Whole-AE: drop every scope.
+                None => false,
+                Some(want) => match s.workitem_uid.as_deref() {
+                    // A per-workitem entry for that workitem is the scope
+                    // itself - drop it.
+                    Some(uid) if uid == want => false,
+                    // A different workitem's scope is untouched.
+                    Some(_) => true,
+                    // The global scope keeps delivering everything EXCEPT the
+                    // workitem the DELETE named.
+                    None => {
+                        let already = s.excluded_workitems.iter().any(|u| u == want);
+                        if !already {
+                            s.excluded_workitems.push(want.to_string());
+                            excluded = true;
+                        }
+                        true
+                    }
+                },
+            }
         });
-        subs.len() != before
+        subs.len() != before || excluded
     }
 
     /// Every subscription whose filter accepts the workitem.
@@ -429,11 +478,30 @@ impl SubscriptionRegistry {
     /// PS3.18 8.3.4.1's AND-of-attributes semantics says. Cloned out under the
     /// lock so the network work happens with no lock held.
     fn matching(&self, workitem_uid: &str, values: &FilterValues<'_>) -> Vec<Subscription> {
-        let subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
-        subs.iter()
-            .filter(|s| subscription_accepts(s, workitem_uid, values))
-            .cloned()
-            .collect()
+        let mut subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::new();
+        for s in subs.iter_mut() {
+            // PS3.4 CC.2.3.3: a filter selects the workitems a subscription is
+            // ATTACHED to. Once attached, every later report about that
+            // workitem goes to its subscribers - including the report that
+            // says the workitem no longer matches the filter. Re-testing the
+            // filter on each report detached the subscriber the moment the
+            // state moved (a `ProcedureStepState=SCHEDULED` subscription never
+            // saw its workitem become IN PROGRESS), which is the opposite of
+            // what a workitem subscription is for.
+            //
+            // Membership is therefore recorded on first qualification and
+            // honoured afterwards; the filter only decides the FIRST sighting.
+            let member = s.member_workitems.iter().any(|u| u == workitem_uid);
+            if !member {
+                if !subscription_accepts(s, workitem_uid, values) {
+                    continue;
+                }
+                s.member_workitems.push(workitem_uid.to_string());
+            }
+            out.push(s.clone());
+        }
+        out
     }
 
     /// Whether `subscriber` holds a subscription accepting the workitem.
@@ -482,18 +550,45 @@ impl SubscriptionRegistry {
     /// The newest Deletion Lock time among all subscriptions, if any lock is
     /// held.
     ///
-    /// The retention sweep asks whether ANY subscription still holds a lock
-    /// it must honour (AIW-I 4.86.4.1.2: the Manager "shall support the use
-    /// of Deletion Locks"), so this returns the most recent lock instant -
-    /// the one that keeps the workitem for the longest. Unsubscribing
-    /// removes the subscription (PS3.4 CC.2.3.1 Table CC.2.3-2), so a
-    /// released lock simply stops appearing here.
+    /// A worklist-scoped lock is process-wide by construction (it is not tied
+    /// to one workitem), but a WORKITEM-scoped lock covers only that workitem.
+    /// A sweep that asks this question globally therefore lets a lock on
+    /// workitem A keep every unrelated workitem B alive - see
+    /// [`SubscriptionRegistry::newest_deletion_lock_for`], which is what the
+    /// retention sweep uses.
     #[must_use]
     pub fn newest_deletion_lock(&self) -> Option<u64> {
         self.subs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
+            .filter_map(|s| s.deletion_lock_at)
+            .max()
+    }
+
+    /// The newest Deletion Lock that actually COVERS `workitem_uid`.
+    ///
+    /// A lock covers a workitem when the subscription holding it accepts that
+    /// workitem, which is the same predicate the push fan-out uses
+    /// ([`subscription_accepts`]). That keeps "which workitems does this
+    /// subscription see" defined once: a worklist subscription's lock covers
+    /// everything it would be notified about, and a per-workitem
+    /// (`/workitems/{uid}/subscribers/...`) subscription's lock covers exactly
+    /// that one - which is what PS3.4 CC.2.3.1 means by the lock protecting
+    /// the workitem it was taken for.
+    ///
+    /// Zero allocations: a scan over the registry under its own lock, so the
+    /// per-record sweep loop pays no allocation per workitem.
+    #[must_use]
+    pub fn newest_deletion_lock_for(
+        &self,
+        workitem_uid: &str,
+        values: &FilterValues<'_>,
+    ) -> Option<u64> {
+        let subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+        subs.iter()
+            .filter(|s| s.deletion_lock_at.is_some())
+            .filter(|s| subscription_accepts(s, workitem_uid, values))
             .filter_map(|s| s.deletion_lock_at)
             .max()
     }
@@ -660,6 +755,26 @@ fn subscription_accepts(
     {
         return false;
     }
+    // A global subscription can have single workitems removed from it by a
+    // scoped DELETE (PS3.18 11.10.1.1). Those exclusions are checked here so
+    // the remaining scopes keep working while the named one stays gone.
+    if subscription
+        .excluded_workitems
+        .iter()
+        .any(|u| u == workitem_uid)
+    {
+        return false;
+    }
+    // Membership recorded by `matching` outranks the filter: the subscription
+    // is attached to this workitem, so later reports about it arrive whatever
+    // the filter would say about the NEW values (PS3.4 CC.2.3.3).
+    if subscription
+        .member_workitems
+        .iter()
+        .any(|u| u == workitem_uid)
+    {
+        return true;
+    }
     // The remaining keys are one rule applied fourteen times: a key the
     // subscription carries must equal the workitem's value, and a key it does
     // not carry constrains nothing. Looping over the fixed table keeps the
@@ -675,7 +790,7 @@ fn subscription_accepts(
             continue;
         };
         match values.get(*key) {
-            Some(actual) if value_matches(want.as_str(), actual) => {}
+            Some(actual) if filter_value_matches(*key, want.as_str(), actual) => {}
             // A `None` in `values` stays a NON-match, unchanged: the
             // subscription asked for workitems carrying that value, and an
             // unknown value is not demonstrably it.
@@ -683,6 +798,24 @@ fn subscription_accepts(
         }
     }
     true
+}
+
+/// Whether one attribute's filter accepts the workitem's value.
+///
+/// Almost every key is a string or wildcard match, but (0040,0405) Scheduled
+/// Procedure Step Start DateTime is typed "Single Value or Range" (PS3.4 Table
+/// CC.2.5-3). Comparing a range as a literal string made a conformant
+/// `20260101000000-20260131235959` filter match nothing at all, so a subscriber
+/// that asked for a month of work silently received no events. DT therefore
+/// goes through the shared range matcher; every other key keeps the wildcard
+/// path unchanged.
+fn filter_value_matches(key: FilterKeyRef, want: &str, actual: &str) -> bool {
+    if key == FilterKeyRef::SpsStartDatetime && want.contains('-') {
+        // PS3.4 C.2.2.2.5: the range is inclusive at both ends, and an open
+        // end (`-20260131` / `20260101-`) means unbounded on that side.
+        return clarus_core::ups::store::dt_filter_matches(actual, want, 0);
+    }
+    value_matches(want, actual)
 }
 
 /// C-FIND wildcard match over ASCII bytes (PS3.4 C.2.2.2: `*` matches zero or
@@ -705,13 +838,18 @@ fn value_matches(pattern: &str, actual: &str) -> bool {
     let mut star: Option<usize> = None;
     let mut star_match = 0usize;
     while ai < a.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == a[ai]) {
-            pi += 1;
-            ai += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
+        // The star is tested BEFORE literal equality. With the comparisons the
+        // other way round, a pattern whose first byte IS `*` consumed it as a
+        // literal against an actual `*`, leaving no backtracking position: `*A`
+        // never matched `*BA`, and the same held for `*` against any value
+        // beginning with a star.
+        if pi < p.len() && p[pi] == b'*' {
             star = Some(pi);
             star_match = ai;
             pi += 1;
+        } else if pi < p.len() && (p[pi] == b'?' || p[pi] == a[ai]) {
+            pi += 1;
+            ai += 1;
         } else if let Some(sp) = star {
             pi = sp + 1;
             star_match += 1;
@@ -851,12 +989,35 @@ fn post_workitem(
     // unreachable host leaves to the OS (a minute or more on a blackholed
     // route). The push queue has ONE worker thread, so a single such endpoint
     // stalled every other subscriber behind it for that whole window.
-    let target = std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+    //
+    // EVERY resolved address is tried, inside ONE deadline. Taking only the
+    // first discarded a working IPv4 address whenever the resolver listed an
+    // unreachable IPv6 one ahead of it, and every retry repeated the same
+    // failure against the same address.
+    let addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
         .map_err(|e| e.to_string())?
-        .next()
-        .ok_or_else(|| format!("cannot resolve {addr}"))?;
-    let mut stream =
-        std::net::TcpStream::connect_timeout(&target, PUSH_TIMEOUT).map_err(|e| e.to_string())?;
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("cannot resolve {addr}"));
+    }
+    let connect_deadline = std::time::Instant::now() + PUSH_TIMEOUT;
+    let mut stream = None;
+    let mut last_error = String::new();
+    for target in addrs {
+        let left = connect_deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            last_error = "connect timeout".to_string();
+            break;
+        }
+        match std::net::TcpStream::connect_timeout(&target, left) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_error = e.to_string(),
+        }
+    }
+    let mut stream = stream.ok_or(last_error)?;
     stream
         .set_write_timeout(Some(PUSH_TIMEOUT))
         .map_err(|e| e.to_string())?;
@@ -888,7 +1049,20 @@ fn post_workitem(
     // long as it liked - every other subscriber queued behind it. The overall
     // deadline is what the caller actually promised.
     let deadline = std::time::Instant::now() + PUSH_TIMEOUT;
-    while buf.len() < 64 {
+    loop {
+        // RFC 9112 2.1: the status line is CRLF-terminated, so its presence
+        // completes the only part this function reads. Waiting for a fixed
+        // 64 bytes made a 201 with short headers look like a timeout whenever
+        // the rest of the response lagged - and a reported failure means the
+        // Create is retried against a subscriber that already committed it.
+        if let Some(status) = parse_complete_status(&buf) {
+            return Ok(status);
+        }
+        if buf.len() >= 64 {
+            // Enough bytes and still no valid status line: the response is
+            // malformed, and reading further cannot make it a status line.
+            return Err("malformed response".to_string());
+        }
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             return Err("response timeout".to_string());
@@ -902,6 +1076,8 @@ fn post_workitem(
             Err(e) => return Err(e.to_string()),
         }
     }
+    // EOF: the connection closed, so a status line already in the buffer is
+    // final even without its CRLF.
     parse_status(&buf).ok_or_else(|| "malformed response".to_string())
 }
 
@@ -926,6 +1102,26 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16, String), String> {
         return Err(format!("empty host in endpoint: {endpoint}"));
     }
     Ok((host.to_string(), port, path.to_string()))
+}
+
+/// Parse a status code from a COMPLETE, validated status line.
+///
+/// RFC 9112 4: `HTTP-version SP status-code SP [reason-phrase] CRLF`, with the
+/// code exactly three digits. Returns `None` while the line is still
+/// incomplete, so the caller keeps reading rather than deciding on a prefix.
+fn parse_complete_status(buf: &[u8]) -> Option<u16> {
+    let end = buf.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&buf[..end]).ok()?;
+    let mut parts = line.split(' ');
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/1.") {
+        return None;
+    }
+    let code = parts.next()?;
+    if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok()
 }
 
 /// Parse the status code out of an HTTP/1.1 status line.
@@ -965,10 +1161,14 @@ fn create_body(workitem_uid: &str, snapshot: &WorkitemSnapshot) -> Vec<u8> {
         "CS",
         Some(snapshot.input_readiness.as_str()),
     );
+    // (0074,1204) Procedure Step Label is VR LO
+    // (`standard/ps3.6/ups-procedure-step-label-vr.json`): declaring SH is a
+    // shorter width than the standard allows, and a receiver that validates the
+    // declared VR refuses the workitem outright.
     push_create_scalar(
         &mut body,
         "00741204",
-        "SH",
+        "LO",
         Some(snapshot.step_label.as_str()),
     );
     push_create_scalar(
@@ -1011,7 +1211,23 @@ fn push_create_scalar(body: &mut Vec<u8>, tag: &str, vr: &str, value: Option<&st
 /// Exposed so the caller and the tests agree on where the workitem lands.
 pub fn workitem_path(endpoint: &str, workitem_uid: &str) -> Result<String, String> {
     let (_, _, base) = parse_endpoint(endpoint)?;
-    Ok(format!("{}/{}", base.trim_end_matches('/'), workitem_uid))
+    // RFC 3986 3.4: the query follows the path. Appending the UID to the whole
+    // endpoint put it INSIDE the query (`/ups?tenant=a/1.2.3`), so the receiver
+    // saw tenant `a/1.2.3` and no workitem UID in the path at all. Split the
+    // query off first and re-attach it after the UID.
+    let (path, query) = match base.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (base.as_str(), None),
+    };
+    let mut out = String::with_capacity(base.len() + workitem_uid.len() + 8);
+    out.push_str(path.trim_end_matches('/'));
+    out.push('/');
+    out.push_str(workitem_uid);
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(query);
+    }
+    Ok(out)
 }
 
 /// Attempts per push, snapshotted from `[ups] push_attempts` at startup.
@@ -1048,6 +1264,244 @@ mod tests {
             code,
             ..Default::default()
         }
+    }
+
+    /// PS3.6: (0074,1204) Procedure Step Label is VR LO. A receiver that
+    /// validates the declared VR refuses an SH-declared LO attribute.
+    #[test]
+    fn the_create_body_declares_the_step_label_as_lo() {
+        let snapshot = WorkitemSnapshot {
+            input_readiness: "READY".to_string(),
+            step_label: "A label longer than sixteen characters".to_string(),
+            priority: "MEDIUM".to_string(),
+            start_datetime: "20260101120000".to_string(),
+        };
+        let body = create_body("1.2.3", &snapshot);
+        let text = String::from_utf8(body).expect("utf-8");
+        assert!(
+            text.contains(r#""00741204":{"vr":"LO""#),
+            "the label is declared LO: {text}"
+        );
+        assert!(
+            !text.contains(r#""00741204":{"vr":"SH""#),
+            "and not the shorter SH width: {text}"
+        );
+    }
+
+    /// RFC 3986 3.4: the query follows the path, so the workitem UID goes
+    /// BEFORE the `?`. Appending it to the whole endpoint put it inside the
+    /// query and left the path without a UID.
+    #[test]
+    fn the_workitem_uid_lands_in_the_path_before_the_query() {
+        assert_eq!(
+            workitem_path("http://h:80/ups", "1.2.3").unwrap(),
+            "/ups/1.2.3"
+        );
+        assert_eq!(
+            workitem_path("http://h:80/ups/", "1.2.3").unwrap(),
+            "/ups/1.2.3"
+        );
+        assert_eq!(
+            workitem_path("http://h:80/ups?tenant=a", "1.2.3").unwrap(),
+            "/ups/1.2.3?tenant=a",
+            "the query keeps its own value"
+        );
+        assert_eq!(
+            workitem_path("http://h:80", "1.2.3").unwrap(),
+            "/1.2.3",
+            "a bare authority still yields a rooted path"
+        );
+    }
+
+    /// A pattern star is a star even when the actual value has one there:
+    /// `*A` must match `*BA`, and `*` must match anything.
+    #[test]
+    fn a_pattern_star_matches_before_literal_equality() {
+        assert!(value_matches("*A", "*BA"));
+        assert!(value_matches("*", "*"));
+        assert!(value_matches("*", "anything"));
+        assert!(value_matches("*A*", "xxAx"));
+        assert!(!value_matches("*A*", "xxB"));
+        // The exact fast path is unchanged.
+        assert!(value_matches("CAD", "CAD"));
+        assert!(!value_matches("CAD", "cad"));
+    }
+
+    /// PS3.4 C.2.2.2.5: a DT filter is a range with inclusive ends. Comparing
+    /// it as a literal string matched nothing.
+    #[test]
+    fn a_datetime_range_filter_matches_by_instant() {
+        let jan = FilterValues {
+            sps_start_datetime: Some("20260101000000-20260131235959"),
+            ..Default::default()
+        };
+        let mut sub = Subscription::unfiltered("AE1", None);
+        sub.sps_start_datetime = Some("20260101000000-20260131235959".to_string());
+        let inside = FilterValues {
+            sps_start_datetime: Some("20260115120000"),
+            ..Default::default()
+        };
+        assert!(
+            subscription_accepts(&sub, "1.2.3", &inside),
+            "an instant inside the range matches"
+        );
+        let outside = FilterValues {
+            sps_start_datetime: Some("20260215120000"),
+            ..Default::default()
+        };
+        assert!(
+            !subscription_accepts(&sub, "1.2.3", &outside),
+            "an instant outside the range does not"
+        );
+        let _ = jan;
+    }
+
+    /// PS3.18 11.10.1.1: a scoped DELETE ends that workitem's subscription.
+    /// An AE holding only a Worklist subscription has no per-workitem entry,
+    /// so the scope must become an exclusion rather than a silent no-op.
+    #[test]
+    fn a_scoped_unsubscribe_detaches_one_workitem_from_a_global_scope() {
+        let reg = SubscriptionRegistry::default();
+        reg.subscribe(Subscription::unfiltered("AE1", Some("http://h/ups")));
+        reg.subscribe(Subscription::unfiltered("AE2", Some("http://h/ups")));
+
+        assert!(reg.unsubscribe_scoped("AE1", Some("1.2.3")));
+        assert!(
+            !reg.accepts_for(
+                "AE1",
+                "1.2.3",
+                &FilterValues {
+                    step_label: "CAD",
+                    ..Default::default()
+                }
+            ),
+            "the named workitem is no longer delivered"
+        );
+        assert!(
+            reg.accepts_for(
+                "AE1",
+                "1.2.4",
+                &FilterValues {
+                    step_label: "CAD",
+                    ..Default::default()
+                }
+            ),
+            "and every other workitem still is"
+        );
+        assert!(
+            reg.accepts_for(
+                "AE2",
+                "1.2.3",
+                &FilterValues {
+                    step_label: "CAD",
+                    ..Default::default()
+                }
+            ),
+            "another subscriber is untouched"
+        );
+    }
+
+    /// PS3.4 CC.2.3.3: the filter attaches the subscription to a workitem, and
+    /// every later report about that workitem goes to it - including the one
+    /// that moves it out of the filter's stated state.
+    #[test]
+    fn a_filtered_subscription_keeps_a_workitem_once_it_matched() {
+        let reg = SubscriptionRegistry::default();
+        let mut sub = Subscription::unfiltered("AE1", Some("http://h/ups"));
+        sub.workflow_state = Some("SCHEDULED".to_string());
+        reg.subscribe(sub);
+
+        let scheduled = FilterValues {
+            workflow_state: Some("SCHEDULED"),
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.matching("1.2.3", &scheduled).len(),
+            1,
+            "the SCHEDULED workitem attaches the subscription"
+        );
+
+        let in_progress = FilterValues {
+            workflow_state: Some("IN PROGRESS"),
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.matching("1.2.3", &in_progress).len(),
+            1,
+            "and its later state change is still reported"
+        );
+        assert_eq!(
+            reg.matching("1.2.4", &in_progress).len(),
+            0,
+            "while a workitem that never matched stays out"
+        );
+    }
+
+    /// A short 201 must be accepted as soon as its status line is complete.
+    ///
+    /// RFC 9112 2.1 terminates the status line with CRLF, so waiting for a
+    /// fixed 64 bytes made a 201 with short headers look like a timeout - and
+    /// a reported failure means the Create is retried against a subscriber
+    /// that already committed it. The server here holds the connection open
+    /// after the status line, which is exactly the shape that used to bill as
+    /// a timeout.
+    #[test]
+    fn a_complete_status_line_is_enough_to_finish_the_push() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            // Drain the request head and body so the client's write completes.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            // A SHORT 201: well under 64 bytes, and the connection then stays
+            // open with no further bytes and no close.
+            // 26 bytes: the status line alone. No headers, no body, and the
+            // socket stays open - so a reader that insists on 64 bytes hangs
+            // until its deadline even though the answer arrived immediately.
+            sock.write_all(b"HTTP/1.1 201 Created\r\n\r\n")
+                .expect("write");
+            // Hold the connection open past PUSH_TIMEOUT with no further
+            // bytes: neither EOF nor a full 64-byte buffer arrives, so a
+            // reader that waits for either reports a timeout for an answer it
+            // already had.
+            // Long enough that the FIXED version's caller has already
+            // returned, short enough not to stall the suite.
+            std::thread::sleep(PUSH_TIMEOUT + std::time::Duration::from_secs(1));
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        });
+
+        let snapshot = WorkitemSnapshot {
+            input_readiness: "READY".to_string(),
+            step_label: "CAD".to_string(),
+            priority: "MEDIUM".to_string(),
+            start_datetime: "20260101120000".to_string(),
+        };
+        let endpoint = format!("http://127.0.0.1:{port}/ups");
+        let status = post_workitem(&endpoint, "1.2.3", &snapshot).expect("the push succeeds");
+        assert_eq!(status, 201);
+        server.join().expect("server thread");
+    }
+
+    /// Only a COMPLETE, validated status line counts: a prefix is not a
+    /// decision, and a malformed one is not a status.
+    #[test]
+    fn a_partial_or_malformed_status_line_is_not_accepted() {
+        assert_eq!(
+            parse_complete_status(b"HTTP/1.1 201 Created\r\n"),
+            Some(201)
+        );
+        assert_eq!(
+            parse_complete_status(b"HTTP/1.1 404 Not Found\r\n"),
+            Some(404)
+        );
+        // Still arriving: no CRLF yet.
+        assert_eq!(parse_complete_status(b"HTTP/1.1 201 Cre"), None);
+        // A prefix of the code is not the code.
+        assert_eq!(parse_complete_status(b"HTTP/1.1 20 X\r\n"), None);
+        // Not HTTP.
+        assert_eq!(parse_complete_status(b"FTP/1.1 201 OK\r\n"), None);
     }
 
     #[test]
@@ -1168,7 +1622,16 @@ mod tests {
             names("CAD"),
             vec!["ALL".to_string(), "CAD_ONLY".to_string()]
         );
-        assert_eq!(names("OTHER"), vec!["ALL".to_string()]);
+        // A workitem that NEVER matched stays out of the filtered
+        // subscription (PS3.4 CC.2.3.3 attached CAD_ONLY to 1.2.3 above, so the
+        // check has to use a different workitem - the attachment outranks the
+        // filter for a workitem it already saw).
+        let other: Vec<String> = reg
+            .matching("1.2.4", &fv("OTHER", None))
+            .into_iter()
+            .map(|s| s.subscriber)
+            .collect();
+        assert_eq!(other, vec!["ALL".to_string()]);
     }
 
     /// PS3.4 C.2.2.2: a filter VALUE may carry `*` (zero or more) and `?`
@@ -1246,9 +1709,13 @@ mod tests {
         by_scheme.code_scheme = Some("99CLARUS".into());
         reg.subscribe(by_scheme);
 
-        let names = |code: Option<(&str, &str)>| {
+        // Each check uses its OWN workitem: `matching` ATTACHES a subscription
+        // to the first workitem it qualifies for (PS3.4 CC.2.3.3), and the
+        // attachment outranks the filter from then on, so re-using one UID
+        // would answer from the attachment rather than from the code.
+        let names_for = |uid: &str, code: Option<(&str, &str)>| {
             let mut v: Vec<String> = reg
-                .matching("1.2.3", &fv("CAD", code))
+                .matching(uid, &fv("CAD", code))
                 .into_iter()
                 .map(|s| s.subscriber)
                 .collect();
@@ -1258,26 +1725,26 @@ mod tests {
 
         // The right value under the right scheme: both subscribers match.
         assert_eq!(
-            names(Some(("CXR-AI", "99CLARUS"))),
+            names_for("1.2.3", Some(("CXR-AI", "99CLARUS"))),
             vec!["BY_SCHEME".to_string(), "BY_VALUE".to_string()]
         );
         // The right value under a FOREIGN scheme: only the value subscriber.
         assert_eq!(
-            names(Some(("CXR-AI", "OTHER"))),
+            names_for("1.2.4", Some(("CXR-AI", "OTHER"))),
             vec!["BY_VALUE".to_string()]
         );
         // A different value: only the scheme subscriber.
         assert_eq!(
-            names(Some(("CT-ORGAN-SEG", "99CLARUS"))),
+            names_for("1.2.5", Some(("CT-ORGAN-SEG", "99CLARUS"))),
             vec!["BY_SCHEME".to_string()]
         );
         // No code at hand: a code-filtered subscription does NOT match - the
         // honest answer, since assuming a match would deliver an event the
         // subscriber asked not to receive.
-        assert!(names(None).is_empty());
+        assert!(names_for("1.2.6", None).is_empty());
         // A different label matches neither, whatever the code.
         assert!(
-            reg.matching("1.2.3", &fv("OTHER", Some(("CXR-AI", "99CLARUS"))))
+            reg.matching("1.2.7", &fv("OTHER", Some(("CXR-AI", "99CLARUS"))))
                 .is_empty()
         );
     }

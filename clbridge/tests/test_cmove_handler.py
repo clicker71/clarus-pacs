@@ -77,7 +77,10 @@ class TestHandleCMove:
         )
         results = list(gen)
         assert len(results) == 1
-        assert results[0] == (0xC000, None)
+        # A malformed identifier is a Processing Failure, NOT a cancel and NOT
+        # a destination pair: yielding 0xC000 here was read by pynetdicom as
+        # (address, port) and answered 0xA801 "unknown destination".
+        assert results[0] == (0x0110, None)
 
     def test_rejects_unknown_move_dest(self, move_jobs):
         """Unknown AE Title not in scp_targets → 0xA801."""
@@ -146,10 +149,10 @@ class TestHandleCMove:
         )
         results = list(gen)
         assert len(results) == 1
-        assert results[0] == (0xC000, None)
+        assert results[0] == (0x0110, None)
 
     def test_empty_move_destination_string(self, move_jobs):
-        """MoveDestination exists but is empty string → 0xC000."""
+        """MoveDestination exists but is empty string -> 0x0110."""
         ds = Dataset()
         ds.StudyInstanceUID = "1.2.3"
         ds.MoveDestination = "   "  # whitespace only
@@ -163,7 +166,7 @@ class TestHandleCMove:
         )
         results = list(gen)
         assert len(results) == 1
-        assert results[0] == (0xC000, None)
+        assert results[0] == (0x0110, None)
 
     def test_creates_job_in_database(self, move_jobs):
         """Valid C-MOVE creates a job in the database (status = pending)."""

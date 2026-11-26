@@ -1,0 +1,88 @@
+{
+  "resourceType": "StructureDefinition",
+  "id": "clinfer-provider",
+  "url": "https://github.com/clicker71/clarus-pacs/blob/main/clinfer/fhir/StructureDefinition/clinfer-provider.json",
+  "name": "ClinferProvider",
+  "title": "clinfer model provider",
+  "status": "draft",
+  "publisher": "Clarus",
+  "kind": "complex-type",
+  "abstract": false,
+  "context": [{ "type": "element", "expression": "Questionnaire" }],
+  "type": "Extension",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+  "derivation": "constraint",
+  "differential": {
+    "element": [
+      {
+        "id": "Extension",
+        "path": "Extension",
+        "short": "clinfer model provider",
+        "definition": "The system identifying information (name, vendor, version) of a clinfer model. Interim local shape until AISPro defines the shared capability record.",
+        "max": "1"
+      },
+      {
+        "id": "Extension.url",
+        "path": "Extension.url",
+        "fixedUri": "https://github.com/clicker71/clarus-pacs/blob/main/clinfer/fhir/StructureDefinition/clinfer-provider.json"
+      },
+      {
+        "id": "Extension.extension",
+        "path": "Extension.extension",
+        "slicing": { "discriminator": [{ "type": "value", "path": "url" }], "rules": "open" }
+      },
+      {
+        "id": "Extension.extension:name",
+        "path": "Extension.extension",
+        "sliceName": "name",
+        "min": 1,
+        "max": "1"
+      },
+      {
+        "id": "Extension.extension:name.url",
+        "path": "Extension.extension.url",
+        "fixedUri": "name"
+      },
+      {
+        "id": "Extension.extension:name.value[x]",
+        "path": "Extension.extension.value[x]",
+        "min": 1,
+        "type": [{ "code": "string" }]
+      },
+      {
+        "id": "Extension.extension:vendor",
+        "path": "Extension.extension",
+        "sliceName": "vendor",
+        "min": 0,
+        "max": "1"
+      },
+      {
+        "id": "Extension.extension:vendor.url",
+        "path": "Extension.extension.url",
+        "fixedUri": "vendor"
+      },
+      {
+        "id": "Extension.extension:vendor.value[x]",
+        "path": "Extension.extension.value[x]",
+        "type": [{ "code": "string" }]
+      },
+      {
+        "id": "Extension.extension:version",
+        "path": "Extension.extension",
+        "sliceName": "version",
+        "min": 0,
+        "max": "1"
+      },
+      {
+        "id": "Extension.extension:version.url",
+        "path": "Extension.extension.url",
+        "fixedUri": "version"
+      },
+      {
+        "id": "Extension.extension:version.value[x]",
+        "path": "Extension.extension.value[x]",
+        "type": [{ "code": "string" }]
+      }
+    ]
+  }
+}

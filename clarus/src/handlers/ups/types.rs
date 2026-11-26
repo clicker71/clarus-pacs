@@ -96,6 +96,31 @@ pub struct UpsQuery {
     /// CANCELED.
     pub workflow_state: Option<String>,
 
+    /// Input Readiness State (0040,4041): READY | INCOMPLETE.
+    ///
+    /// PS3.4 Table CC.2.5-3 lists it as a matching key. Without a branch a
+    /// `InputReadinessState=READY` search was refused as unknown, and the one
+    /// question the attribute exists to answer - "give me the workitems whose
+    /// inputs are complete" - could not be asked.
+    pub input_readiness: Option<String>,
+
+    /// PS3.18 Table 8.3.4-1 control parameters, carried through to the search.
+    ///
+    /// The parser used to validate these values and then drop them, so
+    /// `fuzzymatching=true` and `fuzzymatching=false` reached the store as the
+    /// same query. `None` means the client said nothing, which is the default
+    /// path; `Some(true)` means the client asked for the option explicitly.
+    pub fuzzymatching: Option<bool>,
+    pub empty_value_matching: Option<bool>,
+    pub multiple_value_matching: Option<bool>,
+
+    /// `includefield` attribute list, one entry per requested attribute.
+    ///
+    /// Empty means the client asked for nothing extra, which is the default
+    /// response set. Validated and retained rather than dropped so the
+    /// parameter cannot be half-applied.
+    pub include_fields: Vec<String>,
+
     /// Maximum results to return. `None` = server default (`[ups]
     /// default_limit`, 100).
     pub limit: Option<u64>,
@@ -123,6 +148,11 @@ impl Default for UpsQuery {
             patient_name: None,
             modality: None,
             workflow_state: None,
+            input_readiness: None,
+            fuzzymatching: None,
+            empty_value_matching: None,
+            multiple_value_matching: None,
+            include_fields: Vec::new(),
             limit: None,
             offset: default_offset(),
         }
@@ -165,9 +195,18 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
         // (`%2E`): the key is matched after this decode, so it sees the
         // literal spelling. The value therefore gets NO second decode.
         let pair = crate::handlers::json_common::form_decode_query_str(pair);
-        let (k, v) = match pair.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (pair.as_str(), ""),
+        // PS3.18 8.3.4.1: `normal-match = 1*("&" attribute "=" value)` - the
+        // separator is part of the production. A pair without one (`?PatientID`)
+        // is a malformed query, not an empty value: reading it as one meant a
+        // key the caller meant as a filter reached the store with `""`, which
+        // the matcher drops, and the answer was the whole worklist. An explicit
+        // `PatientID=` stays legal and stays distinct from this case.
+        let Some((k, v)) = pair.split_once('=') else {
+            return Err(format!(
+                "Query parameter '{pair}' has no '=' separator: a matching attribute must be \
+                 given as 'attribute=value' (PS3.18 8.3.4.1); send 'attribute=' for an empty \
+                 value"
+            ));
         };
         let key = k.to_string();
         let val = v.to_string();
@@ -276,6 +315,12 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
             "00741000" | "ProcedureStepState" => {
                 set_match!("ProcedureStepState", q.workflow_state);
             }
+            // (0040,4041) Input Readiness State - a matching key in PS3.4
+            // Table CC.2.5-3, and the only way to ask for workitems whose
+            // inputs are complete.
+            "00404041" | "InputReadinessState" => {
+                set_match!("InputReadinessState", q.input_readiness);
+            }
             // PS3.18 8.3.4 Table 8.3.4-1: limit/offset are uint, and the
             // grammar is closed - a value that is not an unsigned integer is
             // an invalid query parameter (400, PS3.18 8.5), not a silently
@@ -306,18 +351,51 @@ pub fn parse_form_query(query_str: &str) -> Result<UpsQuery, String> {
             // search whose stated semantics the server did not apply, so both
             // are refused as malformed (PS3.18 8.5).
             "fuzzymatching" | "emptyvaluematching" | "multiplevaluematching" => {
-                if val != "true" && val != "false" {
-                    return Err(format!(
-                        "'{key}' must be true or false (got \"{val}\"): PS3.18 Table 8.3.4-1"
-                    ));
+                let flag = match val.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(format!(
+                            "'{key}' must be true or false (got \"{val}\"): PS3.18 Table 8.3.4-1"
+                        ));
+                    }
+                };
+                // Retained, not merely validated: a flag that reaches the store
+                // as `None` is indistinguishable from the client never having
+                // sent it, so the answer would silently use the default mode.
+                match key.as_str() {
+                    "fuzzymatching" => q.fuzzymatching = Some(flag),
+                    "emptyvaluematching" => q.empty_value_matching = Some(flag),
+                    _ => q.multiple_value_matching = Some(flag),
                 }
             }
             "includefield" => {
-                if val.is_empty() {
-                    return Err(
-                        "'includefield' needs at least one attribute or 'all': PS3.18 Table 8.3.4-1"
-                            .to_string(),
-                    );
+                // PS3.18 Table 8.3.4-1: the value is `all` or a comma-separated
+                // list of attribute identifiers. `includefield=,` passed the
+                // old non-empty check while naming NOTHING, so the client's
+                // request was accepted and not honoured. Every entry must be a
+                // real identifier.
+                if val == "all" {
+                    q.include_fields.clear();
+                } else {
+                    let mut any = false;
+                    for entry in val.split(',') {
+                        let entry = entry.trim();
+                        if entry.is_empty() {
+                            return Err(format!(
+                                "'includefield' has an empty entry in \"{val}\": PS3.18 Table \
+                                 8.3.4-1 takes 'all' or a comma-separated attribute list"
+                            ));
+                        }
+                        any = true;
+                        q.include_fields.push(entry.to_string());
+                    }
+                    if !any {
+                        return Err(
+                            "'includefield' needs at least one attribute or 'all': PS3.18 Table 8.3.4-1"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             // PS3.18 8.3.4 defines the matching keys exhaustively: a key that
@@ -390,6 +468,12 @@ pub fn form_urlencode_query(q: &UpsQuery) -> String {
     if let Some(v) = &q.workflow_state {
         push(&mut parts, "00741000", v);
     }
+    if let Some(v) = &q.input_readiness {
+        push(&mut parts, "00404041", v);
+    }
+    // The control parameters are NOT re-emitted: the reroute re-parses this
+    // string as a matching-key query only, and a `true`/`false` flag round
+    // tripped as a matching key would be refused as unknown.
     if let Some(v) = &q.limit {
         push(&mut parts, "limit", &v.to_string());
     }
@@ -404,6 +488,71 @@ mod tests {
 
     use super::*;
     use crate::handlers::json_common::{form_decode_str, form_encode_str};
+
+    /// PS3.18 8.3.4.1 makes the separator part of the production: a pair
+    /// without one is a malformed query, not a key with an empty value. Reading
+    /// it as empty meant the filter was dropped and the whole worklist answered.
+    #[test]
+    fn a_matching_key_without_a_separator_is_refused() {
+        let err = parse_form_query("AccessionNumber").unwrap_err();
+        assert!(
+            err.contains("AccessionNumber"),
+            "the message names the parameter: {err}"
+        );
+
+        // An explicit empty value stays legal and is a different statement.
+        let q = parse_form_query("AccessionNumber=").expect("an explicit empty value is legal");
+        assert_eq!(q.accession_number.as_deref(), Some(""));
+    }
+
+    /// PS3.4 Table CC.2.5-3 lists Input Readiness State as a matching key; with
+    /// no branch the search was refused as an unknown parameter.
+    #[test]
+    fn the_input_readiness_state_is_a_matching_key() {
+        let q = parse_form_query("InputReadinessState=READY").expect("the keyword form");
+        assert_eq!(q.input_readiness.as_deref(), Some("READY"));
+        let q = parse_form_query("00404041=INCOMPLETE").expect("the hex form");
+        assert_eq!(q.input_readiness.as_deref(), Some("INCOMPLETE"));
+
+        // It is one attribute, so the two spellings may not both appear.
+        let err = parse_form_query("00404041=READY&InputReadinessState=INCOMPLETE").unwrap_err();
+        assert!(err.contains("Repeated"), "the repetition is refused: {err}");
+    }
+
+    /// The three *matching flags were validated and then dropped, so `true` and
+    /// `false` reached the store as the same query. They are retained now.
+    #[test]
+    fn the_matching_flags_are_carried_through() {
+        let q = parse_form_query(
+            "fuzzymatching=true&emptyvaluematching=false&multiplevaluematching=true",
+        )
+        .expect("control parameters");
+        assert_eq!(q.fuzzymatching, Some(true));
+        assert_eq!(q.empty_value_matching, Some(false));
+        assert_eq!(q.multiple_value_matching, Some(true));
+
+        // Absent stays None: the default path, not a stated `false`.
+        let none = parse_form_query("").expect("an empty query");
+        assert_eq!(none.fuzzymatching, None);
+    }
+
+    /// `includefield` takes `all` or a comma-separated attribute list; a list
+    /// with an empty entry names nothing and used to pass the non-empty check.
+    #[test]
+    fn the_includefield_list_is_validated() {
+        let q = parse_form_query("includefield=PatientName,PatientID").expect("a valid list");
+        assert_eq!(q.include_fields, vec!["PatientName", "PatientID"]);
+
+        let err = parse_form_query("includefield=,").unwrap_err();
+        assert!(
+            err.contains("includefield"),
+            "an empty entry is refused: {err}"
+        );
+
+        // `all` asks for the default set, so nothing extra is requested.
+        let all = parse_form_query("includefield=all").expect("all is legal");
+        assert!(all.include_fields.is_empty());
+    }
 
     // byte-parity with serde_urlencoded (captured 19.08 - the native
     // form encode/decode must reproduce `url::form_urlencoded` exactly).
@@ -466,6 +615,11 @@ mod tests {
                     patient_name: None,
                     modality: None,
                     workflow_state: None,
+                    input_readiness: None,
+                    fuzzymatching: None,
+                    empty_value_matching: None,
+                    multiple_value_matching: None,
+                    include_fields: Vec::new(),
                     limit: Some(5),
                     offset: Some(0),
                 },
@@ -485,6 +639,11 @@ mod tests {
                     patient_name: None,
                     modality: None,
                     workflow_state: Some("IN PROGRESS".into()),
+                    input_readiness: None,
+                    fuzzymatching: None,
+                    empty_value_matching: None,
+                    multiple_value_matching: None,
+                    include_fields: Vec::new(),
                     limit: None,
                     offset: Some(10),
                 },
@@ -697,6 +856,11 @@ mod tests {
             patient_name: None,
             modality: Some("CT".into()),
             workflow_state: Some("SCHEDULED".into()),
+            input_readiness: None,
+            fuzzymatching: None,
+            empty_value_matching: None,
+            multiple_value_matching: None,
+            include_fields: Vec::new(),
             limit: Some(100),
             offset: Some(0),
         };
@@ -754,12 +918,21 @@ mod tests {
             patient_name: None,
             modality: Some("CT".into()),
             workflow_state: Some("IN PROGRESS".into()),
+            input_readiness: Some("READY".into()),
+            fuzzymatching: None,
+            empty_value_matching: None,
+            multiple_value_matching: None,
+            include_fields: Vec::new(),
             limit: Some(5),
             offset: Some(10),
         };
         let s = form_urlencode_query(&q);
         let got = parse_form_query(&s).expect("the encoder emits matching keys only");
         assert_eq!(got.study_uid, q.study_uid);
+        assert_eq!(
+            got.input_readiness, q.input_readiness,
+            "the readiness key survives the round trip"
+        );
         assert_eq!(got.accession_number, q.accession_number);
         assert_eq!(got.step_label, q.step_label);
         assert_eq!(

@@ -29,10 +29,13 @@ clinfer - DICOMweb inference sidecar.
 
 USAGE:
     clinfer [--config <path>]
+    clinfer -t [--config <path>]
     clinfer --inspect <study-uid> [--config <path>]
 
 OPTIONS:
     --config <path>      Configuration file (default: ./clinfer.conf).
+    -t, --test           Validate the configuration and the models directory,
+                         print every problem found, and exit without serving.
     --inspect <study>    Print the non-empty tags the origin holds for one
                          study, its series and its instances.
     --version            Print version information and exit.
@@ -41,7 +44,7 @@ OPTIONS:
 The sidecar claims UPS workitems from a DICOMweb origin, runs a model and
 stores the result back as an ordinary DICOM object. It listens on the
 address in [server] listen for pushed workitems, and serves /health,
-/metrics and /version there.
+/metrics, /version and /processors/Questionnaire there.
 ";
 
 /// How often the main loop wakes to look at the signal flags.
@@ -56,7 +59,12 @@ const SIGNAL_TICK: Duration = Duration::from_millis(200);
 /// What the command line asked for.
 enum Command {
     Run(PathBuf),
-    Inspect { study: String, config: PathBuf },
+    /// Validate the configuration and the models directory, then exit.
+    Test(PathBuf),
+    Inspect {
+        study: String,
+        config: PathBuf,
+    },
     Version,
     Help,
 }
@@ -81,6 +89,7 @@ fn main() {
             Ok(())
         }
         Command::Inspect { study, config } => inspect(&config, &study),
+        Command::Test(path) => test_config(&path),
         Command::Run(path) => run(&path),
     };
 
@@ -94,11 +103,13 @@ fn main() {
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
     let mut config: Option<PathBuf> = None;
     let mut inspect: Option<String> = None;
+    let mut test = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" | "-V" => return Ok(Command::Version),
             "--help" | "-h" => return Ok(Command::Help),
+            "-t" | "--test" => test = true,
             "--config" => {
                 let value = args
                     .next()
@@ -129,9 +140,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
         }
     }
     let config = config.unwrap_or_else(|| PathBuf::from(clinfer::conf::DEFAULT_CONFIG_FILE));
-    Ok(match inspect {
-        Some(study) => Command::Inspect { study, config },
-        None => Command::Run(config),
+    // `--inspect` and `-t` are different jobs and each needs its own run, so
+    // naming both is a refusal rather than one of them silently winning.
+    if test && inspect.is_some() {
+        return Err("choose one of -t and --inspect".to_string());
+    }
+    Ok(match (test, inspect) {
+        (true, _) => Command::Test(config),
+        (false, Some(study)) => Command::Inspect { study, config },
+        (false, None) => Command::Run(config),
     })
 }
 
@@ -398,13 +415,14 @@ fn run(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         if term.load(Ordering::Relaxed) {
             // The bound the operator actually has: the largest per-run
-            // budget any processor declared. A workitem holds at most one
-            // such run, so this is how long the drain can take.
+            // budget any model declared. A workitem holds at most one such
+            // run, so this is how long the drain can take.
             let budget = shared
                 .current()
                 .models
                 .iter()
-                .map(|model| model.timeout_secs)
+                .filter_map(|model| model.runtime.as_ref())
+                .map(|runtime| runtime.timeout_secs)
                 .max()
                 .unwrap_or(0);
             println!(
@@ -537,35 +555,89 @@ fn report(conf: &clinfer::conf::Conf, path: &Path) {
         conf.server.listen, conf.server.identity_user
     );
     println!("cache:     {}", conf.engine.cache_dir.display());
+    println!(
+        "models:    {} ({} enabled)",
+        conf.models_dir.display(),
+        conf.models.len()
+    );
     // BOTH values, so an operator who set the knob sees what it resolved to
     // and does not read a cap as a broken setting. The number that matters
     // is the second one: it is how many model processes may run at once.
     match conf.engine.workers {
         Some(configured) => println!(
-            "workers:   {configured} configured, capped to {} (models with scripts)",
+            "workers:   {configured} configured, capped to {} (enabled models)",
             conf.workers()
         ),
         None => println!(
-            "workers:   {} (every model with a script; set engine.workers to lower it)",
+            "workers:   {} (one per enabled model; set engine.workers to lower it)",
             conf.workers()
         ),
     }
-    println!("rules (file order; every match runs):");
-    for rule in &conf.rules {
+    // One line per model and one line per object it produces: the model is
+    // what an operator edits, and the objects are what the chain delivers.
+    for model in &conf.models {
+        let outputs: Vec<String> = conf
+            .rules
+            .iter()
+            .filter(|rule| rule.model == model.id)
+            .map(|rule| rule.result.kind.to_string())
+            .collect();
         println!(
-            "  [{}] modality {} -> model '{}' -> {}{}",
-            rule.index,
-            rule.r#match.modality.join("/"),
-            rule.model,
-            rule.result.kind,
-            if rule.result.profile_version == 1 {
-                String::new()
+            "  model '{}' -> {}{}",
+            model.id,
+            if outputs.is_empty() {
+                "nothing".to_string()
             } else {
-                format!(" (profile {})", rule.result.profile_version)
+                outputs.join(", ")
+            },
+            match &model.runtime {
+                Some(runtime) => format!(" (timeout {}s)", runtime.timeout_secs),
+                None => String::new(),
             }
         );
+        if let Some(title) = &model.title {
+            println!("      title: {title}");
+        }
+        if let Some(code) = &model.procedure_code {
+            println!(
+                "      procedure: {} ({}){}",
+                code.value,
+                code.scheme,
+                match &code.meaning {
+                    Some(meaning) => format!(" {meaning}"),
+                    None => String::new(),
+                }
+            );
+        }
     }
     println!("on no match: {}", conf.default_rule.as_str());
+}
+
+/// `-t`: validate the configuration and the models directory, then exit.
+///
+/// The loader already refuses a bad directory, so a success here means it
+/// loaded; the command exists so an operator can ask the question WITHOUT
+/// starting the sidecar - no origin connection, no PID file, no claim. The
+/// problems are printed by the loader's own message, which names the file
+/// and the key.
+fn test_config(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let conf = clinfer::conf::load(path)?;
+    println!(
+        "ok: {} - {} model(s) enabled in {}",
+        path.display(),
+        conf.models.len(),
+        conf.models_dir.display()
+    );
+    for model in &conf.models {
+        let outputs: Vec<&str> = conf
+            .rules
+            .iter()
+            .filter(|rule| rule.model == model.id)
+            .map(|rule| rule.result.kind.as_str())
+            .collect();
+        println!("  {}: {}", model.id, outputs.join(", "));
+    }
+    Ok(())
 }
 
 /// Check the origin's capabilities document and warn about what is missing.

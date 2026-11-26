@@ -185,7 +185,10 @@ class TestQidoLimitAsksForOneExtra:
             )
         statuses = [status for status, _ in results]
         assert 0xFF00 in statuses, statuses
-        assert statuses[-1] == 0xB001, statuses
+        # P9: 0xB001 is not defined for Query/Retrieve by PS3.4 Table C.4.1-1,
+        # so a search the bridge could not complete is the defined refusal
+        # 0xA700 rather than an undefined warning.
+        assert statuses[-1] == 0xA700, statuses
         assert statuses.count(0xFF00) == 1, statuses
 
 
@@ -229,9 +232,9 @@ class TestSeriesSearchKeepsTheStudyCap:
             )
 
         statuses = [status for status, _ in results]
-        assert statuses[-1] == 0xB001, (
+        assert statuses[-1] == 0xA700, (
             "a study cap means matches may exist beyond it; reporting 0x0000 "
-            f"claims the search was complete: {statuses}"
+            f"claims the search was complete, and 0xB001 is undefined: {statuses}"
         )
 
     def test_no_study_cap_and_no_rows_is_a_complete_empty_answer(self):
@@ -446,7 +449,9 @@ class TestPatientRootLevelRouting:
 
         rows = [row for status, row in results if status == 0xFF00]
         assert len(rows) == 2, f"the cap applies to patients, not studies: {rows}"
-        assert results[-1] == (0xB001, None), results[-1]
+        # P9: the defined refusal for a search the bridge could not finish.
+        # 0xB001 is not defined for Query/Retrieve (PS3.4 Table C.4.1-1).
+        assert results[-1] == (0xA700, None), results[-1]
 
 
 class TestSeriesWalkHonoursCancelAndShutdown:

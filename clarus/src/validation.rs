@@ -194,6 +194,161 @@ pub struct PatientElementSplices {
     pub patient_id: Option<PatientElementSplice>,
 }
 
+/// Where a `(0400,0561)` Original Attributes Sequence belongs in `src`.
+///
+/// PS3.5 7.1 requires the tags of a data set to be ordered by increasing
+/// (group, element) and each to appear at most once. Appending the sequence at
+/// end-of-file satisfies neither for an image: group 0400 would follow PixelData
+/// (7FE0), and an object that already carried a 0561 would end up with two.
+///
+/// Returns `(offset, replace_len)`:
+/// - `replace_len > 0` when the tag is present - the existing sequence is
+///   REPLACED, which also merges an incoming object's own history;
+/// - `replace_len == 0` when it is absent - the seam is the first element with
+///   a larger tag, or the end of the (complete) dataset.
+///
+/// `None` when the walk could not reach a trustworthy seam: a partial read has
+/// no defined end, and inserting there would land inside an element.
+pub fn original_attributes_splice(src: &[u8]) -> Option<PatientElementSplice> {
+    const TARGET: (u16, u16) = (0x0400, 0x0561);
+    let data_start = if src.len() >= 132 && &src[128..132] == b"DICM" {
+        132
+    } else if src.len() >= 4 && &src[..4] == b"DICM" {
+        4
+    } else {
+        return None;
+    };
+
+    let mut pos = data_start;
+    let mut anchor: Option<usize> = None;
+    let mut dataset_end: Option<usize> = None;
+    let mut complete = true;
+
+    while pos + 8 <= src.len() {
+        let tag_offset = pos;
+        let tag = (
+            u16::from_le_bytes([src[pos], src[pos + 1]]),
+            u16::from_le_bytes([src[pos + 2], src[pos + 3]]),
+        );
+        if tag.0 == 0xFFFE {
+            dataset_end = Some(pos);
+            break;
+        }
+        let vr = [src[pos + 4], src[pos + 5]];
+        let extended = vr_is_extended(vr);
+        let (value_len, value_start) = if extended {
+            if pos + 12 > src.len() {
+                complete = false;
+                break;
+            }
+            (
+                u32::from_le_bytes([src[pos + 8], src[pos + 9], src[pos + 10], src[pos + 11]])
+                    as usize,
+                pos + 12,
+            )
+        } else {
+            (
+                u16::from_le_bytes([src[pos + 6], src[pos + 7]]) as usize,
+                pos + 8,
+            )
+        };
+        if tag == (0x7FE0, 0x0010) {
+            // PixelData's offset is where the sequence belongs (group 0400
+            // sorts before 7FE0), so it is the default seam - but an object
+            // written by an EARLIER build carries the sequence AFTER the
+            // pixels. Skip the value and keep walking so such an object is
+            // recognised as already holding one, rather than gaining a second
+            // copy when it is corrected again.
+            if anchor.is_none() {
+                anchor = Some(tag_offset);
+            }
+            // An encapsulated PixelData is a fragment stream: its extent is
+            // not `value_len`, so stop rather than mis-walk it.
+            if value_len == 0xFFFF_FFFF {
+                dataset_end = Some(tag_offset);
+                complete = true;
+                break;
+            }
+            let Some(value_end) = value_start.checked_add(value_len) else {
+                complete = false;
+                break;
+            };
+            if value_end > src.len() {
+                complete = false;
+                break;
+            }
+            dataset_end = Some(value_end + (value_len & 1));
+            pos = value_end + (value_len & 1);
+            continue;
+        }
+        if value_len == 0xFFFF_FFFF {
+            match undefined_length_extent(src, value_start) {
+                Some(end) => {
+                    dataset_end = Some(end);
+                    if tag == TARGET {
+                        return Some(PatientElementSplice {
+                            offset: tag_offset,
+                            replace_len: end - tag_offset,
+                        });
+                    }
+                    if tag > TARGET && anchor.is_none() {
+                        anchor = Some(tag_offset);
+                    }
+                    pos = end;
+                    continue;
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        let value_end = match value_start.checked_add(value_len) {
+            Some(v) => v,
+            None => {
+                complete = false;
+                break;
+            }
+        };
+        if value_end > src.len() {
+            complete = false;
+            break;
+        }
+        let elem_len = value_end + (value_len & 1) - tag_offset;
+        if elem_len == 0 {
+            complete = false;
+            break;
+        }
+        dataset_end = Some(value_end + (value_len & 1));
+        if tag == TARGET {
+            return Some(PatientElementSplice {
+                offset: tag_offset,
+                replace_len: elem_len,
+            });
+        }
+        if tag > TARGET && anchor.is_none() {
+            anchor = Some(tag_offset);
+        }
+        pos = value_end + (value_len & 1);
+    }
+
+    if !complete {
+        // A partial walk cannot place the sequence without landing inside the
+        // element that was cut off.
+        return anchor.map(|offset| PatientElementSplice {
+            offset,
+            replace_len: 0,
+        });
+    }
+    // The ANCHOR wins over the dataset end: for an image the anchor is the
+    // PixelData tag, and group 0400 belongs BEFORE it (PS3.5 7.1 ascending
+    // order), not after the pixels.
+    anchor.or(dataset_end).map(|offset| PatientElementSplice {
+        offset,
+        replace_len: 0,
+    })
+}
+
 /// Whether a VR is one of the extended-length forms (PS3.5 7.1.2) that carry
 /// a 32-bit length after two reserved bytes.
 fn vr_is_extended(vr: [u8; 2]) -> bool {
@@ -290,12 +445,18 @@ fn undefined_length_extent(src: &[u8], start: usize) -> Option<usize> {
 /// - present: `offset` is the tag's own byte offset and `replace_len` its full
 ///   element extent (tag + VR + length + value + pad), so the caller REPLACES
 ///   the value and the result carries exactly one occurrence;
-/// - absent: `offset` is the byte offset of the first element whose tag is
-///   GREATER (PS3.5 7.1 ascending tag order), or the PixelData offset when no
-///   larger element precedes it, and `replace_len` is 0 (insert);
-/// - no PixelData at all: `None` for both - a header attribute appended to a
-///   pixel-less dataset is never read, so the caller must leave the bytes
-///   untouched.
+/// - absent: `offset` is the insertion seam and `replace_len` is 0. The seam is
+///   the first element whose tag is not less than the missing one (PS3.5 7.1
+///   ascending tag order), so a missing PatientName inserts BEFORE an existing
+///   PatientID instead of after it; when no such element exists the seam is the
+///   end of the dataset, and only when the walk consumed it all.
+///
+/// The dataset end is the end of the walk: the last element's extent, or the
+/// SequenceDelimitationItem that closed an undefined-length one. PixelData is
+/// NOT required - an SR, a presentation state or a structured report has none,
+/// and its header attributes are just as readable, so a coercion that only the
+/// manifest carried left those datasets unchanged (the ID the server reports
+/// and the ID in the file disagreed).
 pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
     let data_start = if src.len() >= 132 && &src[128..132] == b"DICM" {
         132
@@ -307,9 +468,13 @@ pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
 
     let mut out = PatientElementSplices::default();
     let mut pos = data_start;
-    let mut pixel_data_offset: Option<usize> = None;
     let mut pn_anchor: Option<usize> = None;
     let mut pid_anchor: Option<usize> = None;
+    // The end of what the walk actually consumed: the seam for an insert when
+    // no larger tag follows. A walk that stopped because it ran out of bytes is
+    // a PARTIAL read, so appending there would land inside the dataset.
+    let mut dataset_end: Option<usize> = None;
+    let mut complete = true;
 
     while pos + 8 <= src.len() {
         let tag_offset = pos;
@@ -319,8 +484,9 @@ pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
         );
 
         if tag.0 == 0xFFFE {
-            // Item / delimiter: the walk has left the header dataset (the
-            // patient tags always precede PixelData).
+            // Item / delimiter: the header dataset ends at the delimitation
+            // item itself, which a truncated read may have cut short.
+            dataset_end = Some(pos);
             break;
         }
 
@@ -328,6 +494,7 @@ pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
         let extended = vr_is_extended(vr);
         let (value_len, value_start) = if extended {
             if pos + 12 > src.len() {
+                complete = false;
                 break;
             }
             (
@@ -343,31 +510,78 @@ pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
         };
 
         if tag == (0x7FE0, 0x0010) {
-            pixel_data_offset = Some(tag_offset);
+            // PixelData is the LAST element: everything after it is pixels,
+            // not part of the header walk. Its offset is a valid seam too.
+            dataset_end = Some(tag_offset);
             break;
         }
 
         if value_len == 0xFFFF_FFFF {
             // Undefined-length sequence: skip its whole extent (nested items
             // counted) so the walk lands after the SequenceDelimitationItem.
+            //
+            // Its TAG OFFSET is still a valid insertion anchor, and it has to
+            // be recorded BEFORE the `continue` below. The anchor is "the
+            // first element whose tag is not less than the missing one"; an
+            // undefined-length (0020,xxxx) sequence is such an element, and
+            // skipping it meant a missing PatientName was inserted after it -
+            // or at the end of the dataset - which breaks the ascending order
+            // the reader depends on (PS3.5 7.1).
             match undefined_length_extent(src, value_start) {
                 Some(end) => {
+                    if tag >= (0x0010, 0x0010) && pn_anchor.is_none() {
+                        pn_anchor = Some(tag_offset);
+                    }
+                    if tag >= (0x0010, 0x0020) && pid_anchor.is_none() {
+                        pid_anchor = Some(tag_offset);
+                    }
+                    dataset_end = Some(end);
                     pos = end;
                     continue;
                 }
-                None => break,
+                None => {
+                    // The read stopped inside the sequence: the end of what
+                    // was consumed is not the end of the dataset.
+                    complete = false;
+                    break;
+                }
             }
         }
 
         let value_end = match value_start.checked_add(value_len) {
             Some(v) => v,
-            None => break,
+            None => {
+                complete = false;
+                break;
+            }
         };
         if value_end > src.len() {
+            // Truncated read: the element's value is not all here.
+            complete = false;
             break;
         }
         // Full element extent, including the pad byte of an odd-length value.
         let elem_len = value_end + (value_len & 1) - tag_offset;
+        if elem_len == 0 {
+            // PS3.5 7.1 allows a zero-length value, and then `pos` would not
+            // move: the walk has to stop rather than spin.
+            complete = false;
+            break;
+        }
+        dataset_end = Some(value_end + (value_len & 1));
+
+        // The anchor is recorded for EVERY element at or after the missing
+        // tag, including the sibling patient tag: the PatientID element is
+        // itself the correct seam for an absent PatientName, and its own
+        // replacement seam stays in `out.patient_id`. Recording it only in the
+        // `else` branch put the inserted PatientName after PatientID, i.e.
+        // out of the PS3.5 7.1 ascending order the reader relies on.
+        if tag >= (0x0010, 0x0010) && pn_anchor.is_none() {
+            pn_anchor = Some(tag_offset);
+        }
+        if tag >= (0x0010, 0x0020) && pid_anchor.is_none() {
+            pid_anchor = Some(tag_offset);
+        }
 
         if tag == (0x0010, 0x0010) {
             out.patient_name = Some(PatientElementSplice {
@@ -379,25 +593,32 @@ pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
                 offset: tag_offset,
                 replace_len: elem_len,
             });
-        } else {
-            if tag > (0x0010, 0x0010) && pn_anchor.is_none() {
-                pn_anchor = Some(tag_offset);
-            }
-            if tag > (0x0010, 0x0020) && pid_anchor.is_none() {
-                pid_anchor = Some(tag_offset);
-            }
         }
         pos = value_end + (value_len & 1);
     }
 
-    // No PixelData -> nothing to splice (the attribute would be unreachable).
-    if pixel_data_offset.is_none() {
-        return PatientElementSplices::default();
-    }
+    // The walk ended without consuming the last element: the buffer is a
+    // PARTIAL dataset (a bounded header read), so only the REPLACEMENT seams
+    // found so far can be trusted. Inserting at `dataset_end` would splice
+    // inside the element that was cut off.
+    //
+    // The loop can also fall out with `complete` still true because fewer than
+    // 8 bytes remained. Those few bytes are the START of another element the
+    // probe did not have room to read: a buffer that ends exactly between
+    // elements and one that ends four bytes into the next tag look identical
+    // from inside the loop, and only the caller knows whether the file is
+    // really over. Treating that tail as the end of the dataset put the
+    // inserted element in front of an element that already exists on disk.
+    let trailed = pos < src.len() && complete;
+    let insert_seam = if complete && !trailed {
+        dataset_end
+    } else {
+        None
+    };
 
     if out.patient_name.is_none() {
         out.patient_name = pn_anchor
-            .or(pixel_data_offset)
+            .or(insert_seam)
             .map(|offset| PatientElementSplice {
                 offset,
                 replace_len: 0,
@@ -405,7 +626,7 @@ pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
     }
     if out.patient_id.is_none() {
         out.patient_id = pid_anchor
-            .or(pixel_data_offset)
+            .or(insert_seam)
             .map(|offset| PatientElementSplice {
                 offset,
                 replace_len: 0,
@@ -414,45 +635,103 @@ pub fn patient_element_splices(src: &[u8]) -> PatientElementSplices {
     out
 }
 
+/// The (0400,0562) Attribute Modification DateTime, from ONE clock read.
+///
+/// Both halves used to come from separate calls: the time of day from
+/// `SystemTime::now()` and the civil date from `audit_log::utc_ymd()`, which
+/// reads the clock again. At UTC midnight the two reads land on different days,
+/// so the audit item could claim yesterday's date with this morning's time -
+/// a timestamp that never existed. One `secs` value drives both.
+fn modification_datetime() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    dt_from_secs(secs)
+}
+
+/// The DT value for one UTC instant, as `YYYYMMDDHHMMSS`.
+///
+/// Both halves derive from the SAME `secs`: the civil date from
+/// `secs / 86_400` and the time from `secs % 86_400`. Taking them from two
+/// clock reads is what allowed a midnight-straddling item to name a date and a
+/// time that never coexisted.
+fn dt_from_secs(secs: u64) -> String {
+    let time_of_day = secs % 86_400;
+    let hh = time_of_day / 3600;
+    let mm = (time_of_day % 3600) / 60;
+    let ss = time_of_day % 60;
+    let (y, mo, d) = crate::audit_log::civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}{mo:02}{d:02}{hh:02}{mm:02}{ss:02}")
+}
+
+/// `YYYYMMDD` for a day count since the Unix epoch (test reference).
+#[cfg(test)]
+fn ymd_from_days(days: i64) -> String {
+    let (y, mo, d) = crate::audit_log::civil_from_days(days);
+    format!("{y:04}{mo:02}{d:02}")
+}
+
+/// The bytes to write for an old attribute value.
+///
+/// The stored value is a Rust `String` (decoded text). Writing its UTF-8 bytes
+/// straight into the dataset is wrong whenever the destination declares a
+/// non-UTF-8 Specific Character Set: `José` in a dataset declaring `ISO_IR 100`
+/// (latin-1) would carry the UTF-8 two-byte form where the reader expects one
+/// byte. The round trip then yields mojibake, and the audit record - whose only
+/// purpose is to preserve what the value WAS - would be the thing that corrupted
+/// it.
+///
+/// This crate has no charset encoder, and inventing one here would be a
+/// half-measure that silently picks a repertoire. So the rule is the conservative
+/// one PS3.5's Default Character Repertoire already implies: a value must be
+/// representable as ASCII to be written verbatim. Anything else is replaced by
+/// the value-length-preserving placeholder, and the event is still audited
+/// through the access journal, which carries the change without re-encoding it
+/// into the instance.
+fn encode_old_value(old_value: &str, group: u16, element: u16) -> std::borrow::Cow<'_, str> {
+    if old_value.is_ascii() {
+        return std::borrow::Cow::Borrowed(old_value);
+    }
+    // Not ASCII: the destination repertoire is unknown to this function, so the
+    // bytes cannot be guaranteed to round-trip. Recording a placeholder is the
+    // only answer that cannot write a value that decodes to something else.
+    crate::clog_debug!(
+        "OriginalAttributesSequence: non-ASCII old value for ({group:04X},{element:04X}) \
+         recorded as a placeholder (no charset encoder on this path)"
+    );
+    std::borrow::Cow::Borrowed("***")
+}
+
 /// Build DICOM (0400,0561) OriginalAttributesSequence binary.
 ///
-/// Structure (DICOM PS3.3 Table C.12.1.1.9-1):
-///   (0400,0561) SQ OriginalAttributesSequence
+/// Structure (DICOM PS3.3 Table C.12.1.1.9-1; VRs per PS3.6 group 0400):///   (0400,0561) SQ OriginalAttributesSequence
 ///     Item:
+///       (0400,0550) SQ ModifiedAttributesSequence
+///         Item: (tag) VR [old_value]
 ///       (0400,0562) DT AttributeModificationDateTime
 ///       (0400,0563) LO ModifyingSystem = "CLARUS_SERVER"
 ///       (0400,0564) LO SourceOfPreviousValues = "" (Type 2, may be empty)
-///       (0400,0565) LO ReasonForModification = "CORRECT" | "COERCE"
-///       (0400,0566) LO ModifyingOperator = modifier (effective identity)
-///       (0400,0550) SQ ModifiedAttributesSequence
-///         Item: (tag) VR [old_value]
+///       (0400,0565) CS ReasonForTheAttributeModification = "CORRECT" | "COERCE"
 ///
 /// One Item per modified tag. Appended to the DICOM file before CAS write.
 ///
-/// The (0400,0562) DT uses the REAL civil UTC date (audit_log's
-/// `civil_from_days`, the same helper the audit journal uses) plus real
-/// HHMMSS - the old pseudo-date ("1970 + days/365", month from days%365/30)
-/// produced wrong month/day values.
+/// There is deliberately NO (0400,0566). PS3.6 defines no such attribute, and
+/// PS3.3 C.12.1.1.9.1 lists only the four Who attributes above; group 0400 is
+/// even, so a private element cannot live there either (PS3.5 7.8.1). The
+/// operator's identity is carried by the access journal, which is where a
+/// reader looks for "who requested this", not in a fabricated data element.
 pub fn build_original_attributes_sequence(
     items: &[OriginalAttributeItem],
     modifier: &str,
     modifying_system: &str,
 ) -> Vec<u8> {
-    let dt = {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        // DICOM DT format: YYYYMMDDHHMMSS (UTC).
-        let secs = now.as_secs();
-        let time_of_day = secs % 86_400;
-        let hh = time_of_day / 3600;
-        let mm = (time_of_day % 3600) / 60;
-        let ss = time_of_day % 60;
-        // The civil date comes from audit_log's civil_from_days (via
-        // utc_ymd) - the correct month/day, not the old pseudo-date.
-        let ymd = crate::audit_log::utc_ymd();
-        format!("{ymd}{hh:02}{mm:02}{ss:02}")
-    };
+    // The operator identity has no conformant home in this sequence (see the
+    // doc comment: there is no (0400,0566)). The parameter stays because every
+    // call site already supplies it and the access journal is what actually
+    // records it; discarding it here is deliberate, not an oversight.
+    let _ = modifier;
+    let dt = modification_datetime();
 
     let mut items_out = Vec::new();
     for item in items {
@@ -465,7 +744,7 @@ pub fn build_original_attributes_sequence(
             item.group,
             item.element,
             vr,
-            item.old_value.as_bytes(),
+            encode_old_value(&item.old_value, item.group, item.element).as_bytes(),
         );
 
         // Build ModifiedAttributesSequence (0400,0550) containing the inner item
@@ -474,8 +753,15 @@ pub fn build_original_attributes_sequence(
         let mut mod_attrs_seq = Vec::new();
         write_element(&mut mod_attrs_seq, 0x0400, 0x0550, "SQ", &inner_seq);
 
-        // Build one audit item: who/when/why + ModifiedAttributesSequence
+        // Build one audit item: who/when/why + ModifiedAttributesSequence.
+        //
+        // (0400,0550) comes FIRST. An Item is a dataset, so PS3.5 7.1 requires
+        // its elements in ascending tag order, and 0x0550 < 0x0562. Writing it
+        // last produced an Item that a strict reader either rejects or reads
+        // with the sequence unaccounted for - and the sequence is the only
+        // place the OLD values live.
         let mut audit_item = Vec::new();
+        audit_item.extend_from_slice(&mod_attrs_seq); // ModifiedAttributesSequence
         write_element(&mut audit_item, 0x0400, 0x0562, "DT", dt.as_bytes()); // DateTime
         write_element(
             &mut audit_item,
@@ -485,16 +771,17 @@ pub fn build_original_attributes_sequence(
             modifying_system.as_bytes(),
         ); // ModifyingSystem
         write_element(&mut audit_item, 0x0400, 0x0564, "LO", b""); // SourceOfPreviousValues (empty, Type 2)
+        // (0400,0565) is CS in PS3.6, not LO: its enumerated values are
+        // CORRECT and COERCE (PS3.3 C.12.1.1.9), which is precisely what a
+        // Code String carries. The old LO encoding put the wrong VR byte pair
+        // in front of every reason this server wrote.
         write_element(
             &mut audit_item,
             0x0400,
             0x0565,
-            "LO",
+            "CS",
             item.reason.as_bytes(),
         ); // Reason
-        write_element(&mut audit_item, 0x0400, 0x0566, "LO", modifier.as_bytes()); // ModifyingOperator
-        audit_item.extend_from_slice(&mod_attrs_seq); // ModifiedAttributesSequence
-
         // Wrap in Item tag (FFFE,E000)
         let mut item_wrapped = Vec::new();
         write_element(&mut item_wrapped, 0xFFFE, 0xE000, "SQ", &audit_item);
@@ -515,14 +802,95 @@ pub fn build_original_attributes_sequence(
 mod tests {
     use super::*;
 
+    /// PS3.5 7.1: the Original Attributes Sequence belongs at its sorted
+    /// position, and an existing one is a REPLACEMENT seam, not a second copy.
+    #[test]
+    fn the_original_attributes_seam_is_sorted_and_replaces_an_existing_one() {
+        // A dataset with 0008,0060 (Modality), 0010,0010, then PixelData.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        // (0008,0060) CS "CT"
+        buf.extend_from_slice(&0x0008u16.to_le_bytes());
+        buf.extend_from_slice(&0x0060u16.to_le_bytes());
+        buf.extend_from_slice(b"CS");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(b"CT");
+        // (0010,0010) PN "A" (padded to even)
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"PN");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(b"A ");
+        let before_pixels = buf.len();
+        // (7FE0,0010) OW 4 bytes
+        buf.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"OW");
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+
+        // Absent: the seam is the PixelData tag, NOT the end of the file -
+        // group 0400 sorts before 7FE0.
+        let seam = original_attributes_splice(&buf).expect("a seam");
+        assert_eq!(seam.replace_len, 0, "pure insert");
+        assert_eq!(
+            seam.offset, before_pixels,
+            "the sequence goes before PixelData, not after it"
+        );
+
+        // Present: the seam REPLACES the existing sequence, so the tag cannot
+        // appear twice. Inserted at its SORTED position (before PixelData),
+        // which is where the writer puts it.
+        let mut with_seq = Vec::new();
+        with_seq.extend_from_slice(&buf[..before_pixels]);
+        let seq_start = with_seq.len();
+        // (0400,0561) SQ, defined length 8 (one empty item header).
+        with_seq.extend_from_slice(&0x0400u16.to_le_bytes());
+        with_seq.extend_from_slice(&0x0561u16.to_le_bytes());
+        with_seq.extend_from_slice(b"SQ");
+        with_seq.extend_from_slice(&0u16.to_le_bytes());
+        with_seq.extend_from_slice(&8u32.to_le_bytes());
+        with_seq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        with_seq.extend_from_slice(&0xE000u16.to_le_bytes());
+        with_seq.extend_from_slice(&0u32.to_le_bytes());
+        with_seq.extend_from_slice(&buf[before_pixels..]);
+        let seam = original_attributes_splice(&with_seq).expect("a seam");
+        assert_eq!(seam.offset, seq_start, "the existing sequence's offset");
+        assert_eq!(seam.replace_len, 20, "its whole extent is replaced");
+
+        // LEGACY shape: an object an earlier build wrote carries the sequence
+        // AFTER the pixels. It must still be recognised as existing, or a
+        // correction would add a second copy of the tag.
+        let mut after = buf.clone();
+        let legacy_start = after.len();
+        after.extend_from_slice(&0x0400u16.to_le_bytes());
+        after.extend_from_slice(&0x0561u16.to_le_bytes());
+        after.extend_from_slice(b"SQ");
+        after.extend_from_slice(&0u16.to_le_bytes());
+        after.extend_from_slice(&8u32.to_le_bytes());
+        after.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        after.extend_from_slice(&0xE000u16.to_le_bytes());
+        after.extend_from_slice(&0u32.to_le_bytes());
+        let seam = original_attributes_splice(&after).expect("a seam");
+        assert_eq!(seam.offset, legacy_start, "the trailing sequence is found");
+        assert_eq!(seam.replace_len, 20, "and replaced, not duplicated");
+    }
+
     /// Walk an Explicit VR LE element stream and return `(tag, vr, length)`.
     ///
     /// A reader that trusts the number in the length field is exactly what
     /// the production build must satisfy, so the test parses the way a real
-    /// consumer does rather than searching for byte patterns.
+    /// consumer does rather than searching for byte patterns. Part 10 files
+    /// start after the 128-byte preamble and "DICM".
     fn walk(buf: &[u8]) -> Vec<((u16, u16), [u8; 2], usize)> {
         let mut out = Vec::new();
-        let mut pos = 0usize;
+        let mut pos = if buf.len() >= 132 && &buf[128..132] == b"DICM" {
+            132
+        } else {
+            0
+        };
         while pos + 8 <= buf.len() {
             let group = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
             let elem = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]);
@@ -553,14 +921,54 @@ mod tests {
                 l
             };
             out.push(((group, elem), vr, len));
+            // PS3.5 7.5: an undefined length is a delimiter-terminated run,
+            // not a byte count - follow its items instead of jumping.
+            if len == u32::MAX as usize {
+                pos = skip_undefined(buf, pos);
+                continue;
+            }
+            // PS3.5 7.1.1: a Value Length is always EVEN, and the pad byte is
+            // inside the declared length. The walker used to add the pad back
+            // (`pos += len + (len & 1)`), which made an odd declared length
+            // walk cleanly - so a fixture that wrote `len` without the pad
+            // passed, and the encoder's real padding rule was never tested.
+            // A conformant reader must reject the odd case outright.
+            assert!(
+                len.is_multiple_of(2),
+                "PS3.5 7.1.1: value length must be even, got {len} for {group:04X},{elem:04X}"
+            );
             pos += len;
         }
         assert_eq!(
             pos,
             buf.len(),
-            "the element stream must end exactly at the buffer end"
+            "the element stream must end exactly at the buffer end, walked {:?}",
+            out
         );
         out
+    }
+
+    /// Skip the item/delimiter run of an undefined-length element.
+    fn skip_undefined(buf: &[u8], mut pos: usize) -> usize {
+        loop {
+            assert!(
+                pos + 8 <= buf.len(),
+                "an undefined-length run past the buffer end"
+            );
+            let group = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+            let elem = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]);
+            let len = u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]])
+                as usize;
+            pos += 8;
+            if group == 0xFFFE && (elem == 0xE0DD || elem == 0xE00D) {
+                return pos;
+            }
+            if len == 0xFFFF_FFFF {
+                pos = skip_undefined(buf, pos);
+                continue;
+            }
+            pos += len;
+        }
     }
 
     /// PS3.5 7.1.1: an odd-length value must be padded to even, and the length
@@ -606,11 +1014,19 @@ mod tests {
 
         // The padded bytes are part of the value: 7 bytes of "CORRECT" plus
         // one SPACE, and the length says 8.
+        //
+        // The VR must be CS. PS3.6 defines (0400,0565) as CS and PS3.3
+        // C.12.1.1.9 enumerates CORRECT/COERCE, which is exactly what a Code
+        // String carries; this assertion used to pin LO, i.e. the defect.
         let reason_at = buf
             .windows(15)
             .position(|w| &w[8..15] == b"CORRECT")
             .expect("ReasonForModification value present");
-        assert_eq!(&buf[reason_at + 4..reason_at + 6], b"LO");
+        assert_eq!(
+            &buf[reason_at + 4..reason_at + 6],
+            b"CS",
+            "PS3.6: (0400,0565) ReasonForTheAttributeModification is CS, not LO"
+        );
         assert_eq!(
             u16::from_le_bytes([buf[reason_at + 6], buf[reason_at + 7]]),
             8,
@@ -635,6 +1051,123 @@ mod tests {
         );
         // Value starts at +8 and is 13 bytes, so the pad is the byte at +21.
         assert_eq!(buf[system_at + 21], 0x20, "text VRs pad with SPACE");
+    }
+
+    /// The (0400,0561) Item's elements are in ascending tag order.
+    ///
+    /// An Item is a dataset, so PS3.5 7.1 requires increasing tags inside it -
+    /// the same rule as the outer dataset. `ModifiedAttributesSequence`
+    /// (0400,0550) was written AFTER (0400,0562)..(0400,0566), which put the
+    /// only copy of the OLD values out of order. Fixing the outer sequence's
+    /// position did not fix the Item.
+    #[test]
+    fn the_original_attributes_item_is_in_ascending_tag_order() {
+        let items = [OriginalAttributeItem {
+            group: 0x0010,
+            element: 0x0020,
+            old_value: "PAT-1".to_string(),
+            reason: "CORRECT",
+        }];
+        let buf = build_original_attributes_sequence(&items, "OP", "CLARUS_SERVER");
+
+        // Walk only the elements INSIDE the (0400,0561) Item. The sequence
+        // element is tag(4) + VR(2) + reserved(2) + length(4) = 12 bytes, and
+        // its Item follows immediately: Item tag(4) + length(4) + payload.
+        let seq_at = buf
+            .windows(4)
+            .position(|w| w == [0x00, 0x04, 0x61, 0x05])
+            .expect("the (0400,0561) OriginalAttributesSequence element");
+        let item_pos = seq_at + 12;
+        assert_eq!(
+            &buf[item_pos..item_pos + 4],
+            [0xFE, 0xFF, 0x00, 0xE0],
+            "the sequence's defining Item (FFFE,E000, little-endian fields) follows its header"
+        );
+        let item_len = u32::from_le_bytes([
+            buf[item_pos + 4],
+            buf[item_pos + 5],
+            buf[item_pos + 6],
+            buf[item_pos + 7],
+        ]) as usize;
+        let item = &buf[item_pos + 8..item_pos + 8 + item_len];
+
+        let mut tags: Vec<(u16, u16)> = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= item.len() {
+            let tag = (
+                u16::from_le_bytes([item[pos], item[pos + 1]]),
+                u16::from_le_bytes([item[pos + 2], item[pos + 3]]),
+            );
+            let vr = [item[pos + 4], item[pos + 5]];
+            let extended = vr_is_extended(vr);
+            let (len, header) = if extended {
+                (
+                    u32::from_le_bytes([
+                        item[pos + 8],
+                        item[pos + 9],
+                        item[pos + 10],
+                        item[pos + 11],
+                    ]) as usize,
+                    12,
+                )
+            } else {
+                (
+                    u16::from_le_bytes([item[pos + 6], item[pos + 7]]) as usize,
+                    8,
+                )
+            };
+            // A nested Item (FFFE,E000) inside ModifiedAttributesSequence: skip
+            // the containing SQ by its declared length instead of walking in.
+            tags.push(tag);
+            pos += header + len;
+        }
+        let mut sorted = tags.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            tags, sorted,
+            "the Item's elements must be in ascending tag order (PS3.5 7.1)"
+        );
+        assert!(
+            tags.contains(&(0x0400, 0x0550)),
+            "ModifiedAttributesSequence must be inside the Item"
+        );
+        assert!(
+            !tags.contains(&(0x0400, 0x0566)),
+            "PS3.6 defines no (0400,0566); it must not be written"
+        );
+    }
+
+    /// The audit date and time come from ONE clock read.
+    ///
+    /// They used to come from two: `SystemTime::now()` for the time of day and
+    /// `utc_ymd()` for the civil date, which read the clock again. At UTC
+    /// midnight those two reads land on different days, so the DT could claim
+    /// yesterday's date with today's time - a timestamp that never existed.
+    /// The derivation is now a pure function of `secs`, so both sides of
+    /// midnight are asserted exactly instead of raced.
+    #[test]
+    fn the_modification_datetime_derives_date_and_time_from_one_instant() {
+        // 2026-11-24 is day 20_789; 23:59:59 and the next second are 86_399
+        // and 86_400 seconds into their respective days.
+        let day = 20_789i64;
+        let last_second = day as u64 * 86_400 + 86_399;
+        let next_midnight = day as u64 * 86_400 + 86_400;
+
+        assert_eq!(
+            dt_from_secs(last_second),
+            format!("{}235959", ymd_from_days(day)),
+            "one second before midnight keeps the SAME date"
+        );
+        assert_eq!(
+            dt_from_secs(next_midnight),
+            format!("{}000000", ymd_from_days(day + 1)),
+            "the next second rolls the date AND resets the clock together"
+        );
+
+        // The live call keeps the 14-character DT shape.
+        let dt = modification_datetime();
+        assert_eq!(dt.len(), 14, "DT is YYYYMMDDHHMMSS: {dt}");
+        assert!(dt.bytes().all(|b| b.is_ascii_digit()), "DT is digits: {dt}");
     }
 
     /// An even-length value gains no padding: the rule must not grow values
@@ -706,6 +1239,216 @@ mod tests {
 
     /// Nothing generated means nothing written: an empty value must not become
     /// an empty element, which would claim a value where there is none.
+    /// Append one Explicit VR LE element (PS3.5 7.1) to a test dataset.
+    ///
+    /// An empty Sequence (`SQ`) is written as an undefined-length element with
+    /// an immediately following SequenceDelimitationItem, the shape a real
+    /// writer emits: a zero LENGTH on an SQ means "undefined", not "empty".
+    fn append_element(buf: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], value: &[u8]) {
+        assert_eq!(
+            buf.len() - 132,
+            (buf.len() - 132) & !1,
+            "dataset stays even"
+        );
+        // PS3.5 7.1.1: the pad byte is INSIDE the declared Value Length, so the
+        // length written is the PADDED one. Writing `value.len()` and appending
+        // the pad afterwards left an odd length in the stream; the walker
+        // compensated by adding the pad back, which is why the malformed
+        // fixture still passed. A fixture that writes what the standard says is
+        // what makes the walker's strictness meaningful.
+        let pad: Option<u8> = if value.len().is_multiple_of(2) {
+            None
+        } else if *vr == *b"UI" {
+            Some(0)
+        } else {
+            Some(b' ')
+        };
+        let padded_len = value.len() + usize::from(pad.is_some());
+
+        buf.extend_from_slice(&group.to_le_bytes());
+        buf.extend_from_slice(&element.to_le_bytes());
+        buf.extend_from_slice(vr);
+        let extended = vr_is_extended(*vr);
+        if extended {
+            buf.extend_from_slice(&[0u8, 0u8]);
+            buf.extend_from_slice(&(padded_len as u32).to_le_bytes());
+        } else {
+            buf.extend_from_slice(&(padded_len as u16).to_le_bytes());
+        }
+        if value.is_empty() && *vr == *b"SQ" {
+            // PS3.5 7.5: an sequence may be written with undefined length and
+            // closed by an explicit SequenceDelimitationItem.
+            let len_off = buf.len() - 4;
+            buf[len_off..len_off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            buf.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0, 0, 0, 0, 0]);
+            return;
+        }
+        buf.extend_from_slice(value);
+        if let Some(byte) = pad {
+            buf.push(byte);
+        }
+    }
+
+    /// The fixture walker REJECTS an odd declared value length.
+    ///
+    /// The walker used to add the missing pad byte back (`len + (len & 1)`),
+    /// so a stream that declared an odd length and then wrote an uncounted pad
+    /// walked cleanly. That made the fixture itself malformed and every test
+    /// built on it weaker than it looked: the encoder's padding rule was never
+    /// actually exercised. PS3.5 7.1.1 requires an even Value Length with the
+    /// pad INSIDE it, so an odd one is a broken stream and must stop the walk.
+    #[test]
+    fn the_walker_rejects_an_odd_declared_value_length() {
+        let mut ds = vec![0u8; 128];
+        ds.extend_from_slice(b"DICM");
+        // Hand-build one element with an ODD length and an uncounted pad.
+        ds.extend_from_slice(&0x0010u16.to_le_bytes());
+        ds.extend_from_slice(&0x0020u16.to_le_bytes());
+        ds.extend_from_slice(b"LO");
+        ds.extend_from_slice(&5u16.to_le_bytes()); // 5 is odd
+        ds.extend_from_slice(b"PAT-1");
+        ds.push(b' '); // the pad, NOT included in the declared length
+
+        let caught = std::panic::catch_unwind(|| walk(&ds));
+        assert!(
+            caught.is_err(),
+            "a stream declaring an odd value length must not walk cleanly"
+        );
+
+        // The well-formed twin (padded length declared) walks fine, so the
+        // rejection above is about the length, not about the fixture shape.
+        let mut ok = vec![0u8; 128];
+        ok.extend_from_slice(b"DICM");
+        append_element(&mut ok, 0x0010, 0x0020, b"LO", b"PAT-1");
+        assert_eq!(walk(&ok).len(), 1);
+    }
+
+    /// An undefined-length (0020,xxxx) sequence is a valid insertion anchor.
+    ///
+    /// The sequence branch skipped the element with `continue` before recording
+    /// either anchor, so a missing PatientName was inserted AFTER the sequence
+    /// (or at the end of the dataset instead of before it), breaking the
+    /// ascending tag order the reader relies on. A sequence is a dataset
+    /// element like any other: its tag decides the seam.
+    #[test]
+    fn an_undefined_length_sequence_is_an_insertion_anchor() {
+        let mut ds = vec![0u8; 128];
+        ds.extend_from_slice(b"DICM");
+        // (0008,0060) CS SR, then (0020,000D) SQ with undefined length.
+        append_element(&mut ds, 0x0008, 0x0060, b"CS", b"SR");
+        let seq_at = ds.len();
+        append_element(&mut ds, 0x0020, 0x000D, b"SQ", b"");
+
+        let splices = patient_element_splices(&ds);
+        let pn = splices.patient_name.expect("a seam for PatientName");
+        assert_eq!(
+            pn.replace_len, 0,
+            "an absent tag is an insert, not a replace"
+        );
+        assert_eq!(
+            pn.offset, seq_at,
+            "the undefined-length sequence's own tag offset is the seam: it is \
+             the first element at or after (0010,0010)"
+        );
+
+        // Splicing there keeps the dataset in ascending tag order.
+        let mut out = ds[..pn.offset].to_vec();
+        out.extend_from_slice(&build_coerced_patient_elements("AUTONAME", "AUTOPAT"));
+        out.extend_from_slice(&ds[pn.offset..]);
+        let tags: Vec<(u16, u16)> = walk(&out).iter().map(|(t, _, _)| *t).collect();
+        let mut sorted = tags.clone();
+        sorted.sort_unstable();
+        assert_eq!(tags, sorted, "the spliced dataset must stay ordered");
+    }
+
+    /// A probe that ends PART-WAY into the next element is not a complete
+    /// dataset.
+    ///
+    /// A bounded header read can stop inside an element (the `value_end >
+    /// src.len()` branch) or after only a few bytes of the following tag
+    /// header. The second case used to fall out of the loop with `complete`
+    /// still true, so the end of the walk was offered as an insertion seam -
+    /// and the insert landed in front of an element that already exists on
+    /// disk. A buffer ending exactly between elements is indistinguishable from
+    /// that case, so no end-of-buffer seam is offered unless the walk consumed
+    /// the buffer exactly.
+    #[test]
+    fn a_probe_ending_inside_the_next_tag_offers_no_insert_seam() {
+        let mut ds = vec![0u8; 128];
+        ds.extend_from_slice(b"DICM");
+        append_element(&mut ds, 0x0008, 0x0060, b"CS", b"SR");
+        // Nothing at or after (0010,0010) exists, so the only candidate seam is
+        // the end of the buffer.
+        let whole = patient_element_splices(&ds);
+        assert_eq!(
+            whole
+                .patient_name
+                .expect("seam for the complete buffer")
+                .offset,
+            ds.len(),
+            "a fully consumed buffer ends at the dataset end"
+        );
+
+        // Now cut the next element's header short: 4 bytes of the tag only.
+        let mut truncated = ds.clone();
+        truncated.extend_from_slice(&0x0020u16.to_le_bytes());
+        truncated.extend_from_slice(&0x000Du16.to_le_bytes());
+        let cut = patient_element_splices(&truncated);
+        assert!(
+            cut.patient_name.is_none(),
+            "a trailing partial tag header is not a usable seam"
+        );
+        assert!(cut.patient_id.is_none());
+    }
+
+    /// A non-ASCII old value is never written as raw UTF-8.
+    ///
+    /// The audit record exists to preserve what the value WAS. Writing Rust's
+    /// UTF-8 bytes into a dataset that may declare a different Specific
+    /// Character Set corrupts exactly that: `José` in an `ISO_IR 100` dataset
+    /// arrives as two bytes where the reader expects one, and decodes to
+    /// mojibake. With no charset encoder on this path the value is recorded as
+    /// a placeholder instead - wrong-but-honest beats confidently wrong.
+    #[test]
+    fn a_non_ascii_old_value_is_not_written_as_utf8() {
+        let items = [OriginalAttributeItem {
+            group: 0x0010,
+            element: 0x0010,
+            old_value: "José".to_string(),
+            reason: "CORRECT",
+        }];
+        let buf = build_original_attributes_sequence(&items, "OP", "CLARUS_SERVER");
+        assert!(
+            !buf.windows(2).any(|w| w == "é".as_bytes()),
+            "the UTF-8 two-byte form of a non-ASCII value must not reach the dataset"
+        );
+        assert!(
+            buf.windows(3).any(|w| w == b"***"),
+            "the value is recorded as a placeholder"
+        );
+        // The element is still PRESENT: the audit record keeps its shape even
+        // when the value cannot be preserved. `walk` does not descend into a
+        // sequence Item, so the inner element is located by its tag bytes.
+        assert!(
+            buf.windows(4).any(|w| w == [0x10, 0x00, 0x10, 0x00]),
+            "the (0010,0010) element must still be inside the sequence"
+        );
+
+        // An ASCII value is written verbatim: the guard must not degrade the
+        // common case.
+        let ascii = [OriginalAttributeItem {
+            group: 0x0010,
+            element: 0x0010,
+            old_value: "SMIRNOV^IVAN".to_string(),
+            reason: "CORRECT",
+        }];
+        let buf = build_original_attributes_sequence(&ascii, "OP", "CLARUS_SERVER");
+        assert!(
+            buf.windows(13).any(|w| &w[..12] == b"SMIRNOV^IVAN"),
+            "an ASCII old value must round-trip byte for byte"
+        );
+    }
+
     #[test]
     fn empty_values_produce_no_elements() {
         assert!(build_coerced_patient_elements("", "").is_empty());
@@ -714,5 +1457,135 @@ mod tests {
         let walked = walk(&only_id);
         assert_eq!(walked.len(), 1);
         assert_eq!(walked[0].0, (0x0010, 0x0020));
+    }
+
+    /// A dataset with no PixelData still has to receive the coerced elements.
+    ///
+    /// An SR, a presentation state or any other pixel-less instance has no
+    /// PixelData, and the old walk only ever produced a seam from that tag - so
+    /// the manifest carried the generated identity while the stored dataset did
+    /// not. Every element here sorts BEFORE group 0010, so no tag anchor can
+    /// stand in for the end of the dataset.
+    #[test]
+    fn a_pixel_less_dataset_still_gets_the_coerced_elements() {
+        let mut ds = Vec::new();
+        ds.extend_from_slice(&[0u8; 128]);
+        ds.extend_from_slice(b"DICM");
+        append_element(
+            &mut ds,
+            0x0008,
+            0x0016,
+            b"UI",
+            b"1.2.840.10008.5.1.4.1.1.88.33",
+        );
+        append_element(&mut ds, 0x0008, 0x0060, b"CS", b"SR");
+
+        let splices = patient_element_splices(&ds);
+        let pn = splices.patient_name.expect("a seam for PatientName");
+        let pid = splices.patient_id.expect("a seam for PatientID");
+        assert_eq!(pn.replace_len, 0);
+        assert_eq!(
+            pn.offset,
+            ds.len(),
+            "trailing insert at the end of the dataset"
+        );
+        assert_eq!(pid.offset, pn.offset);
+        assert_eq!(pid.replace_len, 0);
+
+        // Splicing there must still yield a walkable Explicit VR LE dataset.
+        let mut out = ds.clone();
+        out.extend_from_slice(&build_coerced_patient_elements("AUTONAME", "AUTOPAT"));
+        let walked = walk(&out);
+        assert!(
+            walked.iter().any(|(tag, _, _)| *tag == (0x0010, 0x0010)),
+            "coerced PatientName present, walked {:?}",
+            walked
+        );
+        assert!(
+            walked.iter().any(|(tag, _, _)| *tag == (0x0010, 0x0020)),
+            "coerced PatientID present, walked {:?}",
+            walked
+        );
+    }
+
+    /// A partially read dataset must not be appended to.
+    ///
+    /// The caller hands in a bounded header read, so the walk can stop inside
+    /// an element. Appending at that offset would write into the element that
+    /// was cut off, so a seam may only come from a tag that was fully read.
+    #[test]
+    fn a_truncated_dataset_gets_no_trailing_insert() {
+        let mut ds = Vec::new();
+        ds.extend_from_slice(&[0u8; 128]);
+        ds.extend_from_slice(b"DICM");
+        append_element(
+            &mut ds,
+            0x0008,
+            0x0016,
+            b"UI",
+            b"1.2.840.10008.5.1.4.1.1.88.33",
+        );
+        append_element(&mut ds, 0x0008, 0x0060, b"CS", b"SR");
+        // Claim a long value and cut the buffer inside it.
+        ds.extend_from_slice(&[0x08, 0x00, 0x18, 0x00, b'U', b'I', 0xFF, 0x00]);
+        ds.extend_from_slice(b"1.2");
+
+        let splices = patient_element_splices(&ds);
+        assert!(
+            splices.patient_name.is_none(),
+            "no insert seam for a partial read, got {:?}",
+            splices.patient_name
+        );
+        assert!(splices.patient_id.is_none());
+    }
+
+    /// A coerced element is inserted in ascending tag order (PS3.5 7.1).
+    ///
+    /// A missing PatientName has to land BEFORE an existing PatientID. The
+    /// dataset-end seam cannot do that: it follows every element, so the test
+    /// only passes if the PatientID tag itself is used as the anchor.
+    #[test]
+    fn the_insert_seam_sits_before_the_patient_tags() {
+        let mut ds = Vec::new();
+        ds.extend_from_slice(&[0u8; 128]);
+        ds.extend_from_slice(b"DICM");
+        append_element(
+            &mut ds,
+            0x0008,
+            0x0016,
+            b"UI",
+            b"1.2.840.10008.5.1.4.1.1.88.33",
+        );
+        append_element(&mut ds, 0x0010, 0x0020, b"LO", b"PAT-1");
+        append_element(&mut ds, 0x0020, 0x000D, b"UI", b"1.2.3");
+
+        let splices = patient_element_splices(&ds);
+        let pn = splices.patient_name.expect("a seam for PatientName");
+        let pid = splices.patient_id.expect("PatientID is present");
+        assert_eq!(pn.replace_len, 0);
+        assert!(pid.replace_len > 0, "PatientID is replaced, not inserted");
+        // The seam is the PatientID tag itself. It is also the first tag at or
+        // after PatientName, so the anchor and a forward scan agree here - the
+        // order they must produce is what the spliced dataset is asked for
+        // below, and the dataset-end seam fails that check.
+        assert_eq!(
+            pn.offset, pid.offset,
+            "PatientName inserts at the PatientID tag, not at the dataset end"
+        );
+
+        // The spliced dataset keeps the tags in ascending order.
+        let mut out = ds[..pn.offset].to_vec();
+        out.extend_from_slice(&build_coerced_patient_name_element("AUTONAME").unwrap());
+        out.extend_from_slice(&ds[pn.offset..]);
+        let tags: Vec<(u16, u16)> = walk(&out).into_iter().map(|(tag, _, _)| tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                (0x0008, 0x0016),
+                (0x0010, 0x0010),
+                (0x0010, 0x0020),
+                (0x0020, 0x000D)
+            ]
+        );
     }
 }

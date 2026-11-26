@@ -143,7 +143,7 @@ pub enum ParseError {
 /// parsing headers from that offset).
 pub fn parse_request_line(buf: &[u8]) -> Result<(RequestHead<'_>, usize), ParseError> {
     // Find the CRLF that ends the request line (single pass, SIMD).
-    let line_end = find_line_end(buf).ok_or(ParseError::Incomplete)?;
+    let line_end = find_line_end(buf).ok_or_else(|| line_end_error(buf))?;
     let line = &buf[..line_end];
     if line.len() > crate::http::conn::HTTP_LINE_LIMIT {
         return Err(ParseError::LineTooLarge);
@@ -152,6 +152,15 @@ pub fn parse_request_line(buf: &[u8]) -> Result<(RequestHead<'_>, usize), ParseE
     // method SP target SP version
     let (method, rest) = split_space(line).ok_or(ParseError::BadRequestLine)?;
     let (target, version) = split_space(rest).ok_or(ParseError::BadRequestLine)?;
+
+    // RFC 9112 3: method and request-target are both nonempty. An empty method
+    // fell through to `Method::Unknown` and an empty target parsed cleanly, so
+    // `" HTTP/1.1"` was a valid request line - a shape no client sends and no
+    // route can answer. An unknown but WELL-FORMED method token (PATCH, say)
+    // stays distinct: it is unsupported, not malformed.
+    if method.is_empty() || target.is_empty() {
+        return Err(ParseError::BadRequestLine);
+    }
 
     let method = match method {
         b"GET" => Method::Get,
@@ -169,18 +178,67 @@ pub fn parse_request_line(buf: &[u8]) -> Result<(RequestHead<'_>, usize), ParseE
         _ => return Err(ParseError::BadRequestLine), // incl. HTTP/0.9 (no version)
     };
 
+    // RFC 9112 3.2.2: a server MUST accept absolute-form. Keeping the scheme
+    // and authority in `path` meant `GET http://host/health` routed to
+    // `//host/health`, which every route rejected as a malformed path. The
+    // authority is what the Host field would have carried, so it becomes the
+    // effective host; origin-form (`/health`) is untouched.
+    let mut head = RequestHead::borrow_empty();
+    let target = strip_absolute_form(target, &mut head);
+
     // Split target into path + query on '?'.
     let (path, query) = match target.iter().position(|&b| b == b'?') {
         Some(i) => (&target[..i], &target[i + 1..]),
         None => (target, &[][..]),
     };
 
-    let mut head = RequestHead::borrow_empty();
     head.method = method;
     head.path = path;
     head.query = query;
     head.http10 = http10;
     Ok((head, line_end))
+}
+
+/// Rewrite an absolute-form request target into origin-form.
+///
+/// `scheme://authority/path` becomes `/path`, and the authority is recorded as
+/// the effective host. A target that is not absolute-form is returned
+/// unchanged. An absolute-form target with no path yields `/`, which is what
+/// RFC 9110 4.2.3 defines as the empty-path absolute URI.
+fn strip_absolute_form<'a>(target: &'a [u8], head: &mut RequestHead<'a>) -> &'a [u8] {
+    let Some(scheme_end) = target.windows(3).position(|w| w == b"://") else {
+        return target;
+    };
+    let scheme = &target[..scheme_end];
+    // RFC 3986 3.1: the scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
+    // Requiring it keeps a path that merely contains `://` (a DICOM query
+    // value can) from being rewritten.
+    if scheme.is_empty()
+        || !scheme[0].is_ascii_alphabetic()
+        || !scheme
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.')
+    {
+        return target;
+    }
+    let rest = &target[scheme_end + 3..];
+    // The authority ends at the first `/`, `?` or `#`.
+    let auth_end = rest
+        .iter()
+        .position(|&b| b == b'/' || b == b'?' || b == b'#')
+        .unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    if authority.is_empty() {
+        return target;
+    }
+    head.host = Some(authority);
+    let after = &rest[auth_end..];
+    if after.first() == Some(&b'/') {
+        after
+    } else {
+        // No path: `?query` starts an empty path at the root.
+        b"/".as_slice()
+    }
 }
 
 /// Parse headers from `headers[..len]` into a fixed array.
@@ -201,7 +259,7 @@ pub fn parse_headers<'a>(
     while count < MAX_HEADERS {
         let line_end = match find_line_end(&headers[pos..]) {
             Some(e) => pos + e,
-            None => return Err(ParseError::Incomplete),
+            None => return Err(line_end_error(&headers[pos..])),
         };
         let line = &headers[pos..line_end];
         if line.is_empty() {
@@ -219,7 +277,7 @@ pub fn parse_headers<'a>(
     match find_line_end(&headers[pos..]) {
         Some(e) if headers[pos..pos + e].is_empty() => Ok(pos + e + 2),
         Some(_) => Err(ParseError::TooManyHeaders),
-        None => Err(ParseError::Incomplete),
+        None => Err(line_end_error(&headers[pos..])),
     }
 }
 
@@ -251,6 +309,13 @@ fn apply_header<'a>(
         .position(|&b| b == b':')
         .ok_or(ParseError::BadCrlf)?;
     let name = &line[..colon];
+    // RFC 9110 5.1: a field name is a nonempty `token`. A line whose first
+    // byte is `:` has an EMPTY name, which used to pass the whitespace check
+    // below and then match no branch - the line was silently dropped, so the
+    // only record of it was the absence of any effect.
+    if name.is_empty() {
+        return Err(ParseError::BadCrlf);
+    }
     // RFC 9110 5.1: no whitespace between the field name and the colon. This
     // server sits behind proxies that normalise the head, so a padded name is
     // never something an honest client produced - it is the classic way to make
@@ -318,6 +383,13 @@ fn apply_header<'a>(
     } else if name.eq_ignore_ascii_case(b"X-Forwarded-Proto") {
         head.x_forwarded_proto = Some(value);
     } else if name.eq_ignore_ascii_case(b"Host") {
+        // RFC 9112 3.2: a request with more than one Host field is a 400, even
+        // when the values agree - two Host fields are two different routing
+        // decisions for two parsers, which is the shape request smuggling
+        // relies on. Choosing one (the old behaviour) hid the disagreement.
+        if head.host.is_some() {
+            return Err(ParseError::DuplicateHeader);
+        }
         head.host = Some(value);
     } else if name.eq_ignore_ascii_case(b"X-Authenticated-User") {
         head.x_auth_user = Some(value);
@@ -343,16 +415,25 @@ fn apply_header<'a>(
         head.connection_close |= has_token(value, b"close");
         head.connection_upgrade |= has_token(value, b"upgrade");
     } else if name.eq_ignore_ascii_case(b"Expect") {
-        head.expect_100_continue = has_token(value, b"100-continue");
+        // RFC 9110 10.1.1: a repeated `Expect` field combines into one list.
+        // Assigning cleared the flag a previous field set, so
+        // `Expect: 100-continue` followed by any other `Expect` made the server
+        // stop waiting while the client still waited for the interim response.
+        head.expect_100_continue |= has_token(value, b"100-continue");
     }
     Ok(())
 }
 
-/// Parse a decimal Content-Length, rejecting junk and `+`/`-`/leading zeros
-/// (RFC 7230 Section 3.3.2 - reject `01` and `+123` to avoid smuggling).
+/// Parse a decimal Content-Length, rejecting junk and signs.
+///
+/// RFC 9110 8.6 defines the value as `1*DIGIT`, so `01` denotes one octet and
+/// is legal: the leading-zero rule this used to apply came from an older
+/// anti-smuggling reading and rejected a conforming request. Signs stay
+/// rejected, checked arithmetic stays, and repeated or conflicting framings
+/// are refused by [`apply_header`] before this runs.
 fn parse_content_length(v: &[u8]) -> Option<u64> {
-    if v.is_empty() || v[0] == b'0' && v.len() > 1 {
-        return None; // "0" ok, "01" not
+    if v.is_empty() {
+        return None;
     }
     let mut n: u64 = 0;
     for &b in v {
@@ -367,7 +448,6 @@ fn parse_content_length(v: &[u8]) -> Option<u64> {
 /// Find the `\r\n` terminator for the line starting at `buf`.
 /// Returns the index of the `\r` (the line content length), or `None`.
 fn find_line_end(buf: &[u8]) -> Option<usize> {
-    assert!(buf.len() <= crate::http::conn::HEADER_BUF_SIZE + 2);
     let lf = memchr::memchr(b'\n', buf)?;
     if lf == 0 || buf[lf - 1] != b'\r' {
         // A lone LF (no preceding CR) is a strict-CRLF violation.
@@ -378,6 +458,27 @@ fn find_line_end(buf: &[u8]) -> Option<usize> {
         return None;
     }
     Some(lf - 1)
+}
+
+/// Classify why [`find_line_end`] found no terminator.
+///
+/// Both public entry points used to `assert!` that the caller's slice fit the
+/// header buffer and then report `Incomplete` for everything else. A caller
+/// that passed `HEADER_BUF_SIZE + 3` bytes panicked on input that was merely
+/// long; and a line that already carried a bare LF was reported `Incomplete`,
+/// telling the caller to read more when appending bytes could never repair it.
+fn line_end_error(buf: &[u8]) -> ParseError {
+    if buf.len() > crate::http::conn::HEADER_BUF_SIZE + 2 {
+        return ParseError::LineTooLarge;
+    }
+    // A terminator that exists but is not CRLF, or a stray CR before it, is
+    // malformed NOW - more input cannot make it valid.
+    if let Some(lf) = memchr::memchr(b'\n', buf)
+        && (lf == 0 || buf[lf - 1] != b'\r' || memchr::memchr(b'\r', &buf[..lf - 1]).is_some())
+    {
+        return ParseError::BadCrlf;
+    }
+    ParseError::Incomplete
 }
 
 /// Split at the first ASCII SP. Returns `(left, right_after_sp)` or `None`.
@@ -587,13 +688,156 @@ mod tests {
         assert!(!h.expect_100_continue);
     }
 
+    /// RFC 9110 8.6 defines the value as `1*DIGIT`, so `01` is one octet and
+    /// must be accepted. The old check rejected it as a smuggling shape, which
+    /// refused a conforming request; signs and non-digits stay rejected.
+    #[test]
+    fn a_leading_zero_content_length_is_one_octet() {
+        let mut h = RequestHead::borrow_empty();
+        parse_headers(&mut h, b"Content-Length: 01\r\n\r\n").expect("01 is a decimal length");
+        assert_eq!(h.content_length, Some(1));
+    }
+
     #[test]
     fn bad_content_length_rejected() {
+        for bad in [
+            b"Content-Length: +1\r\n\r\n" as &[u8],
+            b"Content-Length: -1\r\n\r\n",
+            b"Content-Length: 1x\r\n\r\n",
+            b"Content-Length:\r\n\r\n",
+            b"Content-Length: 99999999999999999999999\r\n\r\n",
+        ] {
+            let mut h = RequestHead::borrow_empty();
+            assert_eq!(
+                parse_headers(&mut h, bad),
+                Err(ParseError::BadContentLength),
+                "must reject {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// RFC 9110 5.1: a field name is a NONEMPTY token. A line starting with
+    /// `:` had an empty name that matched no branch, so the line vanished
+    /// without a trace instead of being reported.
+    #[test]
+    fn an_empty_field_name_is_rejected() {
         let mut h = RequestHead::borrow_empty();
-        let hdr = b"Content-Length: 01\r\n\r\n";
         assert_eq!(
-            parse_headers(&mut h, hdr),
-            Err(ParseError::BadContentLength)
+            parse_headers(&mut h, b": value\r\n\r\n"),
+            Err(ParseError::BadCrlf)
+        );
+    }
+
+    /// RFC 9112 3.2: more than one Host field is a 400, even when the two
+    /// values agree. Taking the last one hid the disagreement.
+    #[test]
+    fn a_second_host_field_is_rejected() {
+        let mut h = RequestHead::borrow_empty();
+        assert_eq!(
+            parse_headers(&mut h, b"Host: a\r\nHost: b\r\n\r\n"),
+            Err(ParseError::DuplicateHeader)
+        );
+        // Agreeing values are still two fields, hence still refused.
+        let mut h = RequestHead::borrow_empty();
+        assert_eq!(
+            parse_headers(&mut h, b"Host: a\r\nHost: a\r\n\r\n"),
+            Err(ParseError::DuplicateHeader)
+        );
+    }
+
+    /// RFC 9110 10.1.1: repeated `Expect` fields combine. A later field used
+    /// to CLEAR the expectation set by an earlier one, so the server stopped
+    /// waiting while the client still waited for the interim response.
+    #[test]
+    fn a_later_expect_field_does_not_clear_100_continue() {
+        let mut h = RequestHead::borrow_empty();
+        parse_headers(
+            &mut h,
+            b"Expect: 100-continue\r\nExpect: something-else\r\n\r\n",
+        )
+        .expect("ok");
+        assert!(h.expect_100_continue);
+    }
+
+    /// RFC 9112 3: method and request-target are nonempty. An empty method
+    /// became `Unknown` and an empty target parsed cleanly.
+    #[test]
+    fn an_empty_method_or_target_is_a_bad_request_line() {
+        assert_eq!(
+            parse_request_line(b" /health HTTP/1.1\r\n")
+                .err()
+                .expect("must fail"),
+            ParseError::BadRequestLine
+        );
+        assert_eq!(
+            parse_request_line(b"GET  HTTP/1.1\r\n")
+                .err()
+                .expect("must fail"),
+            ParseError::BadRequestLine
+        );
+        // A well-formed but unsupported method stays distinct from malformed.
+        let (h, _) = parse_request_line(b"PATCH /health HTTP/1.1\r\n").expect("well-formed");
+        assert_eq!(h.method, Method::Unknown);
+    }
+
+    /// RFC 9112 3.2.2: a server MUST accept the absolute-form target. The
+    /// scheme and authority used to stay in `path`, so every route rejected
+    /// `GET http://host/health` as a malformed path.
+    #[test]
+    fn an_absolute_form_target_routes_to_its_path() {
+        let (h, _) = parse_request_line(b"GET http://pacs.example/health HTTP/1.1\r\n")
+            .expect("absolute-form is legal");
+        assert_eq!(h.path, b"/health");
+        assert_eq!(h.host, Some(b"pacs.example".as_slice()));
+
+        // Path with a query.
+        let (h, _) = parse_request_line(b"GET http://h:8042/studies?x=1 HTTP/1.1\r\n")
+            .expect("absolute-form with query");
+        assert_eq!(h.path, b"/studies");
+        assert_eq!(h.query, b"x=1");
+        assert_eq!(h.host, Some(b"h:8042".as_slice()));
+
+        // Origin-form is untouched.
+        let (h, _) = parse_request_line(b"GET /health HTTP/1.1\r\n").expect("origin-form");
+        assert_eq!(h.path, b"/health");
+        assert_eq!(h.host, None);
+
+        // A path that merely CONTAINS `://` is not rewritten: the scheme must
+        // be a valid RFC 3986 scheme.
+        let (h, _) = parse_request_line(b"GET /a?u=http://x HTTP/1.1\r\n").expect("origin-form");
+        assert_eq!(h.path, b"/a");
+    }
+
+    /// A line that is ALREADY malformed must not be reported `Incomplete`:
+    /// appending bytes cannot repair a bare LF or a stray CR. A slice longer
+    /// than the head buffer must not panic either.
+    #[test]
+    fn a_malformed_line_is_not_reported_as_incomplete() {
+        assert_eq!(
+            parse_request_line(b"GET /health HTTP/1.1\n")
+                .err()
+                .expect("must fail"),
+            ParseError::BadCrlf
+        );
+        assert_eq!(
+            parse_request_line(b"GET /a\rb HTTP/1.1\r\n")
+                .err()
+                .expect("must fail"),
+            ParseError::BadCrlf
+        );
+        // Truncated input stays incomplete: more bytes could complete it.
+        assert_eq!(
+            parse_request_line(b"GET /health HTTP/1.1")
+                .err()
+                .expect("must fail"),
+            ParseError::Incomplete
+        );
+        // Oversized input is a size error, not a panic.
+        let huge = vec![b'a'; crate::http::conn::HEADER_BUF_SIZE + 3];
+        assert_eq!(
+            parse_request_line(&huge).err().expect("must fail"),
+            ParseError::LineTooLarge
         );
     }
 

@@ -54,4 +54,17 @@ fn bitap_match_never_allocates() {
     // Negative: 2-edit distance is beyond the threshold and must miss.
     let too_far = assert_zero_alloc(|| bitap_match("ивн", "петров"));
     assert!(!too_far, "a >1-edit divergence must miss");
+
+    // Positive: a 1-scalar pattern takes the `plen == 1` whole-name branch
+    // (the bound that keeps a 1-char query at a true 1-edit) - still zero alloc.
+    let one_scalar_hit = assert_zero_alloc(|| bitap_match("李", "李"));
+    assert!(one_scalar_hit, "a 1-scalar pattern matches itself");
+
+    // Negative: a 1-scalar pattern against an unrelated long name must miss
+    // without allocating - this is the leak the `plen == 1` branch closes.
+    let one_scalar_miss = assert_zero_alloc(|| bitap_match("李", "PS18CHECK^PATIENT"));
+    assert!(
+        !one_scalar_miss,
+        "a 1-scalar pattern must not match an unrelated name"
+    );
 }

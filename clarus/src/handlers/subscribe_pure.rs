@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 use crate::handlers::json_common::{JsonVal, err_msg_json, parse_json};
+use crate::handlers::workflow_response::{HTTP_BAD_REQUEST, HTTP_CREATED};
 use crate::push::{Subscription, subscriptions};
 
 /// One filter key: the spellings that name it, and the record field it reads.
@@ -254,17 +255,33 @@ pub fn subscribe_scoped(
     // Present is still validated exactly as before: a URL that was never
     // valid is a configuration error the caller can fix immediately, whereas
     // one that becomes unreachable later is a push problem.
-    let endpoint = match obj.obj_get("endpoint").and_then(|v| v.as_str()) {
-        Some(e) if !e.trim().is_empty() => {
+    //
+    // A PRESENT value that is not a string is refused rather than folded into
+    // the absent case: `{"endpoint":123}` used to become `None` through
+    // `as_str`, so the handler answered 201 for a channel-only subscription and
+    // the caller never learned its push target had been dropped.
+    let endpoint = match obj.obj_get("endpoint") {
+        None => None,
+        // JSON `null` is the standard's "no value", which for an optional
+        // member means absent - the same statement as omitting it.
+        Some(JsonVal::Null) => None,
+        Some(JsonVal::Str(e)) if e.trim().is_empty() => {
+            // Explicitly empty reads as "no endpoint" rather than a malformed
+            // one: an operator clearing the field is asking for exactly what
+            // an absent field asks for.
+            None
+        }
+        Some(JsonVal::Str(e)) => {
             if let Err(e) = crate::push::workitem_path(e, "1") {
                 return bad_request(&e);
             }
             Some(e.to_string())
         }
-        // Explicitly empty reads as "no endpoint" rather than a malformed
-        // one: an operator clearing the field is asking for exactly what an
-        // absent field asks for.
-        _ => None,
+        Some(_) => {
+            return bad_request(
+                "'endpoint' must be a JSON string carrying the subscriber's push URL",
+            );
+        }
     };
 
     // PS3.18 Table 11.10.1-2 ties `filter` to the Filtered Worklist resource.
@@ -321,6 +338,8 @@ pub fn subscribe_scoped(
         code_value: filter.code_value.clone(),
         code_scheme: filter.code_scheme.clone(),
         deletion_lock_at: deletion_lock.then(now_secs),
+        excluded_workitems: Vec::new(),
+        member_workitems: Vec::new(),
         workitem_uid: workitem_uid.map(str::to_string),
         study_uid: filter.study_uid.clone(),
         patient_id: filter.patient_id.clone(),
@@ -346,7 +365,7 @@ pub fn subscribe_scoped(
     );
 
     SubscribeResp {
-        status: 201,
+        status: HTTP_CREATED,
         body: subscription_json(subscriber, filtered, &filter, deletion_lock),
     }
 }
@@ -572,29 +591,88 @@ fn parse_filter_query(query: &str) -> Result<WorklistFilter, String> {
         // value that legitimately contains `%` (`A%2520B` means `A%20B`, not
         // `A B`).
         let value = percent_decode(value);
-        let Some((tag, pattern)) = value.split_once('=') else {
-            return Err(format!(
-                "Invalid filter '{value}': expected a matching key like '00741204=VALUE'"
-            ));
-        };
-        // Repeated keys are legal in the standard's grammar and are combined
-        // below; a repeated TAG is not - PS3.18 8.3.4.1: "Each attribute
-        // shall not be repeated". Accepting two values for one key would make
-        // the subscription's meaning depend on a parse order nobody
-        // documented.
-        let field = FilterKey::from_wire(tag)?;
-        if filter.slot(field).is_some() {
-            return Err(format!(
-                "Filter key '{tag}' is repeated: each matching attribute shall appear once \
-                 (PS3.18 8.3.4.1)"
-            ));
+        // PS3.18 11.10.1.2: `filter` is a COMMA-SEPARATED LIST of matching-key
+        // pairs. Treating the whole value as one pair stored
+        // `P1,ProcedureStepLabel=CAD` as the patient ID, so the subscription
+        // was accepted and then matched nothing. Every member is parsed here.
+        //
+        // A comma inside a VALUE is escaped as `\\,` (the standard's own
+        // escaping), so a member ends at the first comma that is not preceded
+        // by a backslash. A trailing backslash cannot escape anything and is
+        // kept as written, which is the same pass-through the decoder applies
+        // to a malformed percent escape.
+        for member in split_filter_members(&value) {
+            let Some((tag, pattern)) = member.split_once('=') else {
+                return Err(format!(
+                    "Invalid filter '{member}': expected a matching key like '00741204=VALUE'"
+                ));
+            };
+            // Repeated keys are legal in the standard's grammar and are combined
+            // below; a repeated TAG is not - PS3.18 8.3.4.1: "Each attribute
+            // shall not be repeated". Accepting two values for one key would make
+            // the subscription's meaning depend on a parse order nobody
+            // documented.
+            let field = FilterKey::from_wire(tag)?;
+            if filter.slot(field).is_some() {
+                return Err(format!(
+                    "Filter key '{tag}' is repeated: each matching attribute shall appear once \
+                     (PS3.18 8.3.4.1)"
+                ));
+            }
+            if pattern.trim().is_empty() {
+                return Err(format!("Filter key '{tag}' must carry a non-empty value"));
+            }
+            *filter.slot_mut(field) = Some(unescape_filter_value(pattern));
         }
-        if pattern.trim().is_empty() {
-            return Err(format!("Filter key '{tag}' must carry a non-empty value"));
-        }
-        *filter.slot_mut(field) = Some(pattern.to_string());
     }
     Ok(filter)
+}
+
+/// Split one `filter` query value into its comma-separated members.
+///
+/// PS3.18 11.10.1.2 defines the list, and a value may contain a comma written
+/// `\\,`. Splitting on every comma would cut such a value in half and then
+/// fail on the fragment as if it were a key.
+fn split_filter_members(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = value.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b',' => {
+                out.push(&value[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push(&value[start..]);
+    out
+}
+
+/// Remove the `\\` escapes from one member's value.
+///
+/// Only `\\,` and `\\\\` are escapes in the filter grammar; any other
+/// backslash belongs to the value (a pattern may legitimately contain one) and
+/// is left alone.
+fn unescape_filter_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+            && (next == ',' || next == '\\')
+        {
+            out.push(next);
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Percent-decode one query value (the `+`-as-space form PS3.18 uses for
@@ -706,11 +784,23 @@ pub fn deletion_lock_for_query(query: &str) -> Result<bool, String> {
 /// get one would believe the workitem is protected when it is not.
 fn parse_deletion_lock(query: &str) -> Result<bool, String> {
     for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
+        // A bare `?deletionlock` IS the parameter, with no value: PS3.18 11.10
+        // gives it "a value of true", so a present key without one is
+        // malformed. It used to take the `split_once` continue path, identical
+        // to the absent case, and the handler answered 201 with no lock
+        // registered while the caller believed it had one.
+        let (key, value) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => (pair, ""),
         };
         if !key.eq_ignore_ascii_case("deletionlock") {
             continue;
+        }
+        if value.is_empty() {
+            return Err(
+                "Invalid deletionlock parameter: a present parameter must carry true or false"
+                    .to_string(),
+            );
         }
         return match value.trim() {
             v if v.eq_ignore_ascii_case("true") => Ok(true),
@@ -796,10 +886,17 @@ fn subscription_json(
             if index > 0 {
                 body.push(b',');
             }
-            let mut pair = String::with_capacity(tag.len() + value.len() + 1);
-            pair.push_str(tag);
+            // Both sides are QUERY-ENCODED, so the echoed element can be
+            // copied into a `filter=` parameter verbatim. Emitting the raw
+            // value made the echo lossy: a registered `A%20B` came back as a
+            // literal `A%20B`, and re-submitting it decoded to `A B` - a
+            // different subscription from the one the caller had. The `=`
+            // between key and value stays literal, which is the separator a
+            // caller has to see.
+            let mut pair = String::with_capacity(tag.len() + value.len() * 2 + 1);
+            pair.push_str(&crate::handlers::json_common::form_encode_query_str(tag));
             pair.push('=');
-            pair.push_str(value);
+            pair.push_str(&crate::handlers::json_common::form_encode_query_str(value));
             crate::handlers::json_common::push_json_str_loose(&mut body, &pair);
         }
         body.push(b']');
@@ -810,7 +907,7 @@ fn subscription_json(
 
 fn bad_request(msg: &str) -> SubscribeResp {
     SubscribeResp {
-        status: 400,
+        status: HTTP_BAD_REQUEST,
         body: err_msg_json("Bad Request", msg),
     }
 }
@@ -1163,6 +1260,104 @@ mod tests {
         );
     }
 
+    /// PS3.18 11.10.1.2: `filter` is a COMMA-SEPARATED list of matching-key
+    /// pairs. Splitting once stored the rest of the list as the first value, so
+    /// the subscription was accepted and then matched nothing.
+    #[test]
+    fn the_filter_query_is_a_comma_separated_list_of_pairs() {
+        let r = subscribe(
+            "LISTSUB",
+            &body_json("{}"),
+            true,
+            "filter=PatientID=P1,ProcedureStepLabel=CAD",
+        );
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        let entry = subscriptions()
+            .snapshot()
+            .into_iter()
+            .find(|s| s.subscriber == "LISTSUB")
+            .expect("registered");
+        assert_eq!(entry.patient_id.as_deref(), Some("P1"));
+        assert_eq!(entry.step_label.as_deref(), Some("CAD"));
+        assert!(
+            !entry.step_label.as_deref().unwrap_or("").contains(','),
+            "the second member is its own key, not part of the first value"
+        );
+        subscriptions().unsubscribe("LISTSUB");
+
+        // An escaped comma belongs to the value.
+        let r = subscribe(
+            "LISTESC",
+            &body_json("{}"),
+            true,
+            "filter=0040A370.00080050=ACC\\,1,00741204=CAD",
+        );
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        let entry = subscriptions()
+            .snapshot()
+            .into_iter()
+            .find(|s| s.subscriber == "LISTESC")
+            .expect("registered");
+        assert_eq!(entry.accession_number.as_deref(), Some("ACC,1"));
+        assert_eq!(entry.step_label.as_deref(), Some("CAD"));
+        subscriptions().unsubscribe("LISTESC");
+    }
+
+    /// A present `endpoint` of the wrong type is a malformed request, not an
+    /// absent endpoint: folding it into `None` answered 201 for a
+    /// channel-only subscription the caller never asked for.
+    #[test]
+    fn a_non_string_endpoint_is_refused() {
+        for body in [
+            r#"{"endpoint":123}"#,
+            r#"{"endpoint":true}"#,
+            r#"{"endpoint":{"Value":["http://h/ups"]}}"#,
+            r#"{"endpoint":[]}"#,
+        ] {
+            let r = subscribe("TYPED", &body_json(body), false, "");
+            assert_eq!(r.status, 400, "{body} must be refused");
+            assert!(
+                !subscriptions()
+                    .snapshot()
+                    .iter()
+                    .any(|s| s.subscriber == "TYPED"),
+                "{body} must not register anything"
+            );
+        }
+        // Absent, `null` and explicitly empty all stay the channel-only case.
+        for body in [r#"{}"#, r#"{"endpoint":null}"#, r#"{"endpoint":""}"#] {
+            let r = subscribe("TYPED", &body_json(body), false, "");
+            assert_eq!(r.status, 201, "{body} is channel-only");
+            subscriptions().unsubscribe("TYPED");
+        }
+    }
+
+    /// A bare `?deletionlock` is a present parameter with no value, which
+    /// PS3.18 11.10 does not allow. Reading it as absent answered 201 while
+    /// the caller believed it had a lock.
+    #[test]
+    fn a_bare_deletionlock_is_refused() {
+        let r = subscribe("BARELOCK", &body_json("{}"), false, "deletionlock");
+        assert_eq!(r.status, 400, "a bare parameter is malformed");
+        let text = String::from_utf8(r.body).unwrap_or_default();
+        assert!(
+            text.contains("deletionlock"),
+            "the message names the parameter, so the refusal is not some other error: {text}"
+        );
+        assert!(
+            !subscriptions()
+                .snapshot()
+                .iter()
+                .any(|s| s.subscriber == "BARELOCK"),
+            "nothing is registered"
+        );
+
+        // A genuinely absent parameter is still valid.
+        let r = subscribe("BARELOCK", &body_json("{}"), false, "limit=1");
+        assert_eq!(r.status, 201);
+        subscriptions().unsubscribe("BARELOCK");
+    }
+
     /// A filter value is percent-decoded, so an unusual code arrives as
     /// written.
     #[test]
@@ -1175,7 +1370,17 @@ mod tests {
         );
         assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
         let text = String::from_utf8(r.body).unwrap();
-        assert!(text.contains("00741204=CAD STEP"), "decoded: {text}");
+        // The echo is QUERY-ENCODED so it can be re-submitted verbatim: the
+        // registered value is the decoded `CAD STEP`, and that is what the
+        // element must round-trip to.
+        assert!(
+            text.contains("00741204=CAD%20STEP") || text.contains("00741204=CAD+STEP"),
+            "the echoed pair round-trips to the decoded value: {text}"
+        );
+        assert!(
+            !text.contains("00741204=CAD STEP"),
+            "a raw space would not survive being copied into a query: {text}"
+        );
         subscriptions().unsubscribe("PCTSUB");
     }
 
@@ -1256,9 +1461,16 @@ mod tests {
         let r = subscribe("PCTONCE", &body_json("{}"), true, "filter=00741204=A%2520B");
         assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
         let text = String::from_utf8(r.body).unwrap();
+        // One decode leaves a literal `%20` as the VALUE; the echo then
+        // percent-encodes the `%` so the pair can be reused, which is why the
+        // wire form is `%2520`.
         assert!(
-            text.contains("00741204=A%20B"),
-            "one decode leaves a literal %20, not a space: {text}"
+            text.contains("00741204=A%2520B"),
+            "one decode leaves a literal %20, and the echo encodes it for reuse: {text}"
+        );
+        assert!(
+            !text.contains("00741204=A+B") && !text.contains("00741204=A\u{20}B"),
+            "and it never becomes a space: {text}"
         );
         subscriptions().unsubscribe("PCTONCE");
     }
@@ -1683,6 +1895,10 @@ mod tests {
 
     #[test]
     fn deletionlock_true_registers_a_subscription_with_a_lock() {
+        // A foreign lock registered FIRST: the registry is process-wide, so
+        // `newest_deletion_lock().is_some()` would answer from this entry and
+        // stay green even if LOCKED stored nothing.
+        subscribe("OTHERHOLDER", &body_json("{}"), false, "deletionlock=true");
         let r = subscribe(
             "LOCKED",
             &body_json("{\"endpoint\":\"http://127.0.0.1:8124/ups\"}"),
@@ -1695,11 +1911,21 @@ mod tests {
             text.contains("\"deletionlock\":true"),
             "the 201 body reports the lock: {text}"
         );
+        // Assert on THIS subscriber's entry, not on the newest lock in the
+        // registry: the registry is process-wide and another test may hold a
+        // lock, so `newest_deletion_lock().is_some()` would stay green even if
+        // registration stopped storing the instant and only echoed `true`.
+        let entry = subscriptions()
+            .snapshot()
+            .into_iter()
+            .find(|s| s.subscriber == "LOCKED")
+            .expect("registered");
         assert!(
-            subscriptions().newest_deletion_lock().is_some(),
-            "the registry entry carries the lock instant"
+            entry.deletion_lock_at.is_some(),
+            "LOCKED's own entry carries the lock instant: {entry:?}"
         );
         subscriptions().unsubscribe("LOCKED");
+        subscriptions().unsubscribe("OTHERHOLDER");
     }
 
     #[test]

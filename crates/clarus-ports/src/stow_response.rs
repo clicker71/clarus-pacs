@@ -58,12 +58,50 @@ pub enum InstanceOutcome {
         /// PatientID that the new instance claims.
         conflicting_patient_id: String,
     },
+    /// Study-level patient conflict: the incoming StudyInstanceUID
+    /// (0020,000D) already maps to a stored patient whose PatientID
+    /// (0010,0020) or PatientName (0010,0010) differs from this instance's.
+    /// Instance was NOT stored and the stored study is untouched.
+    ///
+    /// PS3.18 10.5.2 leaves two conformant answers to this situation: reject
+    /// the Instance, or coerce it onto the stored patient and record the
+    /// change in (0400,0561) Warn Reason B000. Coercion would silently merge
+    /// two humans into one record, so this server rejects instead.
+    StudyPatientConflict {
+        sop_class_uid: String,
+        sop_instance_uid: String,
+        study_instance_uid: String,
+    },
     /// Processing failure - parse error, I/O error, DB error, etc.
     Failed {
         sop_class_uid: Option<String>,
         sop_instance_uid: Option<String>,
         reason: String,
+        /// Why the instance failed, which decides the request-level status.
+        class: FailureClass,
     },
+}
+
+/// Why a single instance failed, at the granularity that changes the answer.
+///
+/// PS3.18 10.5.3.1 Table 10.5.3-1 lists 400 as the "Failure" status for a
+/// request the server will not or cannot process. A request that is well
+/// formed but cannot be STORED (an unreadable manifest, a full disk) is not a
+/// syntax error: answering 400 tells the client its payload was wrong, so it
+/// stops retrying a request that would succeed once the server recovers. The
+/// two classes are therefore carried explicitly rather than re-derived from the
+/// reason text, which is prose and would need string matching to classify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FailureClass {
+    /// The instance itself is unusable: a parse error, an invalid UID, an
+    /// unsupported transfer syntax. The client must fix the payload, so an
+    /// all-failed request is 400.
+    #[default]
+    InvalidInput,
+    /// The instance is acceptable but the server could not persist it: an I/O
+    /// or manifest failure. The client may retry the same bytes, so an
+    /// all-failed request is a server error rather than 400.
+    StoreFailure,
 }
 
 impl InstanceOutcome {
@@ -73,6 +111,7 @@ impl InstanceOutcome {
             InstanceOutcome::Stored { sop_class_uid, .. }
             | InstanceOutcome::Idempotent { sop_class_uid, .. }
             | InstanceOutcome::Updated { sop_class_uid, .. }
+            | InstanceOutcome::StudyPatientConflict { sop_class_uid, .. }
             | InstanceOutcome::Conflict { sop_class_uid, .. } => Some(sop_class_uid),
             InstanceOutcome::Failed { sop_class_uid, .. } => sop_class_uid.as_deref(),
         }
@@ -88,6 +127,9 @@ impl InstanceOutcome {
                 sop_instance_uid, ..
             }
             | InstanceOutcome::Updated {
+                sop_instance_uid, ..
+            }
+            | InstanceOutcome::StudyPatientConflict {
                 sop_instance_uid, ..
             }
             | InstanceOutcome::Conflict {
@@ -113,6 +155,12 @@ impl InstanceOutcome {
     /// Returns `true` if this is a SOP conflict.
     pub fn is_conflict(&self) -> bool {
         matches!(self, InstanceOutcome::Conflict { .. })
+    }
+
+    /// Returns `true` if the instance was refused because its study already
+    /// belongs to a different patient.
+    pub fn is_study_patient_conflict(&self) -> bool {
+        matches!(self, InstanceOutcome::StudyPatientConflict { .. })
     }
 }
 
@@ -175,6 +223,34 @@ pub enum InsertResult {
         existing_patient_id: String,
         /// PatientID that the new instance claimed.
         conflicting_patient_id: String,
+    },
+    /// The incoming StudyInstanceUID already maps to a stored patient whose
+    /// PatientID or PatientName differs from this instance's. Instance was
+    /// NOT stored and the stored study was left untouched.
+    ///
+    /// PS3.18 10.5.2 permits either rejection or coercion onto the stored
+    /// patient; coercion is refused here because it would silently attribute
+    /// one human's study to another.
+    StudyPatientConflict {
+        sop_class_uid: String,
+        sop_instance_uid: String,
+        study_instance_uid: String,
+    },
+    /// The decision could not be made because the owner study's manifest
+    /// EXISTS but cannot be read.
+    ///
+    /// Deliberately its own variant rather than Idempotent: nothing established
+    /// that this SOP or its bytes are already stored, so answering "duplicate"
+    /// counts an instance the archive may never be able to serve. Rewriting the
+    /// manifest is also wrong - the incoming payload would replace a study that
+    /// a recovery tool may still be able to repair. The caller reports the
+    /// instance as failed and leaves both the manifest and the blob alone.
+    UnreadableOwnerManifest {
+        sop_class_uid: String,
+        sop_instance_uid: String,
+        study_instance_uid: String,
+        series_instance_uid: String,
+        patient_id: String,
     },
 }
 

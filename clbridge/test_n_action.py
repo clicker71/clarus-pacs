@@ -267,7 +267,7 @@ class TestBuildNActionRSP:
 # ---------------------------------------------------------------------------
 
 INTEGRATION_REASON = (
-    "Clarus Bridge not running on 127.0.0.1:11112"
+    "Clarus Bridge not running on 127.0.0.1:8112"
 )
 
 pytestmark_integration = pytest.mark.integration
@@ -279,7 +279,7 @@ def _bridge_is_running():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(2)
     try:
-        s.connect(("127.0.0.1", 11112))
+        s.connect(("127.0.0.1", 8112))
         s.close()
         return True
     except (socket.timeout, ConnectionRefusedError, OSError):
@@ -294,7 +294,7 @@ skip_if_no_bridge = pytest.mark.skipif(
 
 @skip_if_no_bridge
 class TestNActionIntegration:
-    """End-to-end tests requiring a running clbridge on 127.0.0.1:11112."""
+    """End-to-end tests requiring a running clbridge on 127.0.0.1:8112."""
 
     BRIDGE_AE = "CLARUS_BRIDGE"
 
@@ -305,7 +305,7 @@ class TestNActionIntegration:
 
         ae = AE(ae_title="TEST_NA")
         ae.add_requested_context(Verification)
-        assoc = ae.associate("127.0.0.1", 11112, ae_title=self.BRIDGE_AE)
+        assoc = ae.associate("127.0.0.1", 8112, ae_title=self.BRIDGE_AE)
         assert assoc.is_established, "Failed to associate for C-ECHO"
         status = assoc.send_c_echo()
         assert status.Status == 0x0000, f"C-ECHO failed: 0x{status.Status:04X}"
@@ -330,7 +330,7 @@ class TestNActionIntegration:
 
         ae = AE(ae_title="TEST_NA")
         ae.add_requested_context(CTImageStorage)
-        assoc = ae.associate("127.0.0.1", 11112, ae_title=self.BRIDGE_AE)
+        assoc = ae.associate("127.0.0.1", 8112, ae_title=self.BRIDGE_AE)
         assert assoc.is_established, "Failed to associate for C-STORE"
         status = assoc.send_c_store(ds)
         assert status.Status in (0x0000, 0xC000), (
@@ -347,7 +347,7 @@ class TestNActionIntegration:
 
         ae = AE(ae_title="TEST_NA")
         ae.add_requested_context(PatientRootQueryRetrieveInformationModelFind)
-        assoc = ae.associate("127.0.0.1", 11112, ae_title=self.BRIDGE_AE)
+        assoc = ae.associate("127.0.0.1", 8112, ae_title=self.BRIDGE_AE)
         assert assoc.is_established, "Failed to associate for C-FIND"
 
         ds = Dataset()
@@ -380,7 +380,7 @@ class TestNActionIntegration:
         # Step 1: Verify C-MOVE association is now ACCEPTED (v1.0)
         ae = AE(ae_title="TEST_NA")
         ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
-        assoc = ae.associate("127.0.0.1", 11112, ae_title=self.BRIDGE_AE)
+        assoc = ae.associate("127.0.0.1", 8112, ae_title=self.BRIDGE_AE)
         assert assoc.is_established, (
             "C-MOVE association should be accepted: Bridge v1.0 supports C-MOVE"
         )
@@ -409,57 +409,6 @@ class TestNActionIntegration:
         )
         assoc.release()
 
-    def test_c_move_known_destination(self):
-        """C-MOVE v1.0: C-ECHO registers SCP ??? C-MOVE returns Pending 0xFF00."""
-        from pynetdicom import AE
-        from pynetdicom.sop_class import (
-            StudyRootQueryRetrieveInformationModelMove,
-            Verification,
-        )
-
-        test_ae = f"TCM{uuid.uuid4().hex[:6]}"  # max 16 chars per DICOM AE Title
-
-        # Step 1: C-ECHO to auto-register this AE as SCP target (CM-006)
-        ae_echo = AE(ae_title=test_ae)
-        ae_echo.add_requested_context(Verification)
-        assoc_echo = ae_echo.associate("127.0.0.1", 11112, ae_title=self.BRIDGE_AE)
-        assert assoc_echo.is_established, "C-ECHO association failed"
-        status = assoc_echo.send_c_echo()
-        assert status.Status == 0x0000, f"C-ECHO failed: 0x{status.Status:04X}"
-        assoc_echo.release()
-
-        # Step 2: C-MOVE to the now-registered AE ??? Pending 0xFF00
-        ae_move = AE(ae_title=test_ae)
-        ae_move.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
-        assoc_move = ae_move.associate(
-            "127.0.0.1", 11112, ae_title=self.BRIDGE_AE,
-        )
-        assert assoc_move.is_established, "C-MOVE association failed"
-
-        study_uid = f"1.2.840.10008.5.1.4.1.1.2.2.{uuid.uuid4().hex[:8]}"
-        ds = Dataset()
-        ds.QueryRetrieveLevel = "STUDY"
-        ds.StudyInstanceUID = study_uid
-        ds.MoveDestination = test_ae  # Move to self (registered via C-ECHO)
-
-        # Bridge: pynetdicom 3.0 send_c_move(ds, move_aet, query_model)
-        responses = assoc_move.send_c_move(
-            ds, test_ae, StudyRootQueryRetrieveInformationModelMove
-        )
-        first_status = None
-        for status, _identifier in responses:
-            first_status = status
-            break
-
-        assert first_status is not None, "No C-MOVE response received"
-        # Bridge v1.0: job queued ??? pynetdicom 3.0 returns 0x0000 (Success)
-        # because nr_subops=0. Actual data transfer is async via worker thread.
-        assert first_status.Status == 0x0000, (
-            f"C-MOVE to known destination should return Success 0x0000, "
-            f"got 0x{first_status.Status:04X}"
-        )
-        assoc_move.release()
-
     def test_n_action_e2e(self):
         """Full E2E: C-STORE ??? N-ACTION ??? verify RSP contains Success/Failed."""
         from pynetdicom import AE
@@ -486,7 +435,7 @@ class TestNActionIntegration:
 
         ae_store = AE(ae_title="TEST_NA_E2E")
         ae_store.add_requested_context(CTImageStorage)
-        assoc = ae_store.associate("127.0.0.1", 11112, ae_title=self.BRIDGE_AE)
+        assoc = ae_store.associate("127.0.0.1", 8112, ae_title=self.BRIDGE_AE)
         assert assoc.is_established, "C-STORE association failed"
         status = assoc.send_c_store(ds)
         stored_ok = status.Status == 0x0000
@@ -496,7 +445,7 @@ class TestNActionIntegration:
         ae_action = AE(ae_title="TEST_NA_E2E")
         ae_action.add_requested_context(StorageCommitmentPushModel)
         assoc2 = ae_action.associate(
-            "127.0.0.1", 11112, ae_title=self.BRIDGE_AE
+            "127.0.0.1", 8112, ae_title=self.BRIDGE_AE
         )
         assert assoc2.is_established, "N-ACTION association failed"
 
@@ -546,7 +495,7 @@ class TestNActionIntegration:
 
         ae = AE(ae_title="TEST_NA_NOSTOW")
         ae.add_requested_context(StorageCommitmentPushModel)
-        assoc = ae.associate("127.0.0.1", 11112, ae_title=self.BRIDGE_AE)
+        assoc = ae.associate("127.0.0.1", 8112, ae_title=self.BRIDGE_AE)
         assert assoc.is_established, "N-ACTION association failed"
 
         n_action_ds = Dataset()

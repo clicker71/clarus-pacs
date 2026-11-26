@@ -110,6 +110,7 @@ pub fn write_json_val(out: &mut Vec<u8>, v: &JsonVal) {
         JsonVal::Bool(true) => out.extend_from_slice(b"true"),
         JsonVal::Bool(false) => out.extend_from_slice(b"false"),
         JsonVal::U64(n) => push_u64(out, *n),
+        JsonVal::Num(token) => out.extend_from_slice(token.as_bytes()),
         JsonVal::Str(s) => push_json_str(out, s),
         JsonVal::Arr(items) => {
             out.push(b'[');
@@ -210,6 +211,17 @@ pub enum JsonVal {
     Null,
     Bool(bool),
     U64(u64),
+    /// A numeric token that is not an unsigned integer: signed, fractional or
+    /// in exponent form, kept EXACTLY as the sender wrote it.
+    ///
+    /// Held as text rather than a float because the value's purpose is to
+    /// round-trip: PS3.18 F.2.3 lets IS and DS carry a JSON string so the
+    /// original format survives a transformation, and a `1.50` promoted to
+    /// `1.5` would be a different number for a DS whose trailing zero is
+    /// significant. Nothing in this codebase does arithmetic on it - the
+    /// accessors that need a number are [`JsonVal::as_u64`] and
+    /// [`JsonVal::as_f64`], and they refuse a token they cannot represent.
+    Num(String),
     Str(String),
     Arr(Vec<JsonVal>),
     Obj(Vec<(String, JsonVal)>),
@@ -280,6 +292,7 @@ impl JsonVal {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             JsonVal::U64(n) => Some(*n as f64),
+            JsonVal::Num(token) => token.parse::<f64>().ok(),
             _ => None,
         }
     }
@@ -309,15 +322,21 @@ pub fn json_str_array(v: &JsonVal) -> Option<Vec<String>> {
 
 // -- application/x-www-form-urlencoded -----------
 
-/// Encode a `&str` as a form-urlencoded field value (alnum + `-._~` kept;
-/// space -> `+`; every other byte -> `%XX` uppercase). Matches serde_urlencoded
-/// (which uses `url::form_urlencoded` under the hood) for the request
-/// contracts used here.
+/// Encode a `&str` as a form-urlencoded field value.
+///
+/// The safe set is the application/x-www-form-urlencoded "percent-encode set"
+/// of the URL Standard: the ASCII alphanumeric characters plus `*`, `-`, `.`
+/// and `_`, with space as `+`. Tilde is NOT in that set, so it is percent-
+/// encoded - unlike a bare RFC 3986 unreserved character, which `~` is. The
+/// two sets differ on exactly `*` and `~`: keeping `~` emitted `~` where
+/// `url::form_urlencoded` emits `%7E`, and encoding `*` emitted `%2A` where it
+/// emits `*`, so a body this function built could not be byte-compared with
+/// the oracle's.
 pub fn form_encode_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
                 out.push(b as char);
             }
             b' ' => out.push('+'),
@@ -381,6 +400,8 @@ pub fn form_decode_query_str(s: &str) -> String {
     while i < bytes.len() {
         let b = bytes[i];
         match b {
+            // `i + 2 < bytes.len()` is the correct bound: an escape is the
+            // '%' plus two bytes, so the last index it may touch is `len - 1`.
             b'%' if i + 2 < bytes.len() => {
                 let hi = hex_val(bytes[i + 1]);
                 let lo = hex_val(bytes[i + 2]);
@@ -635,6 +656,14 @@ impl<'a> JsonObjParser<'a> {
                     self.pos = end;
                 }
                 _ => {
+                    // RFC 8259 7: all characters U+0000 through U+001F must be
+                    // ESCAPED inside a string. A raw one is not JSON, and
+                    // accepting it let a literal line feed through this arm -
+                    // it is below 0x80, so it passed as a plain ASCII byte and
+                    // the documents on either side merged into one value.
+                    if b < 0x20 {
+                        return None;
+                    }
                     // A raw ASCII byte. Bytes below 0x80 are their own UTF-8
                     // encoding, so pushing the byte IS correct here - the
                     // 0x80..=0xFF arm above handles the rest.
@@ -759,18 +788,46 @@ impl<'a> JsonObjParser<'a> {
             is_unsigned = false;
             self.pos += 1;
         }
-        while let Some(b) = self.peek() {
-            match b {
-                b'0'..=b'9' => self.pos += 1,
-                b'.' | b'e' | b'E' | b'+' => {
-                    is_unsigned = false;
-                    self.pos += 1;
-                }
-                _ => break,
+        // The integer component must carry at least one digit, and a leading
+        // zero is legal only when it is the whole integer part (RFC 8259 6).
+        // Enforcing it here rather than in the `u64` conversion is what makes
+        // `{"n":01}` a refusal instead of `n = 1`: `"01".parse::<u64>()`
+        // succeeds, so the conversion alone never sees the violation.
+        let int_start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.pos == int_start {
+            return None;
+        }
+        if self.pos - int_start > 1 && self.bytes[int_start] == b'0' {
+            return None;
+        }
+        if self.peek() == Some(b'.') {
+            is_unsigned = false;
+            self.pos += 1;
+            let frac_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == frac_start {
+                return None;
             }
         }
-        let slice = &self.bytes[start..self.pos];
-        let text = std::str::from_utf8(slice).ok()?;
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            is_unsigned = false;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                self.pos += 1;
+            }
+            let exp_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == exp_start {
+                return None;
+            }
+        }
         if matches!(
             self.peek(),
             Some(b'0'..=b'9') | Some(b'.') | Some(b'e') | Some(b'E')
@@ -778,12 +835,19 @@ impl<'a> JsonObjParser<'a> {
             // A malformed exponent/mantissa tail; refuse.
             return None;
         }
+        let slice = &self.bytes[start..self.pos];
+        let text = std::str::from_utf8(slice).ok()?;
         if is_unsigned && let Ok(v) = text.parse::<u64>() {
             return Some(JsonVal::U64(v));
         }
-        // Negative or float numbers aren't consumed by the request contracts
-        // (they only read u64/bool/string/array), so treat them as unhandled.
-        None
+        // A signed or fractional token is still a VALID JSON value and must
+        // survive: the opaque UPS Scheduled Processing Parameters subtree can
+        // carry an FD or a negative IS, and refusing the whole document over
+        // one of them dropped the workitem's content. The token is kept as
+        // written rather than re-formatted, so the value the performer sent is
+        // the value that comes back out (PS3.18 F.2.3 allows the string form
+        // for IS/DS precisely to preserve the original format).
+        Some(JsonVal::Num(text.to_string()))
     }
 }
 
@@ -1133,5 +1197,95 @@ mod tests {
         let mut out = Vec::new();
         push_f64(&mut out, 3.0);
         assert_eq!(out, b"3.0");
+    }
+
+    // -- form-urlencoded safe set ------------------------------------
+
+    /// The application/x-www-form-urlencoded percent-encode set keeps `*` and
+    /// encodes `~`, which is the opposite of the RFC 3986 unreserved set. Get
+    /// either wrong and the body cannot be byte-compared with the oracle's.
+    #[test]
+    fn form_encode_uses_the_form_urlencoded_safe_set() {
+        assert_eq!(form_encode_str("*"), "*");
+        assert_eq!(form_encode_str("~"), "%7E");
+        assert_eq!(form_encode_str("*~ "), "*%7E+");
+        // The alnum/dash/dot/underscore set is unchanged.
+        assert_eq!(form_encode_str("aZ0-._"), "aZ0-._");
+    }
+
+    // -- JSON string control characters ------------------------------
+
+    /// RFC 8259 7: U+0000..U+001F must be escaped inside a string. A raw one
+    /// is not JSON, and accepting it let a literal newline merge two documents
+    /// into one value.
+    #[test]
+    fn parse_json_refuses_a_raw_control_character() {
+        for raw in [0x00u8, 0x09, 0x0A, 0x0D, 0x1F] {
+            let mut body = br#"{"msg":""#.to_vec();
+            body.push(raw);
+            body.extend_from_slice(br#""}"#);
+            assert!(
+                parse_json(&body).is_none(),
+                "a raw 0x{raw:02X} in a string must be refused"
+            );
+        }
+        // The escaped form is the conformant spelling and stays accepted.
+        assert!(parse_json(br#"{"msg":"a\nb\tc"}"#).is_some());
+    }
+
+    // -- JSON number grammar -----------------------------------------
+
+    /// RFC 8259 6: a leading zero is legal only when it is the whole integer.
+    /// `"01".parse::<u64>()` succeeds, so the conversion alone never catches
+    /// this - the grammar has to be checked while scanning.
+    #[test]
+    fn parse_json_refuses_a_leading_zero() {
+        for bad in [br#"{"n":01}"#.as_slice(), br#"{"n":-01}"#, br#"{"n":00}"#] {
+            assert!(
+                parse_json(bad).is_none(),
+                "{} has a leading zero",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // The conformant neighbours stay accepted.
+        assert_eq!(
+            parse_json(br#"{"n":0}"#)
+                .unwrap()
+                .obj_get("n")
+                .unwrap()
+                .as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parse_json(br#"{"n":10}"#)
+                .unwrap()
+                .obj_get("n")
+                .unwrap()
+                .as_u64(),
+            Some(10)
+        );
+    }
+
+    /// A signed or fractional number is valid JSON and must be preserved, not
+    /// turned into a whole-document refusal: the opaque Scheduled Processing
+    /// Parameters subtree can carry an FD or a negative IS.
+    #[test]
+    fn parse_json_preserves_signed_and_fractional_numbers() {
+        for (body, expected) in [
+            (br#"{"n":1.5}"#.as_slice(), "1.5"),
+            (br#"{"n":-7}"#, "-7"),
+            (br#"{"n":-0.25}"#, "-0.25"),
+            (br#"{"n":1e-3}"#, "1e-3"),
+            (br#"{"n":2.50}"#, "2.50"),
+        ] {
+            let doc = parse_json(body).expect("a signed/fractional number is valid JSON");
+            let mut out = Vec::new();
+            write_json_val(&mut out, doc.obj_get("n").expect("the member"));
+            assert_eq!(String::from_utf8(out).unwrap(), expected);
+        }
+        // `as_u64` stays strict: a token that is not an unsigned integer has no
+        // unsigned value, so a field requiring one cannot silently take it.
+        let doc = parse_json(br#"{"n":1.5}"#).expect("parsed");
+        assert_eq!(doc.obj_get("n").unwrap().as_u64(), None);
     }
 }

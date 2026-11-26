@@ -46,18 +46,25 @@ pub struct LocalTime {
 /// Millisecond precision comes from `SystemTime`'s sub-second fraction; the
 /// broken-down fields come from `libc::localtime_r` (Unix) / `libc::localtime_s`
 /// (Windows). Zero heap: only the stack `tm` + the return struct.
-pub fn local_now() -> LocalTime {
-    // Unwrap-or-default: before the epoch a saturated 0 is safer than a panic.
+pub fn local_now() -> Result<LocalTime, TimeError> {
+    // A clock that reads before the epoch is not a time we can render: the
+    // old `unwrap_or_default()` turned it into `0`, which renders as
+    // 1970-01-01 00:00:00 - a real-looking timestamp on a log line. The
+    // caller decides whether that is worth reporting or skipping.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+        .map_err(|e| TimeError::ClockBeforeEpoch(e.duration().as_secs()))?;
     let millis = now.subsec_millis();
 
-    let epoch_secs = now.as_secs() as libc::time_t;
+    // `as_secs()` is u64; `libc::time_t` is i64 on both supported targets, so
+    // the conversion cannot trap, but a value above `i64::MAX` would wrap to a
+    // negative instant. Reject it instead of rendering a silent 1901 date.
+    let epoch_secs =
+        libc::time_t::try_from(now.as_secs()).map_err(|_| TimeError::OutOfRange(now.as_secs()))?;
     // The OS clock is the source of truth for local wall time.
-    let (year, month, day, hour, minute, second) = local_broken_down(epoch_secs);
+    let (year, month, day, hour, minute, second) = local_broken_down(epoch_secs)?;
 
-    LocalTime {
+    Ok(LocalTime {
         year,
         month,
         day,
@@ -65,7 +72,7 @@ pub fn local_now() -> LocalTime {
         minute,
         second,
         millis,
-    }
+    })
 }
 
 /// Break down an epoch offset into local wall-clock fields.
@@ -74,9 +81,22 @@ pub fn local_now() -> LocalTime {
 /// conversion has to accept a stored instant rather than reading the clock
 /// again. Sub-second precision is not recoverable from an epoch second and is
 /// reported as 0.
-pub fn from_epoch_secs(epoch_secs: i64) -> LocalTime {
-    let (year, month, day, hour, minute, second) = local_broken_down(epoch_secs as libc::time_t);
-    LocalTime {
+///
+/// FALLIBLE, because the OS conversion can genuinely fail: Windows
+/// `localtime_s` rejects a negative `time_t` outright (MSVC documents
+/// `EINVAL` for out-of-range input), and no `time_t` is guaranteed to be
+/// representable by a civil date. The previous signature returned an ordinary
+/// `LocalTime` built from `(1970, 1, 1, 0, 0, 0)` on failure, so a corrupt or
+/// negative journal timestamp rendered as 1970-01-01 - indistinguishable from
+/// a real event at the epoch. The caller now decides what an unconvertible
+/// instant means.
+pub fn from_epoch_secs(epoch_secs: i64) -> Result<LocalTime, TimeError> {
+    // `libc::time_t` is i64 on both supported targets, but the narrowing must
+    // stay explicit: a 32-bit `time_t` target would truncate silently.
+    let tt = libc::time_t::try_from(epoch_secs)
+        .map_err(|_| TimeError::OutOfRange(epoch_secs.unsigned_abs()))?;
+    let (year, month, day, hour, minute, second) = local_broken_down(tt)?;
+    Ok(LocalTime {
         year,
         month,
         day,
@@ -84,19 +104,47 @@ pub fn from_epoch_secs(epoch_secs: i64) -> LocalTime {
         minute,
         second,
         millis: 0,
+    })
+}
+
+/// A time that the OS could not convert into civil fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeError {
+    /// The requested instant is not representable as a `libc::time_t`.
+    OutOfRange(u64),
+    /// The system clock reads before 1970-01-01.
+    ClockBeforeEpoch(u64),
+    /// The OS rejected the conversion (`localtime_r` returned NULL, or
+    /// `localtime_s` returned non-zero).
+    ConversionFailed,
+}
+
+impl std::fmt::Display for TimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimeError::OutOfRange(s) => write!(f, "epoch second {s} is out of range for time_t"),
+            TimeError::ClockBeforeEpoch(s) => {
+                write!(f, "system clock is {s}s before the epoch")
+            }
+            TimeError::ConversionFailed => write!(f, "OS local-time conversion failed"),
+        }
     }
 }
+
+impl std::error::Error for TimeError {}
 
 /// Fill a `libc::tm` from the OS for a given epoch offset, returning the
 /// broken-down civil fields. The OS call itself lives in
 /// [`crate::ffi::localtime_civil`] (audited OS boundary); here we only
-/// translate the populated `tm` into civil fields, falling back to the
-/// epoch on conversion failure.
-fn local_broken_down(epoch_secs: libc::time_t) -> (i32, u32, u32, u32, u32, u32) {
+/// translate the populated `tm` into civil fields.
+fn local_broken_down(
+    epoch_secs: libc::time_t,
+) -> Result<(i32, u32, u32, u32, u32, u32), TimeError> {
     match crate::ffi::localtime_civil(epoch_secs) {
-        Some(tm) => tm_to_civil(tm),
-        // Fall back to the epoch (1970-01-01 00:00:00) rather than panic.
-        None => (1970, 1, 1, 0, 0, 0),
+        Some(tm) => Ok(tm_to_civil(tm)),
+        // A failed conversion is NOT the epoch: reporting it as such made an
+        // unrenderable instant look like a valid event at 1970-01-01.
+        None => Err(TimeError::ConversionFailed),
     }
 }
 
@@ -221,7 +269,7 @@ mod tests {
 
     #[test]
     fn local_now_has_sane_range() {
-        let t = local_now();
+        let t = local_now().expect("the clock is after the epoch on a sane host");
         // Year within a plausible modern window and fields in valid ranges.
         assert!((2020..=2100).contains(&t.year));
         assert!((1..=12).contains(&t.month));
@@ -230,5 +278,72 @@ mod tests {
         assert!(t.minute <= 59);
         assert!(t.second <= 60);
         assert!(t.millis <= 999);
+    }
+
+    /// A conversion failure must be an ERROR, never a 1970 timestamp.
+    ///
+    /// Windows `localtime_s` rejects a negative `time_t` with `EINVAL`, and
+    /// glibc's `localtime_r` returns NULL for an unrepresentable instant too,
+    /// so `-1` reaches the failure branch on both. The old signature had no
+    /// error channel at all and returned `(1970, 1, 1, 0, 0, 0)`, which renders
+    /// as a perfectly plausible log line.
+    ///
+    /// The `Ok` arm is kept for a libc that DOES convert `-1` (it would be
+    /// 1969-12-31): that answer is legitimate, but 1970-01-01 00:00:00 is the
+    /// swallowed failure this test forbids, so both arms are asserted.
+    #[test]
+    fn a_negative_instant_is_never_silently_the_epoch() {
+        match from_epoch_secs(-1) {
+            Err(e) => {
+                assert!(
+                    matches!(e, TimeError::ConversionFailed | TimeError::OutOfRange(_)),
+                    "unexpected error variant: {e:?}"
+                );
+            }
+            Ok(t) => {
+                assert_ne!(
+                    (t.year, t.month, t.day, t.hour, t.minute, t.second),
+                    (1970, 1, 1, 0, 0, 0),
+                    "a failed conversion was reported as the epoch"
+                );
+            }
+        }
+    }
+
+    /// A normal instant still converts, so the fallible signature did not
+    /// turn the happy path into an error.
+    #[test]
+    fn a_known_instant_converts() {
+        // 2021-01-01T00:00:00Z. Asserting the DATE only, because the result is
+        // local wall time and the hour depends on the host timezone.
+        let t = from_epoch_secs(1_609_459_200).expect("2021-01-01 must convert");
+        assert!(
+            t.year == 2020 || t.year == 2021,
+            "expected 2020-12-31 or 2021-01-01 local, got {t:?}"
+        );
+        assert!((1..=12).contains(&t.month));
+        assert!((1..=31).contains(&t.day));
+    }
+
+    /// An extreme instant never panics and never comes back as a plausible
+    /// modern date.
+    ///
+    /// `libc::time_t` is i64 on both supported targets, so `i64::MAX` fits and
+    /// the OS conversion is what fails - the point of the check is that the
+    /// caller is TOLD, not that a particular variant is returned. On a 32-bit
+    /// `time_t` target the narrowing would itself produce `OutOfRange`.
+    #[test]
+    fn an_extreme_instant_is_reported_not_rendered() {
+        match from_epoch_secs(i64::MAX) {
+            Err(_) => {}
+            Ok(t) => {
+                assert!(
+                    t.year > 2100,
+                    "an extreme instant must not render as a modern date: {t:?}"
+                );
+            }
+        }
+        // The closing panic-free contract: this call must simply return.
+        let _ = from_epoch_secs(i64::MIN);
     }
 }

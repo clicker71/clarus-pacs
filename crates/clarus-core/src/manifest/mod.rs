@@ -43,12 +43,16 @@ pub use read::{
 };
 #[cfg(test)]
 pub(crate) use read::{read_manifest_for_test, read_manifest_study_only_for_test};
-pub(crate) use read::{read_manifest_published, read_manifest_study_only_published};
+pub(crate) use read::{
+    read_manifest_published, read_manifest_published_sized, read_manifest_study_only_published,
+};
 pub use record::{
     AttrValue, FrameRecord, InstanceRecord, Manifest, ManifestError, NOT_REJECTED_REASON,
     QUALITY_REASON_CODE, SeriesRecord, StudyQido, SysHeader, TIER_COLD, TIER_HOT, TIER_S3,
 };
 pub use write::WriteManifestError;
+pub use write::publish_tombstone_bytes;
+pub use write::stale_temp_files;
 #[doc(hidden)]
 pub use write::{block_manifest_write_for_test, unblock_manifest_write_for_test};
 pub use write::{write_bytes_atomic, write_bytes_atomic_validated, write_manifest};

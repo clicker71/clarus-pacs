@@ -1,0 +1,51 @@
+# Surface: a 3D mesh as an Encapsulated STL.
+#
+# DISABLED by default. To enable: install numpy and scikit-image
+# (`pip install numpy scikit-image`) - no weights.
+
+enabled: false
+
+title: "Threshold surface mesh"
+description: "The surface bounding a thresholded volume, stored as an STL."
+
+provider:
+  name: "STL-mesh"
+  vendor: "Clarus"
+  version: "1.0"
+
+input_requirements:
+  # A flat radiograph cannot produce a surface, so this one needs a volume.
+  modalities: [CT, MR]
+
+output_capabilities:
+  sop_classes: ["1.2.840.10008.5.1.4.1.1.104.3"]
+
+parameters:
+  - code: THRESHOLD
+    type: integer
+    text: "Stored value threshold"
+    default: 300
+    min: 0
+  - code: STEP
+    type: integer
+    text: "Marching-cubes step"
+    default: 2
+    min: 1
+  - code: DECIMATE_CELLS
+    type: integer
+    text: "Target cell count"
+    default: 20000
+    min: 100
+
+match:
+  modality: [CT, MR]
+
+runtime:
+  script: "../abi/STL-mesh.py"
+  interpreter: "python3"
+  timeout_secs: 1800
+
+outputs:
+  - kind: stl
+    series_description: "AI Surface"
+    profile_version: 1

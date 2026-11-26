@@ -150,7 +150,7 @@ pub struct StoreFilter<'a> {
     /// Procedure ID - a standard matching key (PS3.4 Table CC.2.5-3, R).
     pub requested_procedure_id: Option<&'a str>,
     pub patient_id: Option<&'a str>,
-    /// (0040,0405) Scheduled Procedure Step Start DateTime - a REQUIRED
+    /// (0040,4005) Scheduled Procedure Step Start DateTime - a REQUIRED
     /// matching key (PS3.4 Table CC.2.5-3, "Single Value or Range").
     ///
     /// A `-`-separated value is a RANGE across the stored DT, which is what the
@@ -174,6 +174,12 @@ pub struct StoreFilter<'a> {
     /// (a modality is a DICOM CS value, so its case is not significant).
     pub modality: Option<&'a str>,
     pub workflow_state: Option<&'a str>,
+    /// (0040,4041) Input Readiness State - a matching key in PS3.4 Table
+    /// CC.2.5-3. `READY` must exclude an INCOMPLETE record, so a workitem with
+    /// no readiness does NOT match a stated one: it has not been declared
+    /// ready, and treating "absent" as "ready" would hand a performer inputs
+    /// the requester never confirmed.
+    pub input_readiness: Option<&'a str>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -262,6 +268,17 @@ impl WorkItemStore {
     /// the second overwrote the first with no conflict reported. `None` is the
     /// separate, explicit "unconditional" case, reserved for callers that
     /// never read a record (the create path).
+    ///
+    /// KNOWN LIMIT: the revision identifies a POSITION, not an INCARNATION.
+    /// Deleting a workitem and creating a different one under the same UID
+    /// restarts the counter at 0, so a caller that read revision 0 before the
+    /// delete presents `Some(0)`, finds a record at revision 0, and overwrites
+    /// the replacement without a conflict. Closing that needs the caller to
+    /// name the incarnation it read - a creation timestamp or a stored
+    /// generation - which means a new parameter on this public signature and a
+    /// matching field on every record. It is recorded here rather than
+    /// half-done: the current API cannot express "the same record" and
+    /// pretending otherwise would give callers a guarantee they do not have.
     pub fn cas_update(
         &self,
         rec: &WorkItemRecord,
@@ -367,7 +384,17 @@ impl WorkItemStore {
                 sync_parent_entry(&path)?;
                 Ok(true)
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // A previous delete may have unlinked the file and then failed
+                // the directory barrier; this retry is what completes it. The
+                // entry is already gone, so the barrier is the SAME one the
+                // success path runs - without it the retry reports a finished
+                // deletion whose directory update was never made durable, and
+                // a crash can bring the workitem back.
+                #[cfg(unix)]
+                sync_parent_entry(&path)?;
+                Ok(false)
+            }
             Err(e) => Err(StoreError::Io(e)),
         }
     }
@@ -386,7 +413,11 @@ impl WorkItemStore {
         };
         for entry in rd {
             let entry = entry.map_err(StoreError::Io)?;
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            // A `file_type` failure is an enumeration failure, not a directory
+            // with fewer files: `unwrap_or(false)` turned it into "skip this
+            // entry" and the caller received an ordinary page with an
+            // ordinary match count.
+            if !entry.file_type().map_err(StoreError::Io)?.is_file() {
                 continue;
             }
             let fname = entry.file_name().to_string_lossy().into_owned();
@@ -397,9 +428,16 @@ impl WorkItemStore {
             if stem.ends_with(".tmp") {
                 continue;
             }
+            // A record that vanishes between the walk and the read is an
+            // EXPECTED omission (a concurrent delete); anything else - an I/O
+            // error, an undecodable file - means the page is incomplete, and
+            // the caller has to be able to tell that from a complete one.
             let rec = match self.find_by_uid(stem) {
                 Ok(Some(r)) => r,
-                _ => continue, // corrupt/missing -> skip, mirror scan resilience
+                // Gone now: the delete that removed it owns the truth.
+                Ok(None) => continue,
+                Err(StoreError::Io(e)) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
             };
             if matches_filter(&rec, f) {
                 all.push(rec);
@@ -571,10 +609,28 @@ fn matches_filter(rec: &WorkItemRecord, f: &StoreFilter<'_>) -> bool {
     {
         return false;
     }
-    // (0040,0405) ScheduledProcedureStepStartDateTime: "Single Value or Range"
+    // (0040,4041) Input Readiness State: an absent readiness is not READY.
+    // The stored value is a DICOM CS, so the comparison is case-insensitive.
+    if let Some(v) = f.input_readiness
+        && !rec
+            .input_readiness
+            .as_deref()
+            .is_some_and(|r| r.eq_ignore_ascii_case(v))
+    {
+        return false;
+    }
+    // (0040,4005) ScheduledProcedureStepStartDateTime: "Single Value or Range"
     // per Table CC.2.5-3. An empty value matches everything (the zero-length
     // key convention); `<lo>-<hi>` is an inclusive range; anything else is one
     // instant compared exactly.
+    //
+    // A trailing SPACE is legal padding, not part of the value: PS3.5 6.2
+    // requires every character-string VR except UI to be padded with SPACE
+    // when an odd length would otherwise result, and DT is in that list
+    // (standard/ps3.5/string-value-padding.json `spacePaddedVrs`). The padding
+    // belongs to the ENCODING, so it is stripped from the stored value before
+    // parsing - otherwise `20261115120000+0100 ` fell through to the lexical
+    // fallback and stopped matching the same instant written `20261115110000+0000`.
     //
     // DT is compared as an INSTANT, not as text. The offset is part of the
     // value (PS3.5 Section 6.2), so `20261115120000+0100` and
@@ -585,21 +641,41 @@ fn matches_filter(rec: &WorkItemRecord, f: &StoreFilter<'_>) -> bool {
     if let Some(v) = f.sps_start_datetime
         && !v.is_empty()
     {
-        let Some(stored) = rec.sps_start_datetime.as_deref() else {
+        let Some(stored) = rec.sps_start_datetime.as_deref().map(str::trim_end) else {
             // A workitem with no start datetime does not match a datetime query.
             return false;
         };
+        // The query value carries the same padding rule as the stored one.
+        let v = v.trim_end();
         let matched = match dt_instant(stored, f.default_offset_secs) {
             Some(stored_i) => match split_dt_range(v) {
                 // A range: both endpoints inclusive. An absent endpoint is an
                 // open end, which is what a bare `-hi` / `lo-` means.
+                //
+                // Both endpoints are already known to parse: `split_dt_range`
+                // returns a range only after `dt_instant` accepted each one,
+                // and `parse_dt` succeeding is the only way into this arm. A
+                // bound that fails here is therefore a programming error, not
+                // an input condition - so it rejects rather than widening the
+                // range to "no bound", which is what a skipped failure would
+                // do.
                 (lo_txt, Some(hi_txt)) => {
-                    let lo_ok = lo_txt.is_empty()
-                        || dt_instant(lo_txt, f.default_offset_secs)
-                            .is_none_or(|lo| stored_i >= lo);
-                    let hi_ok = hi_txt.is_empty()
-                        || dt_upper_instant(hi_txt, f.default_offset_secs)
-                            .is_none_or(|hi| stored_i <= hi);
+                    let lo_ok = if lo_txt.is_empty() {
+                        true
+                    } else {
+                        match dt_instant(lo_txt, f.default_offset_secs) {
+                            Some(lo) => stored_i >= lo,
+                            None => return false,
+                        }
+                    };
+                    let hi_ok = if hi_txt.is_empty() {
+                        true
+                    } else {
+                        match dt_upper_instant(hi_txt, f.default_offset_secs) {
+                            Some(hi) => stored_i <= hi,
+                            None => return false,
+                        }
+                    };
                     lo_ok && hi_ok
                 }
                 // No separator: ONE value. A short value names a PERIOD (a
@@ -615,10 +691,29 @@ fn matches_filter(rec: &WorkItemRecord, f: &StoreFilter<'_>) -> bool {
                     _ => false,
                 },
             },
-            // Unparseable stored value: keep the historical behaviour.
+            // Unparseable stored value: keep the historical lexical
+            // comparison, which is the only ordering available for text we
+            // cannot place in time. What it MUST NOT do is drop a bound: an
+            // endpoint that is present and does not parse rejects the
+            // workitem, exactly as the parsed arm above does. Skipping it
+            // answered with a wider set than the client asked for.
             None => match split_dt_range(v) {
                 (lo, Some(hi)) => {
-                    (lo.is_empty() || stored >= lo) && (hi.is_empty() || stored <= hi)
+                    let lo_ok = if lo.is_empty() {
+                        true
+                    } else if dt_instant(lo, f.default_offset_secs).is_some() {
+                        stored >= lo
+                    } else {
+                        return false;
+                    };
+                    let hi_ok = if hi.is_empty() {
+                        true
+                    } else if dt_instant(hi, f.default_offset_secs).is_some() {
+                        stored <= hi
+                    } else {
+                        return false;
+                    };
+                    lo_ok && hi_ok
                 }
                 (_, None) => stored == v,
             },
@@ -762,6 +857,19 @@ fn parse_dt(value: &str, default_offset_secs: i64) -> Option<DtParts> {
         {
             let hours: i64 = std::str::from_utf8(&[*d0, *d1]).ok()?.parse().ok()?;
             let minutes: i64 = std::str::from_utf8(&[*d2, *d3]).ok()?.parse().ok()?;
+            // PS3.5 6.2 Note 1: the zone offset is bounded to -1200..+1400, and
+            // the minutes field is a clock field (00..59).
+            //
+            // This used to accept anything: `20261115120000-0500-2027` had its
+            // SECOND dash read as the range separator, because
+            // `parse_dt("0500-2027")` saw year 0500 at offset -2027 minutes
+            // (-20:27). The resulting range straddled the wrong period and
+            // excluded a December 2026 workitem that sits between the real
+            // bounds. Rejecting an out-of-range offset makes that first split
+            // fail, so the splitter keeps the valid `-0500` lower bound.
+            if !offset_in_range_signed(*sign == b'+', hours, minutes) {
+                return None;
+            }
             let magnitude = hours * 3600 + minutes * 60;
             if *sign == b'+' { magnitude } else { -magnitude }
         }
@@ -842,6 +950,60 @@ fn dt_upper_instant(value: &str, default_offset_secs: i64) -> Option<(i64, u32)>
     Some((local_end - p.offset_secs, 999_999_999))
 }
 
+/// Whether a stored DT value satisfies a DT filter value.
+///
+/// The one implementation of PS3.4 C.2.2.2.5 range matching for DT: a single
+/// value names a PERIOD (so a date-only value matches its whole day) and a
+/// `lo-hi` pair is an inclusive window with either end open. Every matcher that
+/// takes a DT filter - the workitem search and the push subscription filter -
+/// calls this, so the two can never disagree about what a range means.
+///
+/// `stored` is the value from the record; `pattern` is what the filter asked
+/// for; `default_offset_secs` is the deployment's local UTC offset applied to
+/// values that carry no `&ZZXX` zone (PS3.5 6.2).
+///
+/// Returns `false` for a stored value the parser cannot place in time rather
+/// than guessing, and `false` for a malformed bound rather than widening the
+/// window to match everything.
+pub fn dt_filter_matches(stored: &str, pattern: &str, default_offset_secs: i64) -> bool {
+    let stored = stored.trim_end();
+    let pattern = pattern.trim_end();
+    let Some(stored_i) = dt_instant(stored, default_offset_secs) else {
+        return false;
+    };
+    match split_dt_range(pattern) {
+        (lo_txt, Some(hi_txt)) => {
+            let lo_ok = if lo_txt.is_empty() {
+                true
+            } else {
+                match dt_instant(lo_txt, default_offset_secs) {
+                    Some(lo) => stored_i >= lo,
+                    None => return false,
+                }
+            };
+            let hi_ok = if hi_txt.is_empty() {
+                true
+            } else {
+                match dt_upper_instant(hi_txt, default_offset_secs) {
+                    Some(hi) => stored_i <= hi,
+                    None => return false,
+                }
+            };
+            lo_ok && hi_ok
+        }
+        // One value names a PERIOD, not its lowest instant: `20261115` matches
+        // any instant during that day, and a full-precision value's period is
+        // one second, which keeps exact equality what a single value means.
+        (_, None) => match (
+            dt_instant(pattern, default_offset_secs),
+            dt_upper_instant(pattern, default_offset_secs),
+        ) {
+            (Some(lo), Some(hi)) => stored_i >= lo && stored_i <= hi,
+            _ => false,
+        },
+    }
+}
+
 /// Split a DT range value into its endpoints.
 ///
 /// A DT value may itself begin with an offset-free date, so the range separator
@@ -915,7 +1077,31 @@ fn neg_offset_magnitude_valid(digits: &[u8]) -> bool {
     let Ok(n) = s.parse::<u16>() else {
         return false;
     };
-    n <= 1200
+    // The SAME bound `parse_dt` applies - including the minutes field, which
+    // this used to ignore entirely (`-1299` was accepted as -12:99).
+    offset_in_range_signed(false, (n / 100) as i64, (n % 100) as i64)
+}
+
+/// Whether `HHMM` names an offset PS3.5 6.2 permits: `-1200` through `+1400`.
+///
+/// The bound is asymmetric on purpose (an offset may be an hour further east
+/// of UTC than west), and the minutes field is a clock field. This is the ONE
+/// place the rule lives: `parse_dt` applies it to a value's own zone, and
+/// `split_dt_range` applies it to decide whether a trailing `-HHMM` is an
+/// offset sign or the start of a range endpoint. Two copies of the bound drift,
+/// and a drift here silently re-reads `20261116-0500` as the range
+/// `20261116`..`0500`.
+///
+/// `positive` is the sign: PS3.5 6.2 Note 1 bounds the offset VALUE, so
+/// `-1201` is out of range (past 12:00 west) while `-1200` is in it, and
+/// `+1400` is in while `+1401` is out. A single symmetric window gets one of
+/// those two edges wrong.
+fn offset_in_range_signed(positive: bool, hours: i64, minutes: i64) -> bool {
+    if minutes > 59 {
+        return false;
+    }
+    let (max_hours, max_minutes) = if positive { (14, 0) } else { (12, 0) };
+    hours < max_hours || (hours == max_hours && minutes <= max_minutes)
 }
 
 /// Build `{path}.tmp` - the sibling used by the atomic rename.
@@ -1007,9 +1193,30 @@ mod tests {
         }
     }
 
-    fn store() -> WorkItemStore {
+    /// A store rooted in a `TempDir` that the CALLER keeps alive.
+    ///
+    /// Returning only the store leaked the directory: `TempDir`'s `Drop` ran
+    /// before any test touched the store, so the first insert recreated the
+    /// path unowned and every run left workitem files and temp siblings behind
+    /// in the system temp directory. The fixture keeps the owner in the test
+    /// scope, so the data is removed when the test ends.
+    struct StoreFixture {
+        store: WorkItemStore,
+        // Held for its `Drop`, never read: dropping it deletes the tree.
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for StoreFixture {
+        type Target = WorkItemStore;
+        fn deref(&self) -> &WorkItemStore {
+            &self.store
+        }
+    }
+
+    fn store() -> StoreFixture {
         let dir = tempfile::tempdir().expect("tempdir");
-        WorkItemStore::new(dir.path().join("workitems"))
+        let store = WorkItemStore::new(dir.path().join("workitems"));
+        StoreFixture { store, _dir: dir }
     }
 
     /// An occupied temp name must be SKIPPED, never overwritten.
@@ -1284,6 +1491,46 @@ mod tests {
             ..Default::default()
         };
         assert!(s.search(&f).expect("miss").0.is_empty());
+    }
+
+    /// (0040,4041) Input Readiness State is a matching key of PS3.4 Table
+    /// CC.2.5-3: a `READY` query must exclude an INCOMPLETE record, and a
+    /// record that never stated a readiness is not READY either.
+    #[test]
+    fn search_by_input_readiness_state() {
+        let s = store();
+        for (uid, readiness) in [
+            ("1.2.1", Some("READY")),
+            ("1.2.2", Some("INCOMPLETE")),
+            ("1.2.3", None),
+        ] {
+            let mut rec = sample(uid, "SCHEDULED", "2026-01-01");
+            rec.input_readiness = readiness.map(str::to_string);
+            s.insert(&rec).expect("insert");
+        }
+
+        let f = StoreFilter {
+            input_readiness: Some("READY"),
+            ..Default::default()
+        };
+        let (r, _) = s.search(&f).expect("ready");
+        assert_eq!(r.len(), 1, "only the READY record matches: {r:?}");
+        assert_eq!(r[0].workitem_uid, "1.2.1");
+
+        let f = StoreFilter {
+            input_readiness: Some("INCOMPLETE"),
+            ..Default::default()
+        };
+        let (r, _) = s.search(&f).expect("incomplete");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].workitem_uid, "1.2.2");
+
+        // A DICOM CS is case-insensitive on the wire.
+        let f = StoreFilter {
+            input_readiness: Some("ready"),
+            ..Default::default()
+        };
+        assert_eq!(s.search(&f).expect("lowercase").0.len(), 1);
     }
 
     /// A DT with a UTC offset must match a range naming the SAME instant.
@@ -1590,6 +1837,248 @@ mod tests {
         assert_eq!(split_dt_range("20261116-0500"), ("20261116-0500", None));
         assert_eq!(split_dt_range("2026111612-0100"), ("2026111612-0100", None));
         assert_eq!(split_dt_range("2026-2027"), ("2026", Some("2027")));
+    }
+
+    /// PS3.5 6.2 Note 1 bounds an offset to `-1200..+1400` with a real minutes
+    /// field, and `parse_dt` applies the SAME rule as `split_dt_range`.
+    ///
+    /// Without it `20261115120000-0500-2027` split at the FIRST dash: the
+    /// remainder `0500-2027` parsed as year 0500 at -20:27, so the range was
+    /// nonsense and a December 2026 workitem between the real bounds fell out.
+    #[test]
+    fn an_out_of_range_offset_is_not_an_instant() {
+        // Legal bounds are accepted.
+        assert!(dt_instant("20261115120000-1200", 0).is_some());
+        assert!(dt_instant("20261115120000+1400", 0).is_some());
+        assert!(dt_instant("20261115120000+1300", 0).is_some());
+        // Past the bound, or with a minutes field that is not a clock field.
+        assert!(dt_instant("20261115120000+1401", 0).is_none());
+        assert!(dt_instant("20261115120000-1201", 0).is_none());
+        assert!(dt_instant("20261115120000+1260", 0).is_none());
+        assert!(dt_instant("20261115120000+1299", 0).is_none());
+
+        // The consequence: the second dash is the range separator, so the
+        // lower bound keeps its valid `-0500` zone.
+        assert_eq!(
+            split_dt_range("20261115120000-0500-2027"),
+            ("20261115120000-0500", Some("2027"))
+        );
+    }
+
+    /// A range endpoint that does not parse rejects; it is not an open end.
+    ///
+    /// The parsed arm cannot see this: `split_dt_range` only returns a range
+    /// after both endpoints parsed, so a bound there is always readable. The
+    /// arm that CAN see it is the fallback, which runs when the STORED value
+    /// uses a form this parser refuses (PS3.5 Table 6.2-1 admits 4/6/8/10/12/14
+    /// digit prefixes; anything else is unreadable here). That arm filters the
+    /// endpoints itself and used to skip a neighbour that failed:
+    ///
+    /// ```text
+    /// (lo.is_empty() || stored >= lo) && (hi.is_empty() || stored <= hi)
+    /// ```
+    ///
+    /// `split_dt_range` hands back `("", "-junk")` for `--junk` and
+    /// `("2026", "-0x")` never - but it DOES hand back a two-endpoint range
+    /// straight from the client string when both halves parse, and that range
+    /// is re-tested against the stored text lexically. The hole is the reverse
+    /// direction: the stored text is unreadable AND a bound is unreadable, and
+    /// the old code answered "inside the range" instead of "not comparable".
+    ///
+    /// PS3.18 8.3.4.2.2.1 makes a value the service cannot use a client error;
+    /// a query layer that cannot read a bound must never answer with more than
+    /// it was asked for.
+    #[test]
+    fn an_unreadable_stored_value_still_honours_every_bound() {
+        let s = store();
+        let mut rec = sample("1.2.840.31", "SCHEDULED", "2026-01-01");
+        // A 13-digit run: not a DT prefix `parse_dt` accepts, so the stored
+        // value falls into the lexical fallback.
+        rec.sps_start_datetime = Some("2026111612000".to_string());
+        s.insert(&rec).expect("insert");
+
+        // Lexically "2026111612000" < "20240101", so an upper bound of
+        // 2024-01-01 excludes it.
+        let f = StoreFilter {
+            sps_start_datetime: Some("-20240101"),
+            ..Default::default()
+        };
+        let (rows, _) = s.search(&f).expect("search");
+        assert_eq!(rows.len(), 0, "the upper bound still excludes it");
+
+        // Lexically "2026111612000" > "20270101", so a lower bound of
+        // 2027-01-01 excludes it too.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20270101-"),
+            ..Default::default()
+        };
+        let (rows, _) = s.search(&f).expect("search");
+        assert_eq!(rows.len(), 0, "the lower bound still excludes it");
+
+        // A range that genuinely brackets it still matches: the fallback is a
+        // narrower answer, not an empty one.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20260101-20270101"),
+            ..Default::default()
+        };
+        let (rows, _) = s.search(&f).expect("search");
+        assert_eq!(rows.len(), 1, "a bracketing range still matches");
+    }
+
+    /// A present-but-unreadable range endpoint rejects; it is not an open end.
+    ///
+    /// `split_dt_range` hands back a range for a leading dash whatever follows
+    /// it: `"-2026111"` yields `("", Some("2026111"))`, and a 7-digit run is
+    /// not a DT prefix PS3.5 Table 6.2-1 admits, so `dt_instant` refuses it.
+    /// `.is_none_or(...)` collapsed that refusal into "no upper bound", so the
+    /// query matched every workitem regardless of when it starts - strictly
+    /// WIDER than the ask, and the difference between an empty worklist and
+    /// somebody else's.
+    ///
+    /// PS3.18 8.3.4.2.2.1 makes a value the service cannot use a client error,
+    /// and a query layer that cannot read a bound must never answer with more
+    /// than it was asked for. Only an EMPTY endpoint is an open end.
+    #[test]
+    fn an_unreadable_range_endpoint_does_not_widen_the_range() {
+        let s = store();
+        let mut inside = sample("1.2.840.30", "SCHEDULED", "2026-01-01");
+        inside.sps_start_datetime = Some("20260115000000".to_string());
+        s.insert(&inside).expect("insert inside");
+
+        // `-2026111`: open lower bound, upper endpoint unreadable.
+        let f = StoreFilter {
+            sps_start_datetime: Some("-2026111"),
+            ..Default::default()
+        };
+        let (rows, n) = s.search(&f).expect("search");
+        assert_eq!(
+            (rows.len(), n),
+            (0, 0),
+            "an unreadable upper bound must not open the range"
+        );
+
+        // A readable range still matches: the guard rejects only what it
+        // cannot read.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20260101-20260131"),
+            ..Default::default()
+        };
+        let (rows, _) = s.search(&f).expect("search");
+        assert_eq!(rows.len(), 1, "a readable range still matches");
+    }
+
+    /// The same rule in the fallback arm, reached when the STORED value is the
+    /// one this parser cannot read.
+    ///
+    /// A 13-digit run is not a DT prefix PS3.5 Table 6.2-1 admits, so the
+    /// stored text is compared lexically - the only ordering available for
+    /// something that cannot be placed in time. That arm filtered its own
+    /// endpoints and skipped an unreadable one, so an unreadable bound widened
+    /// the range exactly as in the parsed arm. Lexical comparison is right;
+    /// dropping a bound is not.
+    #[test]
+    fn an_unreadable_bound_still_rejects_an_unreadable_stored_value() {
+        let s = store();
+        let mut rec = sample("1.2.840.31", "SCHEDULED", "2026-01-01");
+        rec.sps_start_datetime = Some("2026111612000".to_string());
+        s.insert(&rec).expect("insert");
+
+        let f = StoreFilter {
+            sps_start_datetime: Some("-2026111"),
+            ..Default::default()
+        };
+        let (rows, n) = s.search(&f).expect("search");
+        assert_eq!(
+            (rows.len(), n),
+            (0, 0),
+            "an unreadable upper bound must not open the range"
+        );
+
+        // The lexical ordering alone would have ACCEPTED this one: the stored
+        // text sorts before the bound. The unreadable bound is what rejects
+        // it, which is the whole point - a bound this code cannot read says
+        // nothing about where the stored value sits.
+        let mut low = sample("1.2.840.32", "SCHEDULED", "2026-01-01");
+        low.sps_start_datetime = Some("!unreadable".to_string());
+        s.insert(&low).expect("insert");
+        let round = s.find_by_uid("1.2.840.32").expect("find").expect("present");
+        assert_eq!(
+            round.sps_start_datetime.as_deref(),
+            Some("!unreadable"),
+            "the stored datetime must round-trip verbatim"
+        );
+        let (rows, n) = s.search(&f).expect("search");
+        assert_eq!(
+            (rows.len(), n),
+            (0, 0),
+            "the unreadable bound rejects regardless of lexical order"
+        );
+    }
+
+    /// A trailing SPACE on a stored DT is encoding padding, not data.
+    ///
+    /// PS3.5 6.2 requires character-string VRs other than UI to be padded with
+    /// SPACE when an odd length would otherwise result, and DT is one of them
+    /// (standard/ps3.5/string-value-padding.json `spacePaddedVrs`). Without
+    /// stripping it the value failed to parse, fell through to the lexical
+    /// fallback, and stopped matching the same instant written in another
+    /// zone - a workitem the client asked for answered "absent".
+    #[test]
+    fn a_trailing_space_on_a_stored_dt_does_not_change_its_instant() {
+        let s = store();
+        let mut rec = sample("1.2.840.40", "SCHEDULED", "2026-01-01");
+        rec.sps_start_datetime = Some("20261115120000+0100 ".to_string());
+        s.insert(&rec).expect("insert");
+
+        // Same instant, written in UTC: 12:00+0100 is 11:00Z.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115110000+0000"),
+            ..Default::default()
+        };
+        let (rows, _) = s.search(&f).expect("search");
+        assert_eq!(rows.len(), 1, "the padded stored value still names 11:00Z");
+        assert_eq!(rows[0].workitem_uid, "1.2.840.40");
+
+        // A padded QUERY value is the same value: padding is the transport's,
+        // not the client's intent.
+        let f = StoreFilter {
+            sps_start_datetime: Some("20261115110000+0000 "),
+            ..Default::default()
+        };
+        let (rows, _) = s.search(&f).expect("search");
+        assert_eq!(rows.len(), 1, "a padded query still matches");
+    }
+
+    /// Deleting an ALREADY-absent workitem still runs the directory barrier.
+    ///
+    /// A previous delete can unlink the file and then fail the barrier; the
+    /// retry finds nothing and used to return `Ok(false)` without flushing the
+    /// directory. The retry then reported a completed deletion whose directory
+    /// update was never made durable, and a crash could bring the workitem
+    /// back. The barrier is therefore run on the `NotFound` path too.
+    ///
+    /// Unix-only because the barrier is: Windows cannot open a directory for
+    /// `FlushFileBuffers`, so there is no barrier to assert there.
+    #[cfg(unix)]
+    #[test]
+    fn deleting_an_absent_workitem_still_barriers_the_directory() {
+        let s = store();
+        let mut rec = sample("1.2.840.41", "SCHEDULED", "2026-01-01");
+        rec.sps_start_datetime = Some("20261116120000".to_string());
+        s.insert(&rec).expect("insert");
+
+        // First delete removes the file and barriers.
+        assert!(s.delete("1.2.840.41").expect("delete"), "the file existed");
+
+        // Second delete finds nothing; it must still barrier, because the
+        // unlink it is completing may be the one whose barrier failed.
+        let (out, barriers) =
+            crate::durable::count_barriers_in_scope(|| s.delete("1.2.840.41").expect("delete"));
+        assert!(!out, "nothing was removed");
+        assert_eq!(
+            barriers, 1,
+            "the absent-file path must run the same directory barrier"
+        );
     }
 
     /// A day-precision query with a negative offset matches a stored instant

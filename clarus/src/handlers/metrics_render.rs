@@ -77,13 +77,14 @@ pub fn render_metrics() -> String {
         CLARUS_IDX_HEALED_TOTAL, CLARUS_IDX_STALE_OBJECTS, CLARUS_LOG_DROPPED, COMMITMENT_GET,
         COMMITMENT_POST, DICOM_STOW_PARSE_ERRORS, DISK_FREE_GB, DISK_FREE_PCT, ERASE_PENDING,
         HTTP_DURATION_COUNT, HTTP_DURATION_SUM_US, HTTP_REQUESTS_ACTIVE, HTTP_REQUESTS_TOTAL,
-        INSTANCES_STORED_TOTAL, IOCM_ANYCLASS_IGNORED_TOTAL, MANIFEST_CORRUPT, MANIFEST_DEGRADED,
-        MANIFEST_MISSING, NUM_STATUS_CLASSES, ORPHANS_PENDING, PROCESS_RSS_BYTES,
-        REJECTED_BY_REASON, REJECTED_INSTANCES_TOTAL, REQUEST_DURATION, RESTORED_BY_REASON,
-        ROUTE_COUNTERS, ROUTE_DURATION_COUNT, ROUTE_DURATION_SUM_US, STATUS_2XX, STATUS_4XX,
-        STATUS_5XX, STORAGE_BYTES_TOTAL, STORAGE_INSTANCES_TOTAL, STORAGE_OBJECTS_TOTAL,
-        STORAGE_READ_BYTES, STORAGE_UNREFERENCED_TOTAL, STORAGE_WRITE_BYTES, STOW_DUPLICATES_TOTAL,
-        UPS_PUSH_DROPPED, UPS_PUSH_RETRIES, UPS_PUSHED,
+        INSTANCES_STORED_TOTAL, IOCM_ANYCLASS_IGNORED_TOTAL, JOURNAL_EVICTED, MANIFEST_CORRUPT,
+        MANIFEST_DEGRADED, MANIFEST_MISSING, NUM_STATUS_CLASSES, ORPHANS_PENDING,
+        PROCESS_RSS_BYTES, REJECTED_BY_REASON, REJECTED_INSTANCES_TOTAL, REQUEST_DURATION,
+        RESTORED_BY_REASON, ROUTE_COUNTERS, ROUTE_DURATION_COUNT, ROUTE_DURATION_SUM_US,
+        STATUS_2XX, STATUS_4XX, STATUS_5XX, STORAGE_BYTES_TOTAL, STORAGE_INSTANCES_TOTAL,
+        STORAGE_OBJECTS_TOTAL, STORAGE_READ_BYTES, STORAGE_UNREFERENCED_TOTAL, STORAGE_WRITE_BYTES,
+        STOW_DUPLICATES_TOTAL, TRANSCODE_DENIED, TRANSCODE_PEAK, TRANSCODE_TOTAL, UPS_PUSH_DROPPED,
+        UPS_PUSH_RETRIES, UPS_PUSHED,
     };
     use std::sync::atomic::Ordering;
 
@@ -136,10 +137,13 @@ pub fn render_metrics() -> String {
     for (i, info) in ROUTE_INFO.iter().enumerate() {
         for sc_idx in 0..NUM_STATUS_CLASSES {
             let val = ROUTE_COUNTERS[i * NUM_STATUS_CLASSES + sc_idx].load(Ordering::Relaxed);
-            // Metrics: skip zero-valued labels - Prometheus fills gaps automatically
-            if val == 0 {
-                continue;
-            }
+            // Emit EVERY known series, including zero. Prometheus creates no
+            // sample for a label set that was never exported, so a scrape
+            // taken before the first request of a class sees the series
+            // disappear and then appear at 1 - the increment itself is lost,
+            // and `rate()` cannot recover it because it has no earlier sample
+            // to subtract. ROUTE_INFO is a fixed table, so the cardinality is
+            // bounded and exporting zeros costs nothing.
             let status_label = match sc_idx {
                 STATUS_2XX => "2xx",
                 STATUS_4XX => "4xx",
@@ -165,10 +169,10 @@ pub fn render_metrics() -> String {
     );
     out.push_str("# TYPE clarus_http_route_duration_seconds_count counter\n");
     for (i, info) in ROUTE_INFO.iter().enumerate() {
+        // Zero is exported, for the same reason as the labeled counters: the
+        // route table is fixed, and a `_count` series that appears only after
+        // the first request makes the first `rate()` window unseen.
         let count = ROUTE_DURATION_COUNT[i].load(Ordering::Relaxed);
-        if count == 0 {
-            continue; // same zero-skip policy as the labeled counters
-        }
         let sum_us = ROUTE_DURATION_SUM_US[i].load(Ordering::Relaxed);
         let handler_label = format!("handler=\"{}\"", info.handler);
         let _ = writeln!(
@@ -244,6 +248,59 @@ pub fn render_metrics() -> String {
         CAS_BLOBS_UNREADABLE.load(Ordering::Relaxed),
     );
 
+    // --- clarus_audit_journal_evicted_total (2808) ---
+    // The audit journal is fail-open: a full journal drops an entry rather
+    // than blocking a STOW. That is the intended policy, but a dropped entry
+    // leaves a HOLE - the journal reads as complete while a request is
+    // missing from it. This counter is the only signal that the hole exists,
+    // and it is deliberately separate from the access-journal drop counters,
+    // which track a different journal.
+    out.push_str(
+        "# HELP clarus_audit_journal_evicted_total Audit journal entries evicted because the journal was full.\n",
+    );
+    out.push_str("# TYPE clarus_audit_journal_evicted_total counter\n");
+    push_metric(
+        &mut out,
+        "clarus_audit_journal_evicted_total",
+        None,
+        JOURNAL_EVICTED.load(Ordering::Relaxed),
+    );
+
+    // --- clarus_transcode_pool (2608) ---
+    // A pool event lasts well under a scrape interval, so an instantaneous
+    // gauge sample would almost always read zero. The counters are what make
+    // saturation visible: `_denied_total` steps when the pool answered 503,
+    // and `_peak` records whether it was EVER full. In a build without the
+    // transcode feature both stay 0, which is the honest reading.
+    out.push_str(
+        "# HELP clarus_transcode_total Transcodes and renders completed by the bounded pool.\n",
+    );
+    out.push_str("# TYPE clarus_transcode_total counter\n");
+    push_metric(
+        &mut out,
+        "clarus_transcode_total",
+        None,
+        TRANSCODE_TOTAL.load(Ordering::Relaxed),
+    );
+    out.push_str(
+        "# HELP clarus_transcode_denied_total Requests the pool refused with 503 because every permit was held.\n",
+    );
+    out.push_str("# TYPE clarus_transcode_denied_total counter\n");
+    push_metric(
+        &mut out,
+        "clarus_transcode_denied_total",
+        None,
+        TRANSCODE_DENIED.load(Ordering::Relaxed),
+    );
+    out.push_str("# HELP clarus_transcode_peak Highest number of pool permits held at one time.\n");
+    out.push_str("# TYPE clarus_transcode_peak gauge\n");
+    push_metric(
+        &mut out,
+        "clarus_transcode_peak",
+        None,
+        TRANSCODE_PEAK.load(Ordering::Relaxed),
+    );
+
     // --- clarus_commitment_requests_total (0210) ---
     // The verdict distribution of Storage Commitment over DICOMweb: POST is
     // the request, GET is the verdict poll (PS3.18 13.4/13.5).
@@ -251,10 +308,10 @@ pub fn render_metrics() -> String {
     out.push_str("# TYPE clarus_commitment_requests_total counter\n");
     for (method, counters) in [("POST", &COMMITMENT_POST), ("GET", &COMMITMENT_GET)] {
         for (sc_idx, counter) in counters.iter().enumerate() {
+            // Emitted even at zero: the method x status matrix is a fixed,
+            // bounded set, and an omitted zero would make the first request
+            // of a class the series' first sample.
             let val = counter.load(Ordering::Relaxed);
-            if val == 0 {
-                continue;
-            }
             let status_label = match sc_idx {
                 STATUS_2XX => "2xx",
                 STATUS_4XX => "4xx",
@@ -618,6 +675,31 @@ pub fn render_metrics() -> String {
         None,
         access_dropped,
     );
+    // Accepted-then-lost batches. Deliberately a SEPARATE series from the
+    // ring-full drops: this one is evidence loss, not backpressure.
+    let access_write_failed = crate::metrics::ACCESS_AUDIT_WRITE_FAILED.load(Ordering::Relaxed);
+    out.push_str(
+        "# HELP clarus_access_audit_write_failed_total Access journal batches accepted but not persisted.\n",
+    );
+    out.push_str("# TYPE clarus_access_audit_write_failed_total counter\n");
+    push_metric(
+        &mut out,
+        "clarus_access_audit_write_failed_total",
+        None,
+        access_write_failed,
+    );
+    let access_write_failed_bytes =
+        crate::metrics::ACCESS_AUDIT_WRITE_FAILED_BYTES.load(Ordering::Relaxed);
+    out.push_str(
+        "# HELP clarus_access_audit_write_failed_bytes_total Bytes in batches the access journal could not persist.\n",
+    );
+    out.push_str("# TYPE clarus_access_audit_write_failed_bytes_total counter\n");
+    push_metric(
+        &mut out,
+        "clarus_access_audit_write_failed_bytes_total",
+        None,
+        access_write_failed_bytes,
+    );
     let access_anonymous = crate::metrics::ACCESS_ANONYMOUS_TOTAL.load(Ordering::Relaxed);
     out.push_str("# HELP clarus_access_anonymous_total Access events without user attribution.\n");
     out.push_str("# TYPE clarus_access_anonymous_total counter\n");
@@ -769,6 +851,78 @@ mod tests {
         assert!(
             out.contains("\nclarus_disk_free_percent 37\n"),
             "missing clarus_disk_free_percent sample:\n{out}"
+        );
+    }
+
+    /// The shadow-journal eviction counter must reach `/metrics`. An eviction
+    /// leaves a hole that makes the journal read as complete, so a counter that
+    /// nothing exports is the same as no signal at all.
+    #[test]
+    fn audit_journal_evictions_are_rendered() {
+        let out = render_metrics();
+        assert!(
+            out.contains("# TYPE clarus_audit_journal_evicted_total counter\n"),
+            "the eviction counter must be declared:\n{out}"
+        );
+        assert!(
+            out.contains("\nclarus_audit_journal_evicted_total "),
+            "the eviction counter must carry a sample:\n{out}"
+        );
+    }
+
+    /// The transcode pool must publish its completed/denied totals and its
+    /// peak permit high-water: a pool event is far shorter than a scrape
+    /// interval, so only the counters can show saturation.
+    #[test]
+    fn transcode_pool_metrics_are_rendered() {
+        let out = render_metrics();
+        assert!(
+            out.contains("# TYPE clarus_transcode_total counter\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("# TYPE clarus_transcode_denied_total counter\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("# TYPE clarus_transcode_peak gauge\n"),
+            "{out}"
+        );
+        for name in [
+            "clarus_transcode_total",
+            "clarus_transcode_denied_total",
+            "clarus_transcode_peak",
+        ] {
+            assert!(
+                out.contains(&format!("\n{name} ")),
+                "{name} must carry a sample:\n{out}"
+            );
+        }
+    }
+
+    /// A fixed counter series is exported at ZERO, not omitted. Prometheus
+    /// creates no sample for a label set that was never exported, so a scrape
+    /// taken before the first request of a class would make that request the
+    /// series' first sample and `rate()` could never see the increment.
+    #[test]
+    fn fixed_series_are_exported_at_zero() {
+        let out = render_metrics();
+        // Every route x status combination, including the ones never used.
+        assert!(
+            out.contains(
+                r#"clarus_http_requests_labeled{method="GET",handler="wado_study",status="5xx"} 0"#
+            ),
+            "a zero-valued labeled series must still be exported:\n{out}"
+        );
+        // Commitment: the whole method x status matrix.
+        assert!(
+            out.contains("clarus_commitment_requests_total{method=\"GET\",status=\"5xx\"} 0"),
+            "the commitment matrix must be complete:\n{out}"
+        );
+        // Route durations: `_count` present even with no requests.
+        assert!(
+            out.contains("clarus_http_route_duration_seconds_count{handler=\"wado_study\"} 0"),
+            "route duration counts must be exported at zero:\n{out}"
         );
     }
 }

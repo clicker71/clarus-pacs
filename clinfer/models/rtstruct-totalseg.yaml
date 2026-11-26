@@ -1,0 +1,70 @@
+# RT Structure Set: organ contours from a head/neck CT.
+#
+# DISABLED by default. To enable: give TotalSegmentator its own venv
+# (it pulls torch), install it there, and PRE-DOWNLOAD the weights:
+#
+#   python -m totalsegmentator.bin.totalseg_download_weights
+#
+# The first run otherwise fetches ~2 GB, which alone can exceed
+# runtime.timeout_secs.
+
+enabled: false
+
+title: "Craniofacial CT segmentation (TotalSegmentator)"
+description: "Traced organ contours on a craniofacial CT, stored as an RT Structure Set."
+
+provider:
+  name: "RTSTRUCT-CT-totalseg"
+  vendor: "Clarus"
+  version: "1.0"
+
+procedure_code:
+  value: "363680008"
+  scheme: "http://snomed.info/sct"
+  meaning: "Radiographic imaging procedure"
+
+input_requirements:
+  modalities: [CT]
+  anatomy:
+    - system: "http://snomed.info/sct"
+      code: "12738006"
+      meaning: "Brain structure"
+
+output_capabilities:
+  sop_classes: ["1.2.840.10008.5.1.4.1.1.481.3"]
+
+parameters:
+  - code: TASK
+    type: string
+    text: "TotalSegmentator task"
+    default: "craniofacial_structures"
+  - code: MIN_AREA_PX
+    type: decimal
+    text: "Smallest traced area, pixels"
+    default: 40.0
+    min: 0.0
+  - code: MAX_COMPONENTS
+    type: integer
+    text: "Components per organ"
+    default: 3
+    min: 1
+  - code: MAX_POINTS
+    type: integer
+    text: "Points per contour"
+    default: 600
+    min: 3
+
+match:
+  modality: [CT]
+
+runtime:
+  script: "../abi/RTSTRUCT-CT-totalseg.py"
+  interpreter: "python3"
+  timeout_secs: 1800
+  # The masks are workdir FILES, so this budget is spent on the contours only.
+  max_result_bytes: 64m
+
+outputs:
+  - kind: rtstruct
+    series_description: "Jaw CT Segmentation"
+    profile_version: 1

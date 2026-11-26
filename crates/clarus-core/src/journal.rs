@@ -482,19 +482,27 @@ pub fn format_plaintext(ev: &DecodedEvent, user_name: Option<&str>, out: &mut Ve
     // stamp yesterday's events with today's date. Tokens without a stamp (IPv6
     // events) fall back to the drain time, which is the closest instant the
     // token still knows.
+    // A conversion failure must stay VISIBLE as a failure. It used to render
+    // as 1970-01-01, which reads as a real event at the epoch; the marker below
+    // is not a date, so it can never be mistaken for one. This path is
+    // reachable: the token's instant is attacker-visible data on the wire
+    // (IPv6 events carry no stamp, and a damaged token can carry any i64).
     let now = match ev.epoch_secs {
         Some(secs) => crate::time::from_epoch_secs(secs as i64),
         None => crate::time::local_now(),
     };
-    fmt_date(
-        out,
-        now.year as u32,
-        now.month,
-        now.day,
-        now.hour,
-        now.minute,
-        now.second,
-    );
+    match now {
+        Ok(t) => fmt_date(
+            out,
+            t.year as u32,
+            t.month,
+            t.day,
+            t.hour,
+            t.minute,
+            t.second,
+        ),
+        Err(_) => out.extend_from_slice(b"<no-local-time>"),
+    }
 
     out.extend_from_slice(b" [");
     out.extend_from_slice(ev.code.level.tag().as_bytes());
@@ -656,7 +664,8 @@ mod tests {
         let mut out = Vec::new();
         format_plaintext(&d, None, &mut out);
         let line = String::from_utf8_lossy(&out);
-        let expected = crate::time::from_epoch_secs(queued as i64);
+        let expected =
+            crate::time::from_epoch_secs(queued as i64).expect("the queued instant must convert");
         let prefix = format!(
             "{:04}/{:02}/{:02}",
             expected.year, expected.month, expected.day

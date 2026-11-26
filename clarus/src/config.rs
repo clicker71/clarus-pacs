@@ -85,10 +85,18 @@ pub struct AuditConfig {
     pub access_prune_dry_run: bool,
 }
 
+impl AuditConfig {
+    /// Shipped default for `access_retention_days` (3 years).
+    pub const DEFAULT_ACCESS_RETENTION_DAYS: u64 = 1095;
+    /// Upper bound of `access_retention_days` (inclusive; 0 = keep forever).
+    /// 36_500 days is a century: past it the value is a typo, not a policy.
+    pub const MAX_ACCESS_RETENTION_DAYS: u64 = 36_500;
+}
+
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
-            access_retention_days: 1095,
+            access_retention_days: Self::DEFAULT_ACCESS_RETENTION_DAYS,
             auth_warn_interval_min: 60,
             access_prune_dry_run: false,
         }
@@ -329,8 +337,25 @@ impl UpsConfig {
     pub const DEFAULT_WORKITEM_CODE_FALLBACK: &'static str = "GENERIC-AI";
     /// The shipped code meaning.
     pub const DEFAULT_WORKITEM_CODE_MEANING: &'static str = "AI inference";
-    /// Upper bound of an AE Title (PS3.5 Table 6.2-1: AE, 16 chars).
+    /// Upper bound of an AE Title (PS3.5 Table 6.2-1: AE, 16 bytes).
+    ///
+    /// Bound to the curated reference in
+    /// `standard/ps3.5/vr-value-lengths-6.2-1.json`; the `vr_lengths_from_standard`
+    /// test asserts every constant in this block against it, so a wrong digit
+    /// fails a test instead of rejecting a conformant value in the field.
     pub const MAX_AE_TITLE: usize = 16;
+
+    /// Upper bound of a CS value (PS3.5 Table 6.2-1: CS, 16 bytes). A Modality
+    /// and a Coding Scheme Designator are CS values.
+    pub const MAX_CS: usize = 16;
+
+    /// Upper bound of an SH value (PS3.5 Table 6.2-1: SH, 16 chars). A Code
+    /// Value is an SH.
+    pub const MAX_SH: usize = 16;
+
+    /// Upper bound of an LO value (PS3.5 Table 6.2-1: LO, 64 chars). A Code
+    /// Meaning is an LO.
+    pub const MAX_LO: usize = 64;
 
     /// The code value for one study Modality, or the fallback.
     ///
@@ -424,6 +449,11 @@ impl UpsConfig {
         // caller to keep its iterator alive for the life of the result.
         let mut pairs: Vec<(String, &str)> = Vec::new();
         let mut has_candidate = false;
+        // Whether ANY catalog row matched a candidate, BEFORE the manual-code
+        // filter. The fallback is for UNLISTED input; a modality that IS listed
+        // but whose only code is parked is listed, and inventing a generic task
+        // for it asks a performer to analyse work the site declared manual.
+        let mut matched_any_row = false;
         for modality in modalities {
             let modality = modality.as_ref().trim();
             if modality.is_empty() || self.is_non_task_modality(modality) {
@@ -435,19 +465,23 @@ impl UpsConfig {
             //     creates them through UPS Create. A manual code therefore
             //     never reaches the mint, so no readiness debounce is armed for
             //     it either (there is nothing to promote).
-            pairs.extend(
-                self.workitem_codes
-                    .iter()
-                    .filter(|(key, _)| key.eq_ignore_ascii_case(modality))
-                    .filter(|(_, value)| !self.is_manual_code(value))
-                    .map(|(_, value)| (modality.to_string(), value.as_str())),
-            );
+            for (key, value) in &self.workitem_codes {
+                if !key.eq_ignore_ascii_case(modality) {
+                    continue;
+                }
+                matched_any_row = true;
+                if !self.is_manual_code(value) {
+                    pairs.push((modality.to_string(), value.as_str()));
+                }
+            }
         }
         // (3) An unlisted input takes the fallback only if the site opted in.
-        //     A fallback has no catalog row, so it gets no trigger modality of
-        //     its own - the record then carries none, which is the honest
-        //     shape for a generic task that belongs to no particular modality.
-        let opted_in = pairs.is_empty() && has_candidate;
+        //     "Unlisted" means no row matched at all: a matched-but-parked row
+        //     is listed, and falls through to nothing rather than to a
+        //     generated task. A fallback has no catalog row, so it gets no
+        //     trigger modality of its own - the record then carries none, which
+        //     is the honest shape for a generic task.
+        let opted_in = pairs.is_empty() && has_candidate && !matched_any_row;
         if let (true, Some(fallback)) = (opted_in, self.workitem_code_fallback.as_deref()) {
             pairs.push((String::new(), fallback));
         }
@@ -1273,7 +1307,7 @@ fn is_known_key(section: &str, key: &str) -> bool {
         // modality key is not folded any more: the site writes DX or dx and
         // the lookup compares case-insensitively.
         !key.is_empty()
-            && key.len() <= 16
+            && key.len() <= UpsConfig::MAX_CS
             && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
     }
     /// `[ups.manual_codes]` is a set of code VALUES, so its keys are the
@@ -1287,7 +1321,9 @@ fn is_known_key(section: &str, key: &str) -> bool {
     /// so the parser does not fold them (`section_is_code_valued`) and the set
     /// keeps the spelling the site used.
     fn is_code_set_key(key: &str) -> bool {
-        !key.is_empty() && key.len() <= 16 && key.bytes().all(|b| b.is_ascii_graphic())
+        !key.is_empty()
+            && key.len() <= UpsConfig::MAX_SH
+            && key.bytes().all(|b| b.is_ascii_graphic())
     }
     /// `[ups.code_meaning]` is CODE -> MEANING, the label each catalog entry
     /// carries. Its keys are code values (validated as such) and its VALUES
@@ -1307,7 +1343,7 @@ fn is_known_key(section: &str, key: &str) -> bool {
     /// folded.
     fn is_coding_scheme_key(key: &str) -> bool {
         !key.is_empty()
-            && key.len() <= 16
+            && key.len() <= UpsConfig::MAX_CS
             && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
     }
     const WORKFLOW: &[&str] = &[
@@ -2202,8 +2238,24 @@ impl Config {
             modifying_system: p.get("server", "modifying_system").map(|s| s.to_string()),
 
             // -- Storage tiers ---------------------------------------
+            // A BLANK value is not "not configured": it resolved to the base
+            // directory itself, so enabling cold migration with an empty path
+            // ordered every aged instance moved into the live data root. Treat
+            // blank as absent, but say so, because a key the operator wrote and
+            // that does nothing is a silent misconfiguration.
             cold_path: p
                 .get("storage_tiers", "cold_path")
+                .map(str::trim)
+                .filter(|s| {
+                    if s.is_empty() {
+                        crate::clog_warn!(
+                            "clarus.conf [storage_tiers] cold_path is blank; cold tier disabled"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .map(|s| resolve(base_dir, s)),
             migration: parse_migration_schedule(&p, base_dir)?,
 
@@ -2684,7 +2736,35 @@ impl Config {
 
             // == [audit] access journal (2808) ==================
             audit: AuditConfig {
-                access_retention_days: p.get_or("audit", "access_retention_days", 1095u64),
+                // Validated, not `get_or`. `get_or` parses the raw text and
+                // falls back to the default on ANY parse failure, so a typo
+                // (`1095d`, a negative number, an empty value) silently became
+                // the shipped default and the operator kept believing their
+                // retention window was in force - the exact class the sibling
+                // `[commitment]` and `[ups]` dials were already fixed for. A
+                // bad knob must be an error, not a quiet substitution.
+                access_retention_days: {
+                    match p.get("audit", "access_retention_days") {
+                        None => AuditConfig::DEFAULT_ACCESS_RETENTION_DAYS,
+                        Some(raw) => {
+                            let v: u64 = raw.trim().parse().map_err(|_| {
+                                format!(
+                                    "clarus.conf [audit] access_retention_days: {raw:?} is not \
+                                     an integer in [0..{}]",
+                                    AuditConfig::MAX_ACCESS_RETENTION_DAYS
+                                )
+                            })?;
+                            if v > AuditConfig::MAX_ACCESS_RETENTION_DAYS {
+                                return Err(format!(
+                                    "clarus.conf [audit] access_retention_days: {v} is out of \
+                                     range [0..{}]",
+                                    AuditConfig::MAX_ACCESS_RETENTION_DAYS
+                                ));
+                            }
+                            v
+                        }
+                    }
+                },
                 // 0 / negative / non-numeric -> WARN + default 60 (owner
                 // 28.08): a wrong knob must be visible but never fatal.
                 //
@@ -2785,7 +2865,12 @@ fn parse_migration_schedule(p: &ConfParser, _base_dir: &Path) -> Result<Migratio
     let emergency_check_secs = emergency_check_interval_mins * 60;
 
     // -- Cold (NAS/HDD) backend -----------------------------------
-    let cold_path_raw = p.get("storage_tiers", "cold_path");
+    // Blank counts as unset, matching the `cold_path` field above: the two must
+    // agree or the schedule would order moves into a tier that is not there.
+    let cold_path_raw = p
+        .get("storage_tiers", "cold_path")
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let cold = if cold_path_raw.is_some() {
         let cold_min_age_days =
@@ -3233,13 +3318,17 @@ port = 8024
     /// documented values when omitted; 0 is rejected (range error).
     #[test]
     fn test_config_max_json_body_and_max_part_header() {
+        // These two keys live in `[server]`, so the body must be appended
+        // INSIDE that section. `load_ups` appends after `[storage]`, which
+        // would place them under the wrong section - a fixture shape, not a
+        // behaviour difference, hence a local loader.
         let parse_and_load = |body: &str| -> Result<Config, String> {
             let dir = tempfile::tempdir().expect("tempdir");
             let conf = dir.path().join("clarus.conf");
             std::fs::write(
                 &conf,
                 format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n{body}\n[storage]\nstorage_dir = ./data\n"
+                    "[storage]\nstorage_dir = ./data\n[server]\nhost = 127.0.0.1\nport = 8024\n{body}\n"
                 ),
             )
             .expect("write conf");
@@ -3274,16 +3363,7 @@ port = 8024
     /// bogus value must fail startup, never silently fall back.
     #[test]
     fn test_config_max_frame_bytes() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!("[storage]\nstorage_dir = ./data\n{body}\n[server]\nhost = 127.0.0.1\nport = 8024\n"),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Default when omitted: 64 MiB.
         let c = parse_and_load("").expect("default parse");
@@ -3318,16 +3398,7 @@ port = 8024
     /// 1_000_000, explicit honored, both bounds accepted, ceiling enforced).
     #[test]
     fn test_config_max_frames_per_instance() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!("[storage]\nstorage_dir = ./data\n{body}\n[server]\nhost = 127.0.0.1\nport = 8024\n"),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Default when omitted: 1_000_000.
         let c = parse_and_load("").expect("default parse");
@@ -3368,16 +3439,7 @@ port = 8024
     /// bare integers stay backward compatible, out-of-range is rejected.
     #[test]
     fn test_config_max_batch_bytes_suffix() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!("[storage]\nstorage_dir = ./data\n{body}\n[server]\nhost = 127.0.0.1\nport = 8024\n"),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // "100m" -> 100 MiB (the documented default value).
         let c = parse_and_load("max_batch_bytes = 100m").expect("suffix parse");
@@ -3404,18 +3466,7 @@ port = 8024
     /// unlimited), unlike the [server] size limits where 0 is an error.
     #[test]
     fn test_config_query_default_limit() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Absent -> default 250.
         let c = parse_and_load("").expect("default parse");
@@ -3446,6 +3497,71 @@ port = 8024
         )
         .expect("write conf");
         Config::from_file(&conf)
+    }
+
+    /// `[audit] access_retention_days` is VALIDATED, not substituted.
+    ///
+    /// It was read with `get_or`, which replaces any unparsable text with the
+    /// shipped default. A typo therefore left the default in force while the
+    /// operator believed their own window was set - the journal would keep
+    /// three years of ACCESS lines for a site that asked for thirty days, and
+    /// nothing anywhere said so.
+    #[test]
+    fn test_config_audit_access_retention_rejects_a_bad_value() {
+        // A suffix on an otherwise valid number.
+        let err = load_ups("[audit]\naccess_retention_days = 1095d\n").unwrap_err();
+        assert!(
+            err.contains("access_retention_days"),
+            "the error must name the key: {err}"
+        );
+        // Out of range.
+        let err = load_ups("[audit]\naccess_retention_days = 99999\n").unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+        // Empty value.
+        assert!(load_ups("[audit]\naccess_retention_days =\n").is_err());
+
+        // The legal extremes still parse, including 0 = keep forever.
+        assert_eq!(
+            load_ups("[audit]\naccess_retention_days = 0\n")
+                .expect("0 is legal")
+                .audit
+                .access_retention_days,
+            0
+        );
+        // Absent -> the shipped default, unchanged.
+        assert_eq!(
+            load_ups("")
+                .expect("default parse")
+                .audit
+                .access_retention_days,
+            AuditConfig::DEFAULT_ACCESS_RETENTION_DAYS
+        );
+    }
+
+    /// A blank `[storage_tiers] cold_path` must not enable the cold tier.
+    ///
+    /// `Some("")` resolved to the base directory, so an operator who wrote the
+    /// key and left it empty (or a template that emitted `cold_path =`) got a
+    /// cold backend pointing at the LIVE data root: aged instances would be
+    /// "migrated" onto themselves. Blank is now absent, and the schedule agrees
+    /// with the field so the two cannot disagree about whether the tier exists.
+    #[test]
+    fn test_config_a_blank_cold_path_does_not_enable_the_cold_tier() {
+        let c = load_ups("[storage_tiers]\ncold_path =\n").expect("blank parses");
+        assert!(
+            c.cold_path.is_none(),
+            "a blank path must leave the tier unset, got {:?}",
+            c.cold_path
+        );
+        assert!(
+            c.migration.cold.is_none(),
+            "the schedule must agree that the tier does not exist"
+        );
+
+        // A real path still configures both halves.
+        let c = load_ups("[storage_tiers]\ncold_path = ./cold\n").expect("a real path parses");
+        assert!(c.cold_path.is_some());
+        assert!(c.migration.cold.is_some());
     }
 
     /// The shipped code table: DX and CT are named, and an unlisted or absent
@@ -3715,6 +3831,37 @@ port = 8024
     /// the strict parser refuses a repeated key, so `DX` twice is an error
     /// rather than two records (`test_config_ups_catalog_refusals` pins
     /// that), and one key carrying a list is the shape that fits.
+    /// A modality whose ONLY catalog row is parked must NOT take the fallback.
+    ///
+    /// The catalog filter drops manual codes before the fallback test, so a
+    /// site with `MG = REVIEW-ONLY` in `[ups.manual_codes]` and a fallback
+    /// configured saw MG fall through to the fallback: the row MATCHED, so the
+    /// modality is listed, and minting a generic workitem for it asks a
+    /// performer to analyse work the site explicitly declared manual. The
+    /// fallback is for unlisted input.
+    #[test]
+    fn test_config_ups_a_parked_only_modality_does_not_take_the_fallback() {
+        let c = load_ups(
+            "[ups.workitem_code]\nDX = CXR-AI\nMG = REVIEW-ONLY\n\
+             fallback = GENERIC-AI\n[ups.manual_codes]\nREVIEW-ONLY = parked\n",
+        )
+        .expect("a parked row plus a fallback parses");
+
+        assert!(
+            c.ups.catalog_for_modality(Some("MG")).is_empty(),
+            "MG is listed and parked: nothing is minted, and not the fallback"
+        );
+        // The unlisted case still takes the fallback, so the fix did not
+        // disable the feature it was narrowing.
+        assert_eq!(
+            c.ups.catalog_for_modality(Some("US")),
+            vec!["GENERIC-AI"],
+            "an UNLISTED modality still takes the configured fallback"
+        );
+        // A listed, unparked modality is unaffected.
+        assert_eq!(c.ups.catalog_for_modality(Some("DX")), vec!["CXR-AI"]);
+    }
+
     #[test]
     fn test_config_ups_catalog_lists_every_matching_record() {
         let c = load_ups(
@@ -3750,10 +3897,40 @@ port = 8024
         assert_eq!(c.ups.code_for_modality(Some("DX")), Some("CXR-AI"));
     }
 
+    /// The VR length bounds are the ones in `standard/`.
+    ///
+    /// The four limits used to be bare literals, each with a comment pointing
+    /// at PS3.5 Table 6.2-1. A comment is not a source: the table's AE row says
+    /// "16 bytes", SH "16 chars" and LO "64 chars", and a digit typed wrong
+    /// here would either reject a conformant site value or accept a
+    /// non-conformant one. This reads the curated reference and compares.
+    #[test]
+    fn vr_lengths_come_from_the_standard_reference() {
+        const STD: &str = include_str!("../../standard/ps3.5/vr-value-lengths-6.2-1.json");
+        let compact: String = STD.chars().filter(|c| !c.is_whitespace()).collect();
+
+        for (vr, len) in [
+            ("AE", UpsConfig::MAX_AE_TITLE),
+            ("CS", UpsConfig::MAX_CS),
+            ("SH", UpsConfig::MAX_SH),
+            ("LO", UpsConfig::MAX_LO),
+        ] {
+            let row = format!("\"vr\":\"{vr}\",");
+            let at = compact
+                .find(&row)
+                .unwrap_or_else(|| panic!("{vr} must be recorded in the standard reference"));
+            let tail = &compact[at..];
+            let want = format!("\"maxLength\":{len},");
+            assert!(
+                tail[..tail.find('}').unwrap_or(tail.len())].contains(&want),
+                "{vr} must be {len} in the standard, per the reference row"
+            );
+        }
+    }
+
     /// The shipped defaults: no section at all still yields a workable
     /// catalog for a NAMED modality, and nothing changes for an existing
-    /// deployment.
-    ///
+    /// deployment.    ///
     /// The shipped config has no fallback, so an unlisted modality yields an
     /// EMPTY catalog - that is the opt-in change, and it is deliberate: a
     /// generic workitem nobody claims is worse than no workitem plus a log.
@@ -4166,18 +4343,7 @@ port = 8024
     /// explicit honored). Separate dial from [query] (12.09).
     #[test]
     fn test_config_ups_default_limit() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Absent -> default 100.
         let c = parse_and_load("").expect("default parse");
@@ -4207,18 +4373,7 @@ port = 8024
     /// accepts `0` (= keep forever) and is refused outside `0..=3650`.
     #[test]
     fn test_config_ups_final_state_retention_days() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Absent -> the shipped default.
         let c = parse_and_load("").expect("default parse");
@@ -4255,18 +4410,7 @@ port = 8024
     /// not clamped, so a typo is a startup error rather than a silent UTC).
     #[test]
     fn test_config_ups_local_utc_offset() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Absent -> the shipped default (+0000 = UTC).
         let c = parse_and_load("").expect("default parse");
@@ -4321,18 +4465,7 @@ port = 8024
     /// honored). Off by default: the STOW path is untouched.
     #[test]
     fn test_config_ups_task_producer() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Absent -> false (the shipped default creates no workitems).
         let c = parse_and_load("").expect("default parse");
@@ -4359,18 +4492,7 @@ port = 8024
     /// retry budget than the operator wrote.
     #[test]
     fn test_config_ups_push_attempts() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Absent -> 3.
         let c = parse_and_load("").expect("default parse");
@@ -4415,18 +4537,7 @@ port = 8024
     /// hide a runaway pool or budget.
     #[test]
     fn test_config_transcode_bounded_pool() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Absent -> automatic default N = clamp(cores/4, 1..=32), budget 64.
         let c = parse_and_load("").expect("default parse");
@@ -4488,16 +4599,7 @@ port = 8024
     /// and an out-of-range number names the accepted range.
     #[test]
     fn test_config_bounded_numeric_keys_fail_fast() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!("[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // Absent keys keep their documented defaults (behaviour unchanged).
         let c = parse_and_load("").expect("defaults");
@@ -4684,18 +4786,7 @@ port = 8024
     /// because validation lives in `Config::from_file`.
     #[test]
     fn test_config_log_level_validation() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        let parse_and_load = load_ups;
 
         // All five valid values, including mixed case -> canonical lowercase.
         for (raw, canonical) in [
@@ -4730,18 +4821,11 @@ port = 8024
     /// glob, no forced fuzzymatch); explicit values are honored.
     #[test]
     fn test_config_query_pn_deviations() {
-        let parse_and_load = |body: &str| -> Result<Config, String> {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let conf = dir.path().join("clarus.conf");
-            std::fs::write(
-                &conf,
-                format!(
-                    "[server]\nhost = 127.0.0.1\nport = 8024\n[storage]\nstorage_dir = ./data\n{body}\n"
-                ),
-            )
-            .expect("write conf");
-            Config::from_file(&conf)
-        };
+        // `load_ups` is the shared loader: a second copy of the same
+        // tempdir-and-format closure meant a fixture change had to be made in
+        // two places, and the copy that was not updated silently wrote a
+        // config missing a section its assertions depended on.
+        let parse_and_load = load_ups;
 
         // Absent -> standard: case-sensitive PN, no override.
         let c = parse_and_load("").expect("default parse");

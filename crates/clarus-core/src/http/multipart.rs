@@ -423,8 +423,27 @@ impl<R: Read> MultipartParser<R> {
                 // else is not a delimiter (could be body bytes that merely
                 // begin with the boundary prefix).
                 let sep = buf[bstart..].starts_with(b"\r\n");
-                if closing || sep {
-                    return Some((i, closing, pad));
+                if closing {
+                    // RFC 2046 5.1.1: after the closing `--` comes transport
+                    // padding and then CRLF (or the end of the message). The
+                    // two hyphens alone are a PREFIX of a longer line such as
+                    // `--boundary--X`, which used to end the part and discard
+                    // everything after it: a body byte immediately after `--`
+                    // silently truncated the message.
+                    let cpad = Self::transport_padding_len(buf, bstart + 2);
+                    let cend = bstart + 2 + cpad;
+                    if buf.len() <= cend {
+                        // Cannot tell yet whether CRLF or junk follows.
+                        return None;
+                    }
+                    if !buf[cend..].starts_with(b"\r\n") {
+                        i += d.len();
+                        continue;
+                    }
+                    return Some((i, true, pad));
+                }
+                if sep {
+                    return Some((i, false, pad));
                 }
                 // A boundary-prefixed run INSIDE the body: keep scanning. This
                 // used to `return None`, which told the caller the delimiter
@@ -444,6 +463,20 @@ impl<R: Read> MultipartParser<R> {
     fn read_part_headers(&mut self) -> io::Result<Option<PartHeader>> {
         loop {
             if let Some(p) = self.hdr.windows(4).position(|w| w == b"\r\n\r\n") {
+                // The cap must be checked HERE too, before the split.
+                //
+                // The `len() > HDR_CAP` guard below only runs when the
+                // terminator has not arrived yet, so 5000 header bytes plus the
+                // blank line in ONE fill slipped past it and were accepted -
+                // while the same block split across two reads was rejected.
+                // The header span is everything before the terminator; body
+                // bytes that arrived in the same fill are not counted.
+                if p > HDR_CAP {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "multipart part headers too large",
+                    ));
+                }
                 let after = p + 4;
                 let body_tail = self.hdr.split_off(after);
                 self.hold.clear();
@@ -938,5 +971,54 @@ mod tests {
         let out = collect_reader(ByteReader(&body), b"b");
         assert_eq!(out.len(), 2, "the later real delimiter must still be found");
         assert_eq!(out[1].1, b"BBBB");
+    }
+
+    /// RFC 2046 5.1.1: the closing delimiter is `--boundary--` followed by
+    /// optional transport padding and a CRLF (or the end of the message). The
+    /// two hyphens alone are a PREFIX of a longer line, so `--boundary--X`
+    /// used to end the part and discard everything after it.
+    #[test]
+    fn a_closing_delimiter_with_trailing_junk_is_not_closing() {
+        let body =
+            b"--b\r\nContent-Type: application/dicom\r\n\r\nA\r\n--b--X still body\r\n--b--\r\n";
+        let out = collect(body, b"b");
+        assert_eq!(out.len(), 1, "the junk line is body, not the end");
+        assert_eq!(
+            out[0].1, b"A\r\n--b--X still body",
+            "everything up to the REAL closing delimiter is payload"
+        );
+
+        // A closing delimiter with padding and CRLF still terminates.
+        let body = b"--b\r\nContent-Type: application/dicom\r\n\r\nA\r\n--b--\t \r\n";
+        let out = collect(body, b"b");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, b"A");
+    }
+
+    /// `HDR_CAP` must hold regardless of how the bytes were split across
+    /// reads. Checking it only when the terminator was absent let a header
+    /// block that arrived complete in ONE fill slip through.
+    #[test]
+    fn oversized_part_headers_are_rejected_even_in_one_fill() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--b\r\n");
+        body.extend_from_slice(&vec![b'x'; HDR_CAP + 1024]);
+        body.extend_from_slice(b"\r\n\r\nA\r\n--b--\r\n");
+        let mut p = MultipartParser::new(&body[..], b"b").expect("parser");
+        let mut err = None;
+        for _ in 0..64 {
+            match p.next_event() {
+                Ok(MultipartEvent::End) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(
+            err.is_some(),
+            "an oversized header block must be rejected, not accepted"
+        );
     }
 }

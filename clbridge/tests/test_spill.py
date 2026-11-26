@@ -21,6 +21,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from clean_code.handlers.cmove import _stream_and_send_study, _walk_meta
 from clean_code.streaming import (
+    InvalidDicomPartError,
+    MultipartFramingError,
     SpilledPart,
     _stream_multipart_instances,
 )
@@ -139,21 +141,22 @@ def test_large_part_spills_and_reassembles_byte_exact():
             os.unlink(part.path)
 
 
-def test_spill_file_cleaned_when_stream_truncated():
-    """A truncated oversized part yields nothing and leaves no temp file."""
+def test_stream_truncated_mid_part_raises_and_leaves_no_temp_file():
+    """A truncated oversized part yields nothing, raises a framing failure so
+    the caller does not report a complete transfer, and leaves no temp file."""
     body = _body(2 * 1024 * 1024)
     threshold = 512 * 1024
     before = set(_spill_files())
     wire = _part_bytes(body)
     resp = _MockResponse([wire[: len(wire) // 2]])
-    results = list(_stream_multipart_instances(resp, spill_threshold=threshold))
-    assert results == []
+    with pytest.raises(MultipartFramingError):
+        list(_stream_multipart_instances(resp, spill_threshold=threshold))
     assert set(_spill_files()) - before == set()
 
 
-def test_spilled_invalid_dicom_part_is_skipped_and_unlinked():
-    """An oversized part without DICM magic is skipped and its spill file
-    is dropped - no consumer ever sees it, so nothing leaks."""
+def test_an_invalid_oversized_part_raises_and_is_unlinked():
+    """An oversized part without DICM magic is a defect of the answer, not a
+    part to skip: it raises, and its spill file never leaks."""
     body = (
         b"\x00" * 128
         + b"XXXX"
@@ -162,8 +165,8 @@ def test_spilled_invalid_dicom_part_is_skipped_and_unlinked():
     threshold = 512 * 1024
     before = set(_spill_files())
     resp = _MockResponse([_part_bytes(body) + _final()])
-    results = list(_stream_multipart_instances(resp, spill_threshold=threshold))
-    assert results == []
+    with pytest.raises(InvalidDicomPartError):
+        list(_stream_multipart_instances(resp, spill_threshold=threshold))
     assert set(_spill_files()) - before == set()
 
 

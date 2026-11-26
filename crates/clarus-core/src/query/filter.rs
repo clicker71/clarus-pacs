@@ -84,6 +84,10 @@ pub mod tag {
     /// RequestedProcedureID (0040,1001) - the second scalar of the same
     /// sequence, stored under its own tag.
     pub const REQUESTED_PROCEDURE_ID: u32 = 0x0040_1001;
+    /// RequestAttributesSequence (0040,0275) - SQ. PS3.18 Table 10.6.1-5
+    /// spells two REQUIRED keys as paths THROUGH this sequence, so the
+    /// sequence tag itself is needed to build the path form.
+    pub const REQUEST_ATTRIBUTES_SEQUENCE: u32 = 0x0040_0275;
     pub const STATION_NAME: u32 = 0x0008_1010;
     pub const SERIES_DESCRIPTION: u32 = 0x0008_103E;
     pub const BODY_PART_EXAMINED: u32 = 0x0018_0015;
@@ -117,6 +121,48 @@ pub mod tag {
     pub const REFERENCED_SERIES_UIDS: u32 = 0xFFF0_0001;
     /// Referenced SOP Instance UIDs (from 0008,1140 / 0008,2112).
     pub const REFERENCED_SOP_INSTANCE_UIDS: u32 = 0xFFF0_0002;
+
+    // -- UPS Event Report (PS3.4 CC.2.4.3) --------------------------------
+    //
+    // `standard/ps3.4/ups-cc-2.4-3-event-report.json` holds these three with
+    // their VRs: (0000,1000) Affected SOP Instance UID is a COMMAND attribute
+    // carried in the DICOMweb Event Report JSON, which is why it identifies
+    // the workitem instead of (0008,0018); the other two are the event
+    // information the SCP "shall give the current value of". Rendering them
+    // from named constants keeps the JSON writer from maintaining a second
+    // tag/VR dictionary beside this one.
+
+    /// (0000,1000) Affected SOP Instance UID - UI, the UPS Instance UID.
+    pub const AFFECTED_SOP_INSTANCE_UID: u32 = 0x0000_1000;
+    /// (0040,4041) Input Readiness State - CS.
+    pub const INPUT_READINESS_STATE: u32 = 0x0040_4041;
+    /// (0074,1000) Procedure Step State - CS.
+    pub const PROCEDURE_STEP_STATE: u32 = 0x0074_1000;
+
+    /// The 8-hex-digit query-key spelling of a tag, lowercase.
+    ///
+    /// PS3.18 10.6.1.2 lets a client send either the keyword or the tag form
+    /// `XXXXXXXX` for a matching key (and `XXXXXXXX.XXXXXXXX` for a nested
+    /// one). Building that string from the tag constant - instead of writing
+    /// the digits out again in the parser's alias table - is what keeps the
+    /// two from describing different attributes after one of them is edited.
+    ///
+    /// Lowercase because the parser lowercases every incoming key before it
+    /// looks it up (PS3.18 8.3.4.2: keys are case-insensitive).
+    #[must_use]
+    pub fn qido_alias(tag: u32) -> String {
+        format!("{:08x}", tag)
+    }
+
+    /// The dotted path spelling of a nested query key, `XXXXXXXX.XXXXXXXX`.
+    ///
+    /// PS3.18 10.6.1.2: a key that lives inside a sequence is addressed as the
+    /// sequence tag followed by the nested attribute tag. Built from the two
+    /// constants so the path and the attributes it names cannot diverge.
+    #[must_use]
+    pub fn qido_nested_alias(sequence: u32, nested: u32) -> String {
+        format!("{}.{}", qido_alias(sequence), qido_alias(nested))
+    }
 }
 
 /// The study-level search keys accepted by the QIDO query engine.
@@ -520,8 +566,26 @@ fn predicate_matches(pred: Predicate<'_>, have: &AttrValue) -> bool {
                 _ => None,
             };
             let Some(date) = date else { return false };
-            let lo = from.and_then(|f| f.parse::<u64>().ok());
-            let hi = to.and_then(|t| t.parse::<u64>().ok());
+            // A bound that does not parse is MALFORMED, not absent. `and_then`
+            // collapsed the two: `study_date_from=bad` became `None`, the
+            // `(None, None)` arm read that as "no bounds", and a bad key
+            // matched every study - the one answer a query layer must never
+            // give for input it cannot interpret (PS3.18 8.3.4.2.2.1 treats an
+            // unusable value as a client error).
+            let lo = match from {
+                Some(f) => match f.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(_) => return false,
+                },
+                None => None,
+            };
+            let hi = match to {
+                Some(t) => match t.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(_) => return false,
+                },
+                None => None,
+            };
             match (lo, hi) {
                 (Some(lo), Some(hi)) => date >= lo && date <= hi,
                 (Some(lo), None) => date >= lo,
@@ -550,12 +614,20 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
     let mut star: Option<(usize, usize)> = None;
 
     while ti < text.len() {
-        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == text[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < pat.len() && pat[pi] == '*' {
+        // The wildcard test comes FIRST, before the literal comparison.
+        //
+        // A text that itself contains `*` (a PN search string such as `*ba`)
+        // makes `pat[pi] == text[ti]` true for a pattern star, so the literal
+        // branch consumed the star as an ordinary character: the backtrack
+        // point was never recorded, the next literal failed, and there was
+        // nothing to retry from. `glob_match("*a", "*ba")` was false although
+        // the text starts with a star that the pattern's star should swallow.
+        if pi < pat.len() && pat[pi] == '*' {
             star = Some((pi, ti));
             pi += 1; // try with the `*` consuming nothing yet
+        } else if pi < pat.len() && (pat[pi] == '?' || pat[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
         } else if let Some((sp, st)) = star {
             // Backtrack: let that `*` swallow one more character and retry.
             pi = sp + 1;
@@ -623,8 +695,23 @@ fn write_u64(buf: &mut [u8; 24], mut v: u64) -> &str {
 ///
 /// Uses a pre-built expected map when provided (hotpath), building one
 /// inline only for callers that do not have it.
+/// Does this manifest's STUDY satisfy the query's STUDY-level predicates?
+///
+/// A `SeriesFilter` narrows the series and instances *within* a study; this
+/// asks only what makes a whole study a candidate at all. The two must not be
+/// confused, which is why the Series IE keys (Modality 0008,0060,
+/// SeriesInstanceUID, SeriesNumber, ...) are REMOVED from the expected map
+/// here. `build_expected` inserts them because a filter is also used to match
+/// series and instance attribute lists, and leaving them in made this function
+/// require the STUDY's own Modality to equal a series-level value: a study whose
+/// first series was CT was rejected for `?Modality=PR`, and the PR instance
+/// inside it was never found.
 pub fn match_study_attrs(filter: &QueryFilter, m: &Manifest) -> bool {
-    filter.matches(&m.study.attrs)
+    let mut expected = filter.build_expected();
+    for series_key in [tag::MODALITY, tag::SERIES_INSTANCE_UID, tag::SERIES_NUMBER] {
+        expected.remove(&series_key);
+    }
+    filter.matches_prebuilt(&m.study.attrs, &expected)
         && filter.modalities_in_study_match(m.study.modalities_in_study.as_deref())
         && filter.other_patient_ids_match(attr_text(&m.study.attrs, tag::OTHER_PATIENT_IDS))
 }
@@ -661,6 +748,59 @@ mod tests {
 
     fn attrs(list: &[(u32, AttrValue)]) -> Vec<(u32, AttrValue)> {
         list.to_vec()
+    }
+
+    /// A SERIES key does not decide whether a STUDY matches.
+    ///
+    /// `build_expected` carries Modality (0008,0060) because the same filter
+    /// also matches series and instance attribute lists. Reusing that map for
+    /// the study gate required the STUDY's own Modality - the first series' -
+    /// to equal a series-level value, so `?Modality=PR` on a study whose first
+    /// series was CT rejected the study and never reached the PR series inside
+    /// it.
+    #[test]
+    fn a_series_key_does_not_gate_a_study() {
+        /// A study with one series of `modality`, and nothing else.
+        fn study_only_manifest(modality: &str) -> crate::manifest::Manifest {
+            crate::manifest::Manifest {
+                sys: crate::manifest::SysHeader {
+                    version: 1,
+                    storage_tier: 0,
+                    total_pixel_bytes: 0,
+                    arrived_at: 0,
+                },
+                study: crate::manifest::StudyQido {
+                    attrs: vec![
+                        (tag::PATIENT_ID, AttrValue::Text("P001".into())),
+                        (tag::MODALITY, AttrValue::Text(modality.into())),
+                    ],
+                    ..Default::default()
+                },
+                series: Vec::new(),
+            }
+        }
+
+        let filter = QueryFilter {
+            modality: Some("PR".into()),
+            ..Default::default()
+        };
+        // The study's own Modality is CT, and it does hold a PR series.
+        assert!(
+            match_study_attrs(&filter, &study_only_manifest("CT")),
+            "a series-level Modality must not gate the study scan"
+        );
+
+        // A STUDY-level key still gates it, so the predicate is not disabled.
+        let filter = QueryFilter {
+            patient_id: Some("P001".into()),
+            ..Default::default()
+        };
+        assert!(match_study_attrs(&filter, &study_only_manifest("CT")));
+        let filter = QueryFilter {
+            patient_id: Some("NOPE".into()),
+            ..Default::default()
+        };
+        assert!(!match_study_attrs(&filter, &study_only_manifest("CT")));
     }
 
     #[test]
@@ -963,6 +1103,87 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("", ""));
         assert!(!glob_match("", "x"));
+    }
+
+    /// A `*` must be recorded as a backtrack point BEFORE the next literal is
+    /// compared, so a matcher can retry a star that swallowed the wrong run.
+    ///
+    /// `*a` against `*ba`: the first `*` has to give up one character for the
+    /// literal `*` in the text to line up with the pattern's `*`. A matcher
+    /// that treats the two stars as plain literals returns false here, and a
+    /// PN query written as `*a` then misses names that do start with `*`.
+    #[test]
+    fn a_star_backtracks_instead_of_consuming_a_literal_star() {
+        assert!(glob_match("*a", "*ba"));
+        assert!(glob_match("*a", "xbxa"));
+        assert!(glob_match("*a*a", "xayaaa"));
+        assert!(glob_match("**", "ab"));
+    }
+
+    /// An unparseable date bound must REJECT, not widen the range.
+    ///
+    /// `from.and_then(|f| f.parse().ok())` turned `study_date_from=bad` into
+    /// `None`, which the `(None, None)` arm read as "no bounds" - so a
+    /// malformed key matched every study instead of none. PS3.18 8.3.4.2.2.1
+    /// makes an unusable value a client error, and a query layer that cannot
+    /// answer it must not answer with everything.
+    #[test]
+    fn a_malformed_date_bound_does_not_widen_the_range() {
+        use crate::manifest::{StudyQido, SysHeader};
+        let mk = |date: u64| Manifest {
+            sys: SysHeader {
+                version: 1,
+                storage_tier: 1,
+                total_pixel_bytes: 0,
+                arrived_at: 0,
+            },
+            study: StudyQido {
+                attrs: vec![(0x0008_0020, AttrValue::UInt(date))],
+                ..Default::default()
+            },
+            series: Vec::new(),
+        };
+        let attrs = mk(20260815);
+        let f = QueryFilter {
+            study_date_from: Some("bad".into()),
+            ..Default::default()
+        };
+        assert!(
+            !match_study_attrs(&f, &attrs),
+            "an unparseable lower bound must not match"
+        );
+
+        let f = QueryFilter {
+            study_date_to: Some("bad".into()),
+            ..Default::default()
+        };
+        assert!(
+            !match_study_attrs(&f, &attrs),
+            "an unparseable upper bound must not match"
+        );
+
+        // Both malformed: still a rejection, never "everything".
+        let f = QueryFilter {
+            study_date_from: Some("1".into()),
+            study_date_to: Some("bad".into()),
+            ..Default::default()
+        };
+        assert!(!match_study_attrs(&f, &attrs));
+
+        // A valid bound keeps working, so the guard rejects only bad input.
+        let f = QueryFilter {
+            study_date_from: Some("20260801".into()),
+            study_date_to: Some("20260831".into()),
+            ..Default::default()
+        };
+        assert!(match_study_attrs(&f, &attrs));
+
+        // An ABSENT bound is still an open end.
+        let f = QueryFilter {
+            study_date_from: Some("20260801".into()),
+            ..Default::default()
+        };
+        assert!(match_study_attrs(&f, &attrs));
     }
 
     #[test]

@@ -24,19 +24,34 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
+/// The bar width, in characters.
+const BAR_WIDTH: usize = 20;
+
+/// Percentage and filled-bar width for a progress reading, both derived from
+/// the SAME clamped ratio.
+///
+/// Clamping `done` to `total` first is what makes the two agree. `done = 3,
+/// total = 1` used to fill the whole bar while `300 as u8` truncated to 44%;
+/// at `done = total = u64::MAX` the `checked_mul(100)` overflow fell back to
+/// `100` while the bar fallback produced 0 - an empty bar reading "100% DONE".
+/// A `u128` intermediate keeps the multiply exact for every `u64` pair, and a
+/// zero total is an explicit answer rather than a division-by-zero fallback.
+fn bar_and_percent(done: u64, total: u64) -> (usize, u8) {
+    if total == 0 {
+        // Nothing to measure: no fill, and 0% rather than a claimed 100%.
+        return (0, 0);
+    }
+    let done = done.min(total);
+    let ratio = (done as u128) * 100 / (total as u128);
+    let filled = ((done as u128) * (BAR_WIDTH as u128) / (total as u128)) as usize;
+    // `ratio <= 100` because `done <= total`, so the cast cannot truncate.
+    (filled.min(BAR_WIDTH), ratio as u8)
+}
+
 /// Print an ASCII progress line with a bar. Stateless - call from any context.
 pub fn progress(tier: &str, phase: &str, done: u64, total: u64, elapsed_s: u64, detail: &str) {
-    let w = 20usize;
-    let filled = (w as u64)
-        .checked_mul(done)
-        .and_then(|v| v.checked_div(total.max(1)))
-        .unwrap_or(0)
-        .min(w as u64) as usize;
-    let bar = "#".repeat(filled) + &".".repeat(w.saturating_sub(filled));
-    let pct = done
-        .checked_mul(100)
-        .and_then(|v| v.checked_div(total.max(1)))
-        .unwrap_or(100) as u8;
+    let (filled, pct) = bar_and_percent(done, total);
+    let bar = "#".repeat(filled) + &".".repeat(BAR_WIDTH.saturating_sub(filled));
     let status = if done >= total && total > 0 {
         " DONE"
     } else {
@@ -50,18 +65,28 @@ pub fn progress(tier: &str, phase: &str, done: u64, total: u64, elapsed_s: u64, 
         format!("{}s", s)
     };
     let line = format!("[{tier}] {phase:>24} [{bar}] {pct:>3}%  {detail} ({elapsed_str}){status}");
+    // `\r` returns carriage to column 0 but does NOT erase what was already
+    // there, so a shorter update left the tail of the longer one visible - and
+    // the final DONE line inherited that stale suffix. `\x1b[K` clears to end
+    // of line after the carriage return. It is emitted only when the stream is
+    // a terminal, so a redirected log stays free of escape sequences.
+    let live = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let clear = if live { "\x1b[K" } else { "" };
     // `\r` returns carriage to column 0. Intermediate updates overwrite the
     // same line (`eprint!`, no newline); the final DONE line ends with `\n`.
     if status == " DONE" {
-        eprintln!("\r{line}");
+        eprintln!("\r{line}{clear}");
     } else {
-        eprint!("\r{line}");
+        eprint!("\r{line}{clear}");
     }
 }
 
 /// Print a plain status line (no bar). For warnings and simple notices.
+///
+/// Starts on a FRESH line: appending it to an in-progress `progress` update
+/// would merge a notice into a half-drawn bar.
 pub fn progress_plain(tier: &str, msg: &str) {
-    eprintln!("[{tier}] {msg}");
+    eprintln!("\n[{tier}] {msg}");
 }
 
 #[cfg(test)]

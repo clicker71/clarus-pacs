@@ -74,13 +74,23 @@ fn chunked_with_trailers_and_content_length_alloc_zero() {
         let mut cr2 = ChunkedReader::new(Cursor::new(chunked_bytes));
         let mut total = 0usize;
         loop {
-            let n = cr2.read(&mut buf).unwrap_or(0);
+            // `expect`, not `unwrap_or(0)`: folding a trailer-decode error into
+            // EOF made the loop exit exactly as a clean end does, so a reader
+            // that returned all nine bytes and THEN failed on the trailer
+            // passed this gate.
+            let n = cr2.read(&mut buf).expect("chunked read must not fail");
             if n == 0 {
                 break;
             }
             total += n;
         }
         assert_eq!(total, 9, "chunked body decodes to 9 bytes");
+        // The message is only complete once the terminating chunk AND its
+        // trailer section have been consumed.
+        assert!(
+            cr2.is_message_complete(),
+            "the trailer must have been decoded, not silently skipped"
+        );
 
         // Content-Length read over 9 body bytes.
         let mut cl_total = 0usize;

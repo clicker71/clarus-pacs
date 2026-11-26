@@ -297,44 +297,78 @@ fn w32tm_status() -> Option<(bool, f64, String)> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let mut synced = false;
+    Some(parse_w32tm_status(&text))
+}
+
+/// Read `w32tm /query /status` output into `(synced, offset_ms, source)`.
+///
+/// The sync verdict is carried by the `Leap Indicator:` value, which is a
+/// NUMBER: 0, 1 and 2 mean the clock is disciplined, and 3 means the host is
+/// holding over (unsynchronised). No output line contains the word "synced", so
+/// substring matching on it reported every host, healthy or not, as unsynced -
+/// the check answered its own question wrong for the whole population it
+/// serves.
+///
+/// `Phase Offset:` carries the last correction (e.g. `-0.0212653s`). It is a
+/// better reading than the absence of any line, and the code keeps 0.0 when it
+/// is missing rather than inventing one.
+///
+/// Field labels are matched case-insensitively, so a build that pads or renames
+/// them cannot silently reintroduce the substring dependence this replaces.
+fn parse_w32tm_status(text: &str) -> (bool, f64, String) {
+    // Unknown until a Leap Indicator line is seen. Reporting "synced" on the
+    // absence of evidence would be the same optimistic default this parser
+    // exists to remove: an unfamiliar or truncated output is NOT a healthy
+    // clock.
+    let mut leap: Option<u32> = None;
     let mut source = String::new();
-    let mut has_offset = false;
-    let mut big_offset = 0.0;
+    let mut phase_offset_secs: Option<f64> = None;
     for line in text.lines() {
-        if line.contains("Source:") {
-            source = line
-                .split("Source:")
-                .nth(1)
+        let trimmed = line.trim();
+        let (label, value) = match trimmed.split_once(':') {
+            Some((l, v)) => (l.trim(), v.trim()),
+            None => continue,
+        };
+        if label.eq_ignore_ascii_case("Recent time source") {
+            // Some builds carry the source under this label instead.
+            if source.is_empty() {
+                source = value.to_string();
+            }
+            continue;
+        }
+        if label.eq_ignore_ascii_case("Source") {
+            // Windows prints `Local CMOS Clock`, `Free-running System Clock`,
+            // or a peer name with a trailing descriptor such as ` (ntp...)`.
+            // The host is what precedes that descriptor.
+            let host = value.split(" (").next().unwrap_or(value).trim();
+            source = host.to_string();
+            continue;
+        }
+        if label.eq_ignore_ascii_case("Leap Indicator") {
+            // The value is `0(no warning)` / `3(not synchronized)` - the code
+            // is the number before the parenthesis.
+            leap = value
+                .split(['(', ' '])
+                .next()
                 .unwrap_or("")
                 .trim()
-                .to_string();
+                .parse::<u32>()
+                .ok();
+            continue;
         }
-        // w32tm prints the state as `Source`'s sibling line `Time since last
-        // good time sync:` and, on a healthy clock, `Leap Indicator: 0(no
-        // warning)`. The state word itself is `Source: Local CMOS Clock` /
-        // `... pending`; the sync verdict is carried by the absence of
-        // "not synced". Matching the substring "synced" also matched
-        // "not synced", so an unsynchronised host reported healthy - the exact
-        // inversion of what the check exists for.
-        let lower = line.to_lowercase();
-        if lower.contains("synced") && !lower.contains("not synced") {
-            synced = true;
-        }
-        if line.contains("Offset:") {
-            has_offset = true;
-            // Example: Offset: -0.0212653s
-            let val = line
-                .split("Offset:")
-                .nth(1)
-                .unwrap_or("")
+        if label.eq_ignore_ascii_case("Phase Offset") {
+            // `-0.0212653s` - a unit suffix is part of the value.
+            phase_offset_secs = value
+                .trim_end_matches(['s', 'S'])
                 .trim()
-                .replace("s", "");
-            big_offset = val.parse().unwrap_or(0.0);
+                .parse::<f64>()
+                .ok();
         }
     }
-    let _ = has_offset;
-    Some((synced, big_offset * 1000.0, source))
+    // 0..=2 is a disciplined clock; 3 is "not currently synchronized". An
+    // absent indicator is not health.
+    let synced = matches!(leap, Some(0..=2));
+    (synced, phase_offset_secs.unwrap_or(0.0) * 1000.0, source)
 }
 
 fn get_memory_rss_mb() -> f64 {
@@ -1571,6 +1605,13 @@ fn access_log_from_files(
             Ok(t) => t,
             Err(_) => continue,
         };
+        let Some(base) = file_first_id(&text, id) else {
+            continue;
+        };
+        let mut ordinal_in_file = 0u64;
+        // This file consumes the id space down to `base`; the next older file
+        // continues from `base - 1`.
+        let restore_id = base.saturating_sub(1);
         let mut kept: std::collections::VecDeque<AccessLogEntryResponse> =
             std::collections::VecDeque::new();
         // The ring holds at most what this file can still contribute: the
@@ -1588,8 +1629,11 @@ fn access_log_from_files(
             if line.trim().is_empty() {
                 continue;
             }
-            let ordinal = id;
-            id = id.saturating_sub(1);
+            // Anchored on this file's base, so the id ascends with the LINE
+            // order inside a file instead of descending against it (see the
+            // `base` comment above).
+            let ordinal = base + ordinal_in_file;
+            ordinal_in_file += 1;
             let v = match parse_json(line.as_bytes()) {
                 Some(v) => v,
                 None => continue, // crash tail: skip the last partial line
@@ -1635,6 +1679,7 @@ fn access_log_from_files(
                 }
             }
         }
+        id = restore_id;
         total += kept.len() as u64 + matches;
         // This file's rows are already newest-first after the reverse; the
         // offset counts rows in that order, so it is consumed here. Older
@@ -1652,6 +1697,31 @@ fn access_log_from_files(
         }
     }
     (total, page)
+}
+
+/// The id of a journal file's FIRST line, plus the running ordinal.
+///
+/// The row `id` is the 1-based line ordinal across all files in NAME order,
+/// while the page is filled newest-file-first. Numbering a file therefore has
+/// to be anchored to its own line count: the file's LAST line keeps the id the
+/// caller already holds, and its first line gets `id - n + 1`. The returned
+/// value is that FIRST id; the caller counts up from it.
+///
+/// Decrementing a single cursor once per line - the previous shape - ran the
+/// ids BACKWARDS inside a file: the newest row of a file got the highest id and
+/// the oldest the lowest, so a client sorting or paging by `id` saw the reverse
+/// of the reading order. Counting per file also stops the ids from shifting
+/// when the journal grows between the counting pass and the walk (it is
+/// appended to while a request runs).
+///
+/// Returns `None` for a file with no non-empty line: there is nothing to
+/// number, and the caller must not consume any of the id space.
+fn file_first_id(text: &str, id: u64) -> Option<u64> {
+    let n = text.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+    if n == 0 {
+        return None;
+    }
+    Some(id.saturating_sub(n.saturating_sub(1)))
 }
 
 /// Build one access row from a parsed journal line.
@@ -1768,6 +1838,13 @@ fn audit_log_from_files(
             Ok(t) => t,
             Err(_) => continue,
         };
+        let Some(base) = file_first_id(&text, id) else {
+            continue;
+        };
+        let mut ordinal_in_file = 0u64;
+        // This file consumes the id space down to `base`; the next older file
+        // continues from `base - 1`.
+        let restore_id = base.saturating_sub(1);
         let mut kept: Vec<RawAuditLine> = Vec::new();
         // Same count-only rule as `access_log_from_files`: a full page cannot
         // accept another row, but `total` must still count every match.
@@ -1777,8 +1854,11 @@ fn audit_log_from_files(
             if line.trim().is_empty() {
                 continue;
             }
-            let ordinal = id;
-            id = id.saturating_sub(1);
+            // Anchored on this file's base, so the id ascends with the LINE
+            // order inside a file instead of descending against it (see the
+            // `base` comment above).
+            let ordinal = base + ordinal_in_file;
+            ordinal_in_file += 1;
             // native JSON parse (serde-free) - same top-level field
             // extraction (user/event/target/reason) as the serde-era path.
             let v = match parse_json(line.as_bytes()) {
@@ -1845,6 +1925,7 @@ fn audit_log_from_files(
                 }
             }
         }
+        id = restore_id;
         total += kept.len() as u64 + matches;
         // Older files are still scanned so `total` covers every match: a
         // full page must not stop the count (PS3.18 8.3.4.4.1).
@@ -2192,18 +2273,22 @@ pub struct HiddenInstanceSummary {
 
 /// The human-readable meaning of a rejection reason code.
 ///
-/// The four codes are quoted from `standard/ps3.3/rejection-note-reasons.json`
-/// (PS3.16 CID 7010). An unknown code is reported as such rather than being
-/// folded into a known one: a manifest may predate this table or be newer than
-/// it, and inventing a meaning would mis-describe a clinical decision.
+/// Read from the ONE table that carries these codes
+/// (`clarus_ports::rejection::REASONS`, which is itself quoted from
+/// `standard/ps3.3/rejection-note-reasons.json` / PS3.16 CID 7010) rather than
+/// restated here: a hardcoded copy is a second source of truth for the same
+/// standard wording, and the admin surface would then describe a code
+/// differently from the code the sequester actually applied.
+///
+/// An unknown code is reported as such rather than being folded into a known
+/// one: a manifest may predate this table or be newer than it, and inventing a
+/// meaning would mis-describe a clinical decision.
 pub fn reason_meaning(code: u32) -> &'static str {
-    match code {
-        113_001 => "Rejected for Quality Reasons",
-        113_037 => "Rejected for Patient Safety Reasons",
-        113_038 => "Incorrect Modality Worklist Entry",
-        113_039 => "Data Retention Policy Expired",
-        _ => "Unknown rejection reason",
-    }
+    let code_value = code.to_string();
+    clarus_ports::rejection::REASONS
+        .iter()
+        .find(|r| r.code_value == code_value && r.scheme == "DCM")
+        .map_or("Unknown rejection reason", |r| r.meaning)
 }
 
 /// `GET /admin/v1/instances/hidden`.
@@ -2799,16 +2884,29 @@ fn manifest_instances_search_general(
         {
             continue;
         }
-        if let Some(f) = patient_name {
-            let pat = like(f);
-            if !matches_pat(&st_patient, &pat) {
-                continue;
+        // An AUDITOR must not filter on a masked field. Masking reveals the
+        // first letter, the last letter and the length of a name, and a LIKE
+        // filter answers "does any name start with these characters": probing
+        // `Sa*`, `Sm*`, `Smi*` confirms one more letter per hit until the whole
+        // name is rebuilt. The filter is therefore IGNORED - the study is still
+        // returned, it just does not narrow the result. Dropping the study
+        // instead would turn a probing attempt into a hit/miss oracle of its
+        // own, which is the same leak with a different shape.
+        if !is_auditor {
+            if let Some(f) = patient_name {
+                let pat = like(f);
+                if !matches_pat(&st_patient, &pat) {
+                    continue;
+                }
             }
-        }
-        if let Some(f) = study_description {
-            let pat = like(f);
-            if !matches_pat(&st_desc, &pat) {
-                continue;
+            // Same rule for the same reason: `study_description` is HIDDEN from
+            // an auditor, so leaving it filterable hands back exactly what the
+            // output suppresses, one character at a time.
+            if let Some(f) = study_description {
+                let pat = like(f);
+                if !matches_pat(&st_desc, &pat) {
+                    continue;
+                }
             }
         }
         for series in &m.series {
@@ -3076,10 +3174,13 @@ fn parse_delete_request(body: &[u8]) -> Result<DeleteRequest, &'static str> {
                 }
                 "dry_run" => match v {
                     JsonVal::Bool(b) => req.dry_run = b,
-                    // The legacy string spellings are unambiguous, so they are
-                    // read rather than refused; anything else is refused.
+                    // The string `"true"` is read because it FAILS SAFE: the
+                    // worst outcome is a rehearsal when a real deletion was
+                    // wanted. `"false"` is NOT read, because it points the
+                    // other way - it would turn an ambiguous value into an
+                    // irreversible delete, which is exactly the coercion this
+                    // parse refuses.
                     JsonVal::Str(ref s) if s.eq_ignore_ascii_case("true") => req.dry_run = true,
-                    JsonVal::Str(ref s) if s.eq_ignore_ascii_case("false") => req.dry_run = false,
                     _ => return Err("'dry_run' must be a boolean"),
                 },
                 _ => {}
@@ -3882,11 +3983,18 @@ fn tombstone_empty_study(
     mv_path: std::path::PathBuf,
     m: &clarus_core::manifest::Manifest,
 ) -> Result<(), String> {
-    // Persist the emptied manifest before the rename so the tombstone carries
-    // accurate counts for the erase-worker's accounting.
-    write_manifest(&mv_path, m).map_err(|e| format!("write manifest: {e}"))?;
+    // Retire the LIVE manifest in one step, carrying the shapes the erase
+    // worker accounts for.
+    //
+    // Writing the emptied manifest to the live name first left a window where
+    // readers still saw the study (and a crash there published an empty
+    // manifest as a live study). The rename below removes the live name and
+    // creates the tombstone atomically; only the retired CONTENT is rewritten
+    // afterwards, under the name readers already ignore.
+    let retired = m.encode().map_err(|e| format!("encode manifest: {e}"))?;
     let tombstone = clarus_core::stow::tombstone_path(manifest_dir, study_uid);
-    std::fs::rename(&mv_path, &tombstone).map_err(|e| format!("tombstone rename: {e}"))?;
+    clarus_core::manifest::publish_tombstone_bytes(&mv_path, &tombstone, &retired)
+        .map_err(|e| format!("tombstone publish: {e}"))?;
     // Sidecar so the erase-worker closes THIS batch with erase_complete.
     let _ = std::fs::write(
         manifest_dir.join(format!("{study_uid}.batch")),
@@ -3925,17 +4033,37 @@ fn blob_is_referenced_live(state: &AppState, blake3_hex: &str) -> bool {
 /// listed: the caller must then treat every blob as referenced (see
 /// [`blob_is_referenced_live`] for why guessing costs an instance).
 fn live_reference_set(state: &AppState) -> Option<std::collections::HashSet<String>> {
-    let rd = std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir)).ok()?;
+    collect_live_references(
+        std::path::Path::new(&state.config.btree.manifest_dir),
+        |uid| state.read_server_manifest(uid),
+    )
+}
+
+/// The scan itself, split out so a directory whose ENTRIES fail can be driven
+/// without a filesystem trick.
+///
+/// `flatten()` would swallow an entry error the directory yielded AFTER it
+/// opened, and the resulting set would look complete: a manifest dropped from
+/// it makes its blobs look orphaned, and the caller unlinks live data. Both
+/// failures are the same answer here - "cannot verify".
+fn collect_live_references(
+    dir: &std::path::Path,
+    read: impl Fn(
+        &str,
+    ) -> Option<
+        Result<clarus_core::manifest::Manifest, clarus_core::manifest::ManifestReadError>,
+    >,
+) -> Option<std::collections::HashSet<String>> {
+    let rd = std::fs::read_dir(dir).ok()?;
     let mut set = std::collections::HashSet::new();
-    for ent in rd.flatten() {
+    for ent in rd {
+        let ent = ent.ok()?;
         let name = ent.file_name();
         let name = name.to_string_lossy();
         if !name.ends_with(".manifest") {
             continue;
         }
-        let m = state
-            .read_server_manifest(name.trim_end_matches(".manifest"))?
-            .ok()?;
+        let m = read(name.trim_end_matches(".manifest"))?.ok()?;
         for series in &m.series {
             for inst in &series.instances {
                 set.insert(clarus_adapters::hex_encode(&inst.blake3));
@@ -4477,13 +4605,25 @@ impl LogFilter {
     }
 }
 
-/// Phase 1: buffered entries matching the filter, in order.
-pub fn initial_log_snapshot(state: &AppState, f: &LogFilter) -> Vec<LogEntry> {
-    state
-        .log_buffer
-        .read()
-        .map(|buf| buf.iter().filter(|e| log_matches(e, f)).cloned().collect())
-        .unwrap_or_default()
+/// Phase 1: buffered entries matching the filter, in order, plus the ring
+/// length the snapshot was taken at.
+///
+/// The cursor is returned WITH the entries because it is only meaningful
+/// relative to them: sampling it later (after the snapshot had been written to
+/// the socket) skipped every entry appended in between. Those entries were
+/// still in the buffer when the poll resumed, but the poll only looks after the
+/// cursor, so the client never saw them - a log line that existed, was
+/// retained, and was lost.
+pub fn initial_log_snapshot(state: &AppState, f: &LogFilter) -> (Vec<LogEntry>, usize) {
+    match state.log_buffer.read() {
+        Ok(buf) => (
+            buf.iter().filter(|e| log_matches(e, f)).cloned().collect(),
+            buf.len(),
+        ),
+        // An unreadable buffer is an empty stream with a cursor at zero, not a
+        // cursor that happens to equal the ring length.
+        Err(_) => (Vec::new(), 0),
+    }
 }
 
 /// Phase 2: new entries after `cursor` (the last emitted ring index).
@@ -4527,6 +4667,7 @@ fn log_matches(entry: &LogEntry, f: &LogFilter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use clarus_core::stow::{
         InstanceModel, SeriesModel, StudyManifestAttrs, write_study_manifest_full,
     };
@@ -4886,6 +5027,36 @@ mod tests {
         );
     }
 
+    /// An entry error the directory yields AFTER it opened must not produce a
+    /// partial answer that looks complete.
+    ///
+    /// `flatten()` dropped such entries, so a manifest missing from the set
+    /// made its study's blobs look orphaned - and the delete unlinks the blobs
+    /// it believes are unreferenced. A scan that cannot enumerate the whole
+    /// directory must answer "cannot verify" instead.
+    #[test]
+    fn a_directory_that_cannot_be_enumerated_yields_no_reference_set() {
+        // The directory path itself does not exist: the same "cannot
+        // enumerate" answer an entry error produces, with no platform trick.
+        let missing = std::path::Path::new("a-directory-that-does-not-exist-4f2c");
+        assert!(collect_live_references(missing, |_| None).is_none());
+
+        // And a directory whose ONE manifest cannot be read is equally
+        // unusable, rather than yielding the other studies only.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_study(
+            tmp.path(),
+            "1.2.8.1.study",
+            "1.2.8.1.series",
+            "1.2.8.1.sop",
+            "Delta^Four",
+        );
+        assert!(
+            collect_live_references(tmp.path(), |_| None).is_none(),
+            "an unreadable manifest must not leave a partial set behind"
+        );
+    }
+
     /// `push_f64` is byte-exact with serde_json/ryu across the positional
     /// value range admin endpoints emit (integral floats keep their `.0`).
     /// `push_f64` is byte-exact with serde_json/ryu across the positional
@@ -5042,14 +5213,23 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
-        // The two unambiguous string spellings are read, not refused: a client
-        // that sent a quoted boolean meant that boolean.
-        for (body, want) in [
-            (br#"{"reason":"x","dry_run":"TRUE"}"#.as_slice(), true),
-            (br#"{"reason":"x","dry_run":"False"}"#.as_slice(), false),
+        // `"true"` is still read: it fails SAFE, because the worst outcome is
+        // a rehearsal when a real deletion was wanted.
+        let q = parse_delete_request(br#"{"reason":"x","dry_run":"TRUE"}"#)
+            .expect("the safe string spelling is accepted");
+        assert!(q.dry_run);
+        // `"false"` points the OTHER way: accepting it turns an ambiguous value
+        // into an irreversible delete, which is the coercion this parse exists
+        // to refuse.
+        for body in [
+            br#"{"reason":"x","dry_run":"false"}"#.as_slice(),
+            br#"{"reason":"x","dry_run":"False"}"#.as_slice(),
         ] {
-            let q = parse_delete_request(body).expect("a boolean spelling is accepted");
-            assert_eq!(q.dry_run, want);
+            assert!(
+                parse_delete_request(body).is_err(),
+                "{} must be refused: `false` means an irreversible delete",
+                String::from_utf8_lossy(body)
+            );
         }
     }
 
@@ -5101,6 +5281,111 @@ mod tests {
         assert_eq!(total3, 2, "one matching row per day");
         assert_eq!(page3.len(), 2);
         assert_eq!(page3[0].timestamp, "2026-01-02T00:00:01Z");
+    }
+
+    /// Row `id` ascends with the line order, in every file.
+    ///
+    /// `id` is the 1-based line ordinal across files in NAME order, so for four
+    /// lines across two files the ids must be 1, 2, 3, 4 in writing order. The
+    /// cursor shape that decremented once per line while walking FORWARD inside
+    /// a file assigned them 2, 1, 4, 3 - each file's rows numbered backwards
+    /// against the order they were written - so a client sorting or paging by
+    /// `id` saw the reverse of the reading order. Revert `file_base` and this
+    /// test reds.
+    #[test]
+    fn access_log_ids_follow_line_order() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path();
+        write_access_day(
+            dir,
+            "20260101",
+            &["2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z"],
+        );
+        write_access_day(
+            dir,
+            "20260102",
+            &["2026-01-02T00:00:01Z", "2026-01-02T00:00:02Z"],
+        );
+
+        let (_, page) = access_log_from_files(dir, None, None, None, None, 10, 0);
+        // The page is newest-first, so the ids must descend by exactly one
+        // across the whole set, ending at 1 for the oldest line.
+        let ids: Vec<i64> = page.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![4, 3, 2, 1], "ids must follow the line order");
+
+        // Stated as the property itself, per file: the OLDER of a pair of lines
+        // within one file must carry the SMALLER id.
+        let older = page
+            .iter()
+            .find(|e| e.timestamp == "2026-01-01T00:00:01Z")
+            .expect("the oldest line");
+        let newer = page
+            .iter()
+            .find(|e| e.timestamp == "2026-01-01T00:00:02Z")
+            .expect("the second line of the older file");
+        assert_eq!((older.id, newer.id), (1, 2), "one file, ascending ids");
+    }
+
+    /// The audit journal numbers its rows by the same rule.
+    #[test]
+    fn audit_log_ids_follow_line_order() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path();
+        for (day, lines) in [("20260101", ["a0", "a1"]), ("20260102", ["b0", "b1"])] {
+            let mut body = String::new();
+            for user in lines {
+                body.push_str(&format!(
+                    "{{\"event\":\"write\",\"ts\":\"2026-01-01T00:00:01Z\",\"user\":\"{user}\",\"target\":\"t\"}}\n"
+                ));
+            }
+            std::fs::write(dir.join(format!("{day}.log")), body).expect("write");
+        }
+
+        let (_, page) = audit_log_from_files(dir, None, None, None, None, 10, 0);
+        let ids: Vec<i64> = page.iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![4, 3, 2, 1],
+            "audit ids must follow the line order"
+        );
+    }
+
+    /// The sync verdict comes from the `Leap Indicator:` NUMBER, not from
+    /// whether some line contains the word "synced" - `w32tm /query /status`
+    /// prints no such word, so the substring form reported every host as
+    /// unsynced. Revert to substring matching and the first case reds.
+    #[test]
+    fn w32tm_status_reads_the_leap_indicator() {
+        // A healthy, NTP-disciplined host.
+        let healthy = "\
+Leap Indicator: 0(no warning)
+Stratum: 3 (secondary reference - syncd by (S)NTP)
+Precision: -23 (119.209ns per tick)
+Root Delay: 0.0200000s
+Root Dispersion: 0.0100000s
+ReferenceId: 0x83B3B2B1 (source IPv4: 131.179.178.177)
+Last Successful Sync Time: 16.12.2026 14:03:11
+Source: time.windows.com,0x8 (ntp.m|0x8|0.0.0.0:123->131.179.178.177:123)
+Phase Offset: -0.0212653s
+";
+        let (synced, offset_ms, source) = parse_w32tm_status(healthy);
+        assert!(synced, "Leap Indicator 0 is a disciplined clock");
+        assert!(
+            (offset_ms - -21.2653).abs() < 1e-9,
+            "the Phase Offset is reported in milliseconds, got {offset_ms}"
+        );
+        assert_eq!(source, "time.windows.com,0x8");
+
+        // A host holding over: Leap Indicator 3, the unsynchronised code.
+        let holding = "Leap Indicator: 3(not synchronized)\nSource: Local CMOS Clock\n";
+        let (synced, _, source) = parse_w32tm_status(holding);
+        assert!(!synced, "Leap Indicator 3 must read as unsynchronised");
+        assert_eq!(source, "Local CMOS Clock");
+
+        // No Leap Indicator at all is NOT health - the old code took the
+        // absence of a "not synced" line as good news.
+        let (synced, _, _) = parse_w32tm_status("Source: Free-running System Clock\n");
+        assert!(!synced, "an unknown clock must not be reported as synced");
     }
 
     /// A truncated tail (a crash mid-flush) is skipped, never an error, and it
@@ -5366,5 +5651,65 @@ mod tests {
             false,
         );
         assert!(none.is_empty(), "a non-matching pattern selects nothing");
+    }
+
+    /// An AUDITOR cannot recover a masked name by probing the filter.
+    ///
+    /// `mask_name` shows the first letter, the last letter and the length. A
+    /// LIKE filter that still ran against the raw value would answer "does the
+    /// name start with these characters", so `S*`, `Sm*`, `Smi*` confirms one
+    /// more letter per hit until the whole name is rebuilt. The same holds for
+    /// `study_description`, which an auditor cannot see at all.
+    ///
+    /// The masked record must still be RETURNED: refusing it would turn a probe
+    /// into a hit/miss oracle of its own, which is the same leak in a different
+    /// shape.
+    #[test]
+    fn an_auditor_cannot_probe_the_patient_name_filter() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path().join("manifests");
+        std::fs::create_dir_all(&dir).expect("dir");
+        write_study(&dir, "1.2.3.600", "1.2.3.600.1", "1.2.3.600.1.1", "Smirnov");
+        let state = state_for(&dir);
+
+        let search = |pattern: &str, is_auditor: bool| {
+            manifest_instances_search_general(
+                &state,
+                Some(pattern),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                100,
+                0,
+                is_auditor,
+            )
+        };
+
+        // An ordinary operator's filter still narrows.
+        assert_eq!(
+            search("Sm*", false).len(),
+            1,
+            "the filter works for an operator"
+        );
+        assert_eq!(search("Zz*", false).len(), 0, "a wrong prefix excludes");
+
+        // For an auditor the filter is IGNORED, so every prefix behaves the
+        // same: no probe can distinguish one from another.
+        let exact = search("Smirnov", true);
+        let prefix = search("Smi*", true);
+        let wrong = search("Zzz*", true);
+        assert_eq!(exact.len(), 1, "the record is still returned");
+        assert_eq!(prefix.len(), exact.len(), "a prefix probe answers nothing");
+        assert_eq!(wrong.len(), exact.len(), "a wrong prefix answers nothing");
+        // And what comes back is masked, not the raw name.
+        assert_ne!(
+            exact[0].patient_name.as_str(),
+            "Smirnov",
+            "the auditor sees the masked name"
+        );
     }
 }

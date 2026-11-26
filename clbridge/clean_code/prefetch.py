@@ -32,10 +32,13 @@ class PartPrefetcher:
 
     Usage:
         pref = PartPrefetcher(_stream_multipart_instances(resp)).start()
-        for dicom_bytes, idx in pref:
+        for part, idx, part_ts in pref:
             ... send ...
         # On early exit (cancel / shutdown / fatal error):
         pref.stop()
+
+    The source yields the three fields `_stream_multipart_instances` produces;
+    unpacking two raised ValueError on the very first part.
     """
 
     def __init__(self, source, max_parts=DEFAULT_PREFETCH_PARTS, on_stop=None):
@@ -43,6 +46,13 @@ class PartPrefetcher:
         self._source = source
         self._error = None
         self._stop = threading.Event()
+        # Guards the once-only claim of `_on_stop`. `stop()` is idempotent and
+        # can be called from both the sender and the shutdown path, so two
+        # calls used to start two close threads against the SAME response - a
+        # second `close()` re-entering urllib3 while the first is still waiting
+        # on the socket read.
+        self._on_stop_lock = threading.Lock()
+        self._on_stop_claimed = False
         # Called ONCE by `stop()` BEFORE the join. The reader may be blocked
         # inside the source (an `iter_content` on a slow or half-open HTTP
         # response), where no queue drain can reach it; closing the response
@@ -62,20 +72,43 @@ class PartPrefetcher:
                     # the queue cannot show it to the drain.
                     self._discard(item)
                     break
-                # Blocks when the queue is full - this is the backpressure.
-                self._q.put(item)
-                if self._stop.is_set():
-                    # Paired with the check above: a stop that landed while
-                    # we were blocked in put() is seen HERE, before the source
-                    # is asked for one more item that nothing would consume.
-                    break
+                # `put_nowait` in a bounded wait loop rather than a bare
+                # `put`: a bare put parks the reader until a slot frees, and
+                # `stop()` only frees one slot per drain pass. A reader that
+                # parked AFTER the stop check could therefore publish its part
+                # after the final drain had run, leaving a spill file that no
+                # one would ever unlink. Here the stop flag is re-checked every
+                # 50 ms, so the reader always gets out on its own, and the item
+                # it was holding is discarded rather than queued.
+                while True:
+                    try:
+                        self._q.put(item, timeout=0.05)
+                        break
+                    except queue.Full:
+                        if self._stop.is_set():
+                            self._discard(item)
+                            return
         except Exception as e:  # surface a reader failure to the sender
             self._error = e
         finally:
-            try:
-                self._q.put(_EOF)
-            except Exception:
-                pass
+            # The EOF sentinel must NEVER be dropped. It is the only thing that
+            # ends the sender's `get()`, so a sentinel lost to a full queue
+            # blocks the drain forever - the reader has finished, nothing more
+            # will ever arrive, and the C-MOVE hangs instead of ending.
+            #
+            # Waits on the queue rather than on a bounded timeout, but the wait
+            # is always finite: either a sender drains a slot, or `stop()`
+            # clears the flag and the loop gives up. On give-up the drain is
+            # already gone, which is exactly what the abandoned sentinel means.
+            while True:
+                try:
+                    self._q.put(_EOF, timeout=0.05)
+                    break
+                except queue.Full:
+                    if self._stop.is_set():
+                        break
+                except Exception:
+                    break
 
     def start(self):
         """Start the reader thread. Returns self."""
@@ -83,7 +116,7 @@ class PartPrefetcher:
         return self
 
     def __iter__(self):
-        """Yield `(dicom_bytes, idx)` as the reader produces them, in order."""
+        """Yield `(part, idx, part_ts)` as the reader produces them, in order."""
         while True:
             item = self._q.get()
             if item is _EOF:
@@ -131,16 +164,47 @@ class PartPrefetcher:
         in `put`, while a reader blocked inside the source (iterating a slow
         or half-open response) is only reachable by closing what it reads.
         Without the callback every early exit waited out the whole 5 s join.
+
+        The callback itself runs on its OWN daemon thread. Closing an HTTP
+        response can wait for the read that is in flight to return, which is
+        exactly the stall this method exists to escape: run inline, a blocked
+        `resp.close()` sat outside the join bound and held `stop()` (and the
+        resume path behind it) until the socket read ended. On a helper thread
+        the join bound is the only bound, and the close finishes whenever the
+        read does.
         """
         self._stop.set()
-        if self._on_stop is not None:
-            try:
-                self._on_stop()
-            except Exception:
-                pass
+        if self._claim_on_stop():
+            closer = threading.Thread(
+                target=self._run_on_stop, name="cmove-prefetch-close", daemon=True
+            )
+            closer.start()
         self._drain()
         if self._thread.is_alive():
             self._thread.join(timeout=5.0)
             if self._thread.is_alive():
                 logging.warning("[B1-prefetch] reader thread did not exit in 5s")
         self._drain()
+
+    def _claim_on_stop(self):
+        """True exactly once, for the first caller that has an `on_stop`.
+
+        The claim is taken under a lock rather than by testing a flag, because
+        `stop()` legitimately runs on more than one thread: the sender's early
+        exit and the shutdown path can both call it, and both would otherwise
+        start their own close thread.
+        """
+        if self._on_stop is None:
+            return False
+        with self._on_stop_lock:
+            if self._on_stop_claimed:
+                return False
+            self._on_stop_claimed = True
+            return True
+
+    def _run_on_stop(self):
+        """Run the close callback; its failure must not kill the helper."""
+        try:
+            self._on_stop()
+        except Exception:
+            pass

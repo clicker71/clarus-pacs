@@ -143,6 +143,9 @@ mod tests {
         StudyAttrs {
             modalities: vec!["DX".into()],
             study_description: "CHEST PA".into(),
+            // The shipped model (clahe.yaml) is selected by its procedure
+            // code, so a study that matches it carries the workitem's code.
+            code: Some("IMG-CLAHE".into()),
             ..StudyAttrs::default()
         }
     }

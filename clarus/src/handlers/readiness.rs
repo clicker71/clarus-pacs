@@ -95,6 +95,17 @@ pub const READINESS_READY: &str = "READY";
 #[derive(Clone, Default)]
 pub struct Readiness {
     pending: Arc<Mutex<HashMap<String, (Instant, u64)>>>,
+    /// The LAST generation each study reached, kept after `take_due` removes
+    /// its pending entry.
+    ///
+    /// The pending map alone cannot carry a monotonic counter: `take_due`
+    /// deletes the entry, so the next `arm` re-inserts it from zero and hands
+    /// out generation 1 again. A promotion holding a token of generation 1
+    /// would then compare equal to a study that was re-armed AFTER it was taken
+    /// due - the exact race the token exists to catch. Keeping the high-water
+    /// mark here makes the counter monotonic for the process lifetime, which is
+    /// what "a later arm superseded this attempt" means.
+    generations: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl Readiness {
@@ -103,6 +114,7 @@ impl Readiness {
     pub fn new() -> Self {
         Self {
             pending: Arc::new(Mutex::new(HashMap::new())),
+            generations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -120,12 +132,21 @@ impl Readiness {
     /// so the clock is an input.
     pub fn arm(&self, study_instance_uid: &str, now: Instant) {
         let deadline = now + READINESS_DEBOUNCE;
+        // The generation lives in its OWN table so it survives `take_due`.
+        // Bumping it first means the pending entry always records the value
+        // this arm produced, and a token taken before this call can never
+        // match it afterwards.
+        let generation = {
+            let mut gens = self
+                .generations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let slot = gens.entry(study_instance_uid.to_string()).or_insert(0);
+            *slot = slot.wrapping_add(1);
+            *slot
+        };
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = pending
-            .entry(study_instance_uid.to_string())
-            .or_insert((deadline, 0));
-        entry.0 = deadline;
-        entry.1 = entry.1.wrapping_add(1);
+        pending.insert(study_instance_uid.to_string(), (deadline, generation));
     }
 
     /// The instant a study becomes READY, if it is still waiting.
@@ -149,29 +170,60 @@ impl Readiness {
     /// landed while the study was being flipped.
     #[must_use]
     pub fn generation(&self, study_instance_uid: &str) -> u64 {
-        self.pending
+        self.generations
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(study_instance_uid)
-            .map(|(_, generation)| *generation)
+            .copied()
             .unwrap_or(0)
     }
 
-    /// Remove every study whose deadline has passed, returning them.
+    /// Remove every study whose deadline has passed, returning each with the
+    /// GENERATION it held when it was taken.
+    ///
+    /// The generation is carried out because [`promote`] must be able to prove
+    /// that no later `arm` superseded this attempt. Reading the generation
+    /// again inside `promote` cannot do that: `take_due` removes the entry, so
+    /// a re-STOW in the window re-inserts it with generation 1 and a "before"
+    /// read taken inside `promote` would see that NEW value and compare equal
+    /// to itself. The token has to come from the same critical section that
+    /// consumed the deadline.
     ///
     /// The lock is released before the caller touches the store, so a slow
     /// write cannot block a concurrent STOW from arming its own study.
-    pub fn take_due(&self, now: Instant) -> Vec<String> {
+    pub fn take_due(&self, now: Instant) -> Vec<DueStudy> {
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        let due: Vec<String> = pending
+        let due: Vec<DueStudy> = pending
             .iter()
             .filter(|(_, (deadline, _))| *deadline <= now)
-            .map(|(uid, _)| uid.clone())
+            .map(|(uid, (deadline, generation))| DueStudy {
+                study_instance_uid: uid.clone(),
+                generation: *generation,
+                deadline: *deadline,
+            })
             .collect();
-        for uid in &due {
-            pending.remove(uid);
+        for entry in &due {
+            pending.remove(&entry.study_instance_uid);
         }
         due
+    }
+
+    /// Whether `token` is STILL the current quiet period for its study.
+    ///
+    /// True only when the study is absent (nothing re-armed it, and the token
+    /// is therefore the last word) or present with the SAME generation. Any
+    /// later `arm` bumps the generation, so a stale token is rejected no
+    /// matter how many times the study has been re-armed since.
+    ///
+    /// This is the single question every post-take check asks: "has anything
+    /// happened since this attempt began?". Asking it in one place is what
+    /// keeps the flips, the demotion, the offer and the retry from disagreeing
+    /// about what "still current" means.
+    fn token_is_current(&self, token: &DueStudy) -> bool {
+        // Compared against the HIGH-WATER mark, not the pending entry: the
+        // entry is removed by `take_due`, so "no pending entry" cannot mean
+        // "nothing happened since". Only an unchanged generation proves that.
+        self.generation(&token.study_instance_uid) == token.generation
     }
 
     /// Whether any study is still waiting. For tests and the status line.
@@ -182,6 +234,22 @@ impl Readiness {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// One study whose quiet period has elapsed, with the generation it held when
+/// it was taken.
+///
+/// The generation is what makes the token: a later [`Readiness::arm`] bumps it,
+/// so a promotion holding a stale token can tell that its study received
+/// instances after the attempt began and must stand down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueStudy {
+    /// The study whose quiet period expired.
+    pub study_instance_uid: String,
+    /// The generation the registry held for it at that moment.
+    pub generation: u64,
+    /// The deadline that expired (kept for logging and for the retry rule).
+    pub deadline: Instant,
 }
 
 /// What one promotion attempt achieved.
@@ -224,7 +292,23 @@ pub enum Promotion {
 /// since extended. A claim that arrives before the flip is refused by the
 /// performer's own INCOMPLETE guard, which is the standard's arrangement
 /// rather than a gap.
-pub fn promote(state: &AppState, study_instance_uid: &str) -> Promotion {
+pub fn promote(state: &AppState, token: &DueStudy) -> Promotion {
+    let study_instance_uid = token.study_instance_uid.as_str();
+    // The attempt is only valid for the quiet period it was taken in. A STOW
+    // that landed between `take_due` and here bumped the generation, which
+    // means the study is being extended right now: publish nothing and let the
+    // newer quiet period decide. Checking it FIRST (rather than at the end)
+    // also means a superseded attempt does no store work at all.
+    //
+    // The seam sits BEFORE this check, not after it: the window the test has
+    // to exercise is "taken due, then a STOW arrives, then promote runs", and
+    // parking here lets a test land that STOW in exactly that window. Parking
+    // after the check would only ever exercise the state the test already
+    // produced.
+    readiness_test_hooks::promote_pause_point(study_instance_uid);
+    if !state.readiness.token_is_current(token) {
+        return Promotion::NothingToPromote;
+    }
     let store: WorkItemStore = super::ups_pure::workitem_store(state);
     // ONE study can carry SEVERAL workitems - one per catalog entry that
     // matched its modality (see `config::UpsConfig::catalog_for_modality`) -
@@ -250,46 +334,31 @@ pub fn promote(state: &AppState, study_instance_uid: &str) -> Promotion {
         return Promotion::NothingToPromote;
     }
 
-    // Capture the generation BEFORE any flip: a re-STOW that arrives while the
-    // flips below are being written calls `arm`, which bumps it. That is how
-    // the interleaving is detected. The deadline is deliberately NOT checked
-    // here: `promote` is also called directly (the tests drive it that way),
-    // where a still-armed study has a deadline and yet must promote - only the
-    // generation distinguishes "a re-arm landed mid-flip" from "this study was
-    // never taken due".
-    let generation_before = state.readiness.generation(study_instance_uid);
-
-    // Test seam: lets a concurrency test park a promotion between the
-    // generation capture above and the flips below, so a re-STOW lands in the
-    // exact window the generation counter exists to detect. A no-op in
-    // production (the seam is disarmed until a test arms it for this study).
-    readiness_test_hooks::promote_pause_point(study_instance_uid);
-
     let mut any_ready = false;
-    let mut any_store_error = false;
-    // (workitem_uid, record) for every workitem this pass just flipped. The
-    // announcement happens only after the generation re-check below, so a
-    // study extended mid-promotion is never announced.
+    // Pending offers, one per workitem this pass flipped to READY. Publishing
+    // is tracked SEPARATELY from the READY value: a sibling that fails its
+    // store write must not cost this one its offer, and the sweep must come
+    // back for it without re-flipping an already-READY record (which would
+    // never publish again).
+    let mut offers: Vec<PreparedOffer> = Vec::new();
     let mut flipped: Vec<(String, clarus_core::ups::WorkItemRecord)> = Vec::new();
+    let mut store_errors: Vec<String> = Vec::new();
     for workitem_uid in &uids {
-        match promote_one(&store, workitem_uid, &mut flipped) {
+        match promote_one(&store, workitem_uid, &mut offers) {
             Promotion::Ready => any_ready = true,
             Promotion::NothingToPromote => {}
-            Promotion::StoreError => any_store_error = true,
+            Promotion::StoreError => store_errors.push(workitem_uid.clone()),
         }
     }
-    if any_store_error {
-        // A failure outranks a success: the workitems that could be flipped
-        // were, and the sweep must come back for the rest.
-        return Promotion::StoreError;
-    }
 
-    // The study received instances while it was being promoted: the
-    // generation moved, so a re-STOW armed in the window. Demote every
-    // workitem just flipped and publish NOTHING - a performer must not be
-    // woken for an input the sender has since extended.
-    if state.readiness.generation(study_instance_uid) != generation_before {
-        for (workitem_uid, mut record) in flipped {
+    // The study received instances while it was being promoted: the token is
+    // stale, so a re-STOW armed in the window. Demote every workitem just
+    // flipped and publish NOTHING at all - not the offers prepared above, and
+    // not a state report either; the newer quiet period re-flips and reports
+    // from a known state. Demoting on the READY value here is safe precisely
+    // because no offer has been sent.
+    if !state.readiness.token_is_current(token) {
+        for (workitem_uid, mut record) in flipped.drain(..) {
             record.input_readiness = Some(READINESS_INCOMPLETE.to_string());
             record.updated_at = Some(super::ups_pure::now_stamp());
             if let Err(error) = store.cas_update(&record, None, None) {
@@ -303,26 +372,40 @@ pub fn promote(state: &AppState, study_instance_uid: &str) -> Promotion {
         return Promotion::NothingToPromote;
     }
 
-    // Announce last: the offer goes out only once the study is known to be
-    // settled. The envelope is the same one the create path used to publish.
-    for (workitem_uid, record) in &flipped {
-        crate::clog_info!(
-            workitem_uid = %workitem_uid,
-            "CAD workitem input is READY; the study has settled"
-        );
-        state.ups_events.notify_created(
-            workitem_uid,
-            super::ups::event_bus::FilterRouting::from_record(record),
-        );
-        // The SAME envelope the create path publishes, and now the same
-        // FILTER: the code travels with the label, so a subscription filtered
-        // on the scheduled code is answered here exactly as it would be on the
-        // create path. Passing only the label would silently drop a
-        // code-filtered subscriber from every generated workitem.
-        crate::push::push_to_subscribers_with_values(
-            workitem_uid,
-            &crate::push::FilterValues::from_record(record),
-        );
+    // Publish each offer, RE-READING the record so the event carries the state
+    // the archive actually holds. The record captured at flip time can be
+    // several writes old by now, and an offer built from it would state a
+    // readiness the store no longer has.
+    let mut unpublished: Vec<String> = Vec::new();
+    for offer in offers {
+        let current = match store.find_by_uid(&offer.workitem_uid) {
+            Ok(Some(record)) => record,
+            // Deleted between the flip and here, or unreadable: nothing to
+            // announce, and the sweep must try again rather than lose the
+            // offer.
+            _ => {
+                unpublished.push(offer.workitem_uid);
+                continue;
+            }
+        };
+        // The offer is only valid while the record still says READY. A
+        // concurrent regression (a STOW that slipped past the token check, or
+        // an operator write) makes this offer describe a state the archive
+        // does not hold.
+        if current.input_readiness.as_deref() != Some(READINESS_READY) {
+            continue;
+        }
+        publish_offer(state, &current);
+    }
+
+    if !store_errors.is_empty() || !unpublished.is_empty() {
+        // An ENVIRONMENTAL failure outranks a success: the workitems that were
+        // already READY keep their READY value, and the sweep must come back to
+        // publish the ones whose offer could not go out and to write the ones
+        // that failed. Re-arming is what makes that happen - the READY flip is
+        // idempotent, so the retry costs one no-op write per already-ready
+        // record and publishes the offer it missed.
+        return Promotion::StoreError;
     }
 
     if any_ready {
@@ -331,6 +414,39 @@ pub fn promote(state: &AppState, study_instance_uid: &str) -> Promotion {
     // Every workitem left SCHEDULED on its own: claimed, cancelled or
     // completed while the study settled. Retrying cannot change that.
     Promotion::NothingToPromote
+}
+
+/// One offer prepared by [`promote_one`] and not yet published.
+///
+/// Holds the UID only. The record is re-read at publication: a prepared
+/// record would go out with the state it had at flip time, which a later write
+/// may already have changed.
+struct PreparedOffer {
+    workitem_uid: String,
+}
+
+/// Publish one READY offer: the event and the push, in that order.
+///
+/// ONE function for both so a future change to the envelope cannot reach the
+/// event path and miss the push path.
+fn publish_offer(state: &AppState, record: &clarus_core::ups::WorkItemRecord) {
+    crate::clog_info!(
+        workitem_uid = %record.workitem_uid,
+        "CAD workitem input is READY; the study has settled"
+    );
+    state.ups_events.notify_created(
+        &record.workitem_uid,
+        super::ups::event_bus::FilterRouting::from_record(record),
+    );
+    // The SAME envelope the create path publishes, and the same FILTER: the
+    // code travels with the label, so a subscription filtered on the scheduled
+    // code is answered here exactly as it would be on the create path. Passing
+    // only the label would silently drop a code-filtered subscriber from every
+    // generated workitem.
+    crate::push::push_to_subscribers_with_values(
+        &record.workitem_uid,
+        &crate::push::FilterValues::from_record(record),
+    );
 }
 
 /// Every workitem of one study, by UID.
@@ -381,7 +497,7 @@ pub(crate) fn workitem_uids_for_study(
 fn promote_one(
     store: &WorkItemStore,
     workitem_uid: &str,
-    flipped: &mut Vec<(String, clarus_core::ups::WorkItemRecord)>,
+    offers: &mut Vec<PreparedOffer>,
 ) -> Promotion {
     let existing = match store.find_by_uid(workitem_uid) {
         Ok(Some(record)) => record,
@@ -407,6 +523,15 @@ fn promote_one(
     if existing.workflow_state != super::cad_workitem::STATE_SCHEDULED {
         return Promotion::NothingToPromote;
     }
+    // Only workitems THIS service minted carry a readiness obligation. A
+    // requester can create one for the same input study over N-CREATE with a
+    // readiness of its own and a station that is not ours; flipping that to
+    // READY would announce a claim on an input nobody here assessed, and to the
+    // requester's own subscriber. Anything else is therefore skipped, not
+    // failed - it can never become ours by retrying.
+    if existing.minted_by.as_deref() != Some(clarus_core::ups::MINTED_BY_READINESS) {
+        return Promotion::NothingToPromote;
+    }
     if existing.input_readiness.as_deref() == Some(READINESS_READY) {
         return Promotion::Ready;
     }
@@ -426,7 +551,11 @@ fn promote_one(
         return Promotion::StoreError;
     }
 
-    flipped.push((workitem_uid.to_string(), record));
+    // The offer is queued, NOT published: `promote` re-checks the token and
+    // re-reads the record before anything leaves the process.
+    offers.push(PreparedOffer {
+        workitem_uid: workitem_uid.to_string(),
+    });
     Promotion::Ready
 }
 
@@ -453,7 +582,8 @@ pub fn spawn_sweeper(state: Arc<AppState>) {
 /// Split out of the thread loop so the re-arm rule is testable with a
 /// controllable clock instead of a sleep.
 pub fn sweep_once(state: &AppState, now: Instant) {
-    for study_uid in state.readiness.take_due(now) {
+    for due in state.readiness.take_due(now) {
+        let study_uid = due.study_instance_uid.clone();
         // `take_due` REMOVED the study, so the re-arm decision is what decides
         // whether it ever comes back. Only an ENVIRONMENTAL failure earns a
         // retry:
@@ -473,14 +603,26 @@ pub fn sweep_once(state: &AppState, now: Instant) {
         //   becomes promotable again.
         //
         // - `Ready`: done, nothing to retry.
-        match promote(state, &study_uid) {
+        match promote(state, &due) {
             Promotion::Ready => {}
             Promotion::NothingToPromote => {}
             Promotion::StoreError => {
-                state.readiness.arm(&study_uid, now);
+                // Arm the retry ONLY when no newer quiet period exists. A STOW
+                // that landed while this attempt ran has already armed a
+                // LATER deadline; re-arming from `now` here would move it
+                // BACKWARD and let the study become claimable after fewer
+                // quiet seconds than the sender's last instance earned. When
+                // nothing newer exists the study is absent from the registry
+                // (take_due removed it) and the retry must still be scheduled,
+                // or the failed attempt is simply lost.
+                let superseded = state.readiness.generation(&study_uid) > due.generation;
+                if !superseded {
+                    state.readiness.arm(&study_uid, now);
+                }
                 crate::clog_warn!(
                     study_instance_uid = %study_uid,
-                    "readiness: the workitem store failed; the study is re-armed"
+                    superseded = superseded,
+                    "readiness: the workitem store failed; the study is re-armed unless a newer STOW already armed it"
                 );
             }
         }
@@ -494,7 +636,11 @@ mod tests {
 
     /// The STUDIES table must contain exactly the studies that were armed.
     fn due_at(registry: &Readiness, now: Instant) -> Vec<String> {
-        let mut due = registry.take_due(now);
+        let mut due: Vec<String> = registry
+            .take_due(now)
+            .into_iter()
+            .map(|d| d.study_instance_uid)
+            .collect();
         due.sort();
         due
     }
@@ -625,7 +771,8 @@ mod tests {
         let expired = t0 + READINESS_DEBOUNCE;
 
         let due = registry.take_due(expired);
-        assert_eq!(due, vec!["1.2.3"], "the study came due");
+        assert_eq!(due.len(), 1, "the study came due");
+        assert_eq!(due[0].study_instance_uid, "1.2.3");
         assert_eq!(
             registry.pending_len(),
             0,
@@ -634,7 +781,7 @@ mod tests {
 
         // The sweeper's failure branch.
         let retry_now = expired;
-        registry.arm(&due[0], retry_now);
+        registry.arm(&due[0].study_instance_uid, retry_now);
 
         assert_eq!(
             registry.pending_len(),

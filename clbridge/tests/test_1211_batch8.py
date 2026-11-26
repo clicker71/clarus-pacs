@@ -89,7 +89,12 @@ def test_a_byte_per_window_head_answers_408(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_a_multi_valued_series_uid_never_becomes_a_python_list_string():
     """`str(MultiValue)` renders "['1.2.3', '1.2.4']", which then became a
-    WADO-RS path segment and turned a legal SERIES C-MOVE into a 404."""
+    WADO-RS path segment and turned a legal SERIES C-MOVE into a 404.
+
+    The values are returned as a LIST so the caller can scope one job per
+    series (PS3.4 Annex C.4.2 permits UID-list matching at the SERIES level);
+    what must never happen is the rendered container reaching a URL path.
+    """
     from clean_code.handlers.cmove import _parse_c_move_rq
 
     from tests.conftest import make_fake_move_event
@@ -104,17 +109,19 @@ def test_a_multi_valued_series_uid_never_becomes_a_python_list_string():
         "UI",
         __import__("pydicom").multival.MultiValue(str, ["1.2.3.4", "1.2.3.5"]),
     )
-    _study, _dest, level, series_uid, _sop = _parse_c_move_rq(event)
+    _study, _dest, level, series_uids, _sop = _parse_c_move_rq(event)
 
     assert level == "SERIES"
-    assert "[" not in series_uid and "'" not in series_uid, series_uid
-    assert series_uid == "1.2.3.4", series_uid
+    # EVERY requested series is scoped, and none of them is a rendered list.
+    assert series_uids == ["1.2.3.4", "1.2.3.5"], series_uids
+    for value in series_uids:
+        assert "[" not in value and "'" not in value, value
 
 
 def test_a_list_shaped_uid_value_is_unwrapped_not_refused():
     """A single rendered list still scopes ONE series, so its UID is recovered;
     what must never happen is the bracket-and-quote text reaching the URL."""
-    from clean_code.handlers.cmove import _parse_c_move_rq
+    from clean_code.handlers.cmove import _parse_scoped_uid
 
     from tests.conftest import make_fake_move_event
 
@@ -122,7 +129,7 @@ def test_a_list_shaped_uid_value_is_unwrapped_not_refused():
     event.identifier.QueryRetrieveLevel = "SERIES"
     event.identifier.StudyInstanceUID = "1.2.3"
     event.identifier.SeriesInstanceUID = "['1.2.3.4']"
-    _study, _dest, _level, series_uid, _sop = _parse_c_move_rq(event)
+    series_uid = _parse_scoped_uid(event.identifier, "SeriesInstanceUID", "0020,000E")
 
     assert series_uid == "1.2.3.4", series_uid
 
@@ -141,7 +148,7 @@ def test_an_ambiguous_container_uid_is_refused():
     try:
         _parse_c_move_rq(event)
     except ValueError as exc:
-        assert "SeriesInstanceUID" in str(exc), exc
+        assert "SeriesInstanceUID" in str(exc) or "scoped UID" in str(exc), exc
     else:  # pragma: no cover - the assertion below reports it
         raise AssertionError("an ambiguous container was accepted into the URL")
 
@@ -360,7 +367,10 @@ def test_an_mwl_date_range_keeps_both_bounds():
 
     value = _build_mwl_params(ds)["00404005"]
     assert value.startswith("20260801000000"), value
-    assert value.endswith("20260831235959"), value
+    # The upper bound covers the WHOLE final second: a bare `235959` is the
+    # instant 23:59:59, so a workitem at 23:59:59.500 sorted after it and a
+    # single-day query silently omitted the last 999 ms of the day.
+    assert value.endswith("20260831235959.999999"), value
 
 
 # ---------------------------------------------------------------------------

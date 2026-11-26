@@ -32,42 +32,18 @@ fn extract_codestream(data: &[u8]) -> Result<Vec<u8>, CodecError> {
     let pix_pos = find_tag_position(data, TAG_PIXEL_DATA)
         .ok_or_else(|| CodecError::DecodeFailed("PixelData (7FE0,0010) not found".into()))?;
 
-    let mut pos = pix_pos + 4;
-    if pos + 2 > data.len() {
-        return Err(CodecError::DecodeFailed("Truncated at PixelData VR".into()));
-    }
-    let vr = std::str::from_utf8(&data[pos..pos + 2]).unwrap_or("OB");
-    pos += 2;
-
-    let ext = matches!(
-        vr,
-        "OB" | "OD" | "OF" | "OL" | "OV" | "OW" | "SQ" | "SV" | "UC" | "UN" | "UR" | "UT" | "UV"
-    );
-    if ext {
-        pos += 2; // reserved
-        if pos + 4 > data.len() {
-            return Err(CodecError::DecodeFailed(
-                "Truncated at PixelData length".into(),
-            ));
-        }
-        let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        pos += 4;
-        if len != 0xFFFF_FFFF {
-            return Err(CodecError::DecodeFailed(format!(
-                "Expected undefined length, got 0x{len:08X}"
-            )));
-        }
-    } else {
-        if pos + 2 > data.len() {
-            return Err(CodecError::DecodeFailed(
-                "Truncated at PixelData length".into(),
-            ));
-        }
-        let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as u32;
-        pos += 2;
-        if len != 0xFFFF {
-            return Err(CodecError::DecodeFailed("Expected undefined length".into()));
-        }
+    // PS3.5 6.2 Table 6.2-1 via `vr_widths`: the width class decides the
+    // header shape. The hand-written list here omitted SV and UV, so such an
+    // element before Pixel Data took the short branch and the walk resumed
+    // inside its header.
+    let value = super::vr_widths::explicit_value(data, pix_pos + 4, false)
+        .ok_or_else(|| CodecError::DecodeFailed("Truncated at PixelData header".into()))?;
+    let mut pos = value.start;
+    if value.len != super::vr_widths::UNDEFINED_LENGTH {
+        return Err(CodecError::DecodeFailed(format!(
+            "Expected undefined length, got 0x{:08X}",
+            value.len
+        )));
     }
 
     // BOT Item (FFFE,E000, len=0)
@@ -91,29 +67,58 @@ fn extract_codestream(data: &[u8]) -> Result<Vec<u8>, CodecError> {
         pos = pos.saturating_add(bot_len);
     }
 
-    // First data fragment (FFFE,E000)
-    if pos + 8 > data.len() {
-        return Err(CodecError::DecodeFailed("Truncated at fragment".into()));
+    // PS3.5 A.4: "Whether more than one Fragment per Frame is permitted or not
+    // is defined per Transfer Syntax." JPEG 2000 permits it, and a Part 1
+    // codestream may be split at any byte boundary - so the whole Item stream
+    // of the frame has to be joined before the decoder sees it. Returning only
+    // the first fragment handed `J2kDecoder` a truncated codestream.
+    //
+    // Only the requested frame is joined. For a single-frame image every
+    // fragment belongs to it (the empty Basic Offset Table above carries no
+    // boundaries); with more frames the fragment-to-frame mapping is what
+    // identifies a frame, and concatenating across it is the error this
+    // decoder's caller is responsible for ruling out.
+    let mut codestream = Vec::new();
+    loop {
+        if pos + 8 > data.len() {
+            return Err(CodecError::DecodeFailed("Truncated at fragment".into()));
+        }
+        let ftag = (
+            u16::from_le_bytes([data[pos], data[pos + 1]]),
+            u16::from_le_bytes([data[pos + 2], data[pos + 3]]),
+        );
+        if ftag == (0xFFFE, 0xE0DD) {
+            // PS3.5 A.4: the Sequence Delimitation Item closes the value.
+            break;
+        }
+        if ftag != (0xFFFE, 0xE000) {
+            return Err(CodecError::DecodeFailed(format!(
+                "Expected fragment Item, got {ftag:?}"
+            )));
+        }
+        pos += 4;
+        let flen =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        if flen == super::vr_widths::UNDEFINED_LENGTH {
+            return Err(CodecError::DecodeFailed(
+                "Undefined-length fragment Item".into(),
+            ));
+        }
+        if pos + flen > data.len() {
+            return Err(CodecError::DecodeFailed(
+                "Fragment extends past data".into(),
+            ));
+        }
+        codestream.extend_from_slice(&data[pos..pos + flen]);
+        pos += flen;
     }
-    let ftag = (
-        u16::from_le_bytes([data[pos], data[pos + 1]]),
-        u16::from_le_bytes([data[pos + 2], data[pos + 3]]),
-    );
-    pos += 4;
-    if ftag != (0xFFFE, 0xE000) {
-        return Err(CodecError::DecodeFailed(format!(
-            "Expected fragment Item, got {ftag:?}"
-        )));
-    }
-    let flen =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos += 4;
-    if pos + flen > data.len() {
+    if codestream.is_empty() {
         return Err(CodecError::DecodeFailed(
-            "Fragment extends past data".into(),
+            "Encapsulated PixelData holds no fragment".into(),
         ));
     }
-    Ok(data[pos..pos + flen].to_vec())
+    Ok(codestream)
 }
 
 /// Find tag position in DICOM byte slice (Explicit VR LE assumed for search).
@@ -131,63 +136,94 @@ fn find_tag_position(data: &[u8], (target_g, target_e): (u16, u16)) -> Option<us
     } else {
         0
     };
+    // PS3.5 7.1: the attributes this function serves (Pixel Data, Samples per
+    // Pixel, Rows, Columns) are TOP-LEVEL. An instance can also carry them
+    // inside a sequence - the Icon Image Sequence (0088,0200) of PS3.3
+    // C.7.6.1.1.5 holds a complete thumbnail - and a walk that enters the item
+    // stream returns the icon's attributes as if they described the image. A
+    // native icon then fails the undefined-length check further down, turning
+    // a decodable file into a decode error.
+    let mut depth: usize = 0;
     while pos + 4 <= data.len() {
         let g = u16::from_le_bytes([data[pos], data[pos + 1]]);
         let e = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
-        if g == target_g && e == target_e {
-            return Some(pos);
-        }
         // PS3.5 7.5: (FFFE,E000), (FFFE,E00D) and (FFFE,E0DD) carry NO VR,
         // so the four bytes after the tag are a length and not a VR plus a
-        // length. Reading a VR here takes two length bytes as the VR and
-        // leaves the walk four bytes out, at every item and delimiter in the
-        // encapsulated payload this function exists to find.
+        // length.
         if g == 0xFFFE {
-            pos += 8;
+            if pos + 8 > data.len() {
+                return None;
+            }
+            let item_len =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            match (e, item_len) {
+                (0xE000, super::vr_widths::UNDEFINED_LENGTH) => {
+                    depth += 1;
+                    pos += 8;
+                }
+                (0xE000, _) => pos = pos.saturating_add(8).saturating_add(item_len),
+                // PS3.5 7.5.1: a sequence closes on (FFFE,E0DD) and an item on
+                // (FFFE,E00D), and each undefined-length item or sequence opens
+                // exactly one level above. Both delimiters must therefore close
+                // one level, or a nested undefined-length item leaves the walk
+                // one level too deep - which hides the top-level attributes
+                // that follow it and reads as "PixelData not found".
+                (0xE00D | 0xE0DD, _) => {
+                    depth = depth.saturating_sub(1);
+                    pos += 8;
+                }
+                _ => pos += 8,
+            }
             continue;
         }
-        pos += 4; // skip tag
-        if pos + 2 > data.len() {
-            break;
+        if depth == 0 && g == target_g && e == target_e {
+            return Some(pos);
         }
-        let vr = std::str::from_utf8(&data[pos..pos + 2]).unwrap_or("");
-        pos += 2;
-        let len: usize = if matches!(
-            vr,
-            "OB" | "OD" | "OF" | "OL" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT"
-        ) {
-            pos += 2;
-            if pos + 4 > data.len() {
-                break;
-            }
-            let l = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                as usize;
-            pos += 4;
-            // A 32-bit length is the only form that can carry the sentinel
-            // (PS3.5 7.5.1), and the sentinel is not a length to step over:
-            // the walk enters the item stream and leaves it at (FFFE,E0DD),
-            // which the branch above consumes.
-            if l == 0xFFFF_FFFF {
-                continue;
-            }
-            l
-        } else {
-            if pos + 2 > data.len() {
-                break;
-            }
-            let l = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-            l
+        // PS3.5 7.1.2 with 6.2 Table 6.2-1: the width class, from the one
+        // table that states it. A 32-bit length is the only form that carries
+        // the undefined sentinel, and the sentinel is not a length to step
+        // over - the walk enters the item stream instead.
+        let Some(value) = super::vr_widths::explicit_value(data, pos + 4, false) else {
+            break;
         };
-        pos += len;
-        if !len.is_multiple_of(2) {
-            pos += 1;
+        let header_len = 4 + value.header_len;
+        if value.len == super::vr_widths::UNDEFINED_LENGTH {
+            pos = pos.saturating_add(header_len);
+            depth += 1;
+        } else {
+            pos = pos.saturating_add(header_len).saturating_add(value.len);
+            if !value.len.is_multiple_of(2) {
+                pos = pos.saturating_add(1);
+            }
         }
     }
     None
 }
 
 // -- Encode helpers --------------------------------------------------------
+
+/// Read (0028,0004) Photometric Interpretation from a byte slice.
+///
+/// PS3.3 C.7.6.3.1.1 makes MONOCHROME1 a statement about the SAMPLES: the
+/// minimum sample is intended to be displayed white. Decoding a JPEG 2000
+/// codestream does not change that (PS3.5 8.2.4 covers the codestream, not the
+/// DICOM attribute), so the interpretation must survive the decode. Reporting a
+/// MONOCHROME1 source as MONOCHROME2 inverted the display polarity for every
+/// consumer that trusted the returned value.
+fn photometric_interpretation_of(data: &[u8]) -> Option<String> {
+    let pos = find_tag_position(data, super::TAG_PHOTOMETRIC_INTERPRETATION)?;
+    let value = super::vr_widths::explicit_value(data, pos + 4, false)?;
+    let end = value.start.checked_add(value.len)?;
+    let raw = data.get(value.start..end)?;
+    let text = std::str::from_utf8(raw).ok()?;
+    let text = text.trim_end_matches([' ', '\0']);
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
 
 /// Read (0028,0002) Samples per Pixel from an explicit-VR DICOM byte slice.
 /// Returns 1 when the tag is absent or unreadable (the default assumed by
@@ -197,26 +233,15 @@ fn samples_per_pixel_of(data: &[u8]) -> u16 {
     let Some(pos) = find_tag_position(data, super::TAG_SAMPLES_PER_PIXEL) else {
         return 1;
     };
-    let Some(vr_bytes) = data.get(pos + 4..pos + 6) else {
-        return 1;
-    };
-    let Ok(vr) = std::str::from_utf8(vr_bytes) else {
-        return 1;
-    };
-    if vr != "US" {
-        return 1;
-    }
-    let Some(len_bytes) = data.get(pos + 6..pos + 8) else {
-        return 1;
-    };
-    let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
-    if len < 2 {
+    // PS3.5 6.2 Table 6.2-1 via `vr_widths`: the two-byte length this used to
+    // read at pos+6 belongs to a SHORT-form header only. SPP is US, so the
+    // shape is fixed here - but reading it through the one table keeps the
+    // width class in a single place, which is what stops the next VR list from
+    // drifting.
+    if data.get(pos + 4..pos + 6) != Some(b"US") {
         return 1;
     }
-    let Some(raw) = data.get(pos + 8..pos + 8 + len) else {
-        return 1;
-    };
-    u16::from_le_bytes([raw[0], raw[1]])
+    super::vr_widths::explicit_u16(data, pos + 4, false).unwrap_or(1)
 }
 
 fn encode_lossless(pixels: &DecodedPixels, meta: &DicomMeta) -> Result<Vec<u8>, CodecError> {
@@ -315,10 +340,17 @@ fn decode_j2k_codestream(dicom_bytes: &[u8]) -> Result<DecodedPixels, CodecError
         // so reporting 12 made the buffer look one byte per sample and every
         // size check rejected a perfectly valid image.
         bits_allocated: (bps * 8) as u8,
+        // PS3.3 C.7.6.3.1.1: the colour interpretation is fixed by the
+        // component count, but the grayscale one is NOT - a MONOCHROME1
+        // source keeps its polarity through the decode. Reporting it as
+        // MONOCHROME2 did not invert the samples, so the returned value
+        // contradicted both the file and the bytes.
         photometric_interpretation: if components == 3 {
             "RGB".into()
         } else {
-            "MONOCHROME2".into()
+            photometric_interpretation_of(dicom_bytes)
+                .filter(|pi| pi == "MONOCHROME1")
+                .unwrap_or_else(|| "MONOCHROME2".into())
         },
     })
 }
@@ -349,10 +381,7 @@ impl DicomCodec for Jpeg2000NativeLosslessCodec {
         meta: &DicomMeta,
     ) -> Result<Vec<u8>, CodecError> {
         let compressed = self.encode(pixels, meta)?;
-        Ok(crate::codec::build_encapsulated_pixeldata(
-            &compressed,
-            false,
-        ))
+        Ok(crate::codec::build_encapsulated_pixeldata(&compressed))
     }
 }
 
@@ -387,10 +416,7 @@ impl DicomCodec for Jpeg2000NativeLossyCodec {
         meta: &DicomMeta,
     ) -> Result<Vec<u8>, CodecError> {
         let compressed = self.encode(pixels, meta)?;
-        Ok(crate::codec::build_encapsulated_pixeldata(
-            &compressed,
-            false,
-        ))
+        Ok(crate::codec::build_encapsulated_pixeldata(&compressed))
     }
 }
 
@@ -513,9 +539,7 @@ mod tests {
         buf.extend_from_slice(&(pi_buf.len() as u16).to_le_bytes());
         buf.extend_from_slice(&pi_buf);
         // (7FE0,0010) encapsulated pixel data
-        buf.extend_from_slice(&crate::codec::build_encapsulated_pixeldata(
-            codestream, false,
-        ));
+        buf.extend_from_slice(&crate::codec::build_encapsulated_pixeldata(codestream));
         buf
     }
 
@@ -898,5 +922,164 @@ mod tests {
         let at = find_tag_position(&dicom, super::super::TAG_PIXEL_DATA)
             .expect("the walker finds PixelData");
         assert_eq!(&dicom[at + 4..at + 6], b"OB", "and lands on its VR");
+    }
+
+    /// A defined-length sequence whose single item holds its own
+    /// (7FE0,0010): the walker must step over the item by its length instead
+    /// of walking into it. PS3.5 7.5.1 lets an Item carry any dataset, and an
+    /// Icon Image Sequence (PS3.3 C.7.6.1.1.5) is exactly a nested image.
+    fn with_nested_pixel_data_item(dicom: Vec<u8>) -> Vec<u8> {
+        let mut inner = Vec::new();
+        // A nested PixelData header; the value need not be codestream since
+        // the walker must never look at it.
+        inner.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        inner.extend_from_slice(&0x0010u16.to_le_bytes());
+        inner.extend_from_slice(b"OB");
+        inner.extend_from_slice(&[0, 0]);
+        inner.extend_from_slice(&0u32.to_le_bytes());
+        // PS3.5 6.2: the item value is even, which an 8-byte header already is.
+        let item_len = inner.len() as u32;
+
+        // PS3.5 7.5.1: an UNDEFINED-length sequence has no usable declared
+        // length, so the walker has to step INTO the item stream and parse the
+        // Items to get past it. A defined-length sequence is skipped by its
+        // length and the Item branch is never reached - which is why this test
+        // used to stay green with that branch removed.
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&0x0088u16.to_le_bytes());
+        seq.extend_from_slice(&0x0200u16.to_le_bytes());
+        seq.extend_from_slice(b"SQ");
+        seq.extend_from_slice(&[0, 0]);
+        seq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        seq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        seq.extend_from_slice(&0xE000u16.to_le_bytes());
+        seq.extend_from_slice(&item_len.to_le_bytes());
+        seq.extend_from_slice(&inner);
+        // Sequence Delimitation Item closes the undefined-length value.
+        seq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        seq.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        seq.extend_from_slice(&0u32.to_le_bytes());
+
+        let pixel_at = dicom
+            .windows(4)
+            .rposition(|w| w == [0xE0, 0x7F, 0x10, 0x00])
+            .expect("the fixture has a PixelData tag");
+        let mut out = Vec::with_capacity(dicom.len() + seq.len());
+        out.extend_from_slice(&dicom[..pixel_at]);
+        out.extend_from_slice(&seq);
+        out.extend_from_slice(&dicom[pixel_at..]);
+        out
+    }
+
+    /// A defined-length Item is stepped over by its length.
+    ///
+    /// Without the `depth` gate the walker enters the item and returns the
+    /// nested (7FE0,0010). That nested element is the same tag with the same
+    /// VR, so only the pixel comparison distinguishes the two positions.
+    #[test]
+    fn the_walker_steps_over_a_defined_length_item() {
+        let (w, h) = (8u32, 8u32);
+        let data = vec![0x11u8; (w * h) as usize];
+        let codestream = encode_j2k(&data, w, h, 1, 8, false);
+
+        let plain = wrap_j2k("MONOCHROME2", 1, &codestream);
+        let nested = with_nested_pixel_data_item(plain.clone());
+        assert!(nested.len() > plain.len());
+
+        let plain_pixels = Jpeg2000NativeLosslessCodec
+            .decode(&plain)
+            .expect("the control fixture decodes");
+        let pixels = Jpeg2000NativeLosslessCodec
+            .decode(&nested)
+            .expect("the nested PixelData is not the image");
+        assert_eq!(pixels.data, plain_pixels.data);
+    }
+
+    /// A one-frame instance whose single codestream is spread over `parts`
+    /// fragment Items, with the offset table empty. PS3.5 A.4 permits the
+    /// split anywhere in the codestream and the empty table (a zero-length
+    /// Basic Offset Table) says the split is not a frame boundary.
+    fn wrap_j2k_split(pi: &str, codestream: &[u8], parts: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0002u16.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0004u16.to_le_bytes());
+        buf.extend_from_slice(b"CS");
+        let mut pi_buf = pi.as_bytes().to_vec();
+        if !pi_buf.len().is_multiple_of(2) {
+            pi_buf.push(b' ');
+        }
+        buf.extend_from_slice(&(pi_buf.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&pi_buf);
+
+        // (7FE0,0010) OB, undefined length, empty BOT.
+        buf.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"OB");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        buf.extend_from_slice(&0xE000u16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        // PS3.5 A.4: a fragment value is even-length, so the split points are
+        // even offsets - padding a fragment instead would insert bytes into
+        // the codestream. A JPEG 2000 codestream ends on the EOC marker and is
+        // therefore even; assert it rather than hide an odd length behind a pad.
+        assert!(codestream.len().is_multiple_of(2));
+        let chunk = ((codestream.len() / parts.max(1)) & !1).max(2);
+        let mut at = 0;
+        while at < codestream.len() {
+            let end = (at + chunk).min(codestream.len());
+            buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+            buf.extend_from_slice(&0xE000u16.to_le_bytes());
+            buf.extend_from_slice(&((end - at) as u32).to_le_bytes());
+            buf.extend_from_slice(&codestream[at..end]);
+            at = end;
+        }
+        buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        buf.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// PS3.5 A.4: a JPEG 2000 frame may be split across several fragments, and
+    /// the split may fall anywhere in the codestream. The decoder must join
+    /// them; handing `J2kDecoder` the first fragment alone reports a
+    /// truncated codestream for a conformant file.
+    #[test]
+    fn a_frame_split_across_fragments_decodes() {
+        let (w, h) = (8u32, 8u32);
+        let data: Vec<u8> = (0..(w * h) as usize).map(|i| (i * 7) as u8).collect();
+        let codestream = encode_j2k(&data, w, h, 1, 8, false);
+
+        let whole = wrap_j2k("MONOCHROME2", 1, &codestream);
+        let split = wrap_j2k_split("MONOCHROME2", &codestream, 3);
+        assert!(split.len() > whole.len(), "two extra Item headers");
+
+        let unsplit_pixels = Jpeg2000NativeLosslessCodec.decode(&whole).expect("decode");
+        let pixels = Jpeg2000NativeLosslessCodec
+            .decode(&split)
+            .expect("every fragment belongs to the one frame");
+        assert_eq!(pixels.data, unsplit_pixels.data);
+    }
+
+    /// PS3.3 C.7.6.3.1.1: MONOCHROME1 keeps its polarity through a lossless
+    /// decode - the codestream is unchanged, so the interpretation is too.
+    #[test]
+    fn a_monochrome1_source_keeps_its_interpretation() {
+        let (w, h) = (8u32, 8u32);
+        let data = vec![0x22u8; (w * h) as usize];
+        let codestream = encode_j2k(&data, w, h, 1, 8, false);
+        let dicom = wrap_j2k("MONOCHROME1", 1, &codestream);
+
+        let pixels = Jpeg2000NativeLosslessCodec.decode(&dicom).expect("decode");
+        assert_eq!(pixels.photometric_interpretation, "MONOCHROME1");
     }
 }

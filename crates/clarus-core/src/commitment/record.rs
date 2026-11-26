@@ -158,6 +158,19 @@ impl FailureReason {
         }
     }
 
+    /// The DICOM code as the UNSIGNED NUMBER a DICOM JSON payload carries.
+    ///
+    /// PS3.18 F.2.3 defines the JSON value of a numeric VR (US here) as a JSON
+    /// NUMBER, not a string - `[274]` for 0112H, not `["0112"]`. A consumer
+    /// that type-checks the declared VR rejects the string form.
+    #[must_use]
+    pub fn code_number(self) -> u16 {
+        match self {
+            Self::NoSuchSopInstance => 0x0112,
+            Self::ProcessingFailure => 0x0110,
+        }
+    }
+
     fn from_code(code: &str) -> Result<Self, RecordError> {
         match code {
             "0112" => Ok(Self::NoSuchSopInstance),
@@ -690,10 +703,16 @@ mod tests {
             w.written()
         };
         let _ = key;
-        assert!(matches!(
-            CommitmentRecord::decode(&buf[..written]),
-            Err(RecordError::Malformed(_))
-        ));
+        // Name the missing thing: `Malformed(_)` alone would also match a
+        // decode that failed for any other reason, so the test would keep
+        // passing if the identity check were replaced by some unrelated one.
+        assert!(
+            matches!(
+                CommitmentRecord::decode(&buf[..written]),
+                Err(RecordError::Malformed(m)) if m.contains("transaction_uid")
+            ),
+            "the missing key must be reported as the missing transaction UID"
+        );
     }
 
     #[test]
@@ -907,5 +926,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A study-shaped failed item without a series UID is STORED.
+    ///
+    /// The natural reading of Annex J.2 ("the series UID is part of the
+    /// study-shaped hierarchy") would make it required, but a study-shaped
+    /// request can name an instance that is NOT PRESENT. That item has no
+    /// manifest, so there is no series UID to report - the request never named
+    /// one and the archive has nothing to look up. Requiring it here rejected a
+    /// legitimate 0112 failure and the whole Commit answered 500
+    /// (`commitment_smoke::a_study_shaped_request_reports_a_missing_instance_under_the_failed_study`
+    /// caught it). The response renders such an item without a series
+    /// reference, which is the truthful answer.
+    ///
+    /// Instance-form items carry no study UID and are unaffected either way.
+    #[test]
+    fn a_study_shaped_result_without_a_series_uid_is_stored() {
+        let mut rec = record();
+        rec.request_form = RequestForm::Study;
+        rec.instances = vec![InstanceResult {
+            sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
+            sop_instance_uid: "1.2.3.4".to_string(),
+            outcome: CommitmentOutcome::Failed,
+            failure_reason: Some(FailureReason::NoSuchSopInstance),
+            study_uid: Some("1.2.3.4.5".to_string()),
+            series_uid: None,
+        }];
+        rec.validate()
+            .expect("a missing instance has no series UID to report");
+
+        // The same record with a series UID is equally valid.
+        rec.instances[0].series_uid = Some("1.2.3.4.5.6".to_string());
+        rec.validate().expect("a complete item is valid");
     }
 }

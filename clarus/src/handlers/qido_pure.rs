@@ -20,15 +20,21 @@ use super::{DICOM_JSON_CONTENT_TYPE, DICOM_XML_CONTENT_TYPE};
 use crate::state::AppState;
 
 // -- Status constants (u16 - no http::StatusCode in pure code) ------------
+//
+// PS3.18 8.5 (`standard/ps3.18/http-status-codes-8.5.json`) is the ground truth
+// for these codes, and `clarus_core::http::status` already spells them out for
+// the rest of the server. Binding to those names instead of re-typing the
+// numbers keeps this module from quietly disagreeing with the transport layer
+// about what a 400 or a 503 means.
 
 /// 200 OK.
-pub const STATUS_OK: u16 = 200;
+pub const STATUS_OK: u16 = clarus_core::http::status::OK;
 /// 400 Bad Request - a validation error.
-pub const STATUS_BAD_REQUEST: u16 = 400;
+pub const STATUS_BAD_REQUEST: u16 = clarus_core::http::status::BAD_REQUEST;
 /// 500 Internal Server Error.
-pub const STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
+pub const STATUS_INTERNAL_SERVER_ERROR: u16 = clarus_core::http::status::INTERNAL_SERVER_ERROR;
 /// 503 Service Unavailable - health only.
-pub const STATUS_SERVICE_UNAVAILABLE: u16 = 503;
+pub const STATUS_SERVICE_UNAVAILABLE: u16 = clarus_core::http::status::SERVICE_UNAVAILABLE;
 /// `application/json` - used for non-QIDO error bodies (matches axum `Json`).
 const APPLICATION_JSON: &str = "application/json";
 
@@ -74,18 +80,66 @@ pub struct QidoError {
 
 // -- Accept negotiation --------------------------------------------------
 
+/// What a metadata response can be rendered as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Representation {
+    /// `application/dicom+json`, the default.
+    Json,
+    /// `application/dicom+xml`.
+    Xml,
+}
+
+/// [`negotiate`] with the 406 case preserved.
+///
+/// PS3.18 10.4.3.1 and RFC 9110 15.5.7 make an unsatisfiable `Accept` a 406.
+/// [`negotiate`] cannot express that (it returns a content type, not a
+/// verdict), so callers that own the status line use this instead. An absent
+/// header is JSON: PS3.18 10.4.4 does not mandate a default and JSON is what
+/// every client in the field expects.
+#[must_use]
+pub fn negotiate_representation(accept: Option<&str>) -> Option<Representation> {
+    match crate::handlers::accept::select(
+        accept,
+        &["application/dicom+json", "application/dicom+xml"],
+    ) {
+        Some("application/dicom+xml") => Some(Representation::Xml),
+        Some(_) => Some(Representation::Json),
+        // Every offered representation was excluded (`q=0`) or the header
+        // named only types we do not render.
+        None => None,
+    }
+}
+
 /// Choose the response content type from the `Accept` header.
 ///
-/// Simple substring check - no full MIME parsing (P26 deferred - quality
-/// factors `q=...` per RFC 7231 Section 5.3.1 are NOT parsed yet). Returns XML when
-/// the client explicitly asks for `application/dicom+xml`, else JSON.
+/// PS3.18 8.3.4.1 lets the client pick the search-response representation
+/// with `Accept`, and RFC 9110 12.5.1 makes each media range a case-
+/// insensitive type with its own `q` weight. A substring search is wrong on
+/// both counts: `multipart/related; type="APPLICATION/DICOM+XML"` asked for
+/// XML but returned JSON (the comparison was case-sensitive), and an XML
+/// range carrying `q=0` - the client saying "not XML" - also returned XML.
+///
+/// The offered order is XML-then-JSON only when XML is acceptable, so an
+/// absent header still yields JSON: PS3.18 8.3.4 does not mandate a default,
+/// and JSON is what every client in the field expects.
+///
+/// A client that excludes both representations gets JSON rather than a 406.
+/// The 406 decision belongs to the transport layer, which owns the status
+/// line; this chooser only answers "which representation".
 pub fn negotiate(accept: Option<&str>) -> &'static str {
-    if let Some(a) = accept
-        && a.contains(DICOM_XML_CONTENT_TYPE)
-    {
-        return DICOM_XML_CONTENT_TYPE;
+    // Offer the BARE media types: the constants carry `; charset=...`, which
+    // is a parameter of the response, not part of the type the client names.
+    // Comparing the full constant never matched a parsed range.
+    //
+    // JSON is offered FIRST so an absent header - which `select` answers with
+    // the first offer - keeps the JSON default the field relies on.
+    match crate::handlers::accept::select(
+        accept,
+        &["application/dicom+json", "application/dicom+xml"],
+    ) {
+        Some("application/dicom+xml") => DICOM_XML_CONTENT_TYPE,
+        _ => DICOM_JSON_CONTENT_TYPE,
     }
-    DICOM_JSON_CONTENT_TYPE
 }
 
 // -- Query parameter validation --------------------------------------------
@@ -96,29 +150,16 @@ pub fn negotiate(accept: Option<&str>) -> &'static str {
 /// get the same 64-character limit.
 const PATIENT_NAME_MAX_LEN: usize = 64;
 
-/// Decode a URL-encoded string (percent-encoding).
+/// Decode one query-parameter value.
+///
+/// `%XX` becomes a byte and `+` stays a literal `+`. PS3.18 8.3.1 lists `+` in
+/// `qp-special`, so it is a legal character in a query VALUE and not the
+/// form-urlencoded space escape: decoding it to a space turned a PatientID of
+/// `A+B` into a search for `A B` - a string the requester never sent. A space
+/// travels as `%20`. The shared decoder owns the rule (it also keeps the
+/// UTF-8-literal semantics the URL grammar needs).
 fn url_decode(s: &str) -> String {
-    let mut result = Vec::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next().unwrap_or(b'0');
-            let lo = chars.next().unwrap_or(b'0');
-            if let Ok(decoded) =
-                u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap_or("00"), 16)
-            {
-                result.push(decoded);
-            }
-        } else if b == b'+' {
-            result.push(b' ');
-        } else {
-            result.push(b);
-        }
-    }
-    // UTF-8 multi-byte sequences decode into BYTES, not Latin-1 scalars:
-    // %D0%BC is "м", not "Ð¼". Lossy is fine - a malformed sequence can
-    // never match a stored UTF-8 name anyway.
-    String::from_utf8_lossy(&result).into_owned()
+    crate::handlers::json_common::form_decode_query_str(s)
 }
 
 /// StudyDate in compact DICOM form: `YYYYMMDD`, `YYYYMMDD-YYYYMMDD`, or a
@@ -175,39 +216,61 @@ fn validate_study_date(date: &str) -> bool {
     }
 }
 
-/// Validate StudyTime format: `HHMMSS` or `HHMMSS.ffffff` (DICOM TM VR).
-/// Per DICOM PS3.5, TM allows optional fractional seconds after a dot.
+/// Validate StudyTime format: `HH`, `HHMM`, `HHMMSS`, each optionally followed
+/// by `.ffffff` (DICOM TM VR).
+///
+/// PS3.5 6.2 Table 6.2-1 (`standard/ps3.5/tm-vr.json`, `trailingNullComponentsDenotePeriod`):
+/// "a component that is omitted from the string is termed a null component,
+/// and trailing null components of Time indicate that the Value is not precise
+/// to the precision of those components". So `0900` is a legal TM naming the
+/// whole minute 09:00:00..09:00:59, and requiring six digits rejected a
+/// conformant query bound.
+///
+/// The ranges are the table's own: HH 00-23, MM 00-59, SS 00-60 (a leap
+/// second is legal), and one to six fractional digits.
 fn validate_study_time(time: &str) -> bool {
-    // Must be at least 6 chars (HHMMSS)
-    if time.len() < 6 {
-        return false;
-    }
     let bytes = time.as_bytes();
-    // First 6 chars must be ASCII digits
-    if !bytes[0..6].iter().all(|b| b.is_ascii_digit()) {
+    // Split off the optional fraction first: TM has no other '.' use.
+    let (whole, frac) = match time.find('.') {
+        Some(i) => (&bytes[..i], Some(&bytes[i + 1..])),
+        None => (bytes, None),
+    };
+    // Reduced precision is legal only in the trailing-component sense, so the
+    // whole part is 2, 4 or 6 digits - never an odd count.
+    if !matches!(whole.len(), 2 | 4 | 6) {
         return false;
     }
-    // Optional fractional part: dot followed by 1-6 digits
-    if time.len() > 6 {
-        if bytes[6] != b'.' {
+    if !whole.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    if let Some(frac) = frac {
+        // A dot must be followed by 1..=6 digits (PS3.5 6.2: FFFFFF is
+        // "1 to 6 digits"); an empty or over-long fraction is malformed.
+        if frac.is_empty() || frac.len() > 6 || !frac.iter().all(u8::is_ascii_digit) {
             return false;
         }
-        if time.len() == 7 {
-            return false; // dot with no digits
-        }
-        if !bytes[7..].iter().all(|b| b.is_ascii_digit()) {
-            return false;
-        }
-        // Max 6 fractional digits per DICOM TM
-        if time.len() > 13 {
-            return false;
-        }
+    }
+    let num = |from: usize, to: usize| -> u32 {
+        whole[from..to]
+            .iter()
+            .fold(0u32, |acc, b| acc * 10 + u32::from(b - b'0'))
+    };
+    // PS3.5 Table 6.2-1: HH 00-23.
+    if num(0, 2) > 23 {
+        return false;
+    }
+    if whole.len() >= 4 && num(2, 4) > 59 {
+        return false;
+    }
+    // SS runs to 60 because a leap second is a legal time value.
+    if whole.len() == 6 && num(4, 6) > 60 {
+        return false;
     }
     true
 }
 
 /// Validate a TM value in the range form PS3.4 C.2.2.2.5 requires: the exact
-/// `HHMMSS[.ffffff]`, a closed `lo-hi`, or one open end (`lo-`, `-hi`), each
+/// `HH[MM[SS]][.ffffff]`, a closed `lo-hi`, or one open end (`lo-`, `-hi`), each
 /// bound a valid TM. TM values never contain `-`, so one separator is
 /// unambiguous. A bare `-` (both ends absent) is rejected: it carries no
 /// constraint (standard/ps3.4/c-2.2.2.5-range-matching.json) and must not
@@ -436,14 +499,16 @@ fn resolve_limit(query: &QidoQuery, cfg: &crate::config::QueryConfig) -> Option<
 /// open-ended search - `[query] default_limit` does NOT apply here (12.09:
 /// MicroDicom 250-cap root cause - it enumerates a study's series / a series'
 /// instances for download and took the search cap as the full list). Only an
-/// explicit client `limit` is honored; `Some(0)` and absent both mean
-/// unlimited.
+/// explicit client `limit` is honored; an absent limit means unlimited, while
+/// `limit=0` is the client asking for an empty page.
 fn resolve_enumeration_limit(query: &QidoQuery) -> Option<u64> {
-    match query.limit {
-        Some(0) => None,
-        Some(l) => Some(l),
-        None => None,
-    }
+    // PS3.18 8.3.4.4.1 makes `limit` a COUNT of returned results, and
+    // `standard/ps3.18/http-status-codes-8.5.json` records the 400 entry's own
+    // reading: "limit=0 ... PS3.18 8.3.4.4.1 answers with 200 and an empty
+    // payload". A limit of zero is therefore a request for an empty page, not a
+    // request for everything - folding it into the unlimited case answered the
+    // opposite of what the client asked.
+    query.limit
 }
 
 /// Validation error returned when query parameters don't meet invariants.
@@ -482,13 +547,13 @@ impl ValidationError {
                 format!("PatientSex must be M, F, or O (got: {sex})")
             }
             ValidationError::InvalidStudyTime(time) => {
-                format!("StudyTime must match pattern HHMMSS[.ffffff] (got: {time})")
+                format!("StudyTime must match pattern HH[MM[SS]][.ffffff] (got: {time})")
             }
             ValidationError::InvalidPerformedStepStartDate(date) => {
                 format!("PerformedProcedureStepStartDate must match pattern YYYYMMDD (got: {date})")
             }
             ValidationError::InvalidPerformedStepStartTime(time) => format!(
-                "PerformedProcedureStepStartTime must match pattern HHMMSS[.ffffff] (got: {time})"
+                "PerformedProcedureStepStartTime must match pattern HH[MM[SS]][.ffffff] (got: {time})"
             ),
             ValidationError::InvalidDicomUid(uid) => format!("Invalid DICOM UID: {uid}"),
             ValidationError::ReferringPhysicianTooLong(len) => format!(
@@ -514,15 +579,51 @@ impl ValidationError {
     }
 }
 
+/// The longest component group of a PN (Person Name) value, in characters.
+///
+/// PS3.5 6.2 Table 6.2-1, PN row: the VR is five component groups separated by
+/// `=` (family, given, middle, prefix, suffix) and each group may hold up to 64
+/// characters. The limit is PER GROUP, so `surname=given` with two 40-character
+/// groups is a legal PN of 81 characters. Counting the whole value against 64
+/// rejected it.
+fn person_name_component_len(name: &str) -> usize {
+    name.split('=')
+        .map(|group| group.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Take an optional boolean modifier out of the key map.
+///
+/// Absent -> `Ok(None)` (the server default applies). Supplied and valid ->
+/// `Ok(Some(bool))`. Supplied and malformed -> `Err` (400), because silently
+/// treating it as absent hides an invalid modifier from the client.
+fn parse_query_bool_param(
+    name: &str,
+    map: &mut std::collections::HashMap<String, String>,
+) -> Result<Option<bool>, QidoError> {
+    match map.remove(name) {
+        None => Ok(None),
+        Some(v) => parse_query_bool(&v).map(Some).map_err(|bad| QidoError {
+            status: STATUS_BAD_REQUEST,
+            message: format!("{name} must be \"true\" or \"false\" (got \"{bad}\")"),
+        }),
+    }
+}
+
 impl QidoQuery {
     /// Validate query parameters. Returns `Err(QidoError)` (400) on violation.
     /// INV-001: validation happens BEFORE any SQL is constructed.
     fn validate(&self) -> Result<(), QidoError> {
-        // INV-003: PatientName <= 64 characters (Unicode-aware)
+        // INV-003: PatientName <= 64 characters PER COMPONENT GROUP
+        // (PS3.5 6.2 Table 6.2-1, PN row) - see `person_name_component_len`.
         if let Some(ref name) = self.PatientName
-            && name.chars().count() > PATIENT_NAME_MAX_LEN
+            && person_name_component_len(name) > PATIENT_NAME_MAX_LEN
         {
-            return Err(ValidationError::PatientNameTooLong(name.chars().count()).into_qido_error());
+            return Err(
+                ValidationError::PatientNameTooLong(person_name_component_len(name))
+                    .into_qido_error(),
+            );
         }
 
         // INV-003: StudyDate must match YYYYMMDD or YYYYMMDD-YYYYMMDD
@@ -580,7 +681,7 @@ impl QidoQuery {
 
         // G-02: PerformingPhysicianName <= 64 characters
         if let Some(ref name) = self.PerformingPhysicianName
-            && name.chars().count() > PATIENT_NAME_MAX_LEN
+            && person_name_component_len(name) > PATIENT_NAME_MAX_LEN
         {
             return Err(
                 ValidationError::PerformingPhysicianTooLong(name.chars().count()).into_qido_error(),
@@ -589,7 +690,7 @@ impl QidoQuery {
 
         // G-02: NameOfPhysiciansReadingStudy <= 64 characters
         if let Some(ref name) = self.NameOfPhysiciansReadingStudy
-            && name.chars().count() > PATIENT_NAME_MAX_LEN
+            && person_name_component_len(name) > PATIENT_NAME_MAX_LEN
         {
             return Err(
                 ValidationError::NameOfReadingPhysiciansTooLong(name.chars().count())
@@ -598,7 +699,7 @@ impl QidoQuery {
         }
         // G-02: ReferringPhysicianName <= 64 characters
         if let Some(ref name) = self.ReferringPhysicianName
-            && name.chars().count() > PATIENT_NAME_MAX_LEN
+            && person_name_component_len(name) > PATIENT_NAME_MAX_LEN
         {
             return Err(
                 ValidationError::ReferringPhysicianTooLong(name.chars().count()).into_qido_error(),
@@ -608,7 +709,7 @@ impl QidoQuery {
         // 08.09: RequestingPhysician follows the ReferringPhysicianName
         // template (PN, <= 64 characters).
         if let Some(ref name) = self.RequestingPhysician
-            && name.chars().count() > PATIENT_NAME_MAX_LEN
+            && person_name_component_len(name) > PATIENT_NAME_MAX_LEN
         {
             return Err(
                 ValidationError::RequestingPhysicianTooLong(name.chars().count()).into_qido_error(),
@@ -618,7 +719,7 @@ impl QidoQuery {
         // 08.09: OperatorsName follows the PerformingPhysicianName template
         // (PN, <= 64 characters).
         if let Some(ref name) = self.OperatorsName
-            && name.chars().count() > PATIENT_NAME_MAX_LEN
+            && person_name_component_len(name) > PATIENT_NAME_MAX_LEN
         {
             return Err(
                 ValidationError::OperatorsNameTooLong(name.chars().count()).into_qido_error()
@@ -687,25 +788,43 @@ impl QidoQuery {
 
 /// Validate that a string looks like a DICOM UID (digits and dots only, non-empty).
 /// Rejects path-traversal attempts like `../../etc/passwd`.
+///
+/// PS3.18 10.6.1.2: a UID matching key may carry a COMMA-SEPARATED LIST
+/// (`StudyInstanceUID=1.2.3,1.2.4`), and the standard's own example of the
+/// Study Instance UID key shows that form. Each component is validated as a
+/// UID; the matcher applies the list as membership (`Predicate::CommaList`).
 fn validate_uid(uid: &str) -> Result<(), QidoError> {
-    if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit() || c == '.') {
+    if uid.is_empty() {
         return Err(ValidationError::InvalidDicomUid(uid.to_string()).into_qido_error());
+    }
+    for component in uid.split(',') {
+        // An empty component (a stray comma) names no UID at all, and PS3.5 9.1
+        // component rules apply to each list member exactly as to a lone UID -
+        // reusing the WADO validator keeps both surfaces from disagreeing about
+        // what a UID is.
+        if component.is_empty() || crate::handlers::wado::validate_dicom_uid(component).is_err() {
+            return Err(ValidationError::InvalidDicomUid(uid.to_string()).into_qido_error());
+        }
     }
     Ok(())
 }
 
-/// Parse a case-insensitive ABNF boolean query value (PS3.18 8.3.4). `true` /
-/// `false` in any case -> `Some(bool)`; anything else (incl. absent) -> `None`.
-/// Used by the non-search modifiers: fuzzymatching, emptyvaluematching,
-/// multiplevaluematching.
-fn parse_query_bool(v: &str) -> Option<bool> {
+/// Parse a case-insensitive ABNF boolean query value (PS3.18 8.3.4).
+///
+/// `true` / `false` in any case -> `Some(bool)`. Anything else is a MALFORMED
+/// value, and returning `None` for it made a supplied-but-invalid modifier
+/// indistinguishable from an absent one: `fuzzymatching=banana` quietly fell
+/// back to the server default instead of telling the client its value was
+/// rejected (PS3.18 8.5: an invalid query parameter is a 400). The `Err` case
+/// is what the callers turn into that 400.
+fn parse_query_bool(v: &str) -> Result<bool, &str> {
     let t = v.trim();
     if t.eq_ignore_ascii_case("true") {
-        Some(true)
+        Ok(true)
     } else if t.eq_ignore_ascii_case("false") {
-        Some(false)
+        Ok(false)
     } else {
-        None
+        Err(v)
     }
 }
 
@@ -717,10 +836,27 @@ fn parse_query_bool(v: &str) -> Option<bool> {
 fn parse_uint_param(name: &str, raw: Option<&str>) -> Result<Option<u64>, QidoError> {
     match raw {
         None => Ok(None),
-        Some(v) => v.parse::<u64>().map(Some).map_err(|_| QidoError {
-            status: 400,
-            message: format!("{name} must be a non-negative integer (got \"{v}\")"),
-        }),
+        Some(v) => {
+            // PS3.18 8.3.4 Table 8.3.4-1 declares these as `uint`, i.e. an ASCII
+            // digit string. `u64::from_str` additionally accepts a leading `+`
+            // (`+1` parses), which the query decoder PRESERVES on purpose - `+`
+            // is a legal character in a query value (PS3.18 8.3.1 qp-special),
+            // not the form-urlencoded space escape - so the sign has to be
+            // rejected here rather than by the decoder.
+            let digits_only = !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+            if !digits_only {
+                return Err(QidoError {
+                    status: STATUS_BAD_REQUEST,
+                    message: format!("{name} must be a non-negative integer (got \"{v}\")"),
+                });
+            }
+            // The digit check above does not bound the magnitude; a value above
+            // u64::MAX is still an invalid unsigned integer.
+            v.parse::<u64>().map(Some).map_err(|_| QidoError {
+                status: STATUS_BAD_REQUEST,
+                message: format!("{name} must be a non-negative integer (got \"{v}\")"),
+            })
+        }
     }
 }
 
@@ -766,50 +902,194 @@ fn parse_qido_query(raw_str: &str) -> Result<QidoQuery, QidoError> {
     let limit = parse_uint_param("limit", take(&mut map, "limit", "").as_deref())?;
     let offset = parse_uint_param("offset", take(&mut map, "offset", "").as_deref())?;
     let query = QidoQuery {
-        PatientName: take(&mut map, "patientname", "00100010"),
-        PatientID: take(&mut map, "patientid", "00100020"),
-        StudyDate: take(&mut map, "studydate", "00080020"),
-        Modality: take(&mut map, "modality", "00080060"),
-        AccessionNumber: take(&mut map, "accessionnumber", "00080050"),
-        StudyDescription: take(&mut map, "studydescription", "00081030"),
-        PatientBirthDate: take(&mut map, "patientbirthdate", "00100030"),
-        PatientSex: take(&mut map, "patientsex", "00100040"),
-        ReferringPhysicianName: take(&mut map, "referringphysicianname", "00080090"),
-        InstitutionName: take(&mut map, "institutionname", "00080080"),
-        RequestingPhysician: take(&mut map, "requestingphysician", "00321032"),
-        RequestedProcedureDescription: take(&mut map, "requestedproceduredescription", "00321060"),
-        PerformingPhysicianName: take(&mut map, "performingphysicianname", "00081050"),
-        NameOfPhysiciansReadingStudy: take(&mut map, "nameofphysiciansreadingstudy", "00081060"),
-        ResponsiblePerson: take(&mut map, "responsibleperson", "00102297"),
-        StudyInstanceUID: take(&mut map, "studyinstanceuid", "0020000d"),
-        StudyTime: take(&mut map, "studytime", "00080030"),
-        StudyID: take(&mut map, "studyid", "00200010"),
-        SeriesInstanceUID: take(&mut map, "seriesinstanceuid", "0020000e"),
-        SeriesNumber: take(&mut map, "seriesnumber", "00200011"),
-        SOPInstanceUID: take(&mut map, "sopinstanceuid", "00080018"),
-        SOPClassUID: take(&mut map, "sopclassuid", "00080016"),
-        InstanceNumber: take(&mut map, "instancenumber", "00200013"),
-        ModalitiesInStudy: take(&mut map, "modalitiesinstudy", "00080061"),
-        SeriesDate: take(&mut map, "seriesdate", "00080021"),
-        SeriesTime: take(&mut map, "seriestime", "00080031"),
-        SeriesDescription: take(&mut map, "seriesdescription", "0008103e"),
-        Manufacturer: take(&mut map, "manufacturer", "00080070"),
-        InstitutionalDepartmentName: take(&mut map, "institutionaldepartmentname", "00081040"),
-        OperatorsName: take(&mut map, "operatorsname", "00081070"),
-        ProtocolName: take(&mut map, "protocolname", "00181030"),
-        StationName: take(&mut map, "stationname", "00081010"),
-        BodyPartExamined: take(&mut map, "bodypartexamined", "00180015"),
+        PatientName: take(
+            &mut map,
+            "patientname",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::PATIENT_NAME),
+        ),
+        PatientID: take(
+            &mut map,
+            "patientid",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::PATIENT_ID),
+        ),
+        StudyDate: take(
+            &mut map,
+            "studydate",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::STUDY_DATE),
+        ),
+        Modality: take(
+            &mut map,
+            "modality",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::MODALITY),
+        ),
+        AccessionNumber: take(
+            &mut map,
+            "accessionnumber",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::ACCESSION_NUMBER),
+        ),
+        StudyDescription: take(
+            &mut map,
+            "studydescription",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::STUDY_DESCRIPTION),
+        ),
+        PatientBirthDate: take(
+            &mut map,
+            "patientbirthdate",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::PATIENT_BIRTH_DATE),
+        ),
+        PatientSex: take(
+            &mut map,
+            "patientsex",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::PATIENT_SEX),
+        ),
+        ReferringPhysicianName: take(
+            &mut map,
+            "referringphysicianname",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::REFERRING_PHYSICIAN),
+        ),
+        InstitutionName: take(
+            &mut map,
+            "institutionname",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::INSTITUTION_NAME),
+        ),
+        RequestingPhysician: take(
+            &mut map,
+            "requestingphysician",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::REQUESTING_PHYSICIAN),
+        ),
+        RequestedProcedureDescription: take(
+            &mut map,
+            "requestedproceduredescription",
+            &clarus_core::query::tag::qido_alias(
+                clarus_core::query::tag::REQUESTED_PROCEDURE_DESCRIPTION,
+            ),
+        ),
+        PerformingPhysicianName: take(
+            &mut map,
+            "performingphysicianname",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::PERFORMING_PHYSICIAN),
+        ),
+        NameOfPhysiciansReadingStudy: take(
+            &mut map,
+            "nameofphysiciansreadingstudy",
+            &clarus_core::query::tag::qido_alias(
+                clarus_core::query::tag::NAME_OF_READING_PHYSICIANS,
+            ),
+        ),
+        ResponsiblePerson: take(
+            &mut map,
+            "responsibleperson",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::RESPONSIBLE_PERSON),
+        ),
+        StudyInstanceUID: take(
+            &mut map,
+            "studyinstanceuid",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::STUDY_INSTANCE_UID),
+        ),
+        StudyTime: take(
+            &mut map,
+            "studytime",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::STUDY_TIME),
+        ),
+        StudyID: take(
+            &mut map,
+            "studyid",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::STUDY_ID),
+        ),
+        SeriesInstanceUID: take(
+            &mut map,
+            "seriesinstanceuid",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::SERIES_INSTANCE_UID),
+        ),
+        SeriesNumber: take(
+            &mut map,
+            "seriesnumber",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::SERIES_NUMBER),
+        ),
+        SOPInstanceUID: take(
+            &mut map,
+            "sopinstanceuid",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::SOP_INSTANCE_UID),
+        ),
+        SOPClassUID: take(
+            &mut map,
+            "sopclassuid",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::SOP_CLASS_UID),
+        ),
+        InstanceNumber: take(
+            &mut map,
+            "instancenumber",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::INSTANCE_NUMBER),
+        ),
+        ModalitiesInStudy: take(
+            &mut map,
+            "modalitiesinstudy",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::MODALITIES_IN_STUDY),
+        ),
+        SeriesDate: take(
+            &mut map,
+            "seriesdate",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::SERIES_DATE),
+        ),
+        SeriesTime: take(
+            &mut map,
+            "seriestime",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::SERIES_TIME),
+        ),
+        SeriesDescription: take(
+            &mut map,
+            "seriesdescription",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::SERIES_DESCRIPTION),
+        ),
+        Manufacturer: take(
+            &mut map,
+            "manufacturer",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::MANUFACTURER),
+        ),
+        InstitutionalDepartmentName: take(
+            &mut map,
+            "institutionaldepartmentname",
+            &clarus_core::query::tag::qido_alias(
+                clarus_core::query::tag::INSTITUTIONAL_DEPARTMENT_NAME,
+            ),
+        ),
+        OperatorsName: take(
+            &mut map,
+            "operatorsname",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::OPERATORS_NAME),
+        ),
+        ProtocolName: take(
+            &mut map,
+            "protocolname",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::PROTOCOL_NAME),
+        ),
+        StationName: take(
+            &mut map,
+            "stationname",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::STATION_NAME),
+        ),
+        BodyPartExamined: take(
+            &mut map,
+            "bodypartexamined",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::BODY_PART_EXAMINED),
+        ),
         PerformedProcedureStepStartDate: take(
             &mut map,
             "performedprocedurestepstartdate",
-            "00400244",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::PPS_START_DATE),
         ),
         PerformedProcedureStepStartTime: take(
             &mut map,
             "performedprocedurestepstarttime",
-            "00400245",
+            &clarus_core::query::tag::qido_alias(clarus_core::query::tag::PPS_START_TIME),
         ),
-        RequestAttributesSequence: take(&mut map, "requestattributessequence", "00400275"),
+        RequestAttributesSequence: take(
+            &mut map,
+            "requestattributessequence",
+            &clarus_core::query::tag::qido_alias(
+                clarus_core::query::tag::REQUEST_ATTRIBUTES_SEQUENCE,
+            ),
+        ),
         // PS3.18 Table 10.6.1-5 spells these two REQUIRED keys as tag paths.
         // The keyword form is the sequence keyword plus the nested attribute's
         // keyword; the hex form is the same path written in digits. Both are
@@ -818,26 +1098,34 @@ fn parse_qido_query(raw_str: &str) -> Result<QidoQuery, QidoError> {
         ScheduledProcedureStepID: take(
             &mut map,
             "requestattributessequence.scheduledprocedurestepid",
-            "00400275.00400009",
+            &clarus_core::query::tag::qido_nested_alias(
+                clarus_core::query::tag::REQUEST_ATTRIBUTES_SEQUENCE,
+                clarus_core::query::tag::SCHEDULED_PROCEDURE_STEP_ID,
+            ),
         ),
         RequestedProcedureIDInSequence: take(
             &mut map,
             "requestattributessequence.requestedprocedureid",
-            "00400275.00401001",
+            &clarus_core::query::tag::qido_nested_alias(
+                clarus_core::query::tag::REQUEST_ATTRIBUTES_SEQUENCE,
+                clarus_core::query::tag::REQUESTED_PROCEDURE_ID,
+            ),
         ),
         OtherPatientIDs: take(
             &mut map,
             "otherpatientidssequence.patientid",
-            "00101002.00100020",
+            &clarus_core::query::tag::qido_nested_alias(
+                clarus_core::query::tag::OTHER_PATIENT_IDS,
+                clarus_core::query::tag::PATIENT_ID,
+            ),
         ),
         limit,
         offset,
         includefield: take(&mut map, "includefield", ""),
-        fuzzymatching: take(&mut map, "fuzzymatching", "").and_then(|v| parse_query_bool(&v)),
-        emptyvaluematching: take(&mut map, "emptyvaluematching", "")
-            .and_then(|v| parse_query_bool(&v)),
-        multiplevaluematching: take(&mut map, "multiplevaluematching", "")
-            .and_then(|v| parse_query_bool(&v)),
+        // A supplied but malformed modifier is a 400, not "as if absent".
+        fuzzymatching: parse_query_bool_param("fuzzymatching", &mut map)?,
+        emptyvaluematching: parse_query_bool_param("emptyvaluematching", &mut map)?,
+        multiplevaluematching: parse_query_bool_param("multiplevaluematching", &mut map)?,
     };
 
     // Any key left in `map` is not one of our supported search keys. Owner
@@ -930,14 +1218,25 @@ fn maybe_heal_study(
     use clarus_core::query::tag;
     let mut modality = String::new();
     let mut day = [b'0'; 8];
+    // A stored StudyDate that is not eight digits is NOT a day key. Deriving
+    // one anyway (the old code kept the low eight digits) filed the study under
+    // an unrelated day, so the heal wrote to a bucket the lookups would never
+    // read. Such a study is skipped: its manifest needs repair, not its index.
+    let mut day_ok = false;
     for (t, v) in attrs {
         match (*t, v) {
             (tag::MODALITY, AttrValue::Text(s)) => modality = s.clone(),
             (tag::STUDY_DATE, AttrValue::UInt(d)) => {
-                day = clarus_core::recovery::day_key_from_yyyymmdd(*d)
+                if let Ok(k) = clarus_core::recovery::day_key_from_yyyymmdd(*d) {
+                    day = k;
+                    day_ok = true;
+                }
             }
             _ => {}
         }
+    }
+    if !day_ok {
+        return;
     }
     if modality.is_empty() {
         return;
@@ -1073,17 +1372,36 @@ fn search_studies_btree(
     }
 }
 
-/// Empty-array response (DICOMweb convention, e.g. unknown study UID).
-/// Rendered via axum `Json` in the old handler -> `application/json`.
-fn empty_json() -> QidoResp {
+/// The empty result set, in the representation the request NEGOTIATED.
+///
+/// An empty answer is still an answer: PS3.18 8.3.4.1 lets the client pick the
+/// search-response representation with `Accept`, and RFC 9110 12.5.1 makes that
+/// choice a property of the response, not of its contents. Answering
+/// `Accept: application/dicom+xml` with `application/json` `[]` handed the
+/// client a body in a format it had not asked for - and one an XML-only parser
+/// cannot read - purely because there happened to be no rows. The missing-study
+/// and empty-archive paths all went through the JSON form.
+fn empty_result(content_type: &'static str) -> QidoResp {
+    // The XML form is the DICOM NativeDicomModel with no members: an empty
+    // document, which is what zero matches serializes to (PS3.19 F.2).
+    let body = if content_type == DICOM_XML_CONTENT_TYPE {
+        empty_dicom_xml()
+    } else {
+        b"[]".to_vec()
+    };
     QidoResp {
         status: STATUS_OK,
-        content_type: APPLICATION_JSON,
+        content_type,
         headers: Vec::new(),
         truncated: false,
         remaining: None,
-        body: b"[]".to_vec(),
+        body,
     }
+}
+
+/// The zero-match DICOM XML document (PS3.19 F.2 `NativeDicomModel`).
+fn empty_dicom_xml() -> Vec<u8> {
+    b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NativeDicomModel/>\n".to_vec()
 }
 
 /// Parse the query string (or default) and validate it for `level`, rejecting
@@ -1158,22 +1476,37 @@ impl QidoLevel {
 
 /// Legal keys of the global All-Series resource.
 ///
-/// The four Patient IE keys are LEGAL on every global (all-Study /
-/// all-Series / all-Instances) relational resource per DICOM 10.6.1.2.1 even
-/// though they live at the Patient/Study level; on this route they are
-/// accepted-and-ignored (the search uses only the route's own level keys).
+/// PS3.18 10.6.1.2.1 makes the whole Patient IE AND Study IE set legal on the
+/// All Series resource. Legality is not enough: a legal key must also be
+/// APPLIED, or the route answers a filtered query with unfiltered rows. Every
+/// key here is turned into study-level predicates by `qido_to_btree_filter`
+/// and gates the manifest scan in `qido_series_global`.
 ///
-/// `StudyInstanceUID` (0020,000D) is different: PS3.18 2026c Table 10.6.1-2
-/// makes it a REQUIRED matching key for Series Search, so it is not foreign on
-/// `/series` and not accept-and-ignore either - the route resolves it to a
-/// single study manifest and applies it as a real filter (see
-/// `qido_series_global`).
-const PATIENT_IE_KEYS_PLUS_STUDY_UID: [&str; 5] = [
+/// `StudyInstanceUID` (0020,000D) is additionally a REQUIRED Series matching
+/// key (PS3.18 Table 10.6.1-2), so it also selects the single manifest the
+/// query names.
+const ALL_STUDY_IE_KEYS: [&str; 17] = [
+    // Patient IE (DICOM 10.6.1.2.1).
     "PatientName",
     "PatientID",
     "PatientBirthDate",
     "PatientSex",
+    // Study IE - legal on All Series, and APPLIED (see `qido_series_global`):
+    // a legal key that is silently ignored answers with rows the client
+    // excluded, which it cannot tell apart from "no matches".
     "StudyInstanceUID",
+    "StudyDate",
+    "StudyTime",
+    "StudyID",
+    "AccessionNumber",
+    "StudyDescription",
+    "ReferringPhysicianName",
+    "InstitutionName",
+    "RequestingPhysician",
+    "RequestedProcedureDescription",
+    "ModalitiesInStudy",
+    "PerformingPhysicianName",
+    "ResponsiblePerson",
 ];
 
 /// Series IE search keys that the instance-level routes actually APPLY.
@@ -1193,7 +1526,7 @@ const PATIENT_IE_KEYS_PLUS_STUDY_UID: [&str; 5] = [
 /// `SeriesFilter` the series routes use. The former list was
 /// accepted-and-ignored, which answered a filtered instance query with the
 /// study's every instance - a wider answer than the ask.
-const SERIES_IE_KEYS: [&str; 15] = [
+const SERIES_IE_KEYS: [&str; 16] = [
     "SeriesInstanceUID",
     "SeriesNumber",
     "SeriesDate",
@@ -1208,6 +1541,7 @@ const SERIES_IE_KEYS: [&str; 15] = [
     "PerformedProcedureStepStartDate",
     "PerformedProcedureStepStartTime",
     "RequestAttributesSequence",
+    "ScheduledProcedureStepID",
     "Modality",
 ];
 
@@ -1215,40 +1549,34 @@ const SERIES_IE_KEYS: [&str; 15] = [
 /// All-Instances resource and both are APPLIED there: the Study IE keys narrow
 /// the manifest scan and the Series IE keys narrow the series the instance
 /// walk descends into.
-const ALL_STUDY_SERIES_KEYS: [&str; 32] = [
-    "PatientName",
-    "PatientID",
-    "StudyDate",
-    "AccessionNumber",
-    "StudyDescription",
-    "PatientBirthDate",
-    "PatientSex",
-    "ReferringPhysicianName",
-    "InstitutionName",
-    "RequestingPhysician",
-    "RequestedProcedureDescription",
-    "PerformingPhysicianName",
-    "NameOfPhysiciansReadingStudy",
-    "StudyInstanceUID",
-    "StudyTime",
-    "StudyID",
-    "ModalitiesInStudy",
-    "SeriesInstanceUID",
-    "SeriesNumber",
-    "SeriesDate",
-    "SeriesTime",
-    "SeriesDescription",
-    "Manufacturer",
-    "InstitutionalDepartmentName",
-    "OperatorsName",
-    "ProtocolName",
-    "StationName",
-    "BodyPartExamined",
-    "PerformedProcedureStepStartDate",
-    "PerformedProcedureStepStartTime",
-    "RequestAttributesSequence",
-    "Modality",
-];
+///
+/// Computed as the union of the two classification tables rather than spelled a
+/// third time. The hand-written copy drifted: `ResponsiblePerson` and
+/// `ScheduledProcedureStepID` were classified as Study/Series keys but were
+/// missing here, so the All-Instances route rejected as foreign a key the
+/// scoped routes accepted. Deriving it means a key added to either table is
+/// legal everywhere it has to be, by construction.
+const ALL_STUDY_SERIES_KEYS: [&str; 33] = {
+    let mut out = [""; 33];
+    let mut n = 0;
+    let mut i = 0;
+    while i < ALL_STUDY_IE_KEYS.len() {
+        out[n] = ALL_STUDY_IE_KEYS[i];
+        n += 1;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < SERIES_IE_KEYS.len() {
+        out[n] = SERIES_IE_KEYS[j];
+        n += 1;
+        j += 1;
+    }
+    assert!(
+        n == 33,
+        "ALL_STUDY_SERIES_KEYS length must match its sources"
+    );
+    out
+};
 
 /// The parsed search keys that do not belong to `level`, as keyword names.
 ///
@@ -1262,7 +1590,7 @@ const ALL_STUDY_SERIES_KEYS: [&str; 32] = [
 /// `SOPInstanceUID`, `SOPClassUID` and `InstanceNumber` (Table 10.6.1-5).
 fn foreign_keys(q: &QidoQuery, level: QidoLevel) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = Vec::new();
-    let study_fields: [(&str, bool); 17] = [
+    let study_fields: [(&str, bool); 18] = [
         ("PatientName", q.PatientName.is_some()),
         ("PatientID", q.PatientID.is_some()),
         ("StudyDate", q.StudyDate.is_some()),
@@ -1289,8 +1617,14 @@ fn foreign_keys(q: &QidoQuery, level: QidoLevel) -> Vec<&'static str> {
         ("StudyTime", q.StudyTime.is_some()),
         ("StudyID", q.StudyID.is_some()),
         ("ModalitiesInStudy", q.ModalitiesInStudy.is_some()),
+        // PS3.18 Table 10.6.1-4 lists ResponsiblePerson (0010,2297) among the
+        // Study-level matching keys. Leaving it out of this table meant it was
+        // not classified at all, so `foreign_keys` never reported it and a
+        // strict instance route accepted it and applied nothing: the client got
+        // every instance of the study, which it cannot tell from "all match".
+        ("ResponsiblePerson", q.ResponsiblePerson.is_some()),
     ];
-    let series_fields: [(&str, bool); 14] = [
+    let series_fields: [(&str, bool); 15] = [
         ("SeriesInstanceUID", q.SeriesInstanceUID.is_some()),
         ("SeriesNumber", q.SeriesNumber.is_some()),
         ("SeriesDate", q.SeriesDate.is_some()),
@@ -1319,6 +1653,16 @@ fn foreign_keys(q: &QidoQuery, level: QidoLevel) -> Vec<&'static str> {
         (
             "RequestAttributesSequence",
             q.RequestAttributesSequence.is_some(),
+        ),
+        // A nested search key is still a key: PS3.18 Table 10.6.1-5 puts
+        // ScheduledProcedureStepID (0040,0009) inside RequestAttributesSequence
+        // (0040,0275), which is a Series IE key. It was parsed into the query
+        // and then classified nowhere, so `/studies?...ScheduledProcedureStepID=`
+        // was accepted and applied to nothing - the unfiltered answer this
+        // whole function exists to prevent.
+        (
+            "ScheduledProcedureStepID",
+            q.ScheduledProcedureStepID.is_some(),
         ),
     ];
     match level {
@@ -1664,6 +2008,56 @@ fn render_instance_page(
     }
 }
 
+/// Render a [`QidoError`] into the response shape the search callers return.
+///
+/// The `status` and message travel unchanged; the body is the same
+/// `{"error":"..."}` document the validation path emits, so a storage failure
+/// and a bad parameter are distinguishable only by their status, as PS3.18 8.5
+/// intends.
+fn qido_error_resp(e: QidoError) -> QidoResp {
+    QidoResp {
+        status: e.status,
+        content_type: APPLICATION_JSON,
+        headers: Vec::new(),
+        truncated: false,
+        remaining: None,
+        body: format!("{{\"error\":\"{}\"}}", e.message.replace('"', "'")).into_bytes(),
+    }
+}
+
+/// Whether a study manifest exists, treating "cannot tell" as an ERROR.
+///
+/// `Path::is_file()` answers `false` for every failure, not just absence: a
+/// permission change on the manifest directory, a stale NFS handle or an
+/// `EIO` all read as "no such study". The callers below turn that answer into
+/// a successful EMPTY search, so a storage fault was reported to the client as
+/// "this study has nothing matching" - an optimistic `ok` for a failed read.
+///
+/// PS3.18 8.5 keeps the two apart: a store that cannot read is a 5xx, while a
+/// study that genuinely is not there is a 404/empty answer.
+///
+/// A non-directory `manifests/` path behaves the same way for the CAS probe and
+/// is covered by [`paths_exist`]'s caller.
+fn manifest_present(path: &std::path::Path) -> Result<bool, QidoError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file()),
+        // The ONLY benign case: the manifest is not there.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        // Everything else is a failure to answer the question, not a "no".
+        Err(e) => {
+            crate::clog_error!(
+                path = %path.display(),
+                error = %e,
+                "Cannot stat a study manifest"
+            );
+            Err(QidoError {
+                status: STATUS_INTERNAL_SERVER_ERROR,
+                message: "Manifest storage is unreadable".to_string(),
+            })
+        }
+    }
+}
+
 /// The B-tree series search, streaming `write_series_json`.
 ///
 /// Opens `manifests/{study_uid}.manifest`, runs [`search_series`] with the
@@ -1679,8 +2073,10 @@ fn btree_series_search(
 ) -> QidoResp {
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let path = manifest_dir.join(format!("{study_uid}.manifest"));
-    if !path.is_file() {
-        return empty_json();
+    match manifest_present(&path) {
+        Ok(true) => {}
+        Ok(false) => return empty_result(content_type),
+        Err(e) => return qido_error_resp(e),
     }
     let manifest = match state.read_server_manifest(study_uid) {
         Some(Ok(m)) => m,
@@ -1688,7 +2084,7 @@ fn btree_series_search(
             crate::clog_error!(error = %e, study_uid = %study_uid, "B-tree QIDO series: undecodable manifest");
             return btree_internal_error();
         }
-        None => return empty_json(),
+        None => return empty_result(content_type),
     };
     // No heal poke from the series path: the study was already found via the
     // study-search point (which does the provenance/absent check); series-level
@@ -1737,8 +2133,10 @@ fn btree_instances_search(
 ) -> QidoResp {
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let path = manifest_dir.join(format!("{study_uid}.manifest"));
-    if !path.is_file() {
-        return empty_json();
+    match manifest_present(&path) {
+        Ok(true) => {}
+        Ok(false) => return empty_result(content_type),
+        Err(e) => return qido_error_resp(e),
     }
     let manifest = match state.read_server_manifest(study_uid) {
         Some(Ok(m)) => m,
@@ -1746,7 +2144,7 @@ fn btree_instances_search(
             crate::clog_error!(error = %e, study_uid = %study_uid, "B-tree QIDO instances: undecodable manifest");
             return btree_internal_error();
         }
-        None => return empty_json(),
+        None => return empty_result(content_type),
     };
     let filter = clarus_core::query::InstanceFilter {
         sop_instance_uid: query.SOPInstanceUID.clone(),
@@ -1837,8 +2235,10 @@ fn btree_study_instances(
 ) -> QidoResp {
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let path = manifest_dir.join(format!("{study_uid}.manifest"));
-    if !path.is_file() {
-        return empty_json();
+    match manifest_present(&path) {
+        Ok(true) => {}
+        Ok(false) => return empty_result(content_type),
+        Err(e) => return qido_error_resp(e),
     }
     let manifest = match state.read_server_manifest(study_uid) {
         Some(Ok(m)) => m,
@@ -1846,8 +2246,21 @@ fn btree_study_instances(
             crate::clog_error!(error = %e, study_uid = %study_uid, "B-tree QIDO study instances: undecodable manifest");
             return btree_internal_error();
         }
-        None => return empty_json(),
+        None => return empty_result(content_type),
     };
+    // The StudyInstanceUID shortcut only chose WHICH manifest to walk; it does
+    // not satisfy the OTHER Study IE keys the client sent. PS3.18 10.6.1.2.1
+    // makes those keys legal on All Instances and the full-scan branch applies
+    // them, so `?StudyInstanceUID=1.2.3&PatientID=P2` must not answer with
+    // study 1.2.3's instances when that study belongs to P1. Applying the same
+    // predicate here keeps the two branches of one route answering the same
+    // question the same way.
+    if !clarus_core::query::match_study_attrs(
+        &qido_to_btree_filter(query, limit, &state.config.query),
+        &manifest,
+    ) {
+        return empty_result(content_type);
+    }
     let filter = clarus_core::query::InstanceFilter {
         sop_instance_uid: query.SOPInstanceUID.clone(),
         sop_class_uid: query.SOPClassUID.clone(),
@@ -2110,7 +2523,7 @@ pub fn qido_series_root_instances(
             retrieve_base,
             expose,
         )),
-        None => Ok(empty_json()),
+        None => Ok(empty_result(content_type)),
     }
 }
 
@@ -2307,7 +2720,17 @@ pub fn qido_patients(
             for p in &patients {
                 doc.clear();
                 clarus_core::query::xml::write_xml_doc_start(&mut doc);
-                clarus_core::query::xml::write_patient_xml_into(&mut doc, p);
+                // A row that cannot be rendered fails the response instead of
+                // silently disappearing from the patient list.
+                match clarus_core::query::xml::write_patient_xml_into(&mut doc, p) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        return Err(QidoError {
+                            status: 500,
+                            message: "patient row does not fit its XML buffer".to_string(),
+                        });
+                    }
+                }
                 clarus_core::query::xml::write_xml_doc_end(&mut doc);
                 push_xml_part(&mut body, &boundary, &mut first, &doc);
             }
@@ -2361,15 +2784,29 @@ pub fn qido_patients(
 /// `read_manifest` pattern (the manifest decode path allocates by
 /// construction); the render and the borrow-form collect/sort stay 0-alloc.
 ///
-/// A directory that cannot be listed yields `Ok(Vec::new())` (treat as empty
-/// archive; a fresh store legitimately has no manifests). A corrupt manifest
-/// aborts the whole request - honest surfacing, matching the scanner's
-/// lazy-recovery contract.
+/// A directory that cannot be listed is an ERROR, not an empty archive.
+///
+/// `NotFound` is the one benign case (a fresh store legitimately has no
+/// manifests). Every other failure - `PermissionDenied`, a stale handle, an
+/// `EIO` - means the question "what is in the archive" could not be answered,
+/// and answering it with an empty result told the client the archive had
+/// nothing matching when the truth was that the server could not look. PS3.18
+/// 8.5 makes that a 5xx. A corrupt manifest aborts the whole request for the
+/// same reason - honest surfacing, matching the scanner's lazy-recovery
+/// contract.
 fn decode_all_manifests(state: &AppState) -> Result<Vec<clarus_core::manifest::Manifest>, ()> {
     let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
     let entries = match std::fs::read_dir(manifest_dir) {
         Ok(it) => it,
-        Err(_) => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            crate::clog_error!(
+                path = %manifest_dir.display(),
+                error = %e,
+                "Cannot list the manifest directory"
+            );
+            return Err(());
+        }
     };
     let mut names: Vec<String> = Vec::new();
     for entry in entries {
@@ -2414,11 +2851,7 @@ pub fn qido_series_global(
     // StudyInstanceUID is NOT accept-and-ignore: the short-circuit below
     // resolves it to one study manifest and applies it as a real filter.
     // The remaining Study IE keys (StudyDate/StudyID/...) stay foreign -> 400.
-    let query = parse_and_validate_with(
-        query_str,
-        QidoLevel::Series,
-        &PATIENT_IE_KEYS_PLUS_STUDY_UID,
-    )?;
+    let query = parse_and_validate_with(query_str, QidoLevel::Series, &ALL_STUDY_IE_KEYS)?;
     let limit = resolve_limit(&query, &state.config.query);
     let filter = series_filter_from(&query, state);
     let offset = query.offset.unwrap_or(0) as usize;
@@ -2435,7 +2868,7 @@ pub fn qido_series_global(
         let path = manifest_dir.join(format!("{study_uid}.manifest"));
         if !path.is_file() {
             // Unknown study -> empty array (200), matching the scoped route.
-            return Ok(empty_json());
+            return Ok(empty_result(content_type));
         }
         let manifest = match state.read_server_manifest(&study_uid) {
             Some(Ok(m)) => m,
@@ -2446,8 +2879,20 @@ pub fn qido_series_global(
                     message: "Internal server error".to_string(),
                 });
             }
-            None => return Ok(empty_json()),
+            None => return Ok(empty_result(content_type)),
         };
+        // The UID chose WHICH manifest to read; the other Study IE keys the
+        // client sent still have to match it. Applying only a SeriesFilter
+        // here answered `?StudyInstanceUID=S&PatientID=P2` with S's series
+        // even when S belongs to P1, i.e. a filtered query returned
+        // unfiltered rows. Both branches of this route now gate on the same
+        // predicate (PS3.18 10.6.1.2.1 makes the Study IE keys legal here).
+        if !clarus_core::query::match_study_attrs(
+            &qido_to_btree_filter(&query, limit, &state.config.query),
+            &manifest,
+        ) {
+            return Ok(empty_result(content_type));
+        }
         // Same SeriesFilter the full scan uses, so Modality and every other
         // series key still narrow WITHIN the resolved study.
         let mut out: Vec<&clarus_core::manifest::SeriesRecord> = Vec::new();
@@ -2483,11 +2928,22 @@ pub fn qido_series_global(
         }
     };
     if manifests.is_empty() {
-        return Ok(empty_json());
+        return Ok(empty_result(content_type));
     }
 
     let mut out: Vec<clarus_core::query::GlobalSeries<'_>> = Vec::new();
-    clarus_core::query::search_all_series(&manifests, &filter, &mut out);
+    // The full scan must apply the SAME study predicate the UID shortcut does,
+    // or one route would answer two different questions depending on whether
+    // the client happened to send a UID. `search_all_series` only takes a
+    // SeriesFilter, so the study gate is applied to the candidate manifests
+    // first - the same order the scoped routes use.
+    let study_filter = qido_to_btree_filter(&query, limit, &state.config.query);
+    clarus_core::query::search_all_series_matching(
+        &manifests,
+        &filter,
+        Some(&study_filter),
+        &mut out,
+    );
 
     // Deterministic pagination over the globally-sorted slice (offset then
     // limit) - no re-ordering, no per-page drift between offset pages. Each
@@ -2569,7 +3025,7 @@ pub fn qido_instances_global(
         }
     };
     if manifests.is_empty() {
-        return Ok(empty_json());
+        return Ok(empty_result(content_type));
     }
 
     let filter = clarus_core::query::InstanceFilter {
@@ -2675,8 +3131,13 @@ pub fn qido_instances_global(
 /// The checks run in this exact order (part of the contract). The SQLite
 /// `DB_UNREACHABLE` check is gone (backend excised).
 pub fn health_check(state: &AppState) -> (u16, &'static str) {
-    // 1. CAS storage - does the directory exist?
-    if !std::path::Path::new(&state.config.storage_dir).exists() {
+    // 1. CAS storage - is there a usable directory?
+    //
+    // `exists()` is true for a regular FILE too, so a `storage_dir` that names a
+    // file reported ready: the probe passed and the first real STOW failed. The
+    // content-addressed layout needs to create subdirectories under this path,
+    // so the requirement is a directory, not merely a name.
+    if !std::path::Path::new(&state.config.storage_dir).is_dir() {
         return (STATUS_SERVICE_UNAVAILABLE, "STORAGE_MISSING");
     }
 
@@ -2720,6 +3181,25 @@ pub fn health_check(state: &AppState) -> (u16, &'static str) {
 /// is the structured source of truth.
 ///
 /// Field semantics:
+/// The three-state audit verdict the viewer badge is driven by.
+///
+/// Only a COMPLETED audit yields a verdict, and a completed audit is `corrupt`
+/// when EITHER count is non-zero - an unreadable blob is as unusable as a
+/// corrupt one. Anything else (idle / running / error) is `unknown`: never red
+/// while the walk is still in progress, and never a premature green either.
+///
+/// Extracted so the mapping can be tested directly. The previous test fed a
+/// ready-made `"audit_state":"corrupt"` string to the JSON renderer, so it
+/// would still have passed if this classification reported a completed
+/// unreadable-only audit as `clean`.
+fn audit_verdict(status: &str, corrupted: u64, unreadable: u64) -> &'static str {
+    match status {
+        "done" if corrupted > 0 || unreadable > 0 => "corrupt",
+        "done" => "clean",
+        _ => "unknown",
+    }
+}
+
 /// - `mnf`: `ok` | `crpt` (some corrupt manifests seen) | `missing` (CAS alive
 ///   but no manifests - "server blind"); `mnf_n` = corrupt-manifest count.
 /// - `idx` / `erase`: IDX stale objects, ERASE pending tombstones.
@@ -2805,11 +3285,7 @@ pub fn health_status(state: &AppState) -> String {
         let a = crate::handlers::admin::pure::AUDIT_STATE.read();
         match a {
             Ok(a) => {
-                let tri = match a.status.as_str() {
-                    "done" if a.corrupted > 0 || a.unreadable > 0 => "corrupt",
-                    "done" => "clean",
-                    _ => "unknown",
-                };
+                let tri = audit_verdict(&a.status, a.corrupted, a.unreadable);
                 (a.corrupted, a.unreadable, tri)
             }
             // A poisoned lock must not be reported as clean: UNKNOWN.
@@ -2953,7 +3429,216 @@ fn status_json(
 
 #[cfg(test)]
 mod tests {
+
+    /// A minimal `AppState` rooted in `root`, for the readiness tests.
+    fn minimal_state(root: &std::path::Path) -> AppState {
+        use std::sync::Arc;
+        use std::sync::RwLock as StdRwLock;
+        use std::time::Instant;
+
+        use crate::shadow::ShadowTier;
+        use clarus_adapters::storage::ContentAddressedStorage;
+        use clarus_core::query::StudyScanner;
+
+        let btree = root.join("btree");
+        let manifest_dir = btree.join("manifests");
+        let idx_dir = btree.join("idx");
+        let cas_dir = root.join("cas");
+        std::fs::create_dir_all(&manifest_dir).expect("manifests");
+        std::fs::create_dir_all(&idx_dir).expect("idx");
+        std::fs::create_dir_all(&cas_dir).expect("cas");
+
+        let mut config = crate::config::Config::test_default();
+        config.btree.manifest_dir = manifest_dir.to_string_lossy().to_string();
+        config.btree.idx_dir = idx_dir.to_string_lossy().to_string();
+        config.storage_dir = cas_dir.to_string_lossy().to_string();
+        config.min_free_disk_mb = 0;
+        config.min_free_disk_pct = 0.0;
+
+        AppState {
+            cas: ContentAddressedStorage::new(cas_dir.clone()).expect("open cas"),
+            codec_registry: clarus_adapters::codec::CodecRegistry::default(),
+            ups_events: crate::sse_fanout::DualEventSink::new(),
+            start_time: Instant::now(),
+            metrics_ring: Arc::new(StdRwLock::new(std::collections::VecDeque::new())),
+            log_buffer: Arc::new(StdRwLock::new(std::collections::VecDeque::new())),
+            maintenance: Arc::new(StdRwLock::new(crate::state::MaintenanceState::default())),
+            #[cfg(feature = "s3")]
+            s3: Arc::new(std::sync::OnceLock::new()),
+            cold_cas: None,
+            shadow: ShadowTier::new(idx_dir.clone()),
+            study_scanner: StudyScanner::new(manifest_dir, idx_dir),
+            config,
+            workitems_dir: btree.join("workitems"),
+            commitments_dir: btree.join("commitments"),
+            transcode_pool: crate::state::TranscodePool::new(2),
+            readiness: crate::handlers::readiness::Readiness::new(),
+        }
+    }
+
+    /// A `storage_dir` that names a regular FILE is not ready storage.
+    ///
+    /// `Path::exists()` answers true for a file, so the readiness probe returned
+    /// 200 while the content-addressed layout could not create a single
+    /// subdirectory under it. The first STOW would then fail on a pod the
+    /// orchestrator had already been told to send traffic to.
+    #[test]
+    fn a_file_at_the_storage_path_is_not_ready_storage() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file_path = temp.path().join("not-a-dir");
+        std::fs::write(&file_path, b"x").expect("write file");
+
+        let mut state = minimal_state(temp.path());
+        state.config.storage_dir = file_path.to_string_lossy().to_string();
+        assert!(
+            std::path::Path::new(&state.config.storage_dir).exists(),
+            "the fixture must exist, or the test proves nothing about `exists`"
+        );
+        assert_eq!(
+            health_check(&state),
+            (STATUS_SERVICE_UNAVAILABLE, "STORAGE_MISSING"),
+            "a file at the storage path cannot serve as CAS"
+        );
+
+        // A real directory passes this check. Asserted on the CHECK and not on
+        // `health_check`, because the later steps of that function read
+        // process-global disk-health state that another test running in
+        // parallel can legitimately degrade.
+        let dir_path = temp.path().join("real-dir");
+        std::fs::create_dir_all(&dir_path).expect("mkdir");
+        assert!(
+            std::path::Path::new(&dir_path).is_dir(),
+            "a directory satisfies the requirement the file above failed"
+        );
+    }
+
+    /// A completed audit with unreadable blobs is `corrupt`, not `clean`.
+    ///
+    /// The badge mapping used to be reachable only through a hand-built JSON
+    /// string, so nothing exercised the classification: reporting an audit that
+    /// found unreadable blobs as `clean` would have kept every test green.
+    #[test]
+    fn an_unreadable_only_audit_is_corrupt_not_clean() {
+        assert_eq!(audit_verdict("done", 0, 0), "clean");
+        assert_eq!(audit_verdict("done", 2, 0), "corrupt");
+        assert_eq!(
+            audit_verdict("done", 0, 3),
+            "corrupt",
+            "an unreadable blob is as unusable as a corrupt one"
+        );
+        // Anything but a completed walk has no verdict at all: a running audit
+        // must not flash red, and an idle one must not report green.
+        for status in ["idle", "running", "error", ""] {
+            assert_eq!(audit_verdict(status, 0, 0), "unknown", "{status}");
+            assert_eq!(audit_verdict(status, 5, 5), "unknown", "{status}");
+        }
+    }
+
+    /// A nested search key is classified by the level its PARENT belongs to.
+    ///
+    /// `ScheduledProcedureStepID` (0040,0009) is parsed out of
+    /// `RequestAttributesSequence.ScheduledProcedureStepID`, but it was listed
+    /// in neither the Study IE nor the Series IE table. `foreign_keys` therefore
+    /// never reported it, so a study-level search accepted
+    /// `?RequestAttributesSequence.ScheduledProcedureStepID=ABC` and applied
+    /// nothing: the client received every study, and PS3.18 gives it no way to
+    /// tell an unfiltered answer from "all studies matched".
+    #[test]
+    fn a_nested_search_key_is_classified_not_ignored() {
+        let q = parse_qido_query("RequestAttributesSequence.ScheduledProcedureStepID=ABC")
+            .expect("the nested key parses");
+        assert_eq!(q.ScheduledProcedureStepID.as_deref(), Some("ABC"));
+
+        // It is a Series IE key, so a study-level search must report it as
+        // foreign (i.e. it is KNOWN and REJECTED, not silently dropped).
+        let at_study = foreign_keys(&q, QidoLevel::Study);
+        assert!(
+            at_study.contains(&"ScheduledProcedureStepID"),
+            "a Series IE key must be foreign at the study level, got {at_study:?}"
+        );
+        // On the resources that apply Series IE keys it is legal.
+        assert!(
+            !foreign_keys(&q, QidoLevel::Series).contains(&"ScheduledProcedureStepID"),
+            "a Series IE key is legal at the series level"
+        );
+    }
+
+    /// `ResponsiblePerson` is a Study IE key, so a strict instance route cannot
+    /// accept it and ignore it.
+    ///
+    /// PS3.18 Table 10.6.1-4 lists it among the Study-level matching keys. It
+    /// was missing from `study_fields`, so the hierarchical instance resource -
+    /// which refuses Study IE keys rather than applying them - returned every
+    /// instance of the study for a query that named a responsible person.
+    #[test]
+    fn a_responsible_person_is_a_study_level_key() {
+        let q = parse_qido_query("ResponsiblePerson=SMITH").expect("parses");
+        assert_eq!(q.ResponsiblePerson.as_deref(), Some("SMITH"));
+        let at_instance = foreign_keys(&q, QidoLevel::Instance);
+        assert!(
+            at_instance.contains(&"ResponsiblePerson"),
+            "a Study IE key must be foreign on the hierarchical instance route, got {at_instance:?}"
+        );
+    }
     use super::*;
+
+    /// An Accept header selects the search representation by media range, not
+    /// by substring: the type is case-insensitive and a parameter value is not
+    /// a media type.
+    ///
+    /// RFC 9110 12.5.1 makes the type case-insensitive, so a client writing
+    /// `APPLICATION/DICOM+XML` still asked for XML. The old `contains` check
+    /// compared bytes and returned JSON. And because
+    /// `multipart/related; type="application/dicom+xml"` carries the XML type
+    /// as a PARAMETER, a substring search matched that too - the multipart
+    /// wrapper was read as a bare XML request.
+    #[test]
+    fn an_accept_range_selects_the_representation_by_its_type() {
+        assert_eq!(
+            negotiate(Some("application/dicom+xml")),
+            DICOM_XML_CONTENT_TYPE
+        );
+        assert_eq!(
+            negotiate(Some("APPLICATION/DICOM+XML")),
+            DICOM_XML_CONTENT_TYPE,
+            "the media type is case-insensitive"
+        );
+        assert_eq!(
+            negotiate(Some("multipart/related; type=\"APPLICATION/DICOM+XML\"")),
+            DICOM_XML_CONTENT_TYPE,
+            "the part type names the representation the wrapper carries"
+        );
+        assert_eq!(
+            negotiate(Some("application/dicom+json")),
+            DICOM_JSON_CONTENT_TYPE
+        );
+        assert_eq!(negotiate(None), DICOM_JSON_CONTENT_TYPE);
+    }
+
+    /// A `q=0` XML range is the client REFUSING XML, so JSON is returned.
+    ///
+    /// RFC 9110 12.5.1: "a weight of 0 means not acceptable". The substring
+    /// check returned XML for the very header that excluded it.
+    #[test]
+    fn an_excluded_xml_range_does_not_select_xml() {
+        assert_eq!(
+            negotiate(Some("application/dicom+xml; q=0, application/dicom+json")),
+            DICOM_JSON_CONTENT_TYPE
+        );
+        assert_eq!(
+            negotiate(Some(
+                "application/dicom+xml; q=0.1, application/dicom+json; q=0.9"
+            )),
+            DICOM_JSON_CONTENT_TYPE,
+            "the higher weight wins"
+        );
+        assert_eq!(
+            negotiate(Some(
+                "application/dicom+xml; q=0.9, application/dicom+json; q=0.1"
+            )),
+            DICOM_XML_CONTENT_TYPE
+        );
+    }
 
     /// The PN length errors must report CHARACTERS. The limit is counted in
     /// characters (PATIENT_NAME_MAX_LEN), so a message that reported bytes
@@ -2996,8 +3681,38 @@ mod tests {
             "Мастяева"
         );
         assert_eq!(url_decode("solga*"), "solga*");
-        assert_eq!(url_decode("a+b"), "a b");
+        // A literal `+` is a QUERY character (PS3.18 8.3.1 `qp-special`), not
+        // the form-urlencoded space escape: `A+B` is a PatientID, not `A B`.
+        assert_eq!(url_decode("a+b"), "a+b");
         assert_eq!(url_decode("%D1%81%D0%BE%D0%BB%D0%B3%D0%B0*"), "солга*");
+    }
+
+    /// A plus sign survives a query round trip, and an encoded one is a
+    /// DIFFERENT value from an encoded space.
+    ///
+    /// `PatientID=A+B` asks for the identifier `A+B`; the space a client means
+    /// must travel as `%20`. Collapsing both to the same string makes a query
+    /// for one patient match another.
+    #[test]
+    fn a_literal_plus_round_trips_and_stays_distinct_from_a_space() {
+        use crate::handlers::json_common::form_encode_query_str;
+
+        // The literal forms a client actually sends: the plus UNENCODED, and
+        // the space as `%20`. Collapsing the first into a space makes a query
+        // for `A+B` search for `A B` - another patient.
+        assert_eq!(url_decode("A+B"), "A+B");
+        assert_eq!(url_decode("A%20B"), "A B");
+        assert_ne!(url_decode("A+B"), url_decode("A%20B"));
+        assert_eq!(url_decode("%2B"), "+");
+
+        let literal_plus = "A+B";
+        assert_eq!(
+            url_decode(&form_encode_query_str(literal_plus)),
+            literal_plus,
+            "round trip"
+        );
+        let space = "A B";
+        assert_eq!(url_decode(&form_encode_query_str(space)), space);
     }
 
     /// Same decoder must round-trip CJK (UTF-8, no case) and mixed scripts.
@@ -3056,8 +3771,10 @@ mod tests {
         };
         // Absent -> unlimited (the search default must NOT leak here).
         assert_eq!(resolve_enumeration_limit(&q(None)), None);
-        // Explicit 0 -> unlimited.
-        assert_eq!(resolve_enumeration_limit(&q(Some(0))), None);
+        // Explicit 0 -> an EMPTY page, not unlimited. PS3.18 8.3.4.4.1 makes
+        // `limit` a count of returned results, and 8.5's 400 entry records
+        // that `limit=0` is answered 200 with an empty payload.
+        assert_eq!(resolve_enumeration_limit(&q(Some(0))), Some(0));
         // Explicit client limit -> honored without clamping.
         assert_eq!(resolve_enumeration_limit(&q(Some(500))), Some(500));
         assert_eq!(resolve_enumeration_limit(&q(Some(1))), Some(1));
@@ -3098,7 +3815,9 @@ mod tests {
 
     /// `fuzzymatching` is an ABNF literal - `true`/`false` are
     /// case-insensitive (PS3.18 8.3.4). `TRUE`/`False` parse exactly like
-    /// their lowercase forms; an invalid value stays absent (no 400).
+    /// their lowercase forms; a supplied but malformed value is a 400, not an
+    /// absent modifier (PS3.18 8.5: an invalid query parameter is a client
+    /// error, and treating it as absent hid the mistake from the client).
     #[test]
     fn test_fuzzymatching_case_insensitive() {
         let q = parse_qido_query("fuzzymatching=TRUE").expect("TRUE parses");
@@ -3109,8 +3828,17 @@ mod tests {
         assert_eq!(q.fuzzymatching, Some(true));
         let q = parse_qido_query("fuzzymatching=fAlSe").expect("mixed-case parses");
         assert_eq!(q.fuzzymatching, Some(false));
-        // Invalid value -> absent (the pre-existing absent semantics).
-        let q = parse_qido_query("fuzzymatching=banana").expect("invalid is absent");
+        // Invalid value -> 400, NOT silently absent.
+        let err = parse_qido_query("fuzzymatching=banana")
+            .expect_err("an invalid boolean must be refused");
+        assert_eq!(err.status, STATUS_BAD_REQUEST);
+        assert!(
+            err.message.contains("fuzzymatching"),
+            "the message names the key: {}",
+            err.message
+        );
+        // Absent stays absent: the server default applies.
+        let q = parse_qido_query("StudyDate=20260101").expect("no modifier parses");
         assert_eq!(q.fuzzymatching, None);
     }
 
@@ -3148,14 +3876,15 @@ mod tests {
             };
             assert_eq!(got, Some(true), "{flag}=TrUe");
 
-            // Invalid value -> absent.
-            let q = parse_qido_query(&format!("{flag}=banana")).expect("invalid absent");
-            let got = if flag == "emptyvaluematching" {
-                q.emptyvaluematching
-            } else {
-                q.multiplevaluematching
-            };
-            assert_eq!(got, None, "{flag}=banana");
+            // Invalid value -> 400, not silent absence.
+            let err = parse_qido_query(&format!("{flag}=banana"))
+                .expect_err("an invalid boolean must be refused");
+            assert_eq!(err.status, STATUS_BAD_REQUEST, "{flag}=banana");
+            assert!(
+                err.message.contains(flag),
+                "the message names the key: {}",
+                err.message
+            );
 
             // Consumed as a named modifier at every QIDO level (never a 400).
             let qs = format!("{flag}=true");
@@ -3317,13 +4046,13 @@ mod tests {
             err.message
         );
         let err = parse_and_validate(
-            Some("PerformedProcedureStepStartTime=10"),
+            Some("PerformedProcedureStepStartTime=25"),
             QidoLevel::Series,
         )
-        .expect_err("short PPS time must 400");
+        .expect_err("an out-of-range hour must 400");
         assert!(
             err.message
-                .contains("PerformedProcedureStepStartTime must match pattern HHMMSS[.ffffff]"),
+                .contains("PerformedProcedureStepStartTime must match pattern HH[MM[SS]][.ffffff]"),
             "{}",
             err.message
         );
@@ -3372,9 +4101,15 @@ mod tests {
                 "{qs} must validate"
             );
         }
-        // Malformed ranges stay 400.
-        let err = parse_and_validate(Some("StudyTime=09-"), QidoLevel::Study)
-            .expect_err("a bound shorter than HHMMSS must 400");
+        // Malformed ranges stay 400. `09-` is now LEGAL: PS3.5 Table 6.2-1
+        // makes trailing components optional, so `09` names the whole hour.
+        assert!(
+            parse_and_validate(Some("StudyTime=09-"), QidoLevel::Study).is_ok(),
+            "HH is a legal reduced-precision TM bound"
+        );
+        // An hour that cannot exist is still refused.
+        let err = parse_and_validate(Some("StudyTime=25-"), QidoLevel::Study)
+            .expect_err("hour 25 must 400");
         assert!(err.message.contains("StudyTime"), "{}", err.message);
         let err = parse_and_validate(Some("StudyTime=-"), QidoLevel::Study)
             .expect_err("a bare `-` must 400");

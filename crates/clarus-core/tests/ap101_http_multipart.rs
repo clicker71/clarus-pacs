@@ -64,7 +64,10 @@ fn multipart_boundary_and_split_read_parses_correctly() {
     .expect("parse new");
 
     let mut parts = 0usize;
-    let mut bytes = 0usize;
+    // Each part's payload, in order. Asserting only the SUM let a parser that
+    // moved a byte across the part boundary - or replaced one - pass, because
+    // 8 + 6 stayed 14 either way.
+    let mut payloads: Vec<Vec<u8>> = vec![Vec::new()];
     loop {
         match parser.next_event().expect("next_event") {
             MultipartEvent::Part(hdr) => {
@@ -74,16 +77,26 @@ fn multipart_boundary_and_split_read_parses_correctly() {
                     "part content-type parsed"
                 );
                 parts += 1;
+                if parts > 1 {
+                    payloads.push(Vec::new());
+                }
             }
             MultipartEvent::Data(chunk) => {
-                bytes += chunk.len();
+                payloads
+                    .last_mut()
+                    .expect("payload bucket")
+                    .extend_from_slice(chunk);
             }
             MultipartEvent::End => break,
         }
     }
 
     assert_eq!(parts, 2, "two parts parsed");
-    assert_eq!(bytes, 8 + 6, "PARTDATA + SECOND across split reads");
+    assert_eq!(
+        payloads,
+        vec![b"PARTDATA".to_vec(), b"SECOND".to_vec()],
+        "each part must carry exactly its own payload"
+    );
 }
 
 /// A one-byte source that returns `WouldBlock` once on its `block_at`-th read
@@ -127,7 +140,12 @@ fn multipart_recoverable_error_keeps_the_hold_window() {
     let mut parser = MultipartParser::new(
         Flaky {
             inner: Cursor::new(body),
-            block_at: 40, // mid first-part body, where `hold` is non-empty
+            // Byte 52 is the 5th byte of `PARTDATA`, i.e. inside the first
+            // part's BODY. The old 40 landed in its `Content-Type` header
+            // (the headers end at 48), where the saved bytes live in `hdr`
+            // and not in `hold` - so the hold-window path was never taken and
+            // the test could pass with `fill` dropping the staged tail.
+            block_at: 52,
             calls: 0,
             blocked: false,
         },
@@ -136,7 +154,7 @@ fn multipart_recoverable_error_keeps_the_hold_window() {
     .expect("parse new");
 
     let mut parts = 0usize;
-    let mut bytes = 0usize;
+    let mut payloads: Vec<Vec<u8>> = vec![Vec::new()];
     loop {
         match parser.next_event() {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -144,14 +162,29 @@ fn multipart_recoverable_error_keeps_the_hold_window() {
             Ok(MultipartEvent::Part(hdr)) => {
                 assert_eq!(hdr.content_type(), b"application/dicom");
                 parts += 1;
+                if parts > 1 {
+                    payloads.push(Vec::new());
+                }
             }
-            Ok(MultipartEvent::Data(chunk)) => bytes += chunk.len(),
+            Ok(MultipartEvent::Data(chunk)) => {
+                payloads
+                    .last_mut()
+                    .expect("payload bucket")
+                    .extend_from_slice(chunk);
+            }
             Ok(MultipartEvent::End) => break,
         }
     }
 
     assert_eq!(parts, 2, "two parts parsed across a recoverable error");
-    assert_eq!(bytes, 8 + 6, "PARTDATA + SECOND survive the retry");
+    // Per-part equality, not the total: a `fill` that dropped the staged tail
+    // would splice the parts or shorten one, and the SUM alone would not say
+    // which.
+    assert_eq!(
+        payloads,
+        vec![b"PARTDATA".to_vec(), b"SECOND".to_vec()],
+        "the hold window must survive the retry byte-for-byte"
+    );
 }
 
 /// A rejected boundary candidate must not pin the hold window: a later real

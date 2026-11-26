@@ -12,6 +12,14 @@ use std::fmt;
 
 // -- Top-level map keys --------------------------------------------------
 
+/// The only manifest format version this codec reads or writes.
+///
+/// Both directions check it exactly. The decoder used to accept any non-zero
+/// version, so a future version-2 manifest decoded as if it were version 1;
+/// the encoder used to accept any non-zero version too, publishing a manifest
+/// no reader in this build can interpret.
+pub const MANIFEST_VERSION: u8 = 1;
+
 pub const KEY_SYS: u64 = 1;
 pub const KEY_QIDO_STUDY: u64 = 2;
 pub const KEY_SERIES: u64 = 3;
@@ -383,27 +391,69 @@ impl Manifest {
     /// A conservative upper bound on the encoded size.
     ///
     /// Used to size the output buffer so `encode` never re-allocates.
+    ///
+    /// The bound must hold for EVERY field the encoders write, because an
+    /// under-count makes `CborWriter` return `BufferFull` for a manifest the
+    /// decoder would happily read - a valid study that cannot be stored.
+    /// Counting attribute VALUES alone was exactly that under-count: it
+    /// ignored the map keys, the array headers, and the per-record system
+    /// keys, so a study of 100 five-byte-keyed `UInt(u64::MAX)` attributes
+    /// estimated 1330 bytes for a payload needing 1400, and 100 EMPTY series
+    /// contributed nothing while still costing a map header and an
+    /// instances-array header each.
+    ///
+    /// The estimate is built from the same numbers the encoders use rather
+    /// than from a running total that has to be re-audited every time a field
+    /// is added: every map/array header is charged at the encoder's own
+    /// maximum (`write_head` for a 64-bit length is 9 bytes) and every key at
+    /// its maximum too, with a 25% margin on top.
     fn encoded_size_hint(&self) -> usize {
-        // Header bytes are tiny; attribute text dominates. Over-allocate by
-        // 25% to cover keys, frame maps, and array headers.
-        let mut total = 64;
+        // A CBOR length/argument header is at most 9 bytes (major type + the
+        // 8-byte 64-bit form); charging every header the maximum is what makes
+        // this a bound rather than an estimate.
+        const HEAD: usize = 9;
+        // Any key this codec writes - a system key or a 32-bit DICOM tag -
+        // encodes in at most `HEAD` bytes.
+        const KEY: usize = HEAD;
+
+        // Envelope: map header + 3 keys, then each child's own header.
+        let mut total = HEAD + 3 * KEY;
+
+        // sys: map header (4 entries) + 4 key/value pairs.
+        total += HEAD + 4 * (KEY + HEAD);
+
+        // qido_study: map header + one key and one value per attribute.
+        total += HEAD + self.study.attrs.len() * KEY;
         for (_, v) in &self.study.attrs {
             total += attr_encoded_size(v);
         }
+
+        // series array header, then each series record.
+        total += HEAD;
         for series in &self.series {
+            // attrs + the instances system key.
+            total += HEAD + (series.attrs.len() + 1) * KEY;
             for (_, v) in &series.attrs {
                 total += attr_encoded_size(v);
             }
-            total += series.instances.len() * 8;
+            // The instances array header, then each instance record.
+            total += HEAD;
             for instance in &series.instances {
+                // attrs + transfer syntax + tier + hash + file size + frames,
+                // plus the rejection reason when the instance is sequestered.
+                let system_keys = 5 + usize::from(instance.rejection_reason != NOT_REJECTED_REASON);
+                total += HEAD + (instance.attrs.len() + system_keys) * KEY;
                 for (_, v) in &instance.attrs {
                     total += attr_encoded_size(v);
                 }
-                total += instance.transfer_syntax.len() + 8;
-                // WADO-facing fields: storage tier + the 32-byte BLAKE3 hash +
-                // file size + their keys.
-                total += 1 + 1 + 32 + 1 + 9 + 6;
-                total += instance.frames.len() * 64;
+                // transfer syntax text, the 32-byte hash, and the scalar
+                // values behind the remaining system keys.
+                total += instance.transfer_syntax.len() + HEAD;
+                total += HEAD + 32;
+                total += 3 * HEAD;
+                // Frames array header, then each 4-entry frame map.
+                total += HEAD;
+                total += instance.frames.len() * (HEAD + 4 * (KEY + HEAD + 32));
             }
         }
         total + total / 4
@@ -443,10 +493,8 @@ fn encode_sys(w: &mut CborWriter<'_>, sys: &SysHeader) -> Result<(), ManifestErr
     // `Default` leaves `storage_tier` at 0, and `build_manifest_full`
     // overwrites its TIER_HOT seed with that field - encoding it as-is would
     // put a tier-0 header on disk that every later read fails to decode.
-    if sys.version == 0 {
-        return Err(ManifestError::MalformedEnvelope(
-            "unsupported sys version 0",
-        ));
+    if sys.version != MANIFEST_VERSION {
+        return Err(ManifestError::MalformedEnvelope("unsupported sys version"));
     }
     if !matches!(sys.storage_tier, TIER_HOT | TIER_COLD | TIER_S3) {
         return Err(ManifestError::MalformedEnvelope("unknown storage tier"));
@@ -466,6 +514,7 @@ fn encode_sys(w: &mut CborWriter<'_>, sys: &SysHeader) -> Result<(), ManifestErr
 fn encode_study(w: &mut CborWriter<'_>, study: &StudyQido) -> Result<(), ManifestError> {
     w.write_map_header(study.attrs.len() as u64)?;
     for (tag, val) in &study.attrs {
+        ensure_tag(*tag)?;
         w.write_u64(*tag as u64)?;
         encode_attr_value(w, val)?;
     }
@@ -553,11 +602,25 @@ fn encode_attr_value(w: &mut CborWriter<'_>, val: &AttrValue) -> Result<(), Mani
 }
 
 fn ensure_tag(tag: u32) -> Result<(), ManifestError> {
-    // DICOM tags live in groups 0002..FFFF and never collide with the low
-    // system keys 1..6 at the same nesting level because those are only
-    // emitted where we know the record type. A tag must fit in 32 bits
-    // (guaranteed by `u32`) - this guard documents the invariant.
-    let _ = tag;
+    // A DICOM tag is a 32-bit group/element pair; the smallest group a data
+    // set can carry is 0002 (PS3.5 7.1 - group 0000 is command, 0002 is file
+    // meta), so every real tag is >= 0x0002_0000. The manifest's own system
+    // keys are small integers 1..=10 at the SAME nesting level as the
+    // attributes, which is why a caller-supplied attribute key below that
+    // floor would be written TWICE into one map: once from the attribute list
+    // and once by the record's own system-key writer.
+    //
+    // CBOR permits a duplicate map key but says nothing about which value
+    // wins (RFC 8949 5.6), and this decoder keeps the one it reads - so a
+    // series attribute named `SERIES_INSTANCES` (key 4) would either be
+    // discarded or be mistaken for a second instances array. Refusing it at
+    // ENCODE time is the only place the ambiguity can be removed without
+    // changing the wire format.
+    if tag < 0x0002_0000 {
+        return Err(ManifestError::MalformedEnvelope(
+            "attribute key collides with a manifest system key",
+        ));
+    }
     Ok(())
 }
 
@@ -596,9 +659,26 @@ fn decode_envelope(r: &mut CborReader<'_>, depth: Depth) -> Result<Manifest, Man
     let mut study: Option<StudyQido> = None;
     let mut series: Vec<SeriesRecord> = Vec::new();
     let mut seen_study = false;
+    // The three envelope keys must each appear EXACTLY once. The entry count
+    // alone does not prove that: a map of {SYS, QIDO_STUDY, QIDO_STUDY} also
+    // has three entries, passes every per-key check, and yields a manifest
+    // with no series at all. Tracking presence per key is what makes the
+    // "== 3" count mean what it claims, in any key order.
+    let mut seen_sys = false;
+    let mut seen_series = false;
     // RAM-only derived instance count, accumulated across every decoded /
     // header-skipped series so 0020,1208 is consistent at any decode depth.
     let mut instance_acc: u64 = 0;
+    // Study aggregates computed from the series array BEFORE the study map was
+    // read, held here until it exists.
+    //
+    // CBOR maps reach this loop in whatever order the writer used, so
+    // KEY_SERIES can legally precede KEY_QIDO_STUDY. Computing the counts and
+    // writing them straight onto `study` silently dropped them whenever the
+    // order was reversed - a manifest with one CT series reported 0 series, 0
+    // instances and no modality at study depth while the full decode of the
+    // same bytes reported 1, 1, "CT".
+    let mut pending_section: Option<(u64, u64, String)> = None;
 
     for _ in 0..entries {
         let key = match r.next()? {
@@ -607,6 +687,10 @@ fn decode_envelope(r: &mut CborReader<'_>, depth: Depth) -> Result<Manifest, Man
         };
         match key {
             KEY_SYS => {
+                if seen_sys {
+                    return Err(ManifestError::MalformedEnvelope("duplicate sys header"));
+                }
+                seen_sys = true;
                 let sys_head = r.next()?;
                 let n = match sys_head {
                     CborToken::MapStart(n) => n,
@@ -615,6 +699,9 @@ fn decode_envelope(r: &mut CborReader<'_>, depth: Depth) -> Result<Manifest, Man
                 sys = Some(read_sys(r, n)?);
             }
             KEY_QIDO_STUDY => {
+                if seen_study {
+                    return Err(ManifestError::MalformedEnvelope("duplicate study map"));
+                }
                 seen_study = true;
                 let study_head = r.next()?;
                 let n = match study_head {
@@ -624,6 +711,10 @@ fn decode_envelope(r: &mut CborReader<'_>, depth: Depth) -> Result<Manifest, Man
                 study = Some(read_study(r, n)?);
             }
             KEY_SERIES => {
+                if seen_series {
+                    return Err(ManifestError::MalformedEnvelope("duplicate series array"));
+                }
+                seen_series = true;
                 if depth == Depth::Study {
                     // QIDO study hotpath: derive the series / instance counts
                     // and the ModalitiesInStudy aggregate from the array + map
@@ -711,15 +802,8 @@ fn decode_envelope(r: &mut CborReader<'_>, depth: Depth) -> Result<Manifest, Man
                             }
                         }
                     }
-                    if let Some(st) = study.as_mut() {
-                        st.series_count = n_series;
-                        st.instance_count = n_instances;
-                        st.modalities_in_study = if modality_agg.is_empty() {
-                            None
-                        } else {
-                            Some(modality_agg)
-                        };
-                    }
+                    // Held until the study map exists (see `pending_section`).
+                    pending_section = Some((n_series, n_instances, modality_agg));
                 } else {
                     let arr_head = r.next()?;
                     let n = match arr_head {
@@ -739,7 +823,21 @@ fn decode_envelope(r: &mut CborReader<'_>, depth: Depth) -> Result<Manifest, Man
     if !seen_study {
         return Err(ManifestError::MalformedEnvelope("missing study keys"));
     }
+    if !seen_series {
+        return Err(ManifestError::MalformedEnvelope("missing series array"));
+    }
     let mut study = study.unwrap_or_default();
+    // Apply the study-depth aggregates NOW, after the loop, so the answer does
+    // not depend on whether KEY_SERIES preceded KEY_QIDO_STUDY.
+    if let Some((n_series, n_instances, modality_agg)) = pending_section {
+        study.series_count = n_series;
+        study.instance_count = n_instances;
+        study.modalities_in_study = if modality_agg.is_empty() {
+            None
+        } else {
+            Some(modality_agg)
+        };
+    }
     // Derived study counts + ModalitiesInStudy (RAM-only, never persisted to
     // CBOR). At Series/Full depth the series array is decoded, so series_count
     // comes from it, instance_count from the accumulation across each series'
@@ -780,8 +878,12 @@ fn read_sys(r: &mut CborReader<'_>, n: u64) -> Result<SysHeader, ManifestError> 
     for _ in 0..n {
         let key = expect_u64_key(r)?;
         match key {
-            SYS_VERSION => version = Some(expect_u64_value(r)? as u8),
-            SYS_STORAGE_TIER => tier = Some(expect_u64_value(r)? as u8),
+            // A narrowing `as u8` would turn 257 into 1, so an out-of-range
+            // version or tier would decode as a LEGAL one - the exact case the
+            // tier/version checks below exist to catch. Convert with `try_from`
+            // so the range check happens before the value loses its high bits.
+            SYS_VERSION => version = Some(narrow_u8(expect_u64_value(r)?, "sys version")?),
+            SYS_STORAGE_TIER => tier = Some(narrow_u8(expect_u64_value(r)?, "sys storage tier")?),
             SYS_TOTAL_PIXEL_BYTES => total = Some(expect_u64_value(r)?),
             SYS_ARRIVED_AT => arrived = expect_u64_value(r)?,
             other => return Err(ManifestError::UnknownKey(other)),
@@ -795,11 +897,12 @@ fn read_sys(r: &mut CborReader<'_>, n: u64) -> Result<SysHeader, ManifestError> 
     ))?;
 
     // Version and tier are bounded; reject unknown values so a future format
-    // never gets silently misread.
-    if version == 0 {
-        return Err(ManifestError::MalformedEnvelope(
-            "unsupported sys version 0",
-        ));
+    // never gets silently misread. The version check is `!=`, not `>=`: the
+    // documented format is exactly version 1, and accepting "anything above 0"
+    // would let a version-2 writer's manifest decode as a version-1 manifest
+    // with whatever fields happen to line up.
+    if version != MANIFEST_VERSION {
+        return Err(ManifestError::MalformedEnvelope("unsupported sys version"));
     }
     if !matches!(storage_tier, TIER_HOT | TIER_COLD | TIER_S3) {
         return Err(ManifestError::MalformedEnvelope("unknown storage tier"));
@@ -841,6 +944,21 @@ fn read_study(r: &mut CborReader<'_>, n: u64) -> Result<StudyQido, ManifestError
 fn bounded_capacity(declared: u64, bound: usize) -> usize {
     let bound = bound as u64;
     declared.min(bound).min(usize::MAX as u64) as usize
+}
+
+/// Convert a decoded CBOR unsigned value to `u8`, rejecting anything that does
+/// not fit.
+///
+/// A plain `as u8` truncates, so 257 decodes as 1 - a value the range checks
+/// downstream then ACCEPT, because by the time they see it the evidence is
+/// gone. `what` names the field for the error.
+fn narrow_u8(v: u64, what: &'static str) -> Result<u8, ManifestError> {
+    u8::try_from(v).map_err(|_| ManifestError::MalformedEnvelope(what))
+}
+
+/// Convert a decoded CBOR unsigned value to `u32`, rejecting anything wider.
+fn narrow_u32(v: u64, what: &'static str) -> Result<u32, ManifestError> {
+    u32::try_from(v).map_err(|_| ManifestError::MalformedEnvelope(what))
 }
 
 /// Append `m` to a comma-joined ModalitiesInStudy aggregate if not already
@@ -936,7 +1054,9 @@ fn read_instance(r: &mut CborReader<'_>) -> Result<InstanceRecord, ManifestError
     for _ in 0..n {
         let key = expect_u64_key(r)?;
         match key {
-            INSTANCE_STORAGE_TIER => storage_tier = Some(expect_u64_value(r)? as u8),
+            INSTANCE_STORAGE_TIER => {
+                storage_tier = Some(narrow_u8(expect_u64_value(r)?, "instance storage tier")?)
+            }
             INSTANCE_TRANSFER_SYNTAX => {
                 seen_ts = true;
                 transfer_syntax = expect_text_value(r)?;
@@ -984,12 +1104,20 @@ fn read_instance(r: &mut CborReader<'_>) -> Result<InstanceRecord, ManifestError
     if !seen_frames {
         return Err(ManifestError::MalformedEnvelope("instance missing frames"));
     }
+    let storage_tier = storage_tier.ok_or(ManifestError::MalformedEnvelope(
+        "instance missing storage tier",
+    ))?;
+    // The same tier vocabulary as the system header, enforced the same way.
+    // Accepting tier 0 (the `Default`) or an out-of-range value would hand an
+    // impossible tier to WADO lookup, which branches on it to choose the
+    // storage backend.
+    if !matches!(storage_tier, TIER_HOT | TIER_COLD | TIER_S3) {
+        return Err(ManifestError::MalformedEnvelope("unknown storage tier"));
+    }
     Ok(InstanceRecord {
         attrs,
         transfer_syntax,
-        storage_tier: storage_tier.ok_or(ManifestError::MalformedEnvelope(
-            "instance missing storage tier",
-        ))?,
+        storage_tier,
         blake3: blake3.ok_or(ManifestError::MalformedEnvelope("instance missing blake3"))?,
         file_size: file_size.ok_or(ManifestError::MalformedEnvelope(
             "instance missing file size",
@@ -1014,7 +1142,11 @@ fn read_frame(r: &mut CborReader<'_>) -> Result<FrameRecord, ManifestError> {
     for _ in 0..n {
         let key = expect_u64_key(r)?;
         match key {
-            FRAME_NUMBER => number = Some(expect_u64_value(r)? as u32),
+            // `as u32` would turn 4_294_967_297 into frame 1, aliasing two
+            // different frames onto one number in a table that lookups walk
+            // linearly. Convert with `try_from` so the overflow is a decode
+            // error, not a silently different frame.
+            FRAME_NUMBER => number = Some(narrow_u32(expect_u64_value(r)?, "frame number")?),
             FRAME_HASH => {
                 hash = Some(expect_hash_value(r)?);
             }
@@ -1024,8 +1156,17 @@ fn read_frame(r: &mut CborReader<'_>) -> Result<FrameRecord, ManifestError> {
         }
     }
 
+    // The frame table is ONE-BASED: frame 0 does not exist, and a reader that
+    // asked for frame 0 is already outside the contract. Storing it here would
+    // make the table satisfy that lookup instead of failing it.
+    let number = number.ok_or(ManifestError::MalformedEnvelope("frame missing number"))?;
+    if number == 0 {
+        return Err(ManifestError::MalformedEnvelope(
+            "frame number is one-based and cannot be 0",
+        ));
+    }
     Ok(FrameRecord {
-        number: number.ok_or(ManifestError::MalformedEnvelope("frame missing number"))?,
+        number,
         hash: hash.ok_or(ManifestError::MalformedEnvelope("frame missing hash"))?,
         offset: offset.ok_or(ManifestError::MalformedEnvelope("frame missing offset"))?,
         compressed_len: compressed_len.ok_or(ManifestError::MalformedEnvelope(
@@ -1248,9 +1389,21 @@ pub mod tests {
         version_zero.sys.version = 0;
         match version_zero.encode() {
             Err(ManifestError::MalformedEnvelope(why)) => {
-                assert_eq!(why, "unsupported sys version 0");
+                assert_eq!(why, "unsupported sys version");
             }
             other => panic!("version 0 must be refused at encode, got {other:?}"),
+        }
+
+        // A FUTURE version is refused too: this build cannot interpret what a
+        // version-2 writer meant, so publishing one would hand every reader a
+        // manifest it has to guess at. The check is `!=`, not `> 0`.
+        let mut version_future = sample_manifest();
+        version_future.sys.version = 2;
+        match version_future.encode() {
+            Err(ManifestError::MalformedEnvelope(why)) => {
+                assert_eq!(why, "unsupported sys version");
+            }
+            other => panic!("version 2 must be refused at encode, got {other:?}"),
         }
     }
 
@@ -1881,5 +2034,332 @@ pub mod tests {
         let bytes = m.encode().expect("encode");
         let decoded = Manifest::decode(&bytes).expect("decode");
         assert_eq!(decoded, m, "round-trip mismatch");
+    }
+
+    /// Encode a hand-built CBOR envelope through `fill`.
+    ///
+    /// The writer borrows its buffer, so a test that needs raw control over the
+    /// wire bytes (duplicate keys, out-of-range system values) cannot go
+    /// through `Manifest::encode`. This closes the borrow and hands back the
+    /// bytes that were written.
+    fn envelope_bytes(fill: impl FnOnce(&mut CborWriter<'_>)) -> Vec<u8> {
+        let mut buf = vec![0u8; 8192];
+        let written = {
+            let mut w = CborWriter::new(&mut buf);
+            fill(&mut w);
+            w.written()
+        };
+        buf.truncate(written);
+        buf
+    }
+
+    /// Write a minimal system map holding `version` and `tier`.
+    ///
+    /// The `KEY_SYS` key itself is the caller's, so the envelope tests can put
+    /// the three entries in any order.
+    fn write_sys(w: &mut CborWriter<'_>, version: u64, tier: u64) {
+        w.write_map_header(4).expect("sys");
+        w.write_u64(SYS_VERSION).expect("k");
+        w.write_u64(version).expect("v");
+        w.write_u64(SYS_STORAGE_TIER).expect("k");
+        w.write_u64(tier).expect("v");
+        w.write_u64(SYS_TOTAL_PIXEL_BYTES).expect("k");
+        w.write_u64(0).expect("v");
+        w.write_u64(SYS_ARRIVED_AT).expect("k");
+        w.write_u64(0).expect("v");
+    }
+
+    /// Write a one-attribute study map.
+    fn write_empty_study(w: &mut CborWriter<'_>) {
+        w.write_u64(KEY_QIDO_STUDY).expect("k");
+        w.write_map_header(0).expect("study");
+    }
+
+    /// The size bound must cover the MAP KEYS and the per-record system keys,
+    /// not just the attribute values.
+    ///
+    /// With 100 study attributes carrying five-byte keys and `UInt(u64::MAX)`
+    /// values the old bound estimated 1330 bytes against 1400 needed, and 100
+    /// EMPTY series contributed nothing at all while still costing a map
+    /// header and an instances-array header each. Both are valid manifests
+    /// that the old hint rejected with `BufferFull` - a study the decoder
+    /// would happily read and the writer refused to store.
+    ///
+    /// Reverting to the value-only estimate reds this test on the encode
+    /// itself, before any round-trip assertion runs.
+    #[test]
+    fn encode_covers_keys_and_empty_series_in_the_size_bound() {
+        let mut m = sample_manifest();
+        m.study.attrs.clear();
+        // Five-byte keys (real DICOM tags) with the widest UInt argument.
+        for i in 0u32..100 {
+            m.study
+                .attrs
+                .push((0x0008_0000 + i, AttrValue::UInt(u64::MAX)));
+        }
+        // 100 empty series: no attribute and no instance to contribute to the
+        // old estimate, yet each still writes a map header and an array
+        // header. Each carries a real UID so the round-trip is meaningful.
+        m.series = (0u32..100)
+            .map(|i| SeriesRecord {
+                attrs: vec![(0x0020_000e, AttrValue::Text(format!("1.2.840.1.{i}")))],
+                instances: Vec::new(),
+            })
+            .collect();
+
+        let bytes = m.encode().expect("encode");
+        let decoded = Manifest::decode(&bytes).expect("decode");
+        assert_eq!(decoded.series.len(), 100);
+        assert_eq!(decoded.study.attrs.len(), 100);
+    }
+
+    /// Each of the three envelope keys must be present EXACTLY once.
+    ///
+    /// Counting entries cannot prove that: a map of {SYS, QIDO_STUDY,
+    /// QIDO_STUDY} has the required three entries and passes every per-key
+    /// check, yielding a manifest with no series at all - a study that QIDO
+    /// lists and WADO can never serve an instance from.
+    #[test]
+    fn a_duplicated_envelope_key_is_refused() {
+        let bytes = envelope_bytes(|w| {
+            w.write_map_header(3).expect("map");
+            w.write_u64(KEY_SYS).expect("key");
+            write_sys(w, 1, u64::from(TIER_HOT));
+            // qido_study, TWICE
+            for _ in 0..2 {
+                write_empty_study(w);
+            }
+        });
+
+        match Manifest::decode(&bytes) {
+            Err(ManifestError::MalformedEnvelope(why)) => {
+                assert_eq!(why, "duplicate study map");
+            }
+            other => panic!("a duplicated study map must be refused, got {other:?}"),
+        }
+    }
+
+    /// A manifest with no series array at all must be refused.
+    ///
+    /// The three-entry count was satisfied by three keys of which one was
+    /// missing and another repeated; nothing checked that `KEY_SERIES` was
+    /// among them.
+    #[test]
+    fn a_missing_series_envelope_key_is_refused() {
+        let bytes = envelope_bytes(|w| {
+            w.write_map_header(3).expect("map");
+            w.write_u64(KEY_SYS).expect("key");
+            write_sys(w, 1, u64::from(TIER_HOT));
+            // Two study maps, no KEY_SERIES anywhere.
+            for _ in 0..2 {
+                write_empty_study(w);
+            }
+        });
+        assert!(matches!(
+            Manifest::decode(&bytes),
+            Err(ManifestError::MalformedEnvelope(_))
+        ));
+    }
+
+    /// Study-depth aggregates must not depend on the CBOR key ORDER.
+    ///
+    /// CBOR maps have no defined order, so a writer may emit KEY_SERIES before
+    /// KEY_QIDO_STUDY. The aggregates were computed straight onto `study`, so
+    /// with that order they were discarded (`study` was still `None`) and a
+    /// manifest holding one CT series reported 0 series, 0 instances and no
+    /// modality - while the same bytes at full depth reported 1, 1, "CT".
+    #[test]
+    fn study_aggregates_survive_a_series_first_envelope() {
+        let m = sample_manifest();
+        let bytes = envelope_bytes(|w| {
+            w.write_map_header(3).expect("map");
+            w.write_u64(KEY_SERIES).expect("key");
+            w.write_array_header(1).expect("series array");
+            encode_series(w, &m.series[0]).expect("series");
+            w.write_u64(KEY_SYS).expect("key");
+            write_sys(w, u64::from(m.sys.version), u64::from(m.sys.storage_tier));
+            w.write_u64(KEY_QIDO_STUDY).expect("key");
+            encode_study(w, &m.study).expect("study");
+        });
+
+        let study = Manifest::decode_study_only(&bytes).expect("study decode");
+        assert_eq!(study.study.series_count, 1, "series count must survive");
+        assert_eq!(study.study.instance_count, 1, "instance count must survive");
+        assert_eq!(
+            study.study.modalities_in_study.as_deref(),
+            Some("CT"),
+            "ModalitiesInStudy must survive a series-first envelope"
+        );
+    }
+
+    /// An attribute key that collides with a manifest system key is refused
+    /// at ENCODE time.
+    ///
+    /// `SERIES_INSTANCES` is 4, which a caller-supplied series attribute could
+    /// claim. The encoder would then write key 4 twice - CBOR permits that
+    /// (RFC 8949 5.6) but says nothing about which value wins, so a text
+    /// attribute would either be discarded or be mistaken for a second
+    /// instances array.
+    #[test]
+    fn a_system_key_used_as_an_attribute_key_is_refused() {
+        let mut m = sample_manifest();
+        m.series[0]
+            .attrs
+            .push((SERIES_INSTANCES as u32, AttrValue::Text("hijack".into())));
+        match m.encode() {
+            Err(ManifestError::MalformedEnvelope(why)) => {
+                assert_eq!(why, "attribute key collides with a manifest system key");
+            }
+            other => panic!("a colliding attribute key must be refused, got {other:?}"),
+        }
+
+        // The study map has the same hazard against its own keys.
+        let mut m2 = sample_manifest();
+        m2.study.attrs.push((1, AttrValue::Text("hijack".into())));
+        assert!(matches!(
+            m2.encode(),
+            Err(ManifestError::MalformedEnvelope(
+                "attribute key collides with a manifest system key"
+            ))
+        ));
+    }
+
+    /// A frame number must be one-based and fit in 32 bits.
+    ///
+    /// `as u32` turned 4_294_967_297 into frame 1, aliasing two frames onto
+    /// one number in a table that lookups walk linearly; frame 0 is outside
+    /// the one-based contract and would satisfy a lookup that should miss.
+    #[test]
+    fn a_frame_number_outside_the_one_based_u32_range_is_refused() {
+        let m = sample_manifest();
+        let inst = &m.series[0].instances[0];
+        for bad in [0u64, u64::from(u32::MAX) + 2] {
+            let bytes = envelope_bytes(|w| {
+                w.write_map_header(3).expect("map");
+                w.write_u64(KEY_SYS).expect("key");
+                write_sys(w, u64::from(m.sys.version), u64::from(m.sys.storage_tier));
+                w.write_u64(KEY_QIDO_STUDY).expect("key");
+                encode_study(w, &m.study).expect("study");
+                w.write_u64(KEY_SERIES).expect("k");
+                w.write_array_header(1).expect("arr");
+                // One series carrying one instance with one frame whose number
+                // is `bad` - hand-written, because `FrameRecord::number` is a
+                // u32 and cannot hold the out-of-range value.
+                w.write_map_header(2).expect("series map");
+                w.write_u64(SERIES_INSTANCES).expect("k");
+                w.write_array_header(1).expect("instances");
+                w.write_map_header(5).expect("instance map");
+                w.write_u64(INSTANCE_STORAGE_TIER).expect("k");
+                w.write_u64(u64::from(inst.storage_tier)).expect("v");
+                w.write_u64(INSTANCE_TRANSFER_SYNTAX).expect("k");
+                w.write_text(&inst.transfer_syntax).expect("v");
+                w.write_u64(INSTANCE_BLAKE3).expect("k");
+                w.write_bytes(&inst.blake3).expect("v");
+                w.write_u64(INSTANCE_FILE_SIZE).expect("k");
+                w.write_u64(inst.file_size).expect("v");
+                w.write_u64(INSTANCE_FRAMES).expect("k");
+                w.write_array_header(1).expect("frames");
+                w.write_map_header(4).expect("frame map");
+                w.write_u64(FRAME_NUMBER).expect("k");
+                w.write_u64(bad).expect("v");
+                w.write_u64(FRAME_HASH).expect("k");
+                w.write_bytes(&inst.frames[0].hash).expect("v");
+                w.write_u64(FRAME_OFFSET).expect("k");
+                w.write_u64(inst.frames[0].offset).expect("v");
+                w.write_u64(FRAME_COMPRESSED_LEN).expect("k");
+                w.write_u64(inst.frames[0].compressed_len).expect("v");
+                w.write_u64(0x0020_000e).expect("series attr key");
+                w.write_text("1.2.840.1.2").expect("v");
+            });
+
+            assert!(
+                matches!(
+                    Manifest::decode(&bytes),
+                    Err(ManifestError::MalformedEnvelope(_))
+                ),
+                "frame number {bad} must be refused"
+            );
+        }
+    }
+
+    /// An out-of-range version or tier must not narrow into a legal one.
+    ///
+    /// `257 as u8` is 1, and 1 is a valid tier and a valid version - so a
+    /// truncating decode reported a manifest this build can read.
+    #[test]
+    fn an_out_of_range_version_or_tier_is_refused_not_truncated() {
+        let bad_tier = envelope_bytes(|w| {
+            w.write_map_header(3).expect("map");
+            w.write_u64(KEY_SYS).expect("key");
+            write_sys(w, 1, 257);
+            write_empty_study(w);
+            w.write_u64(KEY_SERIES).expect("k");
+            w.write_array_header(0).expect("series");
+        });
+        assert!(
+            matches!(
+                Manifest::decode(&bad_tier),
+                Err(ManifestError::MalformedEnvelope("sys storage tier"))
+            ),
+            "a 257 tier must not narrow to TIER_HOT"
+        );
+
+        let bad_version = envelope_bytes(|w| {
+            w.write_map_header(3).expect("map");
+            w.write_u64(KEY_SYS).expect("key");
+            write_sys(w, 257, u64::from(TIER_HOT));
+            write_empty_study(w);
+            w.write_u64(KEY_SERIES).expect("k");
+            w.write_array_header(0).expect("series");
+        });
+        assert!(
+            matches!(
+                Manifest::decode(&bad_version),
+                Err(ManifestError::MalformedEnvelope("sys version"))
+            ),
+            "a 257 version must not narrow to version 1"
+        );
+    }
+
+    /// An instance tier must be one of the three known tiers.
+    ///
+    /// The instance decoder only checked that the key was PRESENT, so tier 0
+    /// (the `Default`) and any out-of-range byte reached WADO lookup, which
+    /// branches on the tier to pick a storage backend.
+    #[test]
+    fn an_invalid_instance_tier_is_refused() {
+        for bad in [0u64, 4, 257] {
+            let bytes = envelope_bytes(|w| {
+                w.write_map_header(3).expect("map");
+                w.write_u64(KEY_SYS).expect("key");
+                write_sys(w, 1, u64::from(TIER_HOT));
+                write_empty_study(w);
+                w.write_u64(KEY_SERIES).expect("k");
+                w.write_array_header(1).expect("series");
+                w.write_map_header(2).expect("series map");
+                w.write_u64(SERIES_INSTANCES).expect("k");
+                w.write_array_header(1).expect("instances");
+                w.write_map_header(5).expect("instance map");
+                w.write_u64(INSTANCE_STORAGE_TIER).expect("k");
+                w.write_u64(bad).expect("v");
+                w.write_u64(INSTANCE_TRANSFER_SYNTAX).expect("k");
+                w.write_text("1.2.840.10008.1.2.1").expect("v");
+                w.write_u64(INSTANCE_BLAKE3).expect("k");
+                w.write_bytes(&[0u8; 32]).expect("v");
+                w.write_u64(INSTANCE_FILE_SIZE).expect("k");
+                w.write_u64(64).expect("v");
+                w.write_u64(INSTANCE_FRAMES).expect("k");
+                w.write_array_header(0).expect("frames");
+                w.write_u64(0x0020_000e).expect("series attr key");
+                w.write_text("1.2.840.1.2").expect("v");
+            });
+            assert!(
+                matches!(
+                    Manifest::decode(&bytes),
+                    Err(ManifestError::MalformedEnvelope(_))
+                ),
+                "instance tier {bad} must be refused"
+            );
+        }
     }
 }

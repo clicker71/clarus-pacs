@@ -180,13 +180,14 @@ fn record_slices(
         return out;
     }
 
-    // New series: admit (evicting the least recently used entry if at cap).
-    if buckets.len() >= CAP
-        && let Some((idx, _)) = buckets.iter().enumerate().min_by_key(|(_, b)| b.last)
-    {
-        out.push(format_partial(&buckets[idx]));
-        buckets.swap_remove(idx);
-    }
+    // New series: admit, evicting the least recently used entry if at cap.
+    //
+    // The bucket is built and COMPLETED first, and eviction only happens if
+    // the new series still needs a slot. Evicting up front meant a one-slice
+    // series that finishes immediately cost an ACTIVE bucket its slot and then
+    // never entered the table at all: the evicted series was logged `partial`
+    // with its next slice starting a fresh session and losing the totals it had
+    // accumulated.
     let mut b = Bucket {
         key: k.clone(),
         user: user.to_vec(),
@@ -201,19 +202,33 @@ fn record_slices(
         last: now,
     };
     record_into(&mut b, status, bytes, us, expected, now);
-    // A brand-new bucket is a new fetch session: surface a start marker FIRST,
-    // before any loaded/partial line the same slice may also produce.
-    let started = format_started(&b);
+    // A brand-new bucket is a new fetch session, and its `started` marker is
+    // APPENDED, not inserted at the front: the sweep above may already have
+    // emitted a `partial` for the OLD session of this very key, and a reader
+    // pairing lines by (study, series, user, ip) would otherwise see the new
+    // start followed by the previous session's totals and close the new one
+    // with them. The sweep's output keeps its position.
     if let Some(n) = b.expected
         && b.fetched >= n as u64
     {
+        // Complete on its first slice: nothing needs a table slot, so nothing
+        // is evicted for it.
+        out.push(format_started(&b));
         out.push(format_loaded(&b));
-        out.insert(0, started);
-        // A fresh bucket already at expected is served once - do not retain
-        // it for a redundant repeat of the same slice.
         return out;
     }
-    out.insert(0, started);
+    // It needs a slot after all: evict at the cap, then admit it. Eviction is
+    // reported AFTER this series' start so the pair stays adjacent.
+    if buckets.len() >= CAP
+        && let Some((idx, _)) = buckets.iter().enumerate().min_by_key(|(_, b)| b.last)
+    {
+        out.push(format_started(&b));
+        out.push(format_partial(&buckets[idx]));
+        buckets.swap_remove(idx);
+        buckets.push(b);
+        return out;
+    }
+    out.push(format_started(&b));
     buckets.push(b);
     out
 }
@@ -272,7 +287,14 @@ fn record_into(
     if b.expected.is_none() && expected.is_some() {
         b.expected = expected;
     }
-    b.last = now;
+    // `now` is sampled BEFORE the table lock is taken, so a worker that
+    // acquired the lock later can still carry an EARLIER timestamp. Assigning it
+    // moved `last` backwards and the TTL sweep then expired an active series
+    // early, ending its session in the middle of a transfer. Keep the later of
+    // the two observations.
+    if now > b.last {
+        b.last = now;
+    }
 }
 
 /// Line marking the first slice of a brand-new fetch session for a series.
@@ -649,6 +671,114 @@ mod tests {
         );
     }
 
+    /// The SAME key returning after its TTL is closed before it is reopened.
+    ///
+    /// A consumer pairing journal lines by (study, series, user, ip) reads the
+    /// sequence in order. When the sweep emits the expired session's `partial`
+    /// and the same key then starts again, the `started` line must come AFTER
+    /// the `partial` - otherwise the reader sees a start followed by the OLD
+    /// session's totals and attributes them to the new one.
+    #[test]
+    fn a_restart_with_the_same_key_closes_the_old_session_first() {
+        let mut h = Harness::new();
+        let t0 = Instant::now();
+        let _ = h.slice("1.2.3", "4.5.6", "u", "ip", 200, None, t0);
+        let _ = h.slice("1.2.3", "4.5.6", "u", "ip", 200, None, t0);
+
+        let t1 = t0 + TTL + Duration::from_secs(1);
+        let out = h.slice("1.2.3", "4.5.6", "u", "ip", 200, None, t1);
+        let partial_at = out
+            .iter()
+            .position(|l| l.starts_with("partial study=1.2.3 series=4.5.6"))
+            .expect("the expired session must be closed");
+        let started_at = out
+            .iter()
+            .position(|l| l.starts_with("started study=1.2.3 series=4.5.6"))
+            .expect("the new session must be opened");
+        assert!(
+            partial_at < started_at,
+            "the old session must be closed BEFORE the new one starts, got {out:?}"
+        );
+    }
+
+    /// A one-slice series that completes immediately evicts nothing.
+    ///
+    /// Eviction used to run BEFORE the new bucket was built and tested for
+    /// completion, so a series that finished on its first slice still cost an
+    /// active bucket its slot - and then never entered the table at all. The
+    /// evicted series was logged `partial` and its next slice started over with
+    /// lost totals.
+    #[test]
+    fn a_complete_first_slice_does_not_evict_an_active_series() {
+        let mut h = Harness::new();
+        let t0 = Instant::now();
+        // Fill the table to exactly the cap with live series.
+        for i in 0..CAP {
+            let study = format!("1.2.{i}");
+            let _ = h.slice(&study, "4.5.6", "u", "ip", 200, Some(2), t0);
+        }
+        assert_eq!(h.buckets.len(), CAP, "the table is full");
+        // Touch the FIRST bucket so its `last` is the newest observation.
+        let _ = h.slice("1.2.0", "4.5.6", "u", "ip", 200, None, t0);
+        let before = h.buckets.len();
+
+        // A series that is complete on its first slice needs no table slot, so
+        // it must not evict anything - not even the least recently used entry.
+        let out = h.slice("9.9.9", "8.8.8", "u", "ip", 200, Some(1), t0);
+        assert!(
+            !out.iter().any(|l| l.starts_with("partial")),
+            "a first-slice-complete series must evict nothing, got {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("loaded study=9.9.9")),
+            "it still reports its completion"
+        );
+        assert_eq!(
+            h.buckets.len(),
+            before,
+            "a series that needs no slot must leave the table untouched"
+        );
+    }
+
+    /// An out-of-order timestamp must not shorten a series' idle window.
+    ///
+    /// `now` is sampled before the table lock, so a worker that acquires the
+    /// lock later can carry an EARLIER instant. Assigning it moved `last`
+    /// backwards, and the TTL sweep then expired a series that was still being
+    /// served - ending its session mid-transfer and losing the rest of it.
+    #[test]
+    fn an_older_timestamp_does_not_expire_an_active_series() {
+        let mut h = Harness::new();
+        let t0 = Instant::now();
+        let _ = h.slice("1.2.3", "4.5.6", "u", "ip", 200, Some(9), t0);
+        assert_eq!(
+            h.buckets[0].last, t0,
+            "the first observation sets the idle anchor"
+        );
+
+        // A slice whose clock was sampled 30 s EARLIER, acquired later.
+        let _ = h.slice(
+            "1.2.3",
+            "4.5.6",
+            "u",
+            "ip",
+            200,
+            None,
+            t0 - Duration::from_secs(30),
+        );
+        assert_eq!(
+            h.buckets[0].last, t0,
+            "a delayed observation must not rewind the idle anchor; it rewound \
+             to {:?} and the sweep then expired an active series",
+            h.buckets[0].last
+        );
+
+        // And the sweep agrees: still live at t0 + TTL/2.
+        let out = sweep_buckets(&mut h.buckets, t0 + TTL / 2);
+        assert!(out.is_empty(), "the series is still active, got {out:?}");
+        assert_eq!(h.buckets.len(), 1, "the series is still tracked");
+    }
+
     #[test]
     fn after_ttl_new_bucket_starts_marker_again() {
         let mut h = Harness::new();
@@ -663,9 +793,14 @@ mod tests {
             out.iter()
                 .any(|l| l.starts_with("partial study=1.2.3 series=4.5.6 got=1"))
         );
+        // The sweep's `partial` comes FIRST and the new session's `started`
+        // after it: a reader pairing lines by key must not see a start
+        // followed by another session's totals. The old assertion pinned the
+        // reverse (start at index 0), which is the ordering this finding names.
         assert!(
-            out.first()
-                .is_some_and(|l| { l.starts_with("started study=2.2.2 series=9.9.9") })
+            out.last()
+                .is_some_and(|l| { l.starts_with("started study=2.2.2 series=9.9.9") }),
+            "the new session starts after the expired one is closed, got {out:?}"
         );
         // Re-recording the ORIGINAL key after it was swept starts a fresh
         // bucket: started again for `1.2.3`.

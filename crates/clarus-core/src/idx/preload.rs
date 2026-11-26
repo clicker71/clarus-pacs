@@ -26,6 +26,29 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Index files preload could not inspect or map, by day.
+///
+/// Preloading is best-effort: one unreadable day must not cost the cache the
+/// other days it could still hold, so a failure is skipped rather than
+/// propagated. Skipping SILENTLY was the other half of that trade - an
+/// unreadable directory looks exactly like an empty one, and an unmappable day
+/// looks like a day that was never sealed, so an operator saw a cold cache with
+/// no cause. The count makes the difference visible without changing the
+/// best-effort policy.
+static SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// How many index files preload has skipped so far.
+#[cfg(test)]
+pub(crate) fn skipped_preloads() -> u64 {
+    SKIPPED.load(Ordering::Relaxed)
+}
+
+/// Record one skip.
+fn note_skipped() {
+    SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Errors produced during preload.
 #[derive(Debug)]
@@ -216,7 +239,15 @@ pub fn preload_recent(
         )));
     }
     let mut days: Vec<[u8; 8]> = fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(|e| match e {
+            Ok(entry) => Some(entry),
+            // An unreadable ENTRY is counted rather than dropped: the day it
+            // names is not known to be absent, only unknown.
+            Err(_) => {
+                note_skipped();
+                None
+            }
+        })
         .filter_map(|e| {
             let name = e.file_name();
             parse_day(&name.to_string_lossy())
@@ -256,6 +287,10 @@ pub fn preload_recent(
         // or truncated again. That is the file class `map_sealed_day` names.
         let opened = crate::ffi::map_sealed_day(root, dir, &day);
         let Ok(mapped_file) = opened else {
+            // Counted, not just skipped: the next-oldest day still fills the
+            // slot, but an operator can tell "fewer sealed days than I asked
+            // for" from "some of them would not map".
+            note_skipped();
             continue;
         };
         mapped.push(MappedIndex {
@@ -283,15 +318,34 @@ pub fn preload_all(root: &SealedIdxRoot, today: [u8; 8], n: usize) -> Vec<Mapped
     }
     // Modality index: idx/modality/{CT,MR,...}/
     let modality_root = root.modality_root();
-    if let Ok(entries) = fs::read_dir(&modality_root) {
-        for entry in entries.flatten() {
-            if !entry.path().is_dir() {
-                continue;
-            }
-            if let Ok(m) = preload_recent(root, &entry.path(), today, n) {
-                out.extend(m);
+    match fs::read_dir(&modality_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => {
+                        // An unreadable entry is a modality directory whose
+                        // days are NOT warmed, which is not the same as a
+                        // modality with no days.
+                        note_skipped();
+                        continue;
+                    }
+                };
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                match preload_recent(root, &entry.path(), today, n) {
+                    Ok(m) => out.extend(m),
+                    // An unreadable modality directory used to look like an
+                    // empty one: `Ok` yields nothing, and this arm is the only
+                    // place the difference can be recorded.
+                    Err(PreloadError::NothingToPreload) => {}
+                    Err(_) => note_skipped(),
+                }
             }
         }
+        // The whole modality tree is unreadable rather than absent.
+        Err(_) => note_skipped(),
     }
     out
 }
@@ -472,6 +526,32 @@ mod tests {
         assert!(
             maps.is_empty(),
             "the writer's current day must not be mapped as sealed"
+        );
+    }
+
+    /// An unreadable sealed day is COUNTED, not silently skipped.
+    ///
+    /// The skip itself is correct - one bad file must not cost the cache the
+    /// other days - but with no signal a day that failed to map is
+    /// indistinguishable from a day that was never sealed, so a cold cache has
+    /// no diagnosable cause.
+    #[test]
+    fn an_unmappable_sealed_day_is_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = test_root(dir.path(), &[*b"20240114", *b"20240115"], *b"20240116");
+        let today = *b"20240116";
+        let dates = dir.path().join("dates");
+        write_file(&dates.join("20240115.idx"), b"2222\n");
+        // A DIRECTORY where a day file is expected: it cannot be mapped.
+        fs::create_dir_all(dates.join("20240114.idx")).expect("plant dir");
+
+        let before = skipped_preloads();
+        let maps = preload_recent(&root, &dates, today, 10).expect("preload");
+        assert_eq!(maps.len(), 1, "the healthy day is still warmed");
+        assert_eq!(maps[0].day, *b"20240115");
+        assert!(
+            skipped_preloads() > before,
+            "the unmappable day must be reported"
         );
     }
 }

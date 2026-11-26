@@ -60,6 +60,19 @@ const SECS_PER_HOUR: u64 = SECS_PER_DAY / 24;
 /// A record with no `updated_at` is left alone: the timestamp is what the
 /// decision reads, and a record without one cannot be shown to be old.
 pub fn sweep_final_workitems(state: &AppState) -> usize {
+    sweep_with_registry(state, crate::push::subscriptions())
+}
+
+/// The sweep, against an explicit subscription registry.
+///
+/// Split out so the tests can drive a LOCAL registry instead of clearing and
+/// restoring the process-wide one. The previous arrangement held a test lock
+/// and did `clear()`/re-seed around each pass, which made the tests interfere
+/// with every other test in the binary: a subscription registered by a
+/// concurrent push test was wiped mid-run, and a lock registered by another
+/// test could change this sweep's expected result. A private registry removes
+/// the shared state entirely - there is nothing to clear.
+fn sweep_with_registry(state: &AppState, registry: &crate::push::SubscriptionRegistry) -> usize {
     let days = state.config.ups.final_state_retention_days;
     if days == 0 {
         return 0;
@@ -70,12 +83,24 @@ pub fn sweep_final_workitems(state: &AppState) -> usize {
     // (PS3.18 11.10 creates it; PS3.4 CC.2.3.1 owns its lifetime; AIW-I
     // 4.86.4.1.2 requires the Manager to support it).
     //
-    // `Some(horizon)` means a lock taken at `lock_at` is still inside the
-    // configured TTL, so a final workitem must survive this pass. `None`
-    // means no lock applies - either none is held, or `deletion_lock_ttl`
-    // is 0, which is the "override" AIW-I 4.85.4.1.3 allows and reproduces
-    // the pre-lock behaviour exactly.
-    let lock_horizon = deletion_lock_horizon(state.config.ups.deletion_lock_ttl);
+    // The lock is resolved PER WORKITEM, not once for the whole sweep. A lock
+    // taken on one workitem covers that workitem (PS3.4 CC.2.3.1: the lock
+    // protects the UPS it was registered for), so a process-wide answer let a
+    // lock on workitem A keep every unrelated final workitem alive - the sweep
+    // silently stopped retiring anything for the TTL, which is the opposite of
+    // what the dial is for. The scope question is answered by the same
+    // predicate the push fan-out uses, so "which workitems does this
+    // subscription see" stays defined in one place.
+    //
+    // `deletion_lock_ttl == 0` turns lock-honouring OFF - the configurability
+    // AIW-I 4.85.4.1.3 attaches to the override - and reproduces the
+    // pre-lock behaviour exactly.
+    let lock_enabled = state.config.ups.deletion_lock_ttl > 0;
+    let ttl_secs = state
+        .config
+        .ups
+        .deletion_lock_ttl
+        .saturating_mul(SECS_PER_HOUR);
     let store = clarus_core::ups::WorkItemStore::new(state.workitems_dir.clone());
 
     let records = match store.search(&clarus_core::ups::StoreFilter::default()) {
@@ -100,10 +125,16 @@ pub fn sweep_final_workitems(state: &AppState) -> usize {
         if updated_secs >= cutoff {
             continue;
         }
-        // A lock inside its TTL holds this workitem back. The lock is
-        // evaluated against the sweep's own clock rather than the
-        // workitem's timestamp: the question is "is a lock still held
+        // A lock inside its TTL holds THIS workitem back. Resolved against the
+        // record so a lock on a different workitem cannot keep this one; the
+        // lock is evaluated against the sweep's own clock rather than the
+        // workitem's timestamp, because the question is "is a lock still held
         // NOW", not "was one held when the workitem finished".
+        let lock_horizon = if lock_enabled {
+            lock_horizon_for(registry, &rec, ttl_secs)
+        } else {
+            None
+        };
         if let Some(horizon) = lock_horizon
             && horizon.is_locked_at(now_secs())
         {
@@ -170,26 +201,28 @@ pub fn sweep_final_workitems(state: &AppState) -> usize {
     deleted
 }
 
-/// The newest Deletion Lock the sweep must honour, if any.
+/// The newest Deletion Lock that covers `rec`, if any. The registry is a
+/// parameter so the sweep tests can drive a LOCAL one instead of the
+/// process-wide registry.
 ///
 /// `ttl_hours == 0` means the operator turned lock-honouring OFF - the
 /// `deletion_lock_ttl` dial's zero value, which is the configurability
-/// AIW-I 4.85.4.1.3 attaches to the override. In that case no horizon is
-/// returned and the sweep behaves exactly as it did before locks existed.
+/// AIW-I 4.85.4.1.3 attaches to the override - and the caller does not get
+/// here at all.
 ///
-/// When locks are honoured, the horizon carries the LOCK INSTANT (the newest
-/// among all subscriptions that hold one) and the TTL, so the caller can ask
-/// both "is a lock still active" and "was a lock held when this workitem
-/// finished" without re-reading the registry.
-fn deletion_lock_horizon(ttl_hours: u64) -> Option<LockHorizon> {
-    if ttl_hours == 0 {
-        return None;
-    }
-    let lock_at = crate::push::subscriptions().newest_deletion_lock()?;
-    Some(LockHorizon {
-        lock_at,
-        ttl_secs: ttl_hours.saturating_mul(SECS_PER_HOUR),
-    })
+/// The horizon carries the LOCK INSTANT of the newest subscription that
+/// COVERS this workitem (see
+/// [`crate::push::SubscriptionRegistry::newest_deletion_lock_for`]) plus the
+/// TTL, so the caller can ask both "is a lock still active" and "was a lock
+/// held when this workitem finished" without re-reading the registry.
+fn lock_horizon_for(
+    registry: &crate::push::SubscriptionRegistry,
+    rec: &clarus_core::ups::WorkItemRecord,
+    ttl_secs: u64,
+) -> Option<LockHorizon> {
+    let values = crate::push::FilterValues::from_record(rec);
+    let lock_at = registry.newest_deletion_lock_for(&rec.workitem_uid, &values)?;
+    Some(LockHorizon { lock_at, ttl_secs })
 }
 
 /// A Deletion Lock the sweep must honour, and until when.
@@ -308,37 +341,38 @@ mod tests {
     use super::*;
     use clarus_core::ups::{StoreFilter, WorkItemRecord, WorkItemStore};
     use std::path::Path;
-    use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+    use std::sync::{Arc, RwLock as StdRwLock};
 
     /// Serialises every test that runs the sweep.
     ///
     /// The sweep reads the process-wide subscription registry, which the
-    /// Deletion Lock tests must seed and clear. Without this lock a lock
-    /// seeded by one test would be visible to another test's sweep and change
-    /// its result - which is exactly how the first draft of these tests
-    /// failed. One mutex for the whole module is the cheapest way to keep the
-    /// registry a shared resource while making each test's view of it its own.
-    static SWEEP_LOCK: StdMutex<()> = StdMutex::new(());
-
-    /// Run `f` holding the module's sweep lock, with an empty registry, and
-    /// restore whatever the registry held afterwards.
-    fn with_clean_registry<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = SWEEP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let registry = crate::push::subscriptions();
-        let saved = registry.snapshot();
-        registry.clear();
-        let out = f();
-        registry.clear();
-        for sub in saved {
-            registry.subscribe(sub);
-        }
-        out
+    /// Run `f` against a PRIVATE subscription registry.
+    ///
+    /// The previous version snapshotted, cleared and re-seeded the
+    /// process-wide registry under a module lock. That only serialised these
+    /// tests against each other: a subscription registered by a concurrent
+    /// push test was wiped mid-run (its next lookup then failed), and a lock
+    /// left by another test could change a sweep's expected result. A private
+    /// registry removes the shared state, so there is nothing to clear and no
+    /// lock to hold.
+    fn with_local_registry<R>(f: impl FnOnce(&crate::push::SubscriptionRegistry) -> R) -> R {
+        f(&crate::push::SubscriptionRegistry::default())
     }
 
     /// Register one subscription carrying a lock taken `age_secs` ago.
-    fn hold_lock_aged(age_secs: u64) {
-        crate::push::subscriptions().subscribe(crate::push::Subscription {
-            subscriber: "LOCKHOLDER".to_string(),
+    ///
+    /// `scope` is the workitem the lock covers: `None` is a Worklist
+    /// subscription (covers every workitem), `Some(uid)` is the per-workitem
+    /// form PS3.4 CC.2.3.1 gives the lock its meaning for.
+    fn hold_lock_aged_on(
+        registry: &crate::push::SubscriptionRegistry,
+        subscriber: &str,
+        scope: Option<&str>,
+        age_secs: u64,
+    ) {
+        registry.subscribe(crate::push::Subscription {
+            subscriber: subscriber.to_string(),
+            workitem_uid: scope.map(str::to_string),
             deletion_lock_at: Some(now_secs().saturating_sub(age_secs)),
             ..crate::push::Subscription::default()
         });
@@ -449,7 +483,7 @@ mod tests {
 
     #[test]
     fn only_a_final_workitem_past_the_window_is_removed() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             let state = state_with_retention(temp.path(), 7);
             let store = seeded(
@@ -467,7 +501,7 @@ mod tests {
                 ],
             );
 
-            let deleted = sweep_final_workitems(&state);
+            let deleted = sweep_with_registry(&state, registry);
 
             assert_eq!(deleted, 2, "the two old final workitems");
             assert_eq!(
@@ -480,7 +514,7 @@ mod tests {
 
     #[test]
     fn a_final_workitem_without_a_readable_stamp_is_kept() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             let state = state_with_retention(temp.path(), 7);
             let store = seeded(
@@ -493,7 +527,11 @@ mod tests {
                 ],
             );
 
-            assert_eq!(sweep_final_workitems(&state), 0, "nothing is provably old");
+            assert_eq!(
+                sweep_with_registry(&state, registry),
+                0,
+                "nothing is provably old"
+            );
             assert_eq!(remaining(&store), vec!["1.2.1.1", "1.2.1.2"]);
         });
     }
@@ -502,17 +540,17 @@ mod tests {
 
     #[test]
     fn a_live_lock_holds_a_final_workitem_back() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             let state = state_with_retention(temp.path(), 7);
             let store = seeded(
                 &state,
                 &[record("2.1.1.1", "COMPLETED", Some(&stamp_days_ago(30)))],
             );
-            hold_lock_aged(0);
+            hold_lock_aged_on(registry, "LOCKHOLDER", None, 0);
 
             assert_eq!(
-                sweep_final_workitems(&state),
+                sweep_with_registry(&state, registry),
                 0,
                 "the lock, taken now, is well inside its TTL"
             );
@@ -522,7 +560,7 @@ mod tests {
 
     #[test]
     fn an_expired_lock_no_longer_holds_a_final_workitem_back() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             let state = state_with_knobs(temp.path(), 7, 24);
             let store = seeded(
@@ -530,10 +568,10 @@ mod tests {
                 &[record("2.2.1.1", "COMPLETED", Some(&stamp_days_ago(30)))],
             );
             // The configured TTL is 24h, so a lock taken 25h ago is spent.
-            hold_lock_aged(25 * SECS_PER_HOUR);
+            hold_lock_aged_on(registry, "LOCKHOLDER", None, 25 * SECS_PER_HOUR);
 
             assert_eq!(
-                sweep_final_workitems(&state),
+                sweep_with_registry(&state, registry),
                 1,
                 "the lock is past its TTL, so AIW-I 4.85.4.1.3's override applies"
             );
@@ -543,7 +581,7 @@ mod tests {
 
     #[test]
     fn a_zero_ttl_overrides_every_lock() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             // The knob is the only thing changed: a lock held RIGHT NOW.
             let state = state_with_knobs(temp.path(), 7, 0);
@@ -551,10 +589,10 @@ mod tests {
                 &state,
                 &[record("2.3.1.1", "COMPLETED", Some(&stamp_days_ago(30)))],
             );
-            hold_lock_aged(0);
+            hold_lock_aged_on(registry, "LOCKHOLDER", None, 0);
 
             assert_eq!(
-                sweep_final_workitems(&state),
+                sweep_with_registry(&state, registry),
                 1,
                 "0 means locks are not honoured at all"
             );
@@ -564,7 +602,7 @@ mod tests {
 
     #[test]
     fn a_lock_does_not_rescue_a_non_final_or_fresh_workitem() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             let state = state_with_retention(temp.path(), 7);
             let store = seeded(
@@ -577,16 +615,16 @@ mod tests {
                     record("2.4.1.2", "COMPLETED", Some(&stamp_days_ago(1))),
                 ],
             );
-            hold_lock_aged(0);
+            hold_lock_aged_on(registry, "LOCKHOLDER", None, 0);
 
-            assert_eq!(sweep_final_workitems(&state), 0);
+            assert_eq!(sweep_with_registry(&state, registry), 0);
             assert_eq!(remaining(&store), vec!["2.4.1.1", "2.4.1.2"]);
         });
     }
 
     #[test]
     fn the_horizon_reads_the_newest_lock_only() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             let state = state_with_retention(temp.path(), 7);
             let store = seeded(
@@ -597,15 +635,86 @@ mod tests {
             // honouring only the newest is the permissive reading and a
             // subscriber that just asked for a lock must not be ignored
             // because an older subscription's lock expired.
-            hold_lock_aged(48 * SECS_PER_HOUR);
-            hold_lock_aged(0);
+            //
+            // The two holders are DISTINCT registrations. Registering the same
+            // AE with the same scope twice REPLACES the entry (PS3.18 11.10 is
+            // idempotent per subscriber and scope), so a single name would
+            // leave only the live lock in the registry and the test could not
+            // tell "newest wins" from "only the newest is registered".
+            hold_lock_aged_on(registry, "SPENT", None, 48 * SECS_PER_HOUR);
+            hold_lock_aged_on(registry, "LIVE", None, 0);
+            assert_eq!(
+                registry.len(),
+                2,
+                "both registrations must be present for the test to mean anything"
+            );
 
             assert_eq!(
-                sweep_final_workitems(&state),
+                sweep_with_registry(&state, registry),
                 0,
                 "the newer lock is still live"
             );
             assert_eq!(remaining(&store), vec!["2.5.1.1"]);
+        });
+    }
+
+    /// A lock on workitem A must not keep unrelated workitem B alive.
+    ///
+    /// The sweep used one process-wide lock instant, so a per-workitem
+    /// subscription's lock - which PS3.4 CC.2.3.1 gives meaning only for the
+    /// UPS it was registered on - stopped the sweep from retiring anything at
+    /// all for the TTL. The lock is now resolved per record through the same
+    /// predicate the push fan-out uses.
+    #[test]
+    fn a_lock_covers_only_the_workitems_it_names() {
+        with_local_registry(|registry| {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let state = state_with_retention(temp.path(), 7);
+            let store = seeded(
+                &state,
+                &[
+                    record("2.5.2.1", "COMPLETED", Some(&stamp_days_ago(30))),
+                    record("2.5.2.2", "COMPLETED", Some(&stamp_days_ago(30))),
+                ],
+            );
+            // A live lock scoped to the FIRST workitem only.
+            hold_lock_aged_on(registry, "SCOPED", Some("2.5.2.1"), 0);
+
+            assert_eq!(
+                sweep_with_registry(&state, registry),
+                1,
+                "the unlocked workitem must still be retired"
+            );
+            assert_eq!(
+                remaining(&store),
+                vec!["2.5.2.1"],
+                "the locked workitem is kept, its neighbour is not"
+            );
+        });
+    }
+
+    /// A WORKLIST lock (no workitem scope) covers every workitem, so it holds
+    /// the whole sweep back.
+    #[test]
+    fn a_worklist_lock_covers_every_workitem() {
+        with_local_registry(|registry| {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let state = state_with_retention(temp.path(), 7);
+            let store = seeded(
+                &state,
+                &[
+                    record("2.5.3.1", "COMPLETED", Some(&stamp_days_ago(30))),
+                    record("2.5.3.2", "CANCELED", Some(&stamp_days_ago(30))),
+                ],
+            );
+            hold_lock_aged_on(registry, "WORKLIST", None, 0);
+
+            assert_eq!(
+                sweep_with_registry(&state, registry),
+                0,
+                "a worklist lock covers everything it would be notified about"
+            );
+            assert_eq!(remaining(&store).len(), 2);
         });
     }
 
@@ -631,7 +740,7 @@ mod tests {
 
     #[test]
     fn zero_days_disables_the_sweep_entirely() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             let state = state_with_retention(temp.path(), 0);
             let store = seeded(
@@ -640,7 +749,7 @@ mod tests {
             );
 
             assert_eq!(
-                sweep_final_workitems(&state),
+                sweep_with_registry(&state, registry),
                 0,
                 "0 keeps final workitems forever"
             );
@@ -650,7 +759,7 @@ mod tests {
 
     #[test]
     fn the_sweep_is_idempotent_on_a_second_pass() {
-        with_clean_registry(|| {
+        with_local_registry(|registry| {
             let temp = tempfile::tempdir().expect("temp dir");
             let state = state_with_retention(temp.path(), 7);
             let store = seeded(
@@ -658,9 +767,13 @@ mod tests {
                 &[record("1.4.1.1", "COMPLETED", Some(&stamp_days_ago(30)))],
             );
 
-            assert_eq!(sweep_final_workitems(&state), 1, "first pass removes it");
             assert_eq!(
-                sweep_final_workitems(&state),
+                sweep_with_registry(&state, registry),
+                1,
+                "first pass removes it"
+            );
+            assert_eq!(
+                sweep_with_registry(&state, registry),
                 0,
                 "second pass finds nothing"
             );

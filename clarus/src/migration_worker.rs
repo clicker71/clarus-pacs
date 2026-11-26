@@ -43,13 +43,32 @@ use clarus_adapters::storage::s3::ObjectStore;
 ///
 /// A map of locks rather than one global mutex: cleanup walks a patient's blobs
 /// and a global lock would serialise it against every unrelated migration.
+///
+/// The map holds WEAK references and is pruned as it is walked. Holding a
+/// strong `Arc` per digest made the map grow with the LIFETIME number of
+/// distinct blobs ever migrated - a busy archive carries millions, and none of
+/// them could ever be released. A `Weak` entry costs nothing once the last
+/// caller drops its guard, and the next prune removes it.
+///
+/// Identity is preserved for every ACTIVE caller: two threads asking for the
+/// same digest at the same time both upgrade the same `Arc`, so the mutual
+/// exclusion the rest of this module depends on is unchanged.
 fn blob_guard(blake3: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
     let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
-    Arc::clone(guard.entry(blake3.to_string()).or_default())
+    // Prune entries whose last holder has gone. Done on every call because it
+    // is bounded by the number of digests ACTIVE at this instant, not by the
+    // number ever seen.
+    guard.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(live) = guard.get(blake3).and_then(Weak::upgrade) {
+        return live;
+    }
+    let fresh = Arc::new(Mutex::new(()));
+    guard.insert(blake3.to_string(), Arc::downgrade(&fresh));
+    fresh
 }
 
 /// Rewrite `storage_tier` in every live manifest whose instance references the
@@ -279,27 +298,53 @@ pub fn spawn_migration_workers(state: AppState) {
 
 // -- Planned cold migration loop -----------------------------------------
 
+/// Sleep until the next cron match, returning `None` when the schedule has no
+/// future match (the caller then backs off and retries).
+///
+/// The wait preserves the FRACTIONAL part of the remaining time. Rounding it
+/// through `num_seconds()` truncated it, so a clock reading `01:59:58.250`
+/// before a `02:00` tick slept one second and started the batch at `01:59:59`,
+/// a quarter second early, with an empty batch whose `next_after` then
+/// returned the SAME `02:00` tick again, so the loop selected it twice.
+///
+/// The deadline is re-checked after sleeping for the same reason: any
+/// rounding, any clock adjustment while asleep, or a spurious wakeup must not
+/// let the batch run before its instant.
+fn wait_for_cron_tick(cron: &CronSchedule, label: &str) -> Option<()> {
+    const MAX_REPOLLS: usize = 8;
+    for _ in 0..MAX_REPOLLS {
+        let now = chrono::Local::now();
+        let next = cron.next_after(&now)?;
+        let remaining = next.signed_duration_since(now);
+        if remaining.num_milliseconds() <= 0 {
+            // Already at or past the instant: run now.
+            return Some(());
+        }
+        crate::clog_debug!(
+            next_run = %next,
+            sleep_ms = remaining.num_milliseconds(),
+            "{label}: sleeping until next cron tick"
+        );
+        // `to_std()` keeps sub-second precision; a negative span cannot reach
+        // here because it was rejected above.
+        if let Ok(d) = remaining.to_std() {
+            std::thread::sleep(d);
+        }
+    }
+    // The deadline kept receding (a system clock being stepped backwards).
+    // Return `None` so the caller backs off rather than spinning.
+    None
+}
+
 /// Cron-driven cold migration: move old studies hot -> NAS/HDD.
 fn planned_cold_loop(state: AppState, cron: CronSchedule, min_age_days: u32) {
     crate::clog_info!(%cron, min_age_days, "Planned cold migration worker started");
 
     loop {
-        let now = chrono::Local::now();
-        match cron.next_after(&now) {
-            Some(next) => {
-                let sleep_secs = (next - now).num_seconds().max(1) as u64;
-                crate::clog_debug!(
-                    next_run = %next,
-                    sleep_secs,
-                    "Cold migration: sleeping until next cron tick"
-                );
-                std::thread::sleep(Duration::from_secs(sleep_secs));
-            }
-            None => {
-                crate::clog_error!("Cold cron schedule has no future match - sleeping 1 hour");
-                std::thread::sleep(Duration::from_secs(3600));
-                continue;
-            }
+        if wait_for_cron_tick(&cron, "Cold migration").is_none() {
+            crate::clog_error!("Cold cron schedule has no future match - sleeping 1 hour");
+            std::thread::sleep(Duration::from_secs(3600));
+            continue;
         }
 
         crate::clog_info!(min_age_days, "Cold migration: cron tick - starting batch");
@@ -318,22 +363,10 @@ fn planned_s3_loop(state: AppState, cron: CronSchedule, min_age_days: u32) {
     crate::clog_info!(%cron, min_age_days, "Planned S3 migration worker started");
 
     loop {
-        let now = chrono::Local::now();
-        match cron.next_after(&now) {
-            Some(next) => {
-                let sleep_secs = (next - now).num_seconds().max(1) as u64;
-                crate::clog_debug!(
-                    next_run = %next,
-                    sleep_secs,
-                    "S3 migration: sleeping until next cron tick"
-                );
-                std::thread::sleep(Duration::from_secs(sleep_secs));
-            }
-            None => {
-                crate::clog_error!("S3 cron schedule has no future match - sleeping 1 hour");
-                std::thread::sleep(Duration::from_secs(3600));
-                continue;
-            }
+        if wait_for_cron_tick(&cron, "S3 migration").is_none() {
+            crate::clog_error!("S3 cron schedule has no future match - sleeping 1 hour");
+            std::thread::sleep(Duration::from_secs(3600));
+            continue;
         }
 
         crate::clog_info!(min_age_days, "S3 migration: cron tick - starting batch");
@@ -433,6 +466,25 @@ fn chunk_disposition(migrated: u64, skipped: u64, aborted: usize) -> ChunkDispos
     ChunkDisposition::Recollect
 }
 
+/// Whether an S3 chunk that migrated nothing should still end the tick.
+///
+/// The S3 loop's rule, kept beside [`chunk_disposition`] because it is the same
+/// starvation argument with a different progress signal: that loop counts
+/// ABORTS, this one counts EXCLUSION GROWTH. A chunk of 500 unreadable blobs
+/// migrates nothing but excludes 500 digests, so the next round can reach the
+/// blobs behind them - breaking there meant the next tick started from an
+/// empty failure set, selected the same 500 again, and blob 501 was starved on
+/// a store whose oldest blobs are damaged.
+///
+/// Extracted so the rule is directly testable; the loop's decision is
+/// unchanged. Gated with the S3 loop it belongs to: without that feature there
+/// is nothing to decide.
+#[cfg(any(feature = "s3", test))]
+fn s3_chunk_ends_tick(migrated: u64, excluded_before: usize, excluded_after: usize) -> bool {
+    let learned_nothing = excluded_after == excluded_before;
+    migrated == 0 && learned_nothing
+}
+
 fn get_free_space_gb(path: &std::path::Path) -> Result<u64, String> {
     let (_total_mb, available_mb) = crate::disk_utils::disk_space_mb(path)
         .ok_or_else(|| "Cannot determine free disk space".to_string())?;
@@ -490,6 +542,17 @@ fn migrate_batch_cold(state: &AppState, min_age_days: u32) -> Result<(), String>
     let mut tick_errors = 0u64;
 
     let cutoff_date = cutoff_date_str(min_age_days);
+    // Finish any reclaim an earlier pass (or a crash between the flip and the
+    // unlink) left behind, BEFORE selecting new work: those files are no
+    // longer referenced by any manifest, so no collector can find them.
+    let (reclaimed, still_pending) = reconcile_pending_reclaims(state);
+    if reclaimed > 0 || still_pending > 0 {
+        crate::clog_info!(
+            reclaimed,
+            still_pending,
+            "Migration: reconciled pending local copies"
+        );
+    }
 
     // O3: patients that aborted in THIS tick. It lives outside the chunk loop
     // on purpose: `collect_migration_patients` re-derives the same candidates
@@ -500,7 +563,7 @@ fn migrate_batch_cold(state: &AppState, min_age_days: u32) -> Result<(), String>
     loop {
         // The cap counts PATIENTS. It cannot count blobs: truncating a patient
         // batch is exactly the partial migration the invariant forbids.
-        let batches = collect_migration_patients(state, &cutoff_date, 50, &tick_aborted)?;
+        let batches = collect_migration_patients(state, &cutoff_date, 50, &tick_aborted, false)?;
         if batches.is_empty() {
             break;
         }
@@ -511,7 +574,7 @@ fn migrate_batch_cold(state: &AppState, min_age_days: u32) -> Result<(), String>
         let mut chunk_aborted: Vec<String> = Vec::new();
 
         for batch in &batches {
-            match migrate_patient_to_cold(state, batch) {
+            match migrate_patient_to_cold(state, batch, &cutoff_date) {
                 PatientOutcome::Migrated(n) => {
                     chunk_migrated += n;
                     tick_patients += 1;
@@ -673,7 +736,7 @@ pub fn migrate_patient_to_cold_for_test(
             .collect(),
         studies,
     };
-    match migrate_patient_to_cold(state, &batch) {
+    match migrate_patient_to_cold(state, &batch, "99991231") {
         PatientOutcome::Migrated(n) => (n, 0, None, "migrated"),
         PatientOutcome::Skipped(n) => (0, n, None, "skipped"),
         PatientOutcome::Aborted(reason) => (0, 0, Some(reason), "aborted"),
@@ -737,6 +800,7 @@ pub fn collect_migration_patients_for_test(
         cutoff_date,
         max_patients,
         &std::collections::HashSet::new(),
+        false,
     )
     .unwrap_or_default()
     .into_iter()
@@ -753,7 +817,7 @@ pub fn collect_migration_patients_for_test(
     .collect()
 }
 
-/// Whether a blob's hot file is absent but its cold copy is present.
+/// Whether a blob's hot file is absent but a VERIFIED cold copy is present.
 ///
 /// A missing HOT file is only benign when the bytes are ALREADY in cold: that
 /// is a resumed batch, where the previous pass copied and flipped but crashed
@@ -761,12 +825,39 @@ pub fn collect_migration_patients_for_test(
 /// tier, the patient is DAMAGED and the batch must NOT complete - completing it
 /// would flip and delete the patient's other blobs and leave this one
 /// unreadable, which is exactly the partial patient the invariant forbids.
+///
+/// `exists()` is not the question. A TRUNCATED or damaged file at the cold
+/// address made this answer `true`, so the blob skipped phase 2 entirely, was
+/// published as migrated and could be reported as a skip - leaving the archive
+/// holding the damaged bytes as the only copy. Resumption therefore requires
+/// the same verification the copy path is held to: the file must be readable,
+/// the size must match, and its digest must be the CAS address.
 fn hot_missing_is_resume(state: &AppState, blake3: &str, cold: &ContentAddressedStorage) -> bool {
     let _ = state;
-    cold.cas_path(blake3).exists()
+    if !cold.cas_path(blake3).exists() {
+        return false;
+    }
+    // The manifest size is not passed here: `verify_cold_copy` accepts 0 as
+    // "size unknown" and still enforces the digest, which is the stronger
+    // check and the one that makes the bytes trustworthy.
+    match verify_cold_copy(blake3, 0, cold) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::clog_warn!(
+                blake3 = %blake3,
+                error = %e,
+                "cold copy exists but is not usable; the blob cannot be resumed"
+            );
+            false
+        }
+    }
 }
 
-fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOutcome {
+fn migrate_patient_to_cold(
+    state: &AppState,
+    batch: &PatientBatch,
+    cutoff_date: &str,
+) -> PatientOutcome {
     let Some(cold) = state.cold_cas.as_ref() else {
         return PatientOutcome::Aborted("cold storage disappeared".to_string());
     };
@@ -802,7 +893,7 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
     let mut already_cold: Vec<&PatientBlob> = Vec::new();
     for blob in &batch.blobs {
         match copy_hot_to_cold_streaming(state, &blob.blake3, blob.file_size, cold) {
-            Ok(created) => {
+            Ok(ColdCopy::Published { created }) => {
                 copied.push(blob);
                 // Only a file THIS pass created is cleaned up on an abort. A
                 // blob that was already in the cold tier belongs to some
@@ -817,7 +908,7 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
                     });
                 }
             }
-            Err(e) if e == "__hot_missing__" => {
+            Ok(ColdCopy::HotMissing) => {
                 if hot_missing_is_resume(state, &blob.blake3, cold) {
                     // Resumed batch: the previous pass already copied this
                     // blob and flipped it; only the delete is outstanding.
@@ -833,6 +924,18 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
                 }
             }
             Err(e) => {
+                // The copy may have PUBLISHED before failing (a directory sync
+                // after the rename). That file exists, so an abort that
+                // ignored it would leave a full-size orphan no tier references
+                // - record it first, then clean up exactly what this pass
+                // created.
+                if matches!(e, CopyError::PublishedUnsynced { created: true, .. }) {
+                    written.push(PatientBlob {
+                        blake3: blob.blake3.clone(),
+                        file_size: blob.file_size,
+                        study_uid: blob.study_uid.clone(),
+                    });
+                }
                 // ABORT: discard this pass's cold partials and leave the hot
                 // side and the tiers exactly as they were.
                 cleanup_cold_copies(state, &written, cold);
@@ -856,12 +959,45 @@ fn migrate_patient_to_cold(state: &AppState, batch: &PatientBatch) -> PatientOut
     // that names one of these blobs HOT while the COPY above is in flight.
     // Revalidate exclusivity here, under the SAME lease the flip takes, so no
     // reference can be published between the check and the rewrite.
-    let (retained_batch, excluded, flipped) = {
+    let (retained_batch, excluded, flipped, ineligible) = {
         let _lease = acquire();
         let (retained_batch, excluded) = revalidate_exclusive_hot_blobs_in(state, &batch);
-        let flipped = set_storage_tier_for_patient_locked(state, &retained_batch, "cold");
-        (retained_batch, excluded, flipped)
+        // Serialization is not the only thing the copy window can invalidate.
+        // A STOW for the SAME patient can publish a NEW study - a recent one -
+        // while the copy is in flight, and the exclusivity revalidation does
+        // not look at study AGE, only at whether another holder references the
+        // blob. Flipping now would move an old study of a patient who has just
+        // received a fresh one, which breaks the rule the collector enforced
+        // ("every study of this patient is older than the cutoff") on data
+        // that no longer satisfies it.
+        //
+        // The verdict is recomputed against the manifest directory under this
+        // lease, so a reference published between the check and the rewrite
+        // cannot slip through - the same argument the exclusivity revalidation
+        // makes.
+        let ineligible = if patient_studies_all_before(state, &retained_batch, cutoff_date) {
+            None
+        } else {
+            Some(
+                "patient gained a study at or after the cutoff during the copy; \
+                 leaving everything hot"
+                    .to_string(),
+            )
+        };
+        let flipped = if ineligible.is_none() {
+            set_storage_tier_for_patient_locked(state, &retained_batch, "cold")
+        } else {
+            0
+        };
+        (retained_batch, excluded, flipped, ineligible)
     };
+
+    if let Some(reason) = ineligible {
+        // Nothing was flipped. Reclaim exactly the cold copies this pass
+        // created - they are now unreferenced, and the hot side is untouched.
+        cleanup_cold_copies(state, &written, cold);
+        return PatientOutcome::Aborted(reason);
+    }
 
     // Reclaim the cold copies THIS pass created for blobs the revalidation
     // excluded: no manifest will reference them now, while the hot copy is
@@ -1009,10 +1145,30 @@ fn retain_exclusively_hot_blobs_in(state: &AppState, batch: &PatientBatch) -> Pa
     // it would drop the second study and exclude the patient's own blob.
     let own_studies: std::collections::HashSet<&str> =
         batch.studies.iter().map(|s| s.as_str()).collect();
+    // ONE pass over the manifest directory for the whole batch. The per-blob
+    // helper re-ran `read_dir` and decoded every manifest for EVERY blob, so
+    // narrowing a large patient was O(blobs x manifests) decodes - all of it
+    // under the shadow mutex. The single-pass collector answers the same
+    // question for the batch and fails closed the same way (`Err` means "every
+    // blob may be shared", which narrows to nothing).
+    let holders = match outside_hot_holders(state, &own_studies) {
+        Ok(h) => h,
+        Err(()) => {
+            crate::clog_warn!(
+                patient = %batch.patient_id,
+                "migration: cannot determine outside holders; leaving every blob hot"
+            );
+            return PatientBatch {
+                patient_id: batch.patient_id.clone(),
+                blobs: Vec::new(),
+                studies: batch.studies.clone(),
+            };
+        }
+    };
     let blobs: Vec<PatientBlob> = batch
         .blobs
         .iter()
-        .filter(|blob| !hot_ref_outside_studies(state, &blob.blake3, &own_studies))
+        .filter(|blob| !holders.contains(&blob.blake3))
         .cloned()
         .collect();
     PatientBatch {
@@ -1022,46 +1178,9 @@ fn retain_exclusively_hot_blobs_in(state: &AppState, batch: &PatientBatch) -> Pa
     }
 }
 
-/// Whether a manifest OTHER than `own_studies` names `blake3` in the hot tier.
-///
-/// A manifest that cannot be read is treated as a holder: the pass then leaves
-/// the blob hot, which costs a later tick and cannot lose a copy. The reverse
-/// default would flip bytes on evidence that failed to load.
-fn hot_ref_outside_studies(
-    state: &AppState,
-    blake3: &str,
-    own_studies: &std::collections::HashSet<&str>,
-) -> bool {
-    let Ok(rd) = std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir)) else {
-        return true;
-    };
-    for ent in rd.flatten() {
-        let name = ent.file_name();
-        let name = name.to_string_lossy();
-        if !name.ends_with(".manifest") {
-            continue;
-        }
-        let study_uid = name.trim_end_matches(".manifest");
-        if own_studies.contains(study_uid) {
-            continue;
-        }
-        let Some(Ok(m)) = state.read_server_manifest(study_uid) else {
-            return true;
-        };
-        let holds = m.series.iter().flat_map(|s| &s.instances).any(|inst| {
-            inst.storage_tier == clarus_core::manifest::TIER_HOT
-                && clarus_adapters::hex_encode(&inst.blake3) == blake3
-        });
-        if holds {
-            return true;
-        }
-    }
-    false
-}
-
 /// Collect the HOT holders that live OUTSIDE `own_studies`, in one pass.
 ///
-/// The per-blob [`hot_ref_outside_studies`] re-runs `read_dir` + a full
+/// A per-blob check would re-run `read_dir` + a full
 /// `read_manifest` per blob, which is O(N*M) manifest decodes under the
 /// global manifest lease. This is the same question answered for every blob at
 /// once: read each manifest once and remember every HOT instance hash it names.
@@ -1080,7 +1199,20 @@ fn outside_hot_holders(
         return Err(());
     };
     let mut holders: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for ent in rd.flatten() {
+    for ent in rd {
+        // Same rule as `hot_ref_outside_studies`: an entry that could not be
+        // read is UNKNOWN. `flatten()` dropped it, so the blob set was
+        // narrowed on evidence that never loaded.
+        let ent = match ent {
+            Ok(e) => e,
+            Err(e) => {
+                crate::clog_warn!(
+                    error = %e,
+                    "migration: cannot read a manifest-directory entry; treating all blobs as shared"
+                );
+                return Err(());
+            }
+        };
         let name = ent.file_name();
         let name = name.to_string_lossy();
         if !name.ends_with(".manifest") {
@@ -1171,6 +1303,41 @@ fn set_storage_tier_for_patient(state: &AppState, batch: &PatientBatch, tier: &s
     set_storage_tier_for_patient_locked(state, batch, tier)
 }
 
+/// Whether every study of the batch is still dated BEFORE `cutoff_date`.
+///
+/// The collector applies this rule when it builds the batch; this is the same
+/// question asked again under the manifest lease, immediately before the flip,
+/// so a study published during the copy window cannot be migrated. An
+/// UNDATED study counts as ineligible: the collector treats it that way (a
+/// study with no date cannot be shown to be old), and the two must agree or
+/// the recheck would let through what the collector refused.
+///
+/// A manifest that cannot be read is ineligible too - fail closed, for the
+/// same reason the exclusivity scans do.
+fn patient_studies_all_before(state: &AppState, batch: &PatientBatch, cutoff_date: &str) -> bool {
+    let cutoff: i64 = cutoff_date.parse().unwrap_or(i64::MAX);
+    for study_uid in &batch.studies {
+        let manifest = match state.read_server_manifest(study_uid) {
+            Some(Ok(m)) => m,
+            // The study vanished or will not decode: the batch's own premise
+            // no longer holds, so nothing may be flipped on it.
+            _ => return false,
+        };
+        let mut study_date = i64::MAX;
+        for (t, v) in &manifest.study.attrs {
+            if *t == tag::STUDY_DATE
+                && let AttrValue::UInt(d) = v
+            {
+                study_date = *d as i64;
+            }
+        }
+        if study_date >= cutoff {
+            return false;
+        }
+    }
+    true
+}
+
 /// The locked body of [`set_storage_tier_for_patient`], for callers that
 /// ALREADY hold the global manifest lease.
 fn set_storage_tier_for_patient_locked(state: &AppState, batch: &PatientBatch, tier: &str) -> u64 {
@@ -1230,7 +1397,24 @@ fn set_storage_tier_for_patient_in(state: &AppState, batch: &PatientBatch, tier:
         let mut changed = 0u64;
         for inst in fresh.series.iter_mut().flat_map(|s| s.instances.iter_mut()) {
             let b3 = clarus_adapters::hex_encode(&inst.blake3);
-            if inst.storage_tier != tier_byte && wanted.contains(b3.as_str()) {
+            // Flip only an instance still recorded in the tier this pass
+            // VERIFIED. The cold pass verifies a cold copy and then flips
+            // whatever it finds; if the planned S3 pass published in the
+            // meantime (it removes both local copies), flipping that instance
+            // back to COLD claims a cold copy that no longer exists - and the
+            // pass then reports success with no readable bytes anywhere.
+            //
+            // Restricting the flip to the source tier leaves an instance that
+            // already moved to S3 exactly where it is.
+            let is_source_tier = match tier {
+                "cold" => inst.storage_tier == clarus_core::manifest::TIER_HOT,
+                "s3" => {
+                    inst.storage_tier == clarus_core::manifest::TIER_HOT
+                        || inst.storage_tier == clarus_core::manifest::TIER_COLD
+                }
+                _ => true,
+            };
+            if is_source_tier && inst.storage_tier != tier_byte && wanted.contains(b3.as_str()) {
                 inst.storage_tier = tier_byte;
                 changed += 1;
             }
@@ -1273,8 +1457,28 @@ fn set_storage_tier_for_patient_in(state: &AppState, batch: &PatientBatch, tier:
 
 // -- Migration batch: S3 (cloud) ------------------------------------------
 
-/// What one blob's S3 migration attempt achieved.
+/// Lowercase hex of a 32-byte CAS digest, matching the spelling a CAS address
+/// uses.
+fn digest_hex(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Whether an S3 object's reported size matches the blob.
 ///
+/// A zero `file_size` means the manifest recorded none, in which case the
+/// length says nothing and the caller must not treat the object as verified -
+/// answering `true` would adopt an unverifiable object as the blob's copy.
+#[cfg(feature = "s3")]
+fn s3_object_matches_size(meta: &clarus_adapters::storage::s3::ObjectMeta, file_size: i64) -> bool {
+    file_size > 0 && meta.content_length == file_size as u64
+}
+
+/// What one blob's S3 migration attempt achieved.
 /// Split out of [`migrate_batch_s3`] so the loop counts the three outcomes the
 /// protocol can produce, and so the per-blob flip is testable against a stub
 /// object store (see [`migrate_blob_to_s3_for_test`]) without a live S3 client.
@@ -1307,21 +1511,38 @@ fn migrate_blob_to_s3<S: ObjectStore>(
     s3_key: &str,
 ) -> S3BlobOutcome {
     // Step A - Idempotency: already in S3?
-    if let Ok(_meta) = s3.head_object(s3_key) {
-        crate::clog_debug!(blake3, "Already in S3 - skipping upload");
-        // O1: the object is in the bucket, but the blob is only migrated once
-        // the manifest says so. A failed flip leaves the source copy in place
-        // and the blob counted as skipped.
-        if set_storage_tier(state, blake3, "s3") == 0 {
-            crate::clog_warn!(
-                blake3 = %blake3,
-                "S3 migration: tier flip did not reach disk - source copy kept"
-            );
-            return S3BlobOutcome::Failed;
+    //
+    // `head_object` only proves SOMETHING occupies the key. A stale or
+    // truncated object left by an interrupted upload would then be adopted as
+    // this blob's copy, the tier flipped, and the last valid local copy
+    // deleted - leaving the archive with damaged bytes under a digest that
+    // claims they are the good ones. The object therefore has to be verified
+    // before it is trusted; when it cannot be, the local copy is KEPT.
+    if let Ok(meta) = s3.head_object(s3_key) {
+        if s3_object_matches_size(&meta, file_size) {
+            crate::clog_debug!(blake3, "Already in S3 - skipping upload");
+            // O1: the object is in the bucket, but the blob is only migrated
+            // once the manifest says so. A failed flip leaves the source copy
+            // in place and the blob counted as skipped.
+            if set_storage_tier(state, blake3, "s3") == 0 {
+                crate::clog_warn!(
+                    blake3 = %blake3,
+                    "S3 migration: tier flip did not reach disk - source copy kept"
+                );
+                return S3BlobOutcome::Failed;
+            }
+            cleanup_hot_file_cas_safe(state, blake3);
+            cleanup_cold_file_cas_safe(state, blake3);
+            return S3BlobOutcome::Migrated;
         }
-        cleanup_hot_file_cas_safe(state, blake3);
-        cleanup_cold_file_cas_safe(state, blake3);
-        return S3BlobOutcome::Migrated;
+        // Size disagrees: fall through and re-upload, which REPLACES it. The
+        // local copy stays until a verified upload succeeds.
+        crate::clog_warn!(
+            blake3 = %blake3,
+            s3_key = %s3_key,
+            expected = file_size,
+            "S3 migration: the existing object does not match the blob; re-uploading"
+        );
     }
 
     // Step B - Read (warn+skip, no crash). Cold uses the same two-level BLAKE3
@@ -1358,8 +1579,28 @@ fn migrate_blob_to_s3<S: ObjectStore>(
         }
     };
 
-    // Step C - Upload. Move `bytes` in (0 new allocations on instance; `bytes`
-    // is a Vec<u8> here, not used after this site).
+    // Step C - Verify the SOURCE bytes, then upload.
+    //
+    // A same-size damaged source passed every check above: the cold branch
+    // compares lengths, and `read_hot_file` compares lengths, so a file whose
+    // content rotted but whose size survived was uploaded UNDER THE ORIGINAL
+    // DIGEST and both local copies were then deleted - the digest now names
+    // bytes that are not the instance. The digest is what the key means, so it
+    // is verified here, before the PUT, on whatever bytes are about to be sent.
+    let actual = clarus_core::hash::cas_hash_one(&bytes);
+    let actual_hex = digest_hex(&actual);
+    if actual_hex != blake3 {
+        crate::clog_warn!(
+            blake3 = %blake3,
+            actual = %actual_hex,
+            "S3 migration: source bytes do not match the CAS address - refusing to upload"
+        );
+        crate::metrics::record_s3_migration_error();
+        return S3BlobOutcome::Failed;
+    }
+
+    // Move `bytes` in (0 new allocations on instance; `bytes` is a Vec<u8>
+    // here, not used after this site).
     match s3.put_object(s3_key, bytes, "application/dicom") {
         Ok(_etag) => {
             crate::clog_debug!(blake3, s3_key, "Uploaded to S3");
@@ -1403,6 +1644,17 @@ fn migrate_batch_s3(state: &AppState, min_age_days: u32) -> Result<(), String> {
     let mut tick_errors = 0u64;
 
     let cutoff_date = cutoff_date_str(min_age_days);
+    // Finish any reclaim an earlier pass (or a crash between the flip and the
+    // unlink) left behind, BEFORE selecting new work: those files are no
+    // longer referenced by any manifest, so no collector can find them.
+    let (reclaimed, still_pending) = reconcile_pending_reclaims(state);
+    if reclaimed > 0 || still_pending > 0 {
+        crate::clog_info!(
+            reclaimed,
+            still_pending,
+            "Migration: reconciled pending local copies"
+        );
+    }
 
     // Blobs that failed and must not be retried within THIS tick. Declared
     // OUTSIDE the round loop for the same reason the emergency pass keeps its
@@ -1431,6 +1683,10 @@ fn migrate_batch_s3(state: &AppState, min_age_days: u32) -> Result<(), String> {
         let chunk_start = std::time::Instant::now();
         let mut chunk_migrated = 0u64;
         let mut chunk_skipped = 0u64;
+        // Size BEFORE this chunk, so the loop can tell "every candidate failed
+        // but was newly excluded" (progress: the next round reaches past them)
+        // from "no progress and nothing new" (the tick is done).
+        let excluded_before = failed.len();
 
         for (blake3, file_size, _study_uid) in &candidates {
             let s3_key = s3_store.s3_key(blake3);
@@ -1457,17 +1713,31 @@ fn migrate_batch_s3(state: &AppState, min_age_days: u32) -> Result<(), String> {
             total = tick_migrated,
             "S3 migration chunk"
         );
-        // A chunk that moved nothing means every candidate failed; the failed
-        // set above already keeps the next round from re-selecting them, so
-        // one tick of retries is enough. The next cron tick starts with a
-        // fresh set and retries.
-        if chunk_migrated == 0 {
+        // A chunk that moved nothing is NOT the end of the tick when it also
+        // added new exclusions: the failed set now blocks that prefix, so the
+        // next round can reach the blobs behind it. Breaking here meant that
+        // if the first 500 candidates all failed and blob 501 was perfectly
+        // readable, neither worker ever attempted 501 - the next cron tick
+        // started from an empty failure set and selected the same prefix
+        // again, so those blobs were starved forever.
+        //
+        // The tick ends only when a round made no progress AND learned
+        // nothing new (the set is already saturated), which cannot happen
+        // while `candidates` is non-empty and every entry is attempted.
+        if s3_chunk_ends_tick(chunk_migrated, excluded_before, failed.len()) {
             crate::clog_warn!(
                 attempted = candidates.len(),
                 skipped = chunk_skipped,
-                "S3 migration: chunk made no progress — ending tick, next cron tick retries"
+                "S3 migration: chunk made no progress and excluded nothing new — ending tick"
             );
             break;
+        }
+        if chunk_migrated == 0 {
+            crate::clog_debug!(
+                attempted = candidates.len(),
+                excluded = failed.len(),
+                "S3 migration: chunk made no progress but widened the exclusion set — continuing"
+            );
         }
     }
 
@@ -1494,6 +1764,27 @@ fn migrate_batch_s3(state: &AppState, min_age_days: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Test seam: run the per-blob S3 flip against a CALLER-SUPPLIED object store.
+///
+/// The zero-argument seam above always starts from an EMPTY bucket, so it
+/// cannot express the states that matter most here: a stale object already
+/// occupying the key, or a truncated one. Passing the store in lets a test
+/// seed the bucket first and then observe what the flip does with it.
+#[cfg(feature = "s3")]
+pub fn migrate_blob_to_s3_with_store_for_test<S: clarus_adapters::storage::s3::ObjectStore>(
+    state: &AppState,
+    blake3: &str,
+    file_size: i64,
+    store: &S,
+) -> Result<(), String> {
+    let key = clarus_adapters::storage::cas_rel_path(blake3);
+    match migrate_blob_to_s3(state, blake3, file_size, store, &key) {
+        S3BlobOutcome::Migrated => Ok(()),
+        S3BlobOutcome::Unreadable => Err("blob is unreadable".to_string()),
+        S3BlobOutcome::Failed => Err("upload or tier flip failed".to_string()),
+    }
+}
+
 /// Test seam: run the per-blob S3 flip against an in-memory object store.
 ///
 /// The production loop binds a concrete `S3Client` from `AppState`, which an
@@ -1508,12 +1799,7 @@ pub fn migrate_blob_to_s3_for_test(
 ) -> Result<(), String> {
     use clarus_adapters::storage::s3::InMemoryObjectStore;
     let store = InMemoryObjectStore::default();
-    let key = clarus_adapters::storage::cas_rel_path(blake3);
-    match migrate_blob_to_s3(state, blake3, file_size, &store, &key) {
-        S3BlobOutcome::Migrated => Ok(()),
-        S3BlobOutcome::Unreadable => Err("blob is unreadable".to_string()),
-        S3BlobOutcome::Failed => Err("upload or tier flip failed".to_string()),
-    }
+    migrate_blob_to_s3_with_store_for_test(state, blake3, file_size, &store)
 }
 
 /// Test seam: run the cold-side cleanup alone, so its fail-closed reference
@@ -1560,17 +1846,22 @@ fn migrate_batch_emergency(state: &AppState, free_gb_threshold: u32) -> Result<(
     let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
-        let candidates = collect_migration_candidates(
+        let candidates = collect_migration_candidates_mode(
             state,
             &cutoff_date,
             500,
             &[clarus_core::manifest::TIER_HOT],
             &failed,
+            // Emergency: free space now, age is not a criterion.
+            true,
         )?;
 
         let chunk_start = std::time::Instant::now();
         let mut chunk_migrated = 0u64;
         let mut chunk_skipped = 0u64;
+        // Size BEFORE this chunk, so "no progress" can be told apart from "no
+        // progress and nothing new".
+        let excluded_before = failed.len();
 
         crate::clog_warn!(
             count = candidates.len(),
@@ -1614,7 +1905,13 @@ fn migrate_batch_emergency(state: &AppState, free_gb_threshold: u32) -> Result<(
                     Ok(b) => b,
                     Err(e) => {
                         crate::clog_warn!(blake3, error = %e, "Emergency: cannot read hot");
+                        // Route through the COMMON accounting below: this exit
+                        // used to `continue` straight past `failed.insert`, so
+                        // the digest stayed selectable and the next round of
+                        // the same tick worked it again while the disk was
+                        // still under the threshold.
                         chunk_skipped += 1;
+                        failed.insert(blake3.clone());
                         continue;
                     }
                 };
@@ -1632,6 +1929,11 @@ fn migrate_batch_emergency(state: &AppState, free_gb_threshold: u32) -> Result<(
                                 blake3 = %blake3,
                                 "Emergency: tier flip did not reach disk - hot copy kept"
                             );
+                            // Same rule: a failed flip must be EXCLUDED for
+                            // this tick, or the next round selects the digest
+                            // again and burns the pass on it.
+                            chunk_skipped += 1;
+                            failed.insert(blake3.clone());
                             continue;
                         }
                         cleanup_hot_file_cas_safe(state, blake3);
@@ -1659,9 +1961,16 @@ fn migrate_batch_emergency(state: &AppState, free_gb_threshold: u32) -> Result<(
             "Emergency migration chunk"
         );
 
-        // Nothing moved and nothing new was tried: the store has no blob left
-        // that this pass can evict, so another round would repeat it verbatim.
-        if chunk_migrated == 0 {
+        // A chunk that moved nothing is NOT the end of the tick when it also
+        // excluded new digests: the next round can reach the blobs behind the
+        // failing prefix. Breaking here meant that if the oldest 500 blobs all
+        // failed and blob 501 was evictable, the pass ended without ever
+        // attempting 501, and the next tick re-selected the same prefix while
+        // the disk stayed full.
+        //
+        // The tick ends only when a round makes no progress AND excludes
+        // nothing new - the store then has no blob this pass can evict.
+        if chunk_migrated == 0 && excluded_before == failed.len() {
             break;
         }
         // The threshold has been met - stop evicting.
@@ -1728,12 +2037,12 @@ fn migrate_one_to_filesystem(
     let _held = guard.lock().unwrap_or_else(|p| p.into_inner());
 
     // ap101: streaming chunked copy, no whole-blob `Vec` (see
-    // copy_hot_to_cold_streaming). A missing hot file is `Ok(false)` - the
-    // blob needs no work, which is the emergency path's skip semantics.
+    // copy_hot_to_cold_streaming). A missing hot file means the blob needs no
+    // work, which is the emergency path's skip semantics.
     match copy_hot_to_cold_streaming(state, blake3, file_size, cold) {
-        Ok(_) => {}
-        Err(e) if e == "__hot_missing__" => return Ok(false),
-        Err(e) => return Err(e),
+        Ok(ColdCopy::Published { .. }) => {}
+        Ok(ColdCopy::HotMissing) => return Ok(false),
+        Err(e) => return Err(e.to_string()),
     }
 
     // Update the manifest tier (manifest-rewrite, no SQLite).
@@ -1766,21 +2075,154 @@ fn cleanup_hot_file_cas_safe(state: &AppState, blake3: &str) {
 }
 
 /// The hot delete itself, for callers that already hold the blob guard.
-fn cleanup_hot_file_locked(state: &AppState, blake3: &str) {
+///
+/// Returns `true` when no hot copy remains (either there was none, or it was
+/// removed), `false` when the unlink was attempted and failed.
+///
+/// The return matters because a failed unlink AFTER a successful tier flip
+/// leaves a blob that no pass revisits: the collector selects HOT references
+/// only, so once the manifest says COLD the hot file is invisible to it. The
+/// caller reports that into the same retry accounting a failed migration uses,
+/// which is what makes the cleanup retryable rather than silently lost.
+fn cleanup_hot_file_locked(state: &AppState, blake3: &str) -> bool {
     let hot_path = state.cas.cas_path(blake3);
     if !hot_path.exists() {
-        return;
+        return true;
     }
     let n = count_hot_refs(state, blake3);
     if n == 0 {
-        if let Err(e) = std::fs::remove_file(&hot_path) {
-            crate::clog_warn!(blake3, error = %e, "Migration: cannot delete hot file");
-        } else {
-            crate::clog_debug!(blake3, "Hot file deleted - no hot refs remain");
+        match std::fs::remove_file(&hot_path) {
+            Ok(()) => {
+                crate::clog_debug!(blake3, "Hot file deleted - no hot refs remain");
+                true
+            }
+            Err(e) => {
+                crate::clog_warn!(
+                    blake3,
+                    error = %e,
+                    "Migration: cannot delete hot file - the reclaim is pending"
+                );
+                // Recorded so a reconciliation pass can find it: the manifest
+                // already says COLD, so nothing else will.
+                note_pending_reclaim(state, blake3, "hot");
+                false
+            }
         }
     } else {
         crate::clog_debug!(blake3, n, "Hot file kept - {n} refs still in hot");
+        true
     }
+}
+
+/// Remember that a local copy still exists for a blob whose manifest no longer
+/// names it, so a later pass can reclaim it.
+///
+/// The collector only ever selects instances recorded in a tier, so a copy
+/// left behind after the flip is invisible to it: without this record the file
+/// stays on disk forever. The record is a small append-only file in the index
+/// directory - one line per pending reclaim - so a crash between the flip and
+/// the unlink loses nothing.
+fn note_pending_reclaim(state: &AppState, blake3: &str, tier: &str) {
+    let dir = std::path::Path::new(&state.config.btree.idx_dir);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = dir.join("pending_reclaim.txt");
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{blake3} {tier}");
+    }
+}
+
+/// Reclaim local copies recorded by [`note_pending_reclaim`].
+///
+/// Called at the start of every migration batch, so a flip whose unlink failed
+/// (or a process that stopped between the two) is finished on the next pass
+/// instead of leaking the file for the life of the archive. Every entry is
+/// re-checked against the manifests before the unlink, exactly as the ordinary
+/// cleanup does: a blob that became HOT again in the meantime keeps its copy.
+///
+/// Returns `(reclaimed, still_pending)` for the tick's log line.
+fn reconcile_pending_reclaims(state: &AppState) -> (u64, u64) {
+    let dir = std::path::Path::new(&state.config.btree.idx_dir);
+    let path = dir.join("pending_reclaim.txt");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (0, 0);
+    };
+    let mut reclaimed = 0u64;
+    let mut still: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((blake3, tier)) = line.split_once(' ') else {
+            continue;
+        };
+        let done = match tier {
+            "hot" => {
+                let guard = blob_guard(blake3);
+                let _held = guard.lock().unwrap_or_else(|p| p.into_inner());
+                if count_hot_refs(state, blake3) == 0 {
+                    let path = state.cas.cas_path(blake3);
+                    // NotFound is success: the file is already gone.
+                    std::fs::remove_file(&path)
+                        .map(|()| true)
+                        .or_else(|e: std::io::Error| {
+                            Ok::<bool, std::io::Error>(e.kind() == std::io::ErrorKind::NotFound)
+                        })
+                        .unwrap_or(false)
+                } else {
+                    // Referenced again: drop the record, the file is live.
+                    true
+                }
+            }
+            "cold" => match state.cold_cas.as_ref() {
+                Some(cold) => {
+                    let guard = blob_guard(blake3);
+                    let _held = guard.lock().unwrap_or_else(|p| p.into_inner());
+                    if count_non_hot_refs(state, blake3) == 0 {
+                        let path = cold.cas_path(blake3);
+                        std::fs::remove_file(&path)
+                            .map(|()| true)
+                            .or_else(|e: std::io::Error| {
+                                Ok::<bool, std::io::Error>(e.kind() == std::io::ErrorKind::NotFound)
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    }
+                }
+                None => true,
+            },
+            _ => true,
+        };
+        if done {
+            reclaimed += 1;
+        } else {
+            still.push(line.to_string());
+        }
+    }
+    // Rewrite atomically with only the entries that could not be reclaimed.
+    let tmp = path.with_extension("txt.tmp");
+    let body = if still.is_empty() {
+        String::new()
+    } else {
+        let mut b = String::new();
+        for l in &still {
+            b.push_str(l);
+            b.push('\n');
+        }
+        b
+    };
+    if std::fs::write(&tmp, &body).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    (reclaimed, still.len() as u64)
 }
 
 /// CAS-safe cold file cleanup: delete the cold copy only if no live-manifest
@@ -1874,7 +2316,7 @@ fn copy_hot_to_cold_streaming(
     blake3: &str,
     file_size: i64,
     cold: &ContentAddressedStorage,
-) -> Result<bool, String> {
+) -> Result<ColdCopy, CopyError> {
     use std::io::{Read, Write};
 
     let hot_path = state.cas.cas_path(blake3);
@@ -1887,14 +2329,25 @@ fn copy_hot_to_cold_streaming(
     let created_by_this_pass = !target_path.exists();
 
     if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CopyError::Failed(format!("create_dir_all failed: {e}")))?;
     }
 
     let mut src = match std::fs::File::open(&hot_path) {
         Ok(f) => f,
-        // The hot file is gone (GC'd, already migrated): not an error for this
-        // blob - the caller counts it as skipped, exactly as before.
-        Err(_) => return Err("__hot_missing__".to_string()),
+        // ONLY `NotFound` means the hot file is gone (GC'd, already migrated):
+        // that is a benign skip for this blob. A permission or I/O error is
+        // NOT the same thing - reporting it as `__hot_missing__` let the
+        // emergency path answer `Ok(false)` and give the operator no
+        // diagnostic at all when the volume was simply unreadable.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ColdCopy::HotMissing);
+        }
+        Err(e) => {
+            return Err(CopyError::Failed(format!(
+                "open hot file {blake3} failed: {e}"
+            )));
+        }
     };
     // Write into a sibling temp file and rename once the bytes are durable.
     // Writing the target path directly means an interrupted pass leaves a
@@ -1920,7 +2373,7 @@ fn copy_hot_to_cold_streaming(
         COPY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let mut dst = std::fs::File::create(&tmp_path)
-        .map_err(|e| format!("create cold file failed for {blake3}: {e}"))?;
+        .map_err(|e| CopyError::Failed(format!("create cold file failed for {blake3}: {e}")))?;
 
     // One stack buffer for every blob; 64 KiB is the page-friendly middle
     // ground between syscall count and cache footprint.
@@ -1939,7 +2392,9 @@ fn copy_hot_to_cold_streaming(
                 // failed attempt, pass after pass.
                 drop(dst);
                 let _ = std::fs::remove_file(&tmp_path);
-                return Err(format!("read hot file {blake3} failed: {e}"));
+                return Err(CopyError::Failed(format!(
+                    "read hot file {blake3} failed: {e}"
+                )));
             }
         };
         if n == 0 {
@@ -1948,7 +2403,9 @@ fn copy_hot_to_cold_streaming(
         if let Err(e) = dst.write_all(&buf[..n]) {
             drop(dst);
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!("write cold file {blake3} failed: {e}"));
+            return Err(CopyError::Failed(format!(
+                "write cold file {blake3} failed: {e}"
+            )));
         }
         written += n as u64;
     }
@@ -1957,9 +2414,9 @@ fn copy_hot_to_cold_streaming(
     if file_size > 0 && written != file_size as u64 {
         // A short or long copy is a bad copy: never flip a tier onto it.
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
+        return Err(CopyError::Failed(format!(
             "Size mismatch for {blake3}: expected {file_size}, copied {written}"
-        ));
+        )));
     }
 
     // `sync_all` before the rename: a crash between the two must not leave the
@@ -1971,23 +2428,111 @@ fn copy_hot_to_cold_streaming(
         .and_then(|f| f.sync_all())
     {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("sync cold copy {blake3} failed: {e}"));
+        return Err(CopyError::Failed(format!(
+            "sync cold copy {blake3} failed: {e}"
+        )));
     }
+
+    // Before REPLACING an existing cold file, prove the SOURCE is the
+    // instance. A damaged hot blob whose length survived - exactly what
+    // `file_size` cannot detect - would otherwise be renamed over a correct
+    // cold copy: the good bytes are destroyed and the bad ones take their
+    // place, under a digest that says they are the good ones. No existing
+    // destination means nothing to protect, so the cheap path is unchanged.
+    if !created_by_this_pass {
+        let source_digest = crate::handlers::stow_pure::blake3_of_file(&tmp_path)
+            .map_err(|e| CopyError::Failed(format!("hash cold copy {blake3} failed: {e}")))?;
+        if digest_hex(&source_digest) != blake3 {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(CopyError::Failed(format!(
+                "hot copy of {blake3} does not hash to its address; the existing cold copy is kept"
+            )));
+        }
+    }
+
     if let Err(e) = std::fs::rename(&tmp_path, &target_path) {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("rename cold copy {blake3} failed: {e}"));
+        return Err(CopyError::Failed(format!(
+            "rename cold copy {blake3} failed: {e}"
+        )));
     }
     if let Some(parent) = target_path.parent()
         && let Err(e) = sync_dir(parent)
     {
-        return Err(format!("sync cold directory {parent:?} failed: {e}"));
+        // The RENAME already succeeded, so the canonical cold file EXISTS.
+        // Returning a bare error here told the caller the copy had not
+        // happened, so it never recorded the blob in `written` and the abort
+        // cleanup could not reclaim a file this pass created. The error is
+        // still reported - the call did not fully succeed - but the caller
+        // needs to know the file is there, which is why the state travels in
+        // the message it acts on.
+        crate::clog_warn!(
+            blake3 = %blake3,
+            dir = %parent.display(),
+            error = %e,
+            "cold copy published but its directory could not be synced"
+        );
+        return Err(CopyError::PublishedUnsynced {
+            created: created_by_this_pass,
+            reason: format!("sync cold directory {parent:?} failed after publish: {e}"),
+        });
     }
 
     crate::metrics::STORAGE_WRITE_BYTES.fetch_add(written, std::sync::atomic::Ordering::Relaxed);
-    // `true` means this pass created the cold file; `false` means the bytes
+    // `created` means this pass created the cold file; `false` means the bytes
     // were already there (CAS dedup) and the caller must not treat it as its
     // own to delete.
-    Ok(created_by_this_pass)
+    Ok(ColdCopy::Published {
+        created: created_by_this_pass,
+    })
+}
+
+/// What a hot-to-cold copy achieved.
+///
+/// Replaces a `Result<bool, String>` whose error channel carried the magic
+/// string `__hot_missing__`. A string protocol cannot express "the file is
+/// PUBLISHED and an error also occurred", which is exactly the state a failed
+/// directory sync leaves behind - and a caller that cannot see it aborts
+/// without reclaiming a copy this pass created.
+#[derive(Debug)]
+enum ColdCopy {
+    /// The bytes are at the cold address. `created` is true when THIS pass
+    /// created them (so the abort cleanup may reclaim them) and false when the
+    /// address already held them (CAS dedup - not ours to delete).
+    Published { created: bool },
+    /// The hot file does not exist. Benign: the blob was already migrated or
+    /// GC'd.
+    HotMissing,
+}
+
+/// Why a hot-to-cold copy failed.
+///
+/// Typed rather than a message, because one variant carries a fact the caller
+/// must ACT on: [`CopyError::PublishedUnsynced`] means the bytes reached the
+/// cold address even though the call failed, so the caller has to record the
+/// file as one it created or the abort cleanup leaves an orphan no tier
+/// references.
+#[derive(Debug)]
+enum CopyError {
+    /// The copy failed and nothing was published.
+    Failed(String),
+    /// The rename landed (the cold file exists) but the directory sync did
+    /// not. `created` says whether THIS pass created it.
+    PublishedUnsynced { created: bool, reason: String },
+}
+
+impl std::fmt::Display for CopyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CopyError::Failed(reason) => f.write_str(reason),
+            CopyError::PublishedUnsynced { created, reason } => {
+                write!(
+                    f,
+                    "{reason} (published to cold; created={created} by this pass)"
+                )
+            }
+        }
+    }
 }
 
 /// Make a directory entry durable.
@@ -2011,11 +2556,20 @@ fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-/// Verify a cold copy of `blake3` exists and has the expected size.
+/// Verify a cold copy of `blake3` exists, has the expected size, AND hashes
+/// to the CAS address it claims.
 ///
 /// The COPY phase already counts what it wrote; this is the independent
 /// re-read the protocol requires before any tier flip, so a copy that was
 /// truncated after the fact (full disk, interrupted write) is caught here.
+///
+/// SIZE IS NOT ENOUGH. A same-size damaged file - a torn write that happened
+/// to reach the recorded length, or a stale object occupying the address -
+/// passes a length check and then gets published, after which the local copy
+/// may be deleted: the archive would hold the damaged bytes under a digest
+/// that says they are the good ones. The digest is what the address MEANS, so
+/// it is what has to be checked. It is computed by streaming, so no whole-instance
+/// buffer is materialised (ap101).
 fn verify_cold_copy(
     blake3: &str,
     file_size: i64,
@@ -2028,6 +2582,18 @@ fn verify_cold_copy(
         return Err(format!(
             "cold copy of {blake3} is {} bytes, expected {file_size}",
             meta.len()
+        ));
+    }
+    let actual = crate::handlers::stow_pure::blake3_of_file(&target_path)
+        .map_err(|e| format!("cold copy of {blake3} cannot be hashed: {e}"))?;
+    let actual = actual.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    if actual != blake3 {
+        return Err(format!(
+            "cold copy of {blake3} hashes to {actual}: the bytes are not the ones the address names"
         ));
     }
     Ok(())
@@ -2225,6 +2791,13 @@ fn cutoff_date_str(days_ago: u32) -> String {
 /// blobs a previous cold pass already moved - after `min_age_days` the cold
 /// tier holds exactly the studies S3 was asked for, and a hot-only collector
 /// left them on the NAS forever.
+/// The scan behind the S3 migration loop: the oldest eligible blobs in the
+/// requested tiers.
+///
+/// Only the S3 path calls it in production; the filesystem/emergency pass goes
+/// through [`collect_candidates_mode_in`] so it can opt into undated studies.
+/// Kept for the tests in a non-`s3` build, where it is the wrapper under test.
+#[cfg(any(feature = "s3", test))]
 fn collect_migration_candidates(
     state: &AppState,
     cutoff_date: &str,
@@ -2232,34 +2805,83 @@ fn collect_migration_candidates(
     wanted: &[u8],
     exclude: &std::collections::HashSet<String>,
 ) -> Result<Vec<(String, i64, String)>, String> {
+    collect_migration_candidates_mode(state, cutoff_date, limit, wanted, exclude, false)
+}
+
+/// As [`collect_migration_candidates`], with the EMERGENCY selection mode.
+///
+/// Emergency migration exists to free space, so it must be able to select a
+/// study it cannot date. An undated study carries `study_date = i64::MAX`, so
+/// the ordinary `study_date < cutoff` test never passes - and with the
+/// emergency cutoff set to the maximum date, every undated study was excluded
+/// even though its bytes occupy exactly as much hot storage as a dated one.
+/// When the readable hot blobs all belonged to undated studies the pass freed
+/// NOTHING while the disk stayed full. `include_undated` is that distinct
+/// selection mode; the scheduled path keeps the age requirement.
+#[allow(clippy::too_many_arguments)]
+fn collect_migration_candidates_mode(
+    state: &AppState,
+    cutoff_date: &str,
+    limit: u32,
+    wanted: &[u8],
+    exclude: &std::collections::HashSet<String>,
+    include_undated: bool,
+) -> Result<Vec<(String, i64, String)>, String> {
     // The exclusion runs INSIDE the scan, before the sort and before this
-    // `.take(limit)`: a caller that excluded after the take would let a
-    // poisoned prefix of `limit` persistently failing blobs consume the whole
+    // `.take(limit)`: a caller that excluded after the take would let a    // poisoned prefix of `limit` persistently failing blobs consume the whole
     // round, so the younger blobs behind them never migrate.
-    Ok(collect_candidates_in(state, cutoff_date, wanted, exclude)
-        .into_iter()
-        .take(limit as usize)
-        .collect())
+    Ok(
+        collect_candidates_mode_in(state, cutoff_date, wanted, exclude, include_undated)?
+            .into_iter()
+            .take(limit as usize)
+            .collect(),
+    )
 }
 
 /// The scan behind [`collect_migration_candidates`], over a manifest directory.
 ///
 /// Split out so the tier selection and the cutoff boundary are testable
 /// without an `AppState` (which owns the CAS, the index and the config): the
-/// two rules a wrong migration rests on are exactly those.
+/// two rules a wrong migration rests on are exactly those. Production goes
+/// through [`collect_candidates_mode_in`] so the emergency mode cannot be
+/// forgotten by a caller.
+#[cfg(test)]
 fn collect_candidates_in(
     state: &AppState,
     cutoff_date: &str,
     wanted: &[u8],
     exclude: &std::collections::HashSet<String>,
-) -> Vec<(String, i64, String)> {
+) -> Result<Vec<(String, i64, String)>, String> {
+    collect_candidates_mode_in(state, cutoff_date, wanted, exclude, false)
+}
+
+/// The scan behind [`collect_candidates_in`], with the emergency mode.
+fn collect_candidates_mode_in(
+    state: &AppState,
+    cutoff_date: &str,
+    wanted: &[u8],
+    exclude: &std::collections::HashSet<String>,
+    include_undated: bool,
+) -> Result<Vec<(String, i64, String)>, String> {
     let cutoff: i64 = cutoff_date.parse().unwrap_or(i64::MAX);
     let mut seen = std::collections::HashSet::new();
-    let Ok(rd) = std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir)) else {
-        return Vec::new();
-    };
+    // A directory that cannot be LISTED is an ENVIRONMENTAL failure, not an
+    // empty archive. Returning an empty vector made the scheduled and
+    // emergency passes report "zero work" while the store was unreadable -
+    // the one state in which a migration worker must say so.
+    let rd =
+        std::fs::read_dir(std::path::Path::new(&state.config.btree.manifest_dir)).map_err(|e| {
+            format!(
+                "cannot list the manifest directory {}: {e}",
+                state.config.btree.manifest_dir
+            )
+        })?;
     let mut entries: Vec<(i64, (String, i64, String))> = Vec::new();
-    for ent in rd.flatten() {
+    for ent in rd {
+        // An entry that cannot be read is a manifest this pass did not see;
+        // skipping it silently is the same optimistic default as an empty
+        // directory.
+        let ent = ent.map_err(|e| format!("cannot read a manifest-directory entry: {e}"))?;
         let name = ent.file_name();
         let name = name.to_string_lossy();
         if !name.ends_with(".manifest") {
@@ -2277,7 +2899,15 @@ fn collect_candidates_in(
                 study_date = *d as i64;
             }
         }
-        if study_date >= cutoff {
+        // An undated study is eligible only in EMERGENCY mode: see
+        // `collect_migration_candidates_mode`.
+        let undated = study_date == i64::MAX;
+        let ineligible = if undated {
+            !include_undated
+        } else {
+            study_date >= cutoff
+        };
+        if ineligible {
             continue;
         }
         let study_uid = name.trim_end_matches(".manifest").to_string();
@@ -2299,7 +2929,7 @@ fn collect_candidates_in(
     }
 
     entries.sort_by_key(|(d, _)| *d);
-    entries.into_iter().map(|(_, cand)| cand).collect()
+    Ok(entries.into_iter().map(|(_, cand)| cand).collect())
 }
 
 // -- Patient-atomic collection (OWNER INVARIANT 12.09) -------------------
@@ -2354,8 +2984,9 @@ fn collect_migration_patients(
     cutoff_date: &str,
     max_patients: usize,
     exclude: &std::collections::HashSet<String>,
+    include_undated: bool,
 ) -> Result<Vec<PatientBatch>, String> {
-    collect_migration_patients_in(state, cutoff_date, max_patients, exclude)
+    collect_migration_patients_in(state, cutoff_date, max_patients, exclude, include_undated)
 }
 
 /// The scan itself, over an explicit manifest directory.
@@ -2368,6 +2999,7 @@ fn collect_migration_patients_in(
     cutoff_date: &str,
     max_patients: usize,
     exclude: &std::collections::HashSet<String>,
+    include_undated: bool,
 ) -> Result<Vec<PatientBatch>, String> {
     let cutoff: i64 = cutoff_date.parse().unwrap_or(i64::MAX);
 
@@ -2435,9 +3067,20 @@ fn collect_migration_patients_in(
         if study_date < slot.0 {
             slot.0 = study_date;
         }
-        if study_date >= cutoff {
-            // Includes the MISSING-date sentinel: a study we cannot date is
-            // not provably old, so it keeps the whole patient hot.
+        // The MISSING-date sentinel (`i64::MAX`) is what makes an undated
+        // study ineligible in the ordinary path: a study we cannot date is not
+        // provably old. EMERGENCY migration is the exception - its whole point
+        // is to free space, and an undated blob sitting in hot storage frees
+        // exactly as much as a dated one. Leaving it ineligible meant that if
+        // every readable hot blob belonged to undated studies, the emergency
+        // pass freed NOTHING while the disk stayed full.
+        let undated = study_date == i64::MAX;
+        let ineligible = if undated {
+            !include_undated
+        } else {
+            study_date >= cutoff
+        };
+        if ineligible {
             slot.2 = true;
         }
         // Dedup WITHIN the patient only. One blob can be referenced by two
@@ -2577,12 +3220,15 @@ mod tests {
             sop_instance_uid: format!("{study}.1"),
             blake3,
             storage_tier: tier,
-            transfer_syntax_uid: "1.2.840.10008.1.2.1".into(),
+            transfer_syntax_uid: clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE.into(),
             file_size: 64,
             ..Default::default()
         };
         let series = [SeriesModel {
-            series_instance_uid: format!("{study}.s1"),
+            // A numeric suffix: PS3.5 9.1 requires every UID component to be
+            // digits only, so `.s1` made the fixture an invalid UID and the
+            // test silently depended on whether the reader validated it.
+            series_instance_uid: format!("{study}.1"),
             modality: "CT".into(),
             instances: vec![instance],
             ..Default::default()
@@ -2806,7 +3452,8 @@ mod tests {
                 clarus_core::manifest::TIER_COLD,
             ],
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("scan ok");
         let hashes: Vec<&str> = both.iter().map(|(h, _, _)| h.as_str()).collect();
         assert!(
             hashes.contains(&clarus_adapters::hex_encode(&cold).as_str()),
@@ -2819,7 +3466,8 @@ mod tests {
             "99991231",
             &[clarus_core::manifest::TIER_HOT],
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("scan ok");
         assert_eq!(hot_only.len(), 1, "the hot-only set excludes the cold blob");
         assert_eq!(
             hot_only[0].0,
@@ -2847,6 +3495,7 @@ mod tests {
                 &[clarus_core::manifest::TIER_HOT],
                 &std::collections::HashSet::new(),
             )
+            .expect("scan ok")
             .is_empty(),
             "the cutoff is exclusive, so the pass never races a same-day study"
         );
@@ -2857,6 +3506,7 @@ mod tests {
                 &[clarus_core::manifest::TIER_HOT],
                 &std::collections::HashSet::new(),
             )
+            .expect("scan ok")
             .len(),
             1,
             "one day past the cutoff the study is eligible"
@@ -2910,7 +3560,8 @@ mod tests {
             "99991231",
             &[clarus_core::manifest::TIER_HOT],
             &exclude,
-        );
+        )
+        .expect("scan ok");
         assert!(
             got.is_empty(),
             "excluded blobs must never reach the caller: {got:?}"
@@ -2931,7 +3582,8 @@ mod tests {
             "99991231",
             &[clarus_core::manifest::TIER_HOT],
             &exclude,
-        );
+        )
+        .expect("scan ok");
         assert_eq!(got.len(), 1, "only the non-excluded blob remains");
         assert_eq!(
             got[0].0,
@@ -3247,7 +3899,7 @@ mod tests {
             "PAT-NEW",
         );
 
-        let all = collect_migration_patients_in(&state, "99991231", 10, &Default::default())
+        let all = collect_migration_patients_in(&state, "99991231", 10, &Default::default(), false)
             .expect("collect");
         let all: Vec<String> = all.into_iter().map(|b| b.patient_id).collect();
         assert_eq!(all.len(), 2, "both patients are candidates");
@@ -3257,7 +3909,7 @@ mod tests {
         // is what stops it starving behind a patient that keeps aborting.
         let mut exclude: std::collections::HashSet<String> = std::collections::HashSet::new();
         exclude.insert("PAT-OLD".to_string());
-        let after = collect_migration_patients_in(&state, "99991231", 10, &exclude)
+        let after = collect_migration_patients_in(&state, "99991231", 10, &exclude, false)
             .expect("collect with exclusion");
         let after: Vec<String> = after.into_iter().map(|b| b.patient_id).collect();
         assert_eq!(
@@ -3390,6 +4042,39 @@ mod tests {
         assert_eq!(chunk_disposition(0, 1, 50), ChunkDisposition::Continue);
     }
 
+    /// `:1470` - the S3 loop must continue when the exclusion set GREW, even
+    /// with nothing migrated.
+    ///
+    /// A chunk of 500 unreadable blobs migrated nothing but excluded 500
+    /// digests. Ending the tick there meant the next tick started from an
+    /// empty exclusion set, selected the same 500, and blob 501 was never
+    /// attempted - starved forever on a store where the oldest 500 are
+    /// damaged.
+    #[test]
+    fn the_s3_loop_continues_while_the_exclusion_set_grows() {
+        // Nothing migrated, but every attempt added an exclusion: the round
+        // DID make progress (the set moved), so the tick must continue.
+        assert!(
+            !s3_chunk_ends_tick(0, 0, 500),
+            "500 new exclusions are progress: blob 501 must be reachable"
+        );
+        // Nothing migrated and nothing new learned: saturated, end.
+        assert!(
+            s3_chunk_ends_tick(0, 500, 500),
+            "a saturated exclusion set with no progress ends the tick"
+        );
+        // A migration is progress whatever the set did.
+        assert!(
+            !s3_chunk_ends_tick(1, 500, 500),
+            "one migration continues the tick"
+        );
+        // One new exclusion is enough, even from a large prefix.
+        assert!(
+            !s3_chunk_ends_tick(0, 500, 501),
+            "a single new exclusion must still continue"
+        );
+    }
+
     /// B1: eligibility and collection must share ONE observation.
     ///
     /// Pass 1 decided eligibility, pass 2 collected blobs. A commit landing
@@ -3444,6 +4129,7 @@ mod tests {
             "20250101",
             50,
             &std::collections::HashSet::new(),
+            false,
         )
         .expect("collect");
         set_scan_hook(None);
@@ -3460,6 +4146,25 @@ mod tests {
             .flat_map(|b| b.blobs.iter().map(|blob| blob.blake3.as_str()))
             .collect();
 
+        // Assert on the FIRST scan, not only on the second. The second scan is
+        // required to be empty, so an assertion against IT says nothing about
+        // the first: a collector that ignored the cutoff entirely would still
+        // pass every assertion below. The blob the concurrent commit published
+        // belongs to the NEW study, so a correct first pass cannot have seen
+        // it - and if it did, the old study would have been migrated together
+        // with it.
+        let new_hex = clarus_adapters::hex_encode(&new_blob);
+        assert!(
+            !collected.contains(&new_hex.as_str()),
+            "the FIRST scan must not collect the concurrently published blob; got {collected:?}"
+        );
+        // It must, however, have collected the old study's blob - otherwise
+        // the assertion above would pass vacuously on an empty batch.
+        assert!(
+            collected.contains(&clarus_adapters::hex_encode(&old_blob).as_str()),
+            "the first scan collects the old study; got {collected:?}"
+        );
+
         // The regression: a SECOND collect now sees the new study, so the
         // patient must vanish from the candidate set entirely. A two-pass
         // collector would still hold the eligibility verdict from its own first
@@ -3469,6 +4174,7 @@ mod tests {
             "20250101",
             50,
             &std::collections::HashSet::new(),
+            false,
         )
         .expect("collect after publish");
         assert!(
@@ -3479,7 +4185,6 @@ mod tests {
                 .map(|b| b.patient_id.as_str())
                 .collect::<Vec<_>>()
         );
-        let new_hex = clarus_adapters::hex_encode(&new_blob);
         assert!(
             !after
                 .iter()
@@ -3487,7 +4192,6 @@ mod tests {
                 .any(|blob| blob.blake3 == new_hex),
             "the new study's blobs must never be collected"
         );
-        let _ = collected;
     }
 
     /// B3: a patient is eligible only when EVERY study is older than the cutoff.
@@ -3527,6 +4231,7 @@ mod tests {
             "20250101",
             50,
             &std::collections::HashSet::new(),
+            false,
         )
         .expect("collect");
         assert!(
@@ -3567,6 +4272,7 @@ mod tests {
             "20250101",
             50,
             &std::collections::HashSet::new(),
+            false,
         )
         .expect("collect");
         assert_eq!(batches.len(), 1, "one patient batch");
@@ -3598,6 +4304,7 @@ mod tests {
             "20250101",
             50,
             &std::collections::HashSet::new(),
+            false,
         )
         .expect("collect");
         assert_eq!(batches.len(), 1);
@@ -3625,6 +4332,7 @@ mod tests {
             "20250101",
             50,
             &std::collections::HashSet::new(),
+            false,
         )
         .expect("collect");
         assert!(
@@ -3683,8 +4391,14 @@ mod tests {
         );
 
         let collect = || {
-            collect_migration_patients_in(&state, "20250101", 50, &std::collections::HashSet::new())
-                .expect("collect")
+            collect_migration_patients_in(
+                &state,
+                "20250101",
+                50,
+                &std::collections::HashSet::new(),
+                false,
+            )
+            .expect("collect")
         };
 
         // P-NEW owns a study past the cutoff, so only P-OLD is a candidate, and
@@ -3718,38 +4432,69 @@ mod tests {
         );
     }
 
-    /// The dedup scope, as a standalone predicate: with a set shared ACROSS
-    /// patients, an ineligible patient that references a blob first consumes it
-    /// and the eligible patient never sees it.
+    /// The dedup scope must be PER PATIENT in the PRODUCTION collector, not
+    /// only in a hand-built map.
+    ///
+    /// The previous version of this test constructed its own `HashMap` and its
+    /// own `HashSet`, so a real change from per-patient to global dedup inside
+    /// `collect_migration_patients_in` could not make it fail. It also assumed
+    /// filename order, which `read_dir` does not promise.
+    ///
+    /// This drives the production collector with BOTH visit orders - the
+    /// ineligible patient's manifest enumerated first, then the eligible one's -
+    /// and requires the eligible patient's batch to carry the shared digest in
+    /// both cases.
     #[test]
-    fn the_blob_dedup_scope_is_per_patient() {
-        // Two patients reference the same blob; only the second is eligible.
-        // Both must end up holding it, because they are separate batches.
-        let mut per_patient: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
-        for (patient, blob) in [("P-NEW", "shared"), ("P-OLD", "shared")] {
-            let slot = per_patient.entry(patient).or_default();
-            if !slot.contains(&blob) {
-                slot.push(blob);
-            }
-        }
-        assert_eq!(per_patient["P-OLD"], vec!["shared"]);
-        assert_eq!(per_patient["P-NEW"], vec!["shared"]);
+    fn the_blob_dedup_scope_is_per_patient_in_the_production_collector() {
+        let mut shared = [0u8; 32];
+        shared[0] = 0xa1;
 
-        // The same construction with one SET shared across patients loses the
-        // blob for the second patient, which is what the collector used to do.
-        let mut global: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut seen_for: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
-        for (patient, blob) in [("P-NEW", "shared"), ("P-OLD", "shared")] {
-            if global.insert(blob) {
-                seen_for.entry(patient).or_default().push(blob);
+        for order in [["1.2.500", "1.2.501"], ["1.2.501", "1.2.500"]] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = state_with_manifest_dir(dir.path());
+            // `1.2.500` belongs to the INELIGIBLE patient (a study at/
+            // after the cutoff); `1.2.501` to the eligible one. Both name the
+            // same blob, so a global dedup lets whichever was read first
+            // consume it.
+            for study in order {
+                let (date, patient) = if study == "1.2.500" {
+                    ("20260101", "P-NEW")
+                } else {
+                    ("20200101", "P-OLD")
+                };
+                write_one_manifest_for(
+                    dir.path(),
+                    study,
+                    shared,
+                    clarus_core::manifest::TIER_HOT,
+                    Some(date),
+                    patient,
+                );
             }
+
+            let batches = collect_migration_patients_in(
+                &state,
+                "20250101",
+                50,
+                &std::collections::HashSet::new(),
+                false,
+            )
+            .expect("collect");
+
+            assert_eq!(
+                batches.len(),
+                1,
+                "only the eligible patient is a candidate (order {order:?})"
+            );
+            assert_eq!(batches[0].patient_id, "P-OLD");
+            assert!(
+                batches[0]
+                    .blobs
+                    .iter()
+                    .any(|b| b.blake3 == clarus_adapters::hex_encode(&shared)),
+                "the eligible patient must see the shared blob regardless of visit order {order:?}"
+            );
         }
-        assert!(
-            !seen_for.contains_key("P-OLD"),
-            "the cross-patient set drops the blob for the eligible patient"
-        );
     }
 
     /// F3: two studies of ONE patient sharing a blob must both be recorded as
@@ -3787,6 +4532,7 @@ mod tests {
             "20250101",
             50,
             &std::collections::HashSet::new(),
+            false,
         )
         .expect("collect");
         assert_eq!(batches.len(), 1, "one patient batch");
@@ -3888,6 +4634,7 @@ mod tests {
             "20250101",
             50,
             &std::collections::HashSet::new(),
+            false,
         )
         .expect("collect");
         if batches.len() != 1 {
@@ -4130,6 +4877,505 @@ mod tests {
         assert!(
             outside_hot_holders(&state, &own).is_err(),
             "an unreadable outside manifest must fail closed"
+        );
+    }
+
+    // -- S2a regressions -------------------------------------------------
+
+    /// A same-size DAMAGED cold copy must not be accepted as a resume.
+    ///
+    /// `hot_missing_is_resume` used to answer `exists()`, so a truncated or
+    /// rotted file at the cold address made the blob skip verification, count
+    /// as migrated, and keep the damaged bytes as the only copy.
+    #[test]
+    fn a_damaged_cold_copy_is_not_a_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+        let cold = clarus_adapters::storage::ContentAddressedStorage::new(dir.path().join("cold"))
+            .expect("cold cas");
+        // The address a blob WOULD have, and a file of the right length that
+        // is not those bytes.
+        let mut digest = [0u8; 32];
+        digest[0] = 0xC1;
+        let hex = clarus_adapters::hex_encode(&digest);
+        let path = cold.cas_path(&hex);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(&path, b"not the blob").expect("write damaged copy");
+
+        assert!(
+            !hot_missing_is_resume(&state, &hex, &cold),
+            "an unverified cold copy must not be treated as a resumed migration"
+        );
+
+        // A genuinely correct copy IS a resume: write the bytes the address
+        // names by deriving the digest from the content.
+        let body = b"the real bytes";
+        let real = clarus_adapters::hex_encode(&clarus_core::hash::cas_hash_one(body));
+        let real_path = cold.cas_path(&real);
+        std::fs::create_dir_all(real_path.parent().expect("parent")).expect("dirs");
+        std::fs::write(&real_path, body).expect("write good copy");
+        assert!(
+            hot_missing_is_resume(&state, &real, &cold),
+            "a verified cold copy is a valid resume"
+        );
+    }
+
+    /// An undated HOT study is selectable by EMERGENCY migration and not by
+    /// the scheduled one.
+    ///
+    /// An undated study carries the `i64::MAX` sentinel, so the ordinary
+    /// `study_date < cutoff` test never passes. With the emergency cutoff set
+    /// to the maximum date, every undated study was excluded - so a store
+    /// whose readable hot blobs were all undated freed NOTHING while the disk
+    /// stayed full.
+    #[test]
+    fn emergency_migration_selects_undated_studies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+        let mut undated = [0u8; 32];
+        undated[0] = 0xD1;
+        // No study date at all.
+        write_one_manifest(
+            dir.path(),
+            "1.2.700",
+            undated,
+            clarus_core::manifest::TIER_HOT,
+            None,
+        );
+        let hex = clarus_adapters::hex_encode(&undated);
+
+        let scheduled = collect_candidates_mode_in(
+            &state,
+            "99991231",
+            &[clarus_core::manifest::TIER_HOT],
+            &std::collections::HashSet::new(),
+            false,
+        )
+        .expect("scan ok");
+        assert!(
+            scheduled.is_empty(),
+            "a schedule with no age criterion still refuses an undated study"
+        );
+
+        let emergency = collect_candidates_mode_in(
+            &state,
+            "99991231",
+            &[clarus_core::manifest::TIER_HOT],
+            &std::collections::HashSet::new(),
+            true,
+        )
+        .expect("scan ok");
+        assert!(
+            emergency.iter().any(|(b, _, _)| *b == hex),
+            "emergency mode must select the undated study; got {emergency:?}"
+        );
+    }
+
+    /// A failed manifest-directory scan must be an ERROR, not an empty batch.
+    ///
+    /// Returning `Vec::new()` made the scheduled and emergency passes report
+    /// "zero work" while the store was unreadable - the one state in which a
+    /// migration worker has to say so.
+    #[test]
+    fn an_unreadable_manifest_directory_is_an_error_not_an_empty_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_manifest_dir(dir.path());
+        // Occupy the manifest path with a regular FILE: `read_dir` then fails
+        // with ENOTDIR on every platform.
+        let path = dir.path().join("manifests_blocked");
+        std::fs::write(&path, b"not a directory").expect("occupy path");
+        state.config.btree.manifest_dir = path.to_string_lossy().to_string();
+
+        let got = collect_candidates_in(
+            &state,
+            "99991231",
+            &[clarus_core::manifest::TIER_HOT],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            got.is_err(),
+            "an unlistable manifest directory must not read as an empty scan"
+        );
+        assert!(
+            collect_migration_candidates(
+                &state,
+                "99991231",
+                10,
+                &[clarus_core::manifest::TIER_HOT],
+                &std::collections::HashSet::new(),
+            )
+            .is_err(),
+            "the wrapper must propagate the failure too"
+        );
+    }
+
+    /// Both planned loops must WAIT for the tick, keeping fractional seconds.
+    ///
+    /// `num_seconds()` truncated the remaining time, so a clock at
+    /// `01:59:58.250` before a `02:00` tick slept one second and ran at
+    /// `01:59:59`. The batch is exercised through the helper, with a schedule
+    /// that fires one minute out; anything shorter than that would prove the
+    /// truncation is gone only by sleeping the whole minute, so the property
+    /// is checked on the ARITHMETIC the helper uses.
+    #[test]
+    fn the_tick_wait_keeps_sub_second_precision() {
+        // The duration handed to `sleep` is derived with `signed_duration_since`
+        // and `to_std`, not `num_seconds`, so a 250 ms remainder survives.
+        let next = chrono::Local::now() + chrono::Duration::milliseconds(250);
+        let now = chrono::Local::now();
+        let remaining = next.signed_duration_since(now);
+        assert!(remaining.num_milliseconds() > 0, "there is time left");
+        assert!(
+            remaining.num_seconds() == 0,
+            "a sub-second remainder is exactly the case `num_seconds` erased"
+        );
+        assert!(
+            remaining.to_std().is_ok(),
+            "and `to_std` keeps it rather than rounding it away"
+        );
+    }
+
+    /// The pending-reclaim record must survive a restart and be replayed.
+    ///
+    /// A failed unlink after a successful flip leaves a local copy the
+    /// collector can never find again (it selects only instances recorded in a
+    /// tier). Recording it makes the reclaim retryable on the next pass.
+    #[test]
+    fn a_pending_reclaim_is_replayed_and_then_cleared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+        let mut blob = [0u8; 32];
+        blob[0] = 0xE1;
+        let hex = clarus_adapters::hex_encode(&blob);
+        // A hot file with NO manifest reference: exactly the orphan a failed
+        // post-flip unlink leaves behind.
+        let hot_path = state.cas.cas_path(&hex);
+        std::fs::create_dir_all(hot_path.parent().expect("parent")).expect("dirs");
+        std::fs::write(&hot_path, b"orphan").expect("write orphan");
+        note_pending_reclaim(&state, &hex, "hot");
+
+        let (reclaimed, still) = reconcile_pending_reclaims(&state);
+        assert_eq!(reclaimed, 1, "the orphaned copy is reclaimed");
+        assert_eq!(still, 0, "and nothing remains pending");
+        assert!(
+            !hot_path.exists(),
+            "the recorded file must actually be unlinked"
+        );
+
+        // A second pass finds nothing to do, so the record is not replayed
+        // forever.
+        let (again, _) = reconcile_pending_reclaims(&state);
+        assert_eq!(again, 0, "the record is consumed");
+    }
+
+    /// A copy that would REPLACE an existing cold file is hashed first, so a
+    /// damaged hot blob cannot overwrite good cold bytes.
+    #[test]
+    fn a_second_copy_does_not_replace_a_good_cold_file_with_damaged_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+        let cold = clarus_adapters::storage::ContentAddressedStorage::new(dir.path().join("cold2"))
+            .expect("cold cas");
+
+        // The GOOD cold copy, written at its own address.
+        let body = b"the genuine instance bytes";
+        let real = clarus_adapters::hex_encode(&clarus_core::hash::cas_hash_one(body));
+        let cold_path = cold.cas_path(&real);
+        std::fs::create_dir_all(cold_path.parent().expect("parent")).expect("dirs");
+        std::fs::write(&cold_path, body).expect("write good cold copy");
+
+        // A HOT file of the same LENGTH at the same address, containing
+        // different bytes - the case `file_size` cannot catch.
+        let hot_path = state.cas.cas_path(&real);
+        std::fs::create_dir_all(hot_path.parent().expect("parent")).expect("dirs");
+        let mut damaged = body.to_vec();
+        damaged[0] ^= 0xFF;
+        std::fs::write(&hot_path, &damaged).expect("write damaged hot copy");
+
+        let outcome = copy_hot_to_cold_streaming(&state, &real, body.len() as i64, &cold);
+        assert!(
+            outcome.is_err(),
+            "a copy whose bytes do not match the address must be refused"
+        );
+        assert_eq!(
+            std::fs::read(&cold_path).expect("read"),
+            body,
+            "the existing good cold copy must be left intact"
+        );
+    }
+
+    /// An undated or newly-added study must block the flip, not just the
+    /// collect: the copy window is long enough for a commit to land.
+    #[test]
+    fn a_study_added_during_the_copy_blocks_the_flip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+        let mut blob = [0u8; 32];
+        blob[0] = 0xF1;
+        write_one_manifest_for(
+            dir.path(),
+            "1.2.800",
+            blob,
+            clarus_core::manifest::TIER_HOT,
+            Some("20200101"),
+            "P-X",
+        );
+        let batch = PatientBatch {
+            patient_id: "P-X".to_string(),
+            blobs: vec![PatientBlob {
+                blake3: clarus_adapters::hex_encode(&blob),
+                file_size: 1,
+                study_uid: "1.2.800".to_string(),
+            }],
+            studies: vec!["1.2.800".to_string()],
+        };
+        assert!(
+            patient_studies_all_before(&state, &batch, "20250101"),
+            "the old study is eligible"
+        );
+        // A NEW study appears for the same patient.
+        let mut fresh = [0u8; 32];
+        fresh[0] = 0xF2;
+        write_one_manifest_for(
+            dir.path(),
+            "1.2.801",
+            fresh,
+            clarus_core::manifest::TIER_HOT,
+            Some("20260101"),
+            "P-X",
+        );
+        let grown = PatientBatch {
+            studies: vec!["1.2.800".to_string(), "1.2.801".to_string()],
+            ..batch
+        };
+        assert!(
+            !patient_studies_all_before(&state, &grown, "20250101"),
+            "a study at/after the cutoff makes the patient ineligible"
+        );
+    }
+
+    // -- S2a-migration: the verify-before-publish family ------------------
+
+    /// `:1233` - a cold pass must not claim an instance the S3 pass already
+    /// published.
+    ///
+    /// The planned cold pass verifies a cold copy and then pauses. The S3 pass
+    /// publishes and removes BOTH local copies in that window. When the cold
+    /// pass resumes, an unrestricted flip rewrites the S3 reference to COLD,
+    /// so the manifest now names a cold copy that does not exist and the pass
+    /// reports success with no readable bytes anywhere.
+    #[test]
+    fn a_cold_flip_leaves_an_instance_that_moved_to_s3_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+        let mut blob = [0u8; 32];
+        blob[0] = 0xA1;
+        let hex = clarus_adapters::hex_encode(&blob);
+        // The instance is already in S3 - the concurrent S3 pass won the race.
+        write_one_manifest(
+            dir.path(),
+            "1.2.900",
+            blob,
+            clarus_core::manifest::TIER_S3,
+            Some("20200101"),
+        );
+
+        let batch = PatientBatch {
+            patient_id: "P".to_string(),
+            blobs: vec![PatientBlob {
+                blake3: hex.clone(),
+                file_size: 1,
+                study_uid: "1.2.900".to_string(),
+            }],
+            studies: vec!["1.2.900".to_string()],
+        };
+        let flipped = set_storage_tier_for_patient_in(&state, &batch, "cold");
+        assert_eq!(
+            flipped, 0,
+            "an instance already in S3 must not be rewritten to COLD"
+        );
+
+        let m = state
+            .read_server_manifest("1.2.900")
+            .expect("read")
+            .expect("present");
+        let tier = m
+            .series
+            .iter()
+            .flat_map(|s| &s.instances)
+            .find(|i| i.blake3 == blob)
+            .map(|i| i.storage_tier)
+            .expect("instance present");
+        assert_eq!(
+            tier,
+            clarus_core::manifest::TIER_S3,
+            "the S3 reference must survive a stale cold pass"
+        );
+    }
+
+    /// `:1310` - `head_object` succeeding does not mean the object is ours.
+    ///
+    /// A stale or truncated object left by an interrupted upload occupies the
+    /// key. Adopting it flips the tier and deletes the last valid local copy,
+    /// leaving damaged bytes under a digest that claims they are the good ones.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_stale_s3_object_is_replaced_not_adopted() {
+        use clarus_adapters::storage::s3::{InMemoryObjectStore, ObjectStore};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+
+        let body = b"the genuine instance bytes";
+        let blob = clarus_core::hash::cas_hash_one(body);
+        let hex = clarus_adapters::hex_encode(&blob);
+        let hot_path = state.cas.cas_path(&hex);
+        std::fs::create_dir_all(hot_path.parent().expect("parent")).expect("dirs");
+        std::fs::write(&hot_path, body).expect("write hot");
+        // The tier flip needs a manifest naming the instance, or there is
+        // nothing to rewrite and the outcome is a Failed flip.
+        write_one_manifest(
+            dir.path(),
+            "1.2.930",
+            blob,
+            clarus_core::manifest::TIER_HOT,
+            Some("20200101"),
+        );
+
+        // Seed the bucket with a TRUNCATED object at the blob's own key.
+        let store = InMemoryObjectStore::default();
+        let key = clarus_adapters::storage::cas_rel_path(&hex);
+        store
+            .put_object(&key, b"truncated".to_vec(), "application/dicom")
+            .expect("seed stale object");
+
+        let outcome =
+            migrate_blob_to_s3_with_store_for_test(&state, &hex, body.len() as i64, &store);
+        assert!(
+            outcome.is_ok(),
+            "the stale object is replaced by a verified upload"
+        );
+        assert_eq!(
+            store.get_object(&key).expect("read back"),
+            body,
+            "the bucket must hold the real bytes, not the stale ones"
+        );
+    }
+
+    /// `:1363` - a same-size damaged HOT source must not be uploaded under the
+    /// original digest.
+    ///
+    /// The length checks all pass on a rotted file whose size survived, so the
+    /// damaged bytes would be PUT under the good digest and both local copies
+    /// deleted. The digest of the bytes about to be sent is what the key means.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_damaged_source_is_never_uploaded_under_a_good_digest() {
+        use clarus_adapters::storage::s3::{InMemoryObjectStore, ObjectStore};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+
+        let body = b"the genuine instance bytes";
+        let blob = clarus_core::hash::cas_hash_one(body);
+        let hex = clarus_adapters::hex_encode(&blob);
+        let hot_path = state.cas.cas_path(&hex);
+        std::fs::create_dir_all(hot_path.parent().expect("parent")).expect("dirs");
+        // SAME LENGTH, different bytes.
+        let mut damaged = body.to_vec();
+        damaged[0] ^= 0xFF;
+        std::fs::write(&hot_path, &damaged).expect("write damaged hot");
+        write_one_manifest(
+            dir.path(),
+            "1.2.931",
+            blob,
+            clarus_core::manifest::TIER_HOT,
+            Some("20200101"),
+        );
+
+        let store = InMemoryObjectStore::default();
+        let key = clarus_adapters::storage::cas_rel_path(&hex);
+        let outcome =
+            migrate_blob_to_s3_with_store_for_test(&state, &hex, body.len() as i64, &store);
+        assert!(
+            outcome.is_err(),
+            "a source whose bytes do not hash to the address must not be uploaded"
+        );
+        assert!(
+            store.get_object(&key).is_err(),
+            "nothing may be written under the digest"
+        );
+        assert!(
+            hot_path.exists(),
+            "the local copy must be kept when the upload is refused"
+        );
+    }
+
+    /// `:1618` - a failed emergency S3 attempt must be excluded for the rest of
+    /// the tick.
+    ///
+    /// The failed-read and failed-flip exits used to `continue` straight past
+    /// `failed.insert`, so the digest stayed selectable: while the disk was
+    /// still under the threshold the next round of the SAME tick worked it
+    /// again instead of moving on to the candidates behind it.
+    ///
+    /// The loop itself needs a live `S3Client` bound into `AppState`, which a
+    /// unit test cannot construct, so this pins the two halves the fix is made
+    /// of: the collector honours the exclusion set (so inserting into it is
+    /// what makes the next round move on), and a digest that reaches that set
+    /// is therefore unreachable for the rest of the tick.
+    #[test]
+    fn an_excluded_digest_is_never_re_selected_in_the_same_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_with_manifest_dir(dir.path());
+        let mut a = [0u8; 32];
+        a[0] = 0xC7;
+        let mut b = [0u8; 32];
+        b[0] = 0xC8;
+        write_one_manifest(
+            dir.path(),
+            "1.2.950",
+            a,
+            clarus_core::manifest::TIER_HOT,
+            Some("20200101"),
+        );
+        write_one_manifest(
+            dir.path(),
+            "1.2.951",
+            b,
+            clarus_core::manifest::TIER_HOT,
+            Some("20200101"),
+        );
+        let a_hex = clarus_adapters::hex_encode(&a);
+
+        // Without the exclusion both blobs are selectable.
+        let all = collect_candidates_in(
+            &state,
+            "99991231",
+            &[clarus_core::manifest::TIER_HOT],
+            &std::collections::HashSet::new(),
+        )
+        .expect("scan ok");
+        assert_eq!(all.len(), 2, "both blobs are candidates before any failure");
+
+        // Once a digest is in the failure set, the collector refuses it - so
+        // the next round of the tick reaches the blob BEHIND it instead of
+        // reworking the one that just failed.
+        let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        failed.insert(a_hex.clone());
+        let after = collect_candidates_in(
+            &state,
+            "99991231",
+            &[clarus_core::manifest::TIER_HOT],
+            &failed,
+        )
+        .expect("scan ok");
+        assert!(
+            !after.iter().any(|(h, _, _)| *h == a_hex),
+            "a failed digest must not be re-selected in the same tick: {after:?}"
+        );
+        assert_eq!(
+            after.len(),
+            1,
+            "the blob behind the failed one must still be reached"
         );
     }
 }

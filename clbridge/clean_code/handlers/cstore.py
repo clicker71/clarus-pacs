@@ -37,7 +37,7 @@ from clean_code.utils import (
     mask_patient_id,
     mask_patient_name,
 )
-from clean_code.validation import sanitize_dataset
+from clean_code.validation import record_modification, sanitize_dataset
 
 # ---------------------------------------------------------------------------
 # Backpressure: limit concurrent C-STORE handlers (like nginx worker_connections)
@@ -55,6 +55,47 @@ def set_max_concurrent_cstore(n: int) -> None:
     global _MAX_CONCURRENT_CSTORE, _cstore_semaphore
     _MAX_CONCURRENT_CSTORE = n
     _cstore_semaphore = threading.Semaphore(n)
+
+
+# ---------------------------------------------------------------------------
+# Study -> PatientID guard (C-STORE, synchronous)
+# ---------------------------------------------------------------------------
+# The outbox is fire-and-forget: C-STORE answers 0x0000 right after enqueue,
+# before the STOW verdict exists, so the server's patient-conflict refusal
+# (409 -> 0xC000) never reaches the modality. The bridge must therefore refuse
+# a study it already holds under a DIFFERENT non-empty PatientID,
+# synchronously, BEFORE the enqueue. The map is bounded (eviction of the
+# oldest entry on overflow): an unbounded dict would grow one entry per
+# StudyInstanceUID for the process lifetime - a memory DoS on a long-running
+# forwarder.
+_STUDY_PATIENT_CAP = 1_000_000
+_study_patient_lock = threading.Lock()
+_study_patient_map = {}  # study_uid -> patient_id (insertion-ordered)
+
+
+def _study_patient_get(study_uid):
+    """Return the PatientID this bridge holds for a study, or None."""
+    with _study_patient_lock:
+        return _study_patient_map.get(study_uid)
+
+
+def _study_patient_put(study_uid, patient_id):
+    """Record a study's PatientID after a SUCCESSFUL enqueue.
+
+    Insertion order makes the first key the oldest; on overflow the oldest is
+    evicted. The map is a guard cache, not an archive - an evicted study is
+    simply no longer guarded, which is the honest degradation of a bound.
+    """
+    with _study_patient_lock:
+        if study_uid in _study_patient_map:
+            _study_patient_map[study_uid] = patient_id
+            return
+        if len(_study_patient_map) >= _STUDY_PATIENT_CAP:
+            # dict preserves insertion order, so the first key is the oldest;
+            # plain dict.popitem() removes the NEWEST (LIFO), which is wrong
+            # for an eviction-by-age bound.
+            _study_patient_map.pop(next(iter(_study_patient_map)))
+        _study_patient_map[study_uid] = patient_id
 
 
 # ---------------------------------------------------------------------------
@@ -262,18 +303,32 @@ def _fix_cp1251_krakozyabry(ds):
                 run = 0
         return False
 
-    # Short-name exception:
-    # Korean surnames transcribed in Cyrillic (for example the 2-3 character
-    # transliterations of Ho, Yu, Lee and Kim) are 1-4 chars, all Cyrillic, but
-    # never form a >=3 run in isolation. Without this exception a radiology
-    # department whose staff include Korean-Russian colleagues would see those
-    # names garbled in the viewer.
-    def _is_all_cyrillic(text):
-        return (
-            len(text) >= 1
-            and len(text) <= 4
-            and all(ch in _CYRILLIC_BLOCK for ch in text)
-        )
+    def _cyrillic_dominates(text):
+        """Whether the Cyrillic content is the body of the value, not an island.
+
+        A genuine cp1251 mojibake is Cyrillic throughout, because the whole
+        value was Russian text. Text that merely CONTAINS a Cyrillic run - a
+        Latin-1 value whose box-drawing bytes happen to decode into letters -
+        keeps most of its Latin letters and spaces, so the Cyrillic share is
+        small. Half is the threshold: it separates "this value IS Cyrillic"
+        from "this value mentions something Cyrillic", and it is loose enough
+        that a mixed value such as `Иванов Ivanov` still repairs.
+
+        Whitespace, digits and punctuation are not counted either way, so a
+        short Cyrillic surname inside a long ASCII description does not pass on
+        the strength of the description's own length.
+        """
+        letters = 0
+        cyrillic = 0
+        for ch in text:
+            if ch in _CYRILLIC_BLOCK:
+                cyrillic += 1
+                letters += 1
+            elif ch.isalpha():
+                letters += 1
+        if letters == 0:
+            return False
+        return cyrillic * 2 >= letters
 
     def _cp1251_fix_one(value):
         """Repair one text value. Returns (new_value, examined).
@@ -310,14 +365,31 @@ def _fix_cp1251_krakozyabry(ds):
 
         fixed = raw_bytes.decode("cp1251", errors="replace")
 
-        # Only accept the fix if the result contains >=3 consecutive Cyrillic
-        # characters OR is a short all-Cyrillic name (1-4 chars, no long run).
-        if (
-            fixed != value
-            and not _has_cyrillic_run(fixed, 3)
-            and not _is_all_cyrillic(fixed)
-        ):
-            return value, True
+        # A repair needs INDEPENDENT evidence, which is what a Cyrillic run is:
+        # three consecutive Cyrillic letters cannot arise by accident from
+        # valid Latin-1 text. The former short-name rule ("1-4 characters, all
+        # Cyrillic") had no such force - a two-character Latin-1 name decodes
+        # into two Cyrillic letters often enough that the bridge rewrote valid
+        # ISO_IR 100 text and then relabelled the data set ISO_IR 192 on the
+        # strength of it.
+        #
+        # A Cyrillic run is NECESSARY but not SUFFICIENT. Single-byte Latin-1
+        # text built from the box-drawing/box-shade range decodes into a solid
+        # Cyrillic run too: `├Й├Й├Й Industries` (a real ISO_IR 100 value) becomes
+        # `ЩйЩйЩй Industries` under cp1251, passes the run test, and would have
+        # been forwarded as UTF-8 - silently altering declared Latin-1 text that
+        # was never mojibake. So the run must also be a MEANINGFUL proportion of
+        # the value rather than a token inside otherwise-ordinary Latin text,
+        # and the declared charset must not already be trustworthy.
+        if fixed != value:
+            if not _has_cyrillic_run(fixed, 3):
+                return value, True
+            if not _cyrillic_dominates(fixed):
+                # A Cyrillic island in Latin text: leave the declared Latin-1
+                # alone. Rewriting it is the alteration this guard exists to
+                # prevent, and a genuinely misencoded Russian name is
+                # Cyrillic throughout, not three letters inside a word.
+                return value, True
         return fixed, True
 
     fixed_any = False
@@ -613,7 +685,15 @@ def handle_c_store(
         except Exception as fm_err:
             logging.warning("[C-STORE] Cannot attach file_meta: %s", fm_err)
 
-        sop_uid = str(getattr(ds, "SOPInstanceUID", ""))
+        # The SOP Instance UID is read from the VALUE, not from `str()` of the
+        # element: an element present with a null value yields the string
+        # "None", which is non-empty and slipped past the missing-UID guard
+        # below - so the instance was persisted under a UID literally named
+        # "None" and the modality received 0x0000 for a dataset that carries no
+        # Type 1 identifier (PS3.3 C.12.1.1.2). Read the raw value and require
+        # a non-blank string.
+        _sop_uid_value = getattr(ds, "SOPInstanceUID", None)
+        sop_uid = "" if _sop_uid_value is None else str(_sop_uid_value).strip()
         study_uid = str(getattr(ds, "StudyInstanceUID", ""))
         patient = str(getattr(ds, "PatientName", "unknown"))
 
@@ -742,6 +822,22 @@ def handle_c_store(
             logging.error("Validation failed: %s - returning 0xC000", e)
             return 0xC000
 
+        # Synchronous study->PatientID guard: the outbox answers 0x0000 before
+        # the STOW verdict exists, so the server's patient-conflict refusal
+        # (409 -> 0xC000) can never reach this modality. Refuse a study the
+        # bridge already holds under a DIFFERENT non-empty PatientID BEFORE
+        # the enqueue; the rule mirrors the origin's `study_patient_conflict`,
+        # and an empty PatientID is Type 2 "not stated" - never a conflict.
+        _pid = str(getattr(ds, "PatientID", "") or "").strip()
+        _stored_pid = _study_patient_get(study_uid)
+        if _pid and _stored_pid and _stored_pid != _pid:
+            logging.warning(
+                "[C-STORE] Study %s already held under a different patient - "
+                "refusing 0xC000",
+                study_uid[:50] if study_uid else "?",
+            )
+            return 0xC000
+
         # "Don't do heavy work on the hot path. Accept bytes -> return
         # Success -> done. Everything else happens in the background."
 
@@ -756,7 +852,10 @@ def handle_c_store(
                     "[C-STORE] SOP %s already in outbox (duplicate) - 0x0000 Success",
                     sop_uid,
                 )
-                return 0x0000  # Success  -  idempotent, already persisted
+                # Still a coercion warning when THIS request carried
+                # modifications: the duplicate is the stored instance, and the
+                # status describes the answer to the request in hand.
+                return 0xB000 if mods else 0x0000
             if not ok:
                 logging.error(
                     "[C-STORE] Outbox enqueue failed for %s (SOP: %s) - returning 0xA700",
@@ -766,6 +865,22 @@ def handle_c_store(
                 return 0xA700  # Out of Resources  -  transient, sender should retry
 
             status = 0x0000  # Success  -  SOP persisted in outbox, will be delivered
+            # PS3.4 B.4: a coercion of an identifying attribute is a Warning,
+            # not a plain Success. The instance WAS accepted and stored, so the
+            # status stays in the warning range - but answering 0x0000 told the
+            # modality (and every audit downstream of it) that the data set it
+            # sent is exactly the one that was stored, when the bridge had
+            # replaced its Patient ID. 0xB000 is the defined "coercion"
+            # warning; without the changes the plain Success stands.
+            if mods:
+                status = 0xB000
+
+            # Record the study's PatientID only AFTER a successful enqueue: a
+            # failed enqueue must not poison the map (the study was not
+            # accepted), and the guard above already ran on the pre-enqueue
+            # state.
+            if _pid:
+                _study_patient_put(study_uid, _pid)
 
             # -- 0409 forwarder hook ----------------------------------
             # Best-effort DIMSE->DIMSE mirror to a SECOND (non-authoritative)
@@ -808,6 +923,36 @@ def handle_c_store(
             logging.warning(
                 "[C-STORE] No queue configured - falling back to sync forward"
             )
+            # `sanitize_dataset` ran with write_audit=False, on the assumption
+            # that an outbox worker would apply the audit trail from `mods`
+            # before the STOW. On THIS path there is no worker: the dataset goes
+            # out immediately, so the coercion of an empty Patient ID reached
+            # the origin with no Modified Attributes Sequence and no record of
+            # the original value anywhere. The audit is therefore applied
+            # inline, here, before the send - the deferred form is only correct
+            # where something is actually deferred TO.
+            if mods:
+                try:
+                    for tag, old, _new in mods:
+                        record_modification(
+                            ds,
+                            tag,
+                            old,
+                            reason="COERCE",
+                            modifying_system=bridge_ae_title,
+                        )
+                except Exception as audit_err:
+                    # Without the audit trail the forwarded record no longer
+                    # matches what this bridge documents, so the instance is
+                    # refused instead of stored anonymously.
+                    logging.error(
+                        "[C-STORE] Cannot record the coercion audit for %s "
+                        "(%s) - refusing the instance rather than forwarding "
+                        "it without provable audit data",
+                        sop_uid,
+                        audit_err,
+                    )
+                    return 0xC000
             status, http_status, reason = stow_single_instance(
                 ds,
                 clarus_url,
@@ -822,6 +967,8 @@ def handle_c_store(
                     _dimse_status_name(status),
                     reason,
                 )
+            elif _pid:
+                _study_patient_put(study_uid, _pid)
 
         # Bridge: translation duration observation
         translation_duration.observe(time.monotonic() - start_time)

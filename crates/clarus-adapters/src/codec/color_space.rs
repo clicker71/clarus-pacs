@@ -83,6 +83,17 @@ fn clamp_i32(v: i32) -> u8 {
     }
 }
 
+/// The sample interpretation needed to convert a buffer losslessly.
+#[derive(Debug, Clone, Copy)]
+pub struct SampleShape {
+    /// BitsAllocated (0028,0100): the container width of one sample.
+    pub bits_allocated: u8,
+    /// BitsStored (0028,0101): the meaningful width inside that container.
+    pub bits_stored: u8,
+    /// PixelRepresentation (0028,0103): 0 unsigned, 1 two's complement.
+    pub pixel_representation: u8,
+}
+
 /// Apply color-space conversion to an entire pixel buffer.
 ///
 /// The input and output use planar layout (RRR...GGG...BBB...).
@@ -92,56 +103,139 @@ pub fn convert_color_space(
     from: &str,
     to: &str,
     samples_per_pixel: u8,
-    bits_allocated: u8,
+    shape: SampleShape,
 ) -> Result<Vec<u8>, CodecError> {
     if from == to {
         return Ok(pixels.to_vec());
     }
 
+    // PS3.3 C.7.6.3.1.1: SamplesPerPixel is 1 or 3 and the planar layout is
+    // one whole plane per sample. Dividing by zero panicked, and a buffer that
+    // is not a whole number of equal planes indexed past its end - both on
+    // input the caller supplies.
+    if samples_per_pixel == 0 {
+        return Err(CodecError::InvalidMetadata(
+            "SamplesPerPixel must not be 0".into(),
+        ));
+    }
     let pixel_count = pixels.len() / samples_per_pixel as usize;
+    if pixel_count * samples_per_pixel as usize != pixels.len() {
+        return Err(CodecError::InvalidMetadata(format!(
+            "Planar buffer of {} bytes is not a whole number of {} sample planes",
+            pixels.len(),
+            samples_per_pixel
+        )));
+    }
 
     match (from, to) {
-        ("RGB", "YBR_FULL") => {
-            let mut out = vec![0u8; pixels.len()];
-            for i in 0..pixel_count {
-                let r = pixels[i];
-                let g = pixels[pixel_count + i];
-                let b = pixels[2 * pixel_count + i];
-                let (y, cb, cr) = rgb_to_ybr_full(r, g, b);
-                out[i] = y;
-                out[pixel_count + i] = cb;
-                out[2 * pixel_count + i] = cr;
+        ("RGB", "YBR_FULL") | ("YBR_FULL", "RGB") => {
+            // PS3.3 C.7.6.3.1.1: RGB and YBR_FULL are defined on three 8-bit
+            // components. A 16-bit colour buffer read one byte at a time was
+            // halved in resolution and wrong in value; a buffer without three
+            // planes indexed past its end.
+            if samples_per_pixel != 3 {
+                return Err(CodecError::InvalidMetadata(format!(
+                    "{from} -> {to} needs SamplesPerPixel 3, got {samples_per_pixel}"
+                )));
             }
-            Ok(out)
-        }
-        ("YBR_FULL", "RGB") => {
+            if shape.bits_allocated != 8 {
+                return Err(CodecError::InvalidMetadata(format!(
+                    "{from} -> {to} is defined for 8-bit samples, got BitsAllocated {}",
+                    shape.bits_allocated
+                )));
+            }
             let mut out = vec![0u8; pixels.len()];
-            for i in 0..pixel_count {
-                let y = pixels[i];
-                let cb = pixels[pixel_count + i];
-                let cr = pixels[2 * pixel_count + i];
-                let (r, g, b) = ybr_full_to_rgb(y, cb, cr);
-                out[i] = r;
-                out[pixel_count + i] = g;
-                out[2 * pixel_count + i] = b;
+            if from == "RGB" {
+                for i in 0..pixel_count {
+                    let r = pixels[i];
+                    let g = pixels[pixel_count + i];
+                    let b = pixels[2 * pixel_count + i];
+                    let (y, cb, cr) = rgb_to_ybr_full(r, g, b);
+                    out[i] = y;
+                    out[pixel_count + i] = cb;
+                    out[2 * pixel_count + i] = cr;
+                }
+            } else {
+                for i in 0..pixel_count {
+                    let y = pixels[i];
+                    let cb = pixels[pixel_count + i];
+                    let cr = pixels[2 * pixel_count + i];
+                    let (r, g, b) = ybr_full_to_rgb(y, cb, cr);
+                    out[i] = r;
+                    out[pixel_count + i] = g;
+                    out[2 * pixel_count + i] = b;
+                }
             }
             Ok(out)
         }
         ("MONOCHROME1", "MONOCHROME2") | ("MONOCHROME2", "MONOCHROME1") => {
-            let bytes_per_sample = (bits_allocated as usize) >> 3;
-            if bytes_per_sample == 0 {
-                return Err(CodecError::InvalidMetadata("bits_allocated < 8".into()));
+            let bytes_per_sample = (shape.bits_allocated as usize) >> 3;
+            if bytes_per_sample != 1 && bytes_per_sample != 2 {
+                return Err(CodecError::InvalidMetadata(format!(
+                    "BitsAllocated {} is not 8 or 16",
+                    shape.bits_allocated
+                )));
+            }
+            // PS3.3 C.7.6.3.1.1 with PS3.5 8.1.1: the samples carry BitsStored
+            // bits and the container may be wider, so the range to invert
+            // WITHIN is [0, 2^BitsStored - 1] (unsigned) or the signed range of
+            // the same width. Complementing the whole container turned a
+            // 12-bit value stored in 16 bits into a 16-bit one, so the four
+            // uninitialised high bits became signal.
+            let stored = shape.bits_stored;
+            if stored == 0 || stored > shape.bits_allocated || shape.bits_allocated > 16 {
+                return Err(CodecError::InvalidMetadata(format!(
+                    "BitsStored {stored} does not fit BitsAllocated {}",
+                    shape.bits_allocated
+                )));
+            }
+            if shape.pixel_representation > 1 {
+                return Err(CodecError::InvalidMetadata(format!(
+                    "PixelRepresentation must be 0 or 1, got {}",
+                    shape.pixel_representation
+                )));
             }
             let mut out = pixels.to_vec();
             if bytes_per_sample == 1 {
+                // PS3.5 8.1.1: a one-byte container holds 8 bits, so BitsStored
+                // 8 is the only width it can carry.
+                if stored != 8 {
+                    return Err(CodecError::InvalidMetadata(format!(
+                        "8-bit container cannot hold BitsStored {stored}"
+                    )));
+                }
                 for byte in out.iter_mut() {
                     *byte = 255u8.wrapping_sub(*byte);
                 }
             } else {
-                // 16-bit: invert each u16 little-endian word
+                // PS3.5 8.1.1: a 16-bit container holds 2 bytes per sample, so
+                // the buffer must be a whole number of samples. `as_chunks_mut`
+                // silently ignores a trailing byte, so an odd-length buffer
+                // (which the plane check admits when spp is 1) lost its last
+                // sample with no error and the image came back one sample short.
+                if !out.len().is_multiple_of(2) {
+                    return Err(CodecError::InvalidMetadata(format!(
+                        "16-bit container holds {} bytes, which is not a whole number of samples",
+                        out.len()
+                    )));
+                }
+                let mask: u16 = if stored == 16 {
+                    u16::MAX
+                } else {
+                    (1u16 << stored) - 1
+                };
+                // PS3.3 C.7.6.3.1.1: the polarity swap mirrors the sample
+                // about the middle of its range, i.e. `max + min - v`. For an
+                // unsigned b-bit range that is `mask - v`; for a signed one it
+                // is `-1 - v`, which the same `mask - v` produces because a
+                // two's complement encoding wraps exactly that way.
+                //
+                // The wrap is deliberate: `mask - v` keeps the result inside
+                // the stored width, which is the bit width the file declares.
                 for chunk in out.as_chunks_mut::<2>().0 {
                     let val = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    let inv = 65535u16.wrapping_sub(val);
+                    let stored_val = val & mask;
+                    let inv = mask.wrapping_sub(stored_val) & mask;
                     chunk[0] = inv as u8;
                     chunk[1] = (inv >> 8) as u8;
                 }
@@ -222,7 +316,7 @@ mod tests {
     #[test]
     fn test_convert_color_space_identity() {
         let data = vec![10u8, 20, 30, 40, 50, 60];
-        let result = convert_color_space(&data, "RGB", "RGB", 3, 8).unwrap();
+        let result = convert_color_space(&data, "RGB", "RGB", 3, shape8(3)).unwrap();
         assert_eq!(result, data);
     }
 
@@ -238,10 +332,10 @@ mod tests {
         data.extend_from_slice(&g);
         data.extend_from_slice(&b);
 
-        let ybr = convert_color_space(&data, "RGB", "YBR_FULL", 3, 8).unwrap();
+        let ybr = convert_color_space(&data, "RGB", "YBR_FULL", 3, shape8(3)).unwrap();
         assert_eq!(ybr.len(), data.len());
 
-        let rgb_back = convert_color_space(&ybr, "YBR_FULL", "RGB", 3, 8).unwrap();
+        let rgb_back = convert_color_space(&ybr, "YBR_FULL", "RGB", 3, shape8(3)).unwrap();
 
         let tol = 3i32; // RGB<->YBR roundtrip is inherently lossy
         for i in 0..pixel_count {
@@ -270,24 +364,192 @@ mod tests {
     #[test]
     fn test_monochrome_invert() {
         let data = vec![0u8, 128, 255, 64];
-        let inverted = convert_color_space(&data, "MONOCHROME2", "MONOCHROME1", 1, 8).unwrap();
+        let inverted =
+            convert_color_space(&data, "MONOCHROME2", "MONOCHROME1", 1, shape8(1)).unwrap();
         assert_eq!(inverted, vec![255, 127, 0, 191]);
     }
 
     #[test]
     fn test_monochrome_double_invert() {
         let data = vec![10u8, 20, 30, 40];
-        let inverted1 = convert_color_space(&data, "MONOCHROME2", "MONOCHROME1", 1, 8).unwrap();
+        let inverted1 =
+            convert_color_space(&data, "MONOCHROME2", "MONOCHROME1", 1, shape8(1)).unwrap();
         let inverted2 =
-            convert_color_space(&inverted1, "MONOCHROME1", "MONOCHROME2", 1, 8).unwrap();
+            convert_color_space(&inverted1, "MONOCHROME1", "MONOCHROME2", 1, shape8(1)).unwrap();
         assert_eq!(inverted2, data);
+    }
+
+    /// PS3.5 8.1.1: a 16-bit container holds two bytes per sample, so an
+    /// odd-length buffer is not a whole number of samples.
+    ///
+    /// `as_chunks_mut::<2>` silently ignores a trailing byte, and the plane
+    /// check admits an odd buffer whenever SamplesPerPixel is 1 - so the last
+    /// sample was dropped with no error and the image came back one short.
+    #[test]
+    fn a_sixteen_bit_buffer_that_holds_half_a_sample_is_refused() {
+        // 5 bytes at 16 bits per sample: two whole samples plus one stray byte.
+        let data = vec![1u8, 2, 3, 4, 5];
+        let shape = SampleShape {
+            bits_allocated: 16,
+            bits_stored: 16,
+            pixel_representation: 0,
+        };
+        let err = convert_color_space(&data, "MONOCHROME2", "MONOCHROME1", 1, shape)
+            .expect_err("an odd 16-bit buffer is not a whole number of samples");
+        assert!(
+            err.to_string().contains("not a whole number of samples"),
+            "got: {err}"
+        );
+
+        // An even buffer of the same width still inverts.
+        let ok = convert_color_space(&[1u8, 2, 3, 4], "MONOCHROME2", "MONOCHROME1", 1, shape)
+            .expect("two whole samples convert");
+        assert_eq!(ok.len(), 4);
     }
 
     #[test]
     fn test_unsupported_conversion() {
-        let data = vec![0u8; 10];
-        let result = convert_color_space(&data, "RGB", "YBR_ICT", 3, 8);
-        assert!(result.is_err());
+        // A buffer that IS a whole number of planes, so the plane check passes
+        // and the unsupported pair is what refuses. Ten bytes with three
+        // components is not a whole number of planes, so the earlier version
+        // exercised the plane check and never reached the branch it names.
+        let data = vec![0u8; 9]; // three pixels, three 8-bit components
+        let result = convert_color_space(&data, "RGB", "YBR_ICT", 3, shape8(3));
+        let err = result.expect_err("RGB -> YBR_ICT is not implemented");
+        assert!(
+            err.to_string()
+                .contains("Unsupported color space conversion"),
+            "must reach the unsupported-pair branch, got: {err}"
+        );
+    }
+
+    /// An 8-bit, unsigned sample shape: the common case the colour tests use.
+    fn shape8(_samples: u8) -> SampleShape {
+        SampleShape {
+            bits_allocated: 8,
+            bits_stored: 8,
+            pixel_representation: 0,
+        }
+    }
+
+    /// PS3.3 C.7.6.3.1.1: SamplesPerPixel 0 is not a sample count, so it is
+    /// refused instead of dividing by it.
+    #[test]
+    fn a_zero_sample_count_is_refused_not_divided_by() {
+        let data = vec![0u8; 12];
+        assert!(
+            convert_color_space(&data, "RGB", "YBR_FULL", 0, shape8(0)).is_err(),
+            "SamplesPerPixel 0 must be an error"
+        );
+    }
+
+    /// Three planes are R, G and B - a buffer that is not a whole number of
+    /// planes cannot be laid out that way.
+    #[test]
+    fn a_ragged_plane_count_is_refused_not_indexed() {
+        let data = vec![0u8; 5];
+        assert!(convert_color_space(&data, "RGB", "YBR_FULL", 3, shape8(3)).is_err());
+    }
+
+    /// PS3.3 C.7.6.3.1.1: a two-plane buffer with SamplesPerPixel 3 indexes
+    /// past its end on the third plane.
+    #[test]
+    fn a_two_plane_buffer_with_three_samples_is_refused() {
+        let data = vec![0u8; 7];
+        let err = convert_color_space(&data, "RGB", "YBR_FULL", 3, shape8(3))
+            .expect_err("7 bytes is not a whole number of planes");
+        let CodecError::InvalidMetadata(msg) = err else {
+            panic!("expected InvalidMetadata");
+        };
+        assert!(msg.contains("whole number"), "{msg}");
+    }
+
+    /// RGB <-> YBR_FULL is an 8-bit three-component transform. A 16-bit buffer
+    /// read one byte per sample was halved in resolution.
+    #[test]
+    fn a_sixteen_bit_colour_buffer_is_refused() {
+        let data = vec![0u8; 12];
+        let shape = SampleShape {
+            bits_allocated: 16,
+            bits_stored: 12,
+            pixel_representation: 0,
+        };
+        assert!(convert_color_space(&data, "RGB", "YBR_FULL", 3, shape).is_err());
+    }
+
+    /// PS3.3 C.7.6.3.1.1 with PS3.5 8.1.1: a 12-bit sample stored in 16 bits
+    /// inverts within [0, 4095]; complementing the container gave 65535 - v.
+    #[test]
+    fn a_twelve_bit_sample_inverts_within_its_stored_range() {
+        let mut data = Vec::new();
+        for value in [0u16, 4095, 1000] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let shape = SampleShape {
+            bits_allocated: 16,
+            bits_stored: 12,
+            pixel_representation: 0,
+        };
+        let out = convert_color_space(&data, "MONOCHROME2", "MONOCHROME1", 1, shape)
+            .expect("a 12-in-16 instance is legal");
+        let values: Vec<u16> = out
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(values, vec![4095, 0, 3095], "inverted inside 12 bits");
+    }
+
+    /// A signed sample inverts about the midpoint of its signed range, so the
+    /// most negative value becomes the most positive.
+    #[test]
+    fn a_signed_sample_inverts_about_its_midpoint() {
+        // 12-bit signed: -2048 .. 2047, stored two's complement in 16 bits.
+        let mut data = Vec::new();
+        for value in [-2048i16, 0, -1, 2047] {
+            data.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        let shape = SampleShape {
+            bits_allocated: 16,
+            bits_stored: 12,
+            pixel_representation: 1,
+        };
+        let out = convert_color_space(&data, "MONOCHROME2", "MONOCHROME1", 1, shape)
+            .expect("signed 12-in-16 is legal");
+        let stored: Vec<u16> = out
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) & 0x0FFF)
+            .collect();
+        let signed: Vec<i16> = stored
+            .iter()
+            .map(|v| {
+                if *v >= 0x0800 {
+                    (*v as i32 - 0x1000) as i16
+                } else {
+                    *v as i16
+                }
+            })
+            .collect();
+        assert_eq!(
+            signed,
+            vec![2047, -1, 0, -2048],
+            "max + min - v, i.e. -1 - v for a signed sample"
+        );
+    }
+
+    /// A 1-byte container cannot carry more than 8 stored bits.
+    #[test]
+    fn a_stored_width_wider_than_its_container_is_refused() {
+        let data = vec![1u8; 4];
+        let shape = SampleShape {
+            bits_allocated: 8,
+            bits_stored: 12,
+            pixel_representation: 0,
+        };
+        assert!(convert_color_space(&data, "MONOCHROME2", "MONOCHROME1", 1, shape).is_err());
     }
 
     #[test]

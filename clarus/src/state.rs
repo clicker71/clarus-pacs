@@ -254,8 +254,44 @@ mod tests {
     // asserting the absolute value made the assertion depend on what else was
     // running at the time, which is precisely the flakiness a parallel runner
     // produces on a green tree.
+    //
+    // A delta alone is NOT enough: a sibling test that is REFUSED a permit
+    // between a test's two reads moves the delta as well. The tests that
+    // compare a delta therefore take this lock, so no other test can increment
+    // the counter inside their window.
+    static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A competing DENIAL the counter lock must exclude.
+    ///
+    /// The race is only observable if another denial lands between the two
+    /// reads, and a real one is microseconds wide. This hook lets the test
+    /// place one there deterministically: it is the same interference a
+    /// sibling test would produce, made reliable. With the lock held the hook
+    /// cannot fire, because the competing thread must take the same lock
+    /// first.
+    static COMPETING_DENIAL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Fire one competing denial unless the counter lock is held.
+    ///
+    /// Returns whether it fired, so a test can assert the lock actually
+    /// excluded the interference instead of assuming it.
+    fn fire_competing_denial_unless_locked() -> bool {
+        if COUNTER_LOCK.try_lock().is_err() {
+            // The lock is held by the test under measurement: nothing may
+            // touch the counter.
+            return false;
+        }
+        if COMPETING_DENIAL.swap(false, Ordering::Relaxed) {
+            crate::metrics::TRANSCODE_DENIED.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
     #[test]
     fn pool_one_permit_two_calls_first_ok_second_503() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let denied_before = crate::metrics::TRANSCODE_DENIED.load(Ordering::Relaxed);
         let pool = TranscodePool::new(1);
         // First acquire succeeds, second is refused (503-path, no wait).
@@ -264,6 +300,15 @@ mod tests {
             !pool.try_acquire(),
             "second acquire with a full pool must be refused (no queue)"
         );
+
+        // A second test's denial, offered right here - the exact window that
+        // made the delta assertion flaky. The lock must refuse it.
+        COMPETING_DENIAL.store(true, Ordering::Relaxed);
+        assert!(
+            !fire_competing_denial_unless_locked(),
+            "the counter lock must exclude a competing denial from the window"
+        );
+
         let denied_after = crate::metrics::TRANSCODE_DENIED.load(Ordering::Relaxed);
         assert_eq!(
             denied_after - denied_before,
@@ -294,6 +339,9 @@ mod tests {
 
     #[test]
     fn pool_concurrent_acquire_release_is_lock_free_and_bounded() {
+        // Excluded from the counter window above: this test DENIES permits by
+        // design, so it would move any concurrent delta assertion.
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pool = std::sync::Arc::new(TranscodePool::new(4));
         let mut handles = Vec::new();
         for _ in 0..8 {

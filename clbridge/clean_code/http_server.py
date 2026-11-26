@@ -151,6 +151,24 @@ class _UnknownPrintAttribute(ValueError):
 # was written.
 _NUMERIC_VRS = frozenset({"US", "SS", "UL", "SL", "UV", "SV", "IS", "DS", "FL", "FD"})
 
+# The BINARY numeric VRs: their value is packed as an integer/float, so
+# pydicom's writer requires a NUMBER and rejects a string outright. The string
+# VRs (IS, DS) are decimal text on the wire and must stay strings.
+_BINARY_NUMERIC_VRS = frozenset({"US", "SS", "UL", "SL", "UV", "SV"})
+
+# PS3.5 Table 6.2-1: the inclusive range of each binary integer VR. US/UL/UV
+# are unsigned, SS/SL/SV signed. A value outside its VR's range cannot be
+# encoded at all, so it is refused here rather than failing inside pydicom
+# with an exception the caller cannot act on.
+_BINARY_NUMERIC_RANGES = {
+    "US": (0, 2**16 - 1),
+    "UL": (0, 2**32 - 1),
+    "UV": (0, 2**64 - 1),
+    "SS": (-(2**15), 2**15 - 1),
+    "SL": (-(2**31), 2**31 - 1),
+    "SV": (-(2**63), 2**63 - 1),
+}
+
 
 def _print_attr_value(vr, value):
     """One attribute value, typed for the VR the dictionary gave the tag.
@@ -162,7 +180,26 @@ def _print_attr_value(vr, value):
     a strict SCP reads the element with the wrong value type. Numbers pass
     through untouched and pydicom's own converter applies the VR's rules;
     everything else keeps the historical string form.
+
+    A numeric STRING for a BINARY numeric VR is converted and range-checked:
+    the documented `"1"` form is valid input, but the binary writer packs an
+    integer and cannot encode text, so passing the string through produced an
+    element pydicom refused to write. IS/DS keep their string form - they are
+    decimal text on the wire and pydicom encodes them as such.
     """
+    if vr in _BINARY_NUMERIC_VRS and isinstance(value, str):
+        text = value.strip()
+        try:
+            # `int(text, 0)` would accept "0x10"; DICOM values are decimal.
+            parsed = int(text, 10)
+        except (TypeError, ValueError):
+            raise ValueError(f"{vr} value {value!r} is not an integer")
+        lo, hi = _BINARY_NUMERIC_RANGES[vr]
+        if not (lo <= parsed <= hi):
+            raise ValueError(
+                f"{vr} value {parsed} is outside the encodable range {lo}..{hi}"
+            )
+        return parsed
     if (
         vr in _NUMERIC_VRS
         and isinstance(value, (int, float))
@@ -453,7 +490,16 @@ class BridgeHTTPHandler(BaseHTTPRequestHandler):
             # The head budget ran out. 408 says what happened; dropping the
             # connection silently leaves the peer with no answer at all.
             self.close_connection = True
+            # `BaseHTTPRequestHandler.send_error` writes the status line and
+            # headers ONLY when `request_version` looks like HTTP/1.x. A head
+            # timeout escapes before `parse_request` sets that field, so it is
+            # still the stdlib's HTTP/0.9 default here and the peer received a
+            # bare body with no status line - i.e. not a 408 at all. The
+            # request version is genuinely unknown at this point, so answer as
+            # HTTP/1.0: no keep-alive to honour, no chunking to negotiate.
             try:
+                if str(self.request_version) not in ("HTTP/1.0", "HTTP/1.1"):
+                    self.request_version = "HTTP/1.0"
                 self.send_error(408, "Request header timed out")
             except OSError:
                 pass

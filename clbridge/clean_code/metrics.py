@@ -237,6 +237,16 @@ cstore_outbound_duration = _h(
     buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
 )
 
+# Instances the peer accepted with a Warning status (PS3.4 B.2.3.1). Counted
+# apart from the delivered total because a warning means the SCP coerced
+# something to store it: the instance IS there, but the modality's copy and the
+# stored copy differ, which is worth seeing before a viewer reads it.
+cstore_warnings = _c(
+    "clarus_bridge_cstore_warnings_total",
+    "Outbound C-STORE responses with a Warning status (accepted, elements coerced)",
+    ["peer"],
+)
+
 # ---------------------------------------------------------------------------
 # Group: queue depth gauges
 # ---------------------------------------------------------------------------

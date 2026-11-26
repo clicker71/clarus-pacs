@@ -11,10 +11,14 @@
 //! # Edge case files
 //!
 //! Files under `tests/dicoms/edge/` are intentionally malformed,
-//! unsupported transfer syntaxes, or otherwise invalid. The parser
-//! MUST return `Err` for these - this is correct behaviour, not a
-//! regression. LV1 requires that the parser does NOT panic; an `Err`
-//! return is expected and acceptable.
+//! unsupported transfer syntaxes, or otherwise unrepresentable. The
+//! invariant this suite enforces for them is LV1: the parser must NOT
+//! panic, whatever it decides. Either outcome is accepted - a
+//! successful parse (when the file happens to be legible) and a
+//! graceful `Err` - because the edge corpus mixes files that are truly
+//! invalid with files that are merely unusual. A fixture that MUST be
+//! rejected belongs in a dedicated test that asserts that exact error,
+//! not in this corpus-wide sweep.
 //!
 //! # Known non-DICOM files with .dcm extension
 //!
@@ -30,8 +34,11 @@ use clarus_ports::dicom::DicomParser;
 const TEST_DICOM_DIR: &str = "../../tests";
 
 /// Subdirectory containing intentionally invalid DICOM files.
-/// These are EXPECTED to fail parsing - the test only checks
-/// that the parser returns `Err` gracefully (no panic).
+///
+/// The invariant for these is LV1 only: no panic. Both a legible parse and a
+/// graceful `Err` are accepted, because the corpus mixes truly invalid files
+/// with merely unusual ones - see the module header for why a fixture that
+/// MUST be rejected belongs in its own dedicated test.
 const EDGE_CASE_DIR: &str = "dicoms/edge";
 
 /// Files with .dcm extension that are NOT DICOM at all.
@@ -64,10 +71,20 @@ fn regression_all_dcm_files_parse() {
     let mut edge_panics: Vec<String> = Vec::new();
     let mut missing_tags: Vec<String> = Vec::new();
 
-    for entry in walkdir::WalkDir::new(&test_root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    // A subtree the walk cannot read is not a subtree with no fixtures: the
+    // sweep would pass while silently checking fewer files than it claims.
+    // Traversal errors join the failure list so the count stays honest.
+    let mut walk = walkdir::WalkDir::new(&test_root).into_iter();
+    let mut entries = Vec::new();
+    loop {
+        match walk.next() {
+            Some(Ok(entry)) => entries.push(entry),
+            Some(Err(e)) => unexpected_failures.push(format!("corpus traversal failed: {e}")),
+            None => break,
+        }
+    }
+
+    for entry in entries {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -274,11 +291,45 @@ fn frame_scan_file_matches_bytes() {
             eprintln!("single-frame / no table in either variant (expected)");
         }
     } else {
+        // Above SLICE_LIMIT there is no in-memory reference to compare with, so
+        // the check becomes a STREAMING check: the frame count must match a
+        // number supplied independently, and the first and last chunks must be
+        // non-degenerate. Printing the count and passing was a test that could
+        // not fail - a walk that returned nothing reported success.
+        let expected: u32 = match std::env::var("CLARUS_FRAME_PARITY_EXPECTED") {
+            Ok(v) => v.parse().unwrap_or_else(|e| {
+                panic!("CLARUS_FRAME_PARITY_EXPECTED is not a frame count: {e}")
+            }),
+            Err(_) => panic!(
+                "file {} is {} bytes, over the {} byte slice limit, so \
+                 CLARUS_FRAME_PARITY_EXPECTED=<frame count> is required to check the \
+                 streaming walk",
+                path.display(),
+                meta.len(),
+                SLICE_LIMIT
+            ),
+        };
+        assert!(
+            !streamed.is_empty(),
+            "the streaming walk produced no frames for a {expected}-frame file"
+        );
+        assert_eq!(
+            streamed.len() as u32,
+            expected,
+            "the streaming walk must table every declared frame"
+        );
+        for (i, chunk) in streamed.iter().enumerate() {
+            assert!(
+                chunk.len > 0,
+                "frame {} has an empty range in a {expected}-frame file",
+                i + 1
+            );
+        }
         eprintln!(
-            "file {} > {} bytes: slice reference skipped, streaming walk produced {} frames",
-            meta.len(),
-            SLICE_LIMIT,
-            streamed.len()
+            "streaming check OK: {} frames tabled for {} ({} bytes), no in-memory reference",
+            streamed.len(),
+            path.display(),
+            meta.len()
         );
     }
 }

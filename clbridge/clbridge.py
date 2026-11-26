@@ -24,6 +24,7 @@ CLI:
 """Bridge: nginx-style config parser - 0 dependencies, KISS."""
 
 import logging
+import os
 from urllib.parse import urlsplit
 
 VERSION = "0.3.4-beta"
@@ -33,6 +34,10 @@ class ConfParser:
 
     def __init__(self, path):
         self.values = {}  # (section, key) -> value
+        # The file this config was read from. Path-valued settings under it
+        # (the mTLS pair) are resolved relative to its directory, which is what
+        # an operator writing `certs/client.pem` means.
+        self.path = path
         self._parse(path)
 
     def _parse(self, path):
@@ -95,6 +100,20 @@ class ConfParser:
 # ---------------------------------------------------------------------------
 # One clarus_url knob for DICOMweb (replaces host/clarus_port)
 # ---------------------------------------------------------------------------
+def _redact_url_userinfo(url):
+    """Return `url` with any `user:password@` part replaced by `***`.
+
+    Only for diagnostics. Uses string surgery rather than urlsplit because the
+    URLs reaching it are the MALFORMED ones - the cases where a structural
+    parser has already refused to give a usable answer, which is exactly when
+    the operator still needs the value quoted back to find it in their config.
+    """
+    at = url.find("@")
+    scheme_end = url.find("://")
+    if at <= 0 or scheme_end < 0 or at < scheme_end:
+        return url
+    return url[: scheme_end + 3] + "***@" + url[at + 1 :]
+
 def validate_clarus_url(cfg):
     """Validate the [dicomweb] clarus_url knob. Raises ValueError on failure.
 
@@ -126,15 +145,43 @@ def validate_clarus_url(cfg):
         )
 
     parts = urlsplit(clarus_url)
+    # Diagnostics must not echo the raw URL before the credential check below
+    # has run: a malformed URL can still carry `user:password@`, and an error
+    # message is the one place a secret is guaranteed to be printed.
+    _safe = _redact_url_userinfo(clarus_url)
     if parts.scheme.lower() not in ("http", "https"):
         raise ValueError(
-            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            f"Configuration error: [dicomweb] clarus_url '{_safe}' "
             "has invalid scheme (must be http or https)"
         )
     if not parts.hostname:
         raise ValueError(
-            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            f"Configuration error: [dicomweb] clarus_url '{_safe}' "
             "has no host (expected scheme://host[:port]/dicomweb)"
+        )
+
+    # A query string or fragment is not part of a DICOMweb base URL. STOW
+    # appends `/studies` to the URL as a STRING, so `...?site=a` becomes
+    # `...?site=a/studies` - the path stays bare and the query grows. A
+    # fragment has the same effect: everything after '#' is never sent.
+    if parts.query or parts.fragment:
+        raise ValueError(
+            "Configuration error: [dicomweb] clarus_url must be a plain base "
+            "URL - remove the query string ('?') and fragment ('#'); the "
+            "bridge appends its own path segments to it"
+        )
+
+    # A URL carrying `user:password@` is refused outright. This bridge has no
+    # way to use those credentials (every HTTP client here is built from the
+    # URL plus an optional mTLS pair), so accepting them only parked a
+    # plaintext secret in a config file and in every message that printed the
+    # URL - including the startup INFO line. Refusing is the honest answer and
+    # keeps the secret out of the logs by construction.
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(
+            "Configuration error: [dicomweb] clarus_url must not carry "
+            "credentials (user:password@) - the bridge cannot use them; "
+            "configure mTLS or an authenticating proxy instead"
         )
 
     # `urlsplit` accepts any text after ':' as the netloc, so `host:abc` and
@@ -148,7 +195,7 @@ def validate_clarus_url(cfg):
         port = parts.port
     except ValueError:
         raise ValueError(
-            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            f"Configuration error: [dicomweb] clarus_url '{_safe}' "
             "has an invalid port (expected a number between 1 and 65535)"
         ) from None
     # `urlsplit` returns 0 for ':0' without raising. Port 0 means "pick any
@@ -156,7 +203,7 @@ def validate_clarus_url(cfg):
     # accepting it started the bridge with a URL it can never reach.
     if port == 0:
         raise ValueError(
-            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            f"Configuration error: [dicomweb] clarus_url '{_safe}' "
             "has port 0 (expected a number between 1 and 65535)"
         )
 
@@ -172,6 +219,31 @@ def validate_clarus_url(cfg):
         )
 
     return clarus_url, tls_cert, tls_key
+
+def resolve_config_path(value, config_path):
+    """A path from the config file, resolved against the file's directory.
+
+    A relative path in a config file means "relative to that file" - the
+    operator wrote `certs/client.pem` next to the config, not next to whatever
+    working directory the service manager happened to start the process in.
+    An absolute path is returned unchanged, and a path that is already
+    resolvable from the working directory is left alone (that is how the
+    deployment ran before this rule, and breaking it would be a silent
+    regression for anyone who relied on it).
+    """
+    if not value:
+        return value
+    if os.path.isabs(value):
+        return value
+    base = os.path.dirname(os.path.abspath(config_path)) if config_path else ""
+    if not base:
+        return value
+    candidate = os.path.join(base, value)
+    # Prefer the config-relative path when it exists; otherwise keep the value
+    # as written so a working-directory-relative deployment keeps working.
+    if os.path.exists(candidate) and not os.path.exists(value):
+        return candidate
+    return value
 
 # ---------------------------------------------------------------------------
 # peers.conf parser - nginx-style: one peer per line
@@ -239,6 +311,15 @@ def parse_peers_conf(path):
                     if not (1 <= port <= 65535):
                         raise ValueError(f"port {port} out of range")
 
+                    # A peer must name a host. `CT :104` parses cleanly through
+                    # `rsplit(":", 1)` and would otherwise be registered with an
+                    # empty host: every later lookup compares against "" and
+                    # never matches, so the peer silently occupies a slot and
+                    # accepts nothing. Reject it through the same malformed-
+                    # address handler, which reports the line number.
+                    if not host:
+                        raise ValueError("empty host")
+
                     peers.append((ae_title, host, port))
                 except (ValueError, IndexError):
                     logging.warning(
@@ -254,6 +335,462 @@ def parse_peers_conf(path):
     except OSError as e:
         logging.warning("[peers.conf] Cannot read %s: %s", path, e)
     return peers
+
+# ---------------------------------------------------------------------------
+# Bridge: inbound_guard
+# ---------------------------------------------------------------------------
+
+"""Inbound association guards: PDU size ceiling and calling-AE allowlist.
+
+Two checks that a DICOM SCP owes its peers and that pynetdicom 3.0.4 does not
+perform for it. Both live here rather than inside a service handler because
+they apply to the ASSOCIATION, not to one operation: the PDU ceiling is a
+property of the negotiated maximum and the allowlist is a property of the
+calling AE, so a per-handler copy would have to be repeated six times and
+would drift.
+
+DIMSE status codes and their Chinese-wall decoding are in protocol.py; this
+module only distinguishes "accept" from "refuse".
+"""
+
+import logging
+
+# pynetdicom's own provider and the PDU grammar this module reads. Imported at
+# module scope so the bundled file carries the same binding; no new
+# dependency - both modules ship with pynetdicom itself.
+from pynetdicom.dul import DULServiceProvider
+
+# ---------------------------------------------------------------------------
+# T1: negotiated maximum PDU length
+# ---------------------------------------------------------------------------
+# PS3.8 9.3.2.2 / Figure 9-1: the User Information item of A-ASSOCIATE
+# carries Maximum Length Received, "the maximum length (in bytes) of a PDU
+# that may be received" - the negotiated value is the one THIS side announced,
+# which pynetdicom stores in `assoc.acceptor.maximum_length`.
+#
+# pynetdicom 3.0.4 does NOT enforce it. `DULServiceProvider._read_pdu_data`
+# (dul.py:245-334) unpacks the six-byte header and then calls
+# `self.socket.recv(pdu_length)` (dul.py:302) with no comparison, so a peer
+# that declares a near-4 GiB PDU makes the bridge READ it before anything can
+# object. `EVT_PDU_RECV` fires from `_decode_pdu` (dul.py:140), i.e. after the
+# body is already in memory - a guard there bounds DISPATCH, not memory.
+#
+# There is no event between header and body, so the bound is placed in a
+# DULServiceProvider SUBCLASS (`GuardedDUL`) that reads the header, compares
+# the declared length, and only then reads the body. That is the only point in
+# the receive path the bridge owns.
+PDU_HEADER_LEN = 6
+PDU_LEN_OFFSET = 2
+# PS3.8 9.3.1 Table 9-1: byte 0 is the PDU type. Only P-DATA-TF (0x04) is
+# subject to the negotiated Maximum Length Received: PS3.8 9.3.2.2 scopes that
+# value to the variable field of a P-DATA-TF, and an A-ASSOCIATE-RQ is
+# legitimately larger than the default before anything has been negotiated.
+P_DATA_TF_TYPE = 0x04
+A_ABORT_TYPE = 0x07
+
+# PS3.8 9.3.1 Table 9-1: the complete set of PDU types, and the exact declared
+# length each fixed-size control PDU must carry once no A-ASSOCIATE has been
+# negotiated. A peer that names type 0x09 or 0xFF is not speaking DICOM; a peer
+# that names A-RELEASE-RQ with a 4 GiB body is not speaking it either.
+#
+# The ceiling in `pdu_exceeds_maximum` covers only P-DATA-TF (PS3.8 9.3.2.2 is
+# explicit that the maximum length received governs the P-DATA-TF variable
+# field), so every other type reached `self.socket.recv(declared)` with an
+# unbounded allocation - a six-byte header was enough to make the bridge
+# allocate and read whatever the peer declared. A-ASSOCIATE-RQ/RJ/AC are the
+# variable-size exceptions and keep a generous but finite cap of their own.
+_KNOWN_PDU_TYPES = frozenset(
+    {
+        0x01,  # A-ASSOCIATE-RQ
+        0x02,  # A-ASSOCIATE-AC
+        0x03,  # A-ASSOCIATE-RJ
+        0x04,  # P-DATA-TF
+        0x05,  # A-RELEASE-RQ
+        0x06,  # A-RELEASE-RP
+        0x07,  # A-ABORT
+    }
+)
+
+# Declared body length of each fixed-size control PDU (PS3.8 9.3.1 Table 9-1
+# and the individual section definitions). A mismatch is a framing error, so
+# the body is never read.
+_FIXED_PDU_BODY_LEN = {
+    0x03: 4,  # A-ASSOCIATE-RJ: reserved(1) + reserved/result/source/reason(3)
+    0x05: 4,  # A-RELEASE-RQ: reserved(4)
+    0x06: 4,  # A-RELEASE-RP: reserved(4)
+    0x07: 4,  # A-ABORT: reserved(2) + reserved/source/reason(2)
+}
+
+# Upper bound for the three A-ASSOCIATE PDUs, which are variable-size by design
+# and legitimately exceed the default P-DATA maximum before anything has been
+# negotiated. 1 MiB is far above any real association item set (a maximal
+# implementation class UID list plus every declared context is tens of KiB) and
+# far below the ~4 GiB a bare length field can announce.
+_ASSOCIATE_PDU_MAX_BODY = 1024 * 1024
+
+def declared_pdu_length(header):
+    """The 32-bit length field of a PDU header, or None when unreadable.
+
+    PS3.8 9.3.1: bytes 0-1 are the PDU type and reserved field, bytes 2-5 the
+    big-endian length of everything that follows. Fewer than six bytes means
+    the caller has not received a header yet, which is not this check's
+    business - None says "cannot judge", never "fits".
+    """
+    if header is None or len(header) < PDU_HEADER_LEN:
+        return None
+    return int.from_bytes(header[PDU_LEN_OFFSET:PDU_HEADER_LEN], "big")
+
+def pdu_type_of(header):
+    """The PDU type byte of a header, or None when unreadable."""
+    if header is None or len(header) < 1:
+        return None
+    return header[0]
+
+def header_rejection_reason(header):
+    """Why this header must not be followed by a body read, or '' when it may.
+
+    Pynetdicom's own reader rejects an unrecognised PDU type from the HEADER
+    (dul.py, before any body read). `GuardedDUL` skipped that check whenever
+    the P-DATA ceiling did not apply - which is exactly the case for every type
+    that is not P-DATA-TF - so a type it would have refused reached
+    `socket.recv(declared)` and the body was accumulated before decode could
+    object.
+
+    This restores the early type check AND bounds the types whose length is
+    fixed or merely generous, so an unrecognised type and an oversized control
+    PDU are both refused from six bytes instead of after the allocation.
+    """
+    if header is None or len(header) < PDU_HEADER_LEN:
+        return ""
+    pdu_type = header[0]
+    if pdu_type not in _KNOWN_PDU_TYPES:
+        return f"unknown PDU type 0x{pdu_type:02X} (PS3.8 9.3.1 Table 9-1)"
+    length = declared_pdu_length(header)
+    if length is None:
+        return ""
+    fixed = _FIXED_PDU_BODY_LEN.get(pdu_type)
+    if fixed is not None and length != fixed:
+        return (
+            f"PDU type 0x{pdu_type:02X} declares {length} body bytes, "
+            f"the standard fixes {fixed}"
+        )
+    if pdu_type in (0x01, 0x02) and length > _ASSOCIATE_PDU_MAX_BODY:
+        return (
+            f"PDU type 0x{pdu_type:02X} declares {length} body bytes, over "
+            f"the {_ASSOCIATE_PDU_MAX_BODY}-byte association cap"
+        )
+    return ""
+
+def ceiling_applies(pdu_type, maximum):
+    """True when the negotiated maximum governs this PDU.
+
+    Only P-DATA-TF, and only once a maximum has been negotiated. A PDU seen
+    before A-ASSOCIATE-AC has no ceiling to check against (PS3.8 9.3.2.2), and
+    the association request itself is never subject to it.
+    """
+    return pdu_type == P_DATA_TF_TYPE and bool(maximum)
+
+def pdu_exceeds_maximum(assoc, header):
+    """True when the declared PDU length is over the negotiated maximum.
+
+    "Over" is strict: a PDU of exactly the announced maximum is conformant
+    (PS3.8 9.3.2.2 says "maximum length ... that may be received"), and
+    refusing it would break every peer that fills its window exactly.
+    """
+    length = declared_pdu_length(header)
+    if length is None:
+        return False
+    maximum = getattr(getattr(assoc, "acceptor", None), "maximum_length", None)
+    if not ceiling_applies(pdu_type_of(header), maximum):
+        return False
+    return length > maximum
+
+def pdu_ceiling_message(assoc, length):
+    """Operator-facing text for an oversized PDU, or '' when it fits."""
+    maximum = getattr(getattr(assoc, "acceptor", None), "maximum_length", 0) or 0
+    return f"PDU of {length} bytes exceeds the negotiated maximum of {maximum} bytes"
+
+def pdu_length_of(pdu):
+    """The declared length of an already-decoded PDU, or None when unknown.
+
+    `EVT_PDU_RECV` hands over the DECODED PDU, whose `pdu_length` is the same
+    32-bit header field `declared_pdu_length` reads off the wire - one fact,
+    two carriers. A PDU class without that attribute is not judged (None),
+    never assumed to fit.
+    """
+    length = getattr(pdu, "pdu_length", None)
+    if length is None:
+        return None
+    try:
+        return int(length)
+    except (TypeError, ValueError):
+        return None
+
+def pdu_exceeds(pdu, maximum):
+    """True when the decoded PDU is longer than the negotiated maximum.
+
+    The dispatch-level twin of `pdu_exceeds_maximum`: same rule, applied to an
+    object that has already been read. Kept because a PDU can also reach the
+    reactor through the requestor path, where this module does not install a
+    guarded provider.
+    """
+    length = pdu_length_of(pdu)
+    if length is None:
+        return False
+    return ceiling_applies(getattr(pdu, "pdu_type", None), maximum) and (
+        length > maximum
+    )
+
+class GuardedDUL(DULServiceProvider):
+    """A DUL provider that refuses an oversized P-DATA-TF BEFORE reading it.
+
+    `_read_pdu_data` is the only function that turns wire bytes into a DIMSE
+    message, so overriding it is the one place the ceiling can bound receive
+    work rather than merely reject the result. Everything else - the state
+    machine, the queues, the timers - is pynetdicom's own, inherited.
+
+    On a breach the provider sends an A-ABORT and queues NOTHING: no `Evt10`,
+    no PDU on `_recv_pdu`. The DIMSE layer therefore never sees the frame and
+    no service handler can run for it, which is what makes the refusal
+    effective even for a complete C-STORE-RQ.
+    """
+
+    def __init__(self, assoc, source=None):
+        """Build a guarded provider carrying `source`'s configured timeouts.
+
+        `DULServiceProvider.__init__` starts from the LIBRARY defaults (`idle`
+        60 s, ARTIM 30 s) and expects the owner to overwrite them afterwards.
+        Pynetdicom does that on the provider it creates itself, but this
+        replacement is constructed later, from `install_guarded_dul` - after
+        the association already applied the configured ACSE and network
+        timeouts to the ORIGINAL provider. A fresh provider therefore silently
+        reverted a configured five-second idle timeout to sixty, and the
+        association then checked the new idle timer.
+
+        `source` is that original provider; its timer values are copied so the
+        replacement is a drop-in for it in every respect except the read.
+        """
+        super().__init__(assoc)
+        if source is None:
+            return
+        try:
+            self._idle_timer = source._idle_timer
+        except AttributeError:
+            pass
+        try:
+            self.artim_timer = source.artim_timer
+        except AttributeError:
+            pass
+
+    def _read_pdu_data(self):
+        bytestream = bytearray()
+        try:
+            bytestream.extend(self.socket.recv(PDU_HEADER_LEN))
+        except (OSError, TimeoutError):
+            # Same classification pynetdicom uses: connection closed.
+            self.event_queue.put("Evt17")
+            return
+
+        if pdu_exceeds_maximum(self.assoc, bytestream):
+            length = declared_pdu_length(bytestream)
+            logging.error(
+                "[DIMSE] Refusing association: %s",
+                pdu_ceiling_message(self.assoc, length),
+            )
+            # Refuse without reading the declared body: this is the whole
+            # point of the subclass. The abort must NOT block here: we are
+            # running ON the DUL thread, and `Association._abort_blocking`
+            # with block=True calls `self.kill()` and waits for the state
+            # machine to go idle - which can only happen on the thread that is
+            # now waiting, i.e. a deadlock. The A-ABORT itself is already
+            # queued by `acse.send_abort` before that point, so the peer is
+            # told either way.
+            self.assoc.abort(block=False)
+            return
+
+        declared = declared_pdu_length(bytestream)
+        if declared is None:
+            # Fewer than six bytes arrived: the peer closed mid-header.
+            self.event_queue.put("Evt17")
+            return
+        # Refuse an unusable header BEFORE its body is read. The negotiated
+        # ceiling above only governs P-DATA-TF, so every other type used to
+        # reach `recv(declared)` with an unbounded allocation: six bytes from
+        # the peer decided how much the bridge would read into memory.
+        rejection = header_rejection_reason(bytestream)
+        if rejection:
+            logging.error("[DIMSE] Refusing association: %s", rejection)
+            self.assoc.abort(block=False)
+            return
+        try:
+            bytestream += self.socket.recv(declared)
+        except (OSError, TimeoutError):
+            self.event_queue.put("Evt17")
+            return
+        if len(bytestream) != PDU_HEADER_LEN + declared:
+            self.event_queue.put("Evt17")
+            return
+
+        try:
+            pdu, event = self._decode_pdu(bytestream)
+            self.event_queue.put(event)
+        except Exception:
+            logging.exception("[DIMSE] Unable to decode the received PDU data")
+            self.event_queue.put("Evt19")
+            return
+        self._recv_pdu.put(pdu)
+
+def install_guarded_dul(event):
+    """EVT_CONN_OPEN handler: swap in `GuardedDUL` before the DUL thread runs.
+
+    `RequestHandler.handle` (transport.py:718-723) fires EVT_CONN_OPEN and only
+    then calls `assoc.start()`, which is what starts the DUL thread, so the
+    replacement here is in place before a single byte is read.
+
+    The original provider's queues and socket are SHARED, not copied:
+    `AssociationSocket.__init__` has already put the acceptor's `Evt5` (the
+    transport-connection indication that drives the state machine from Sta1 to
+    Sta2, transport.py:353) on the existing event queue, and the send path uses
+    `assoc.dul.to_provider_queue`. A fresh set of queues would strand that
+    priming and the association would never establish.
+    """
+    assoc = event.assoc
+    current = getattr(assoc, "dul", None)
+    if current is None or isinstance(current, GuardedDUL):
+        return
+    if getattr(assoc, "_started_dul", False):
+        # Already running: swapping the provider under a live thread would
+        # lose whatever it is holding. Nothing to do, and nothing unsafe.
+        return
+    guarded = GuardedDUL(assoc, source=current)
+    guarded.socket = current.socket
+    guarded.event_queue = current.event_queue
+    guarded.to_user_queue = current.to_user_queue
+    guarded.to_provider_queue = current.to_provider_queue
+    guarded._recv_pdu = current._recv_pdu
+    assoc.dul = guarded
+
+def make_pdu_ceiling_handler():
+    """Build the EVT_PDU_RECV handler: the dispatch-level second line.
+
+    The receive-side bound is `GuardedDUL`. This handler stays because a PDU
+    can also reach the reactor through a path where no guarded provider was
+    installed (the requestor side, or a future pynetdicom that starts the DUL
+    before EVT_CONN_OPEN). It is a backstop, not the primary bound.
+    """
+
+    def on_pdu_recv(event):
+        assoc = event.assoc
+        maximum = getattr(getattr(assoc, "acceptor", None), "maximum_length", 0)
+        if not pdu_exceeds(event.pdu, maximum):
+            return
+        length = pdu_length_of(event.pdu)
+        logging.error(
+            "[DIMSE] Refusing association: %s", pdu_ceiling_message(assoc, length)
+        )
+        assoc.abort(block=False)
+
+    return on_pdu_recv
+
+# ---------------------------------------------------------------------------
+# T3: calling-AE allowlist
+# ---------------------------------------------------------------------------
+def normalise_ae_title(value):
+    """An AE title reduced to what the DICOM rules compare.
+
+    PS3.5 6.2: an AE title is leading- and trailing-space padded to 16
+    characters, so `" CT_ROOM "` and `"CT_ROOM"` name the same AE. The
+    comparison is also case-insensitive (AE titles are not case-sensitive in
+    the field, and a modality that announces `ct_room` must not be locked out
+    by a config line that spells it in upper case).
+    """
+    return str(value or "").strip().upper()
+
+def calling_ae_allowed(calling_aet, allowed_titles):
+    """True when `calling_aet` is on the allowlist (case/space insensitive).
+
+    An EMPTY allowlist means "no filter", which is what a deployment that
+    turned the knob off wants - and is also the pynetdicom default for
+    `require_calling_aet`. A CALLING side that announces an empty AE title is
+    never on the list: it names nobody, and accepting it would let any peer
+    bypass the check by sending blanks.
+    """
+    allowed = {normalise_ae_title(t) for t in (allowed_titles or ())}
+    if not allowed:
+        return True
+    requested = normalise_ae_title(calling_aet)
+    return bool(requested) and requested in allowed
+
+def unknown_calling_ae_message(calling_aet, peer_address):
+    """The operator warning for a refused association.
+
+    Mirrors the unknown Move Destination report in move_jobs.lookup_scp: name
+    what was seen, name where it came from, and name the fix. The source PORT
+    is deliberately absent - it is ephemeral, whereas the AE title is the
+    stable thing the operator can write down.
+    """
+    where = peer_address or "unknown address"
+    return (
+        f"unknown calling AE '{calling_aet or '(empty)'}' from {where} - "
+        "add it to peers.conf"
+    )
+
+def log_unknown_calling_ae(calling_aet, peer_address):
+    """Emit the allowlist warning. Returns the message for the caller/log."""
+    message = unknown_calling_ae_message(calling_aet, peer_address)
+    logging.warning("[PEER] %s", message)
+    return message
+
+def make_calling_ae_guard(allowed_titles):
+    """Build the EVT_REQUESTED handler: one comparison, one decision.
+
+    The problem this solves: pynetdicom's `require_calling_aet` is a good
+    REFUSAL (it answers with a real A-ASSOCIATE-RJ through its own state
+    machine, fsm.AE_8) but a bad COMPARISON - `acse._negotiate_as_acceptor`
+    (acse.py:330-334) strips the configured titles and then does a plain `in`
+    against the received one, which is case-SENSITIVE. A peer announcing
+    `ct_room` against a config line `CT_ROOM` was therefore refused while a
+    case-insensitive warning saw it as known and stayed silent: a refusal with
+    no log line.
+
+    The fix keeps pynetdicom's refusal and normalises what it compares.
+    EVT_REQUESTED fires (association.py:667) with the A-ASSOCIATE-RQ in hand
+    and BEFORE `acse.negotiate_association` runs (:671), so folding the
+    received title here means the comparison at acse.py:333 sees the same
+    spelling the allowlist uses. The allowlist is folded the same way in
+    `_load_calling_ae_allowlist`, so both sides are canonical and one rule
+    decides both the warning and the rejection.
+
+    Sending our own RJ from this handler does NOT work: `acse.send_reject`
+    only queues a primitive on the DUL (`send_pdu` puts it on
+    `to_provider_queue`), and the reactor that would transmit it is torn down
+    by the `is_rejected` check at association.py:670 before it can be sent -
+    the peer sees a closed connection, not an RJ. The state machine's own
+    path is the one that actually puts bytes on the wire.
+    """
+    allowed = tuple(allowed_titles or ())
+
+    def on_assoc_requested(event):
+        if not allowed:
+            return
+        assoc = event.assoc
+        requestor = getattr(assoc, "requestor", None)
+        primitive = getattr(requestor, "primitive", None)
+        if primitive is None:
+            return
+        incoming = getattr(primitive, "calling_ae_title", None)
+        if not calling_ae_allowed(incoming, allowed):
+            # Warn for exactly the peer the negotiation is about to refuse.
+            address = getattr(requestor, "address", None) if requestor else None
+            log_unknown_calling_ae(incoming, address)
+            return
+        # Canonicalise in place so pynetdicom's case-sensitive compare at
+        # acse.py:333 agrees with `calling_ae_allowed` above.
+        folded = normalise_ae_title(incoming)
+        if folded and folded != incoming:
+            primitive.calling_ae_title = folded
+
+    return on_assoc_requested
 
 # ---------------------------------------------------------------------------
 # Bridge: metrics
@@ -487,6 +1024,16 @@ cstore_outbound_duration = _h(
     "Outbound C-STORE round-trip latency (request -> C-STORE-RSP)",
     ["peer"],
     buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
+)
+
+# Instances the peer accepted with a Warning status (PS3.4 B.2.3.1). Counted
+# apart from the delivered total because a warning means the SCP coerced
+# something to store it: the instance IS there, but the modality's copy and the
+# stored copy differ, which is worth seeing before a viewer reads it.
+cstore_warnings = _c(
+    "clarus_bridge_cstore_warnings_total",
+    "Outbound C-STORE responses with a Warning status (accepted, elements coerced)",
+    ["peer"],
 )
 
 # ---------------------------------------------------------------------------
@@ -735,22 +1282,50 @@ NON_IMAGE_TS = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
 # accepted, released with no C-STORE; a probe against a live peer proved the
 # rejects). The SCP side has NO fallback mechanism - a rejected context is a
 # failed export. The bridge never decodes incoming pixels (store bytes ->
-# STOW), so the incoming list mirrors exactly what the server can ingest:
-# the transcode announceable set plus the two native uncompressed TS. The
-# SCU proposal keeps its narrower list above.
+# STOW), so this list mirrors what the SERVER CAN INGEST AS-IS, and nothing
+# else. It is deliberately BROADER than the transcode announceable set
+# (IMAGE_TS): the negotiation decides what a sender may use, and a syntax the
+# server accepts is a context the bridge must not refuse.
+#
+# The wider entries are not a claim that every one of them is common. They
+# close the "sender offers only this" case, which used to be a silent failed
+# export:
+#   - HTJ2K (4.201/.202/.203) and JPEG 2000 Part 2 (4.92/.93): the server
+#     writes header attributes into these instances and decodes them, so the
+#     bridge would be refusing bytes its own archive handles.
+#   - MPEG family (4.100-.105): the server does not decode video, exactly
+#     like 4.51 today - stored and served raw, which is what a sender holding
+#     a video object needs. This mirrors the "store+serve raw" case, not a
+#     claim of analysis support.
+#
 # Order: uncompressed first - acceptor-driven negotiation picks the first
-# supported match when a sender offers several TS per context.
+# supported match when a sender offers several TS per context - and the
+# appended syntaxes keep their ascending UID order after the existing set.
 # ---------------------------------------------------------------------------
 IMAGE_TS_INCOMING = [
     ExplicitVRLittleEndian,  # native
     ImplicitVRLittleEndian,  # native
     JPEGLS_LOSSLESS_TS,  # 4.80 JPEG-LS Lossless (server CAPS)
     "1.2.840.10008.1.2.4.70",  # 4.70 JPEG Lossless SV1 (server CAPS)
+    "1.2.840.10008.1.2.4.57",  # 4.57 JPEG Lossless P14 (server CAPS: JpegLosslessCodec)
     "1.2.840.10008.1.2.4.50",  # 4.50 JPEG Baseline (server CAPS; field US scanner)
+    "1.2.840.10008.1.2.4.51",  # 4.51 JPEG Extended (server parses; store+serve raw, no transcode)
     RLELossless,  # 4.1.2.5 RLE (server CAPS; field US)
     "1.2.840.10008.1.2.4.81",  # 4.81 JPEG-LS Near-Lossless (server CAPS)
     "1.2.840.10008.1.2.4.90",  # 4.90 JPEG 2000 Lossless (server CAPS)
     "1.2.840.10008.1.2.4.91",  # 4.91 JPEG 2000 (server CAPS)
+    # Appended 21.11 - see the "what the server can ingest as-is" note above.
+    "1.2.840.10008.1.2.4.92",  # 4.92 JPEG 2000 Part 2 Multi-component Lossless
+    "1.2.840.10008.1.2.4.93",  # 4.93 JPEG 2000 Part 2 Multi-component
+    "1.2.840.10008.1.2.4.100",  # 4.100 MPEG2 Main Profile / Main Level
+    "1.2.840.10008.1.2.4.101",  # 4.101 MPEG2 Main Profile / High Level
+    "1.2.840.10008.1.2.4.102",  # 4.102 MPEG-4 AVC/H.264 High Profile / Level 4.1
+    "1.2.840.10008.1.2.4.103",  # 4.103 MPEG-4 AVC/H.264 BD-compatible High / Level 4.1
+    "1.2.840.10008.1.2.4.104",  # 4.104 MPEG-4 AVC/H.264 High / Level 4.2 For 2D
+    "1.2.840.10008.1.2.4.105",  # 4.105 MPEG-4 AVC/H.264 High / Level 4.2 For 3D
+    "1.2.840.10008.1.2.4.201",  # 4.201 HTJ2K Lossless (server decodes)
+    "1.2.840.10008.1.2.4.202",  # 4.202 HTJ2K Lossless RPCL (server decodes)
+    "1.2.840.10008.1.2.4.203",  # 4.203 HTJ2K Lossy (server decodes)
 ]
 
 # ---------------------------------------------------------------------------
@@ -816,6 +1391,9 @@ QIDO_KEY_TO_TAG = {
     "00100040": (0x0010, 0x0040, "CS", "PatientSex"),
     "0020000D": (0x0020, 0x000D, "UI", "StudyInstanceUID"),
     "00200010": (0x0020, 0x0010, "SH", "StudyID"),
+    "00201200": (0x0020, 0x1200, "IS", "NumberOfPatientRelatedStudies"),
+    "00201202": (0x0020, 0x1202, "IS", "NumberOfPatientRelatedSeries"),
+    "00201204": (0x0020, 0x1204, "IS", "NumberOfPatientRelatedInstances"),
     "00201206": (0x0020, 0x1206, "IS", "NumberOfStudyRelatedSeries"),
     "00201208": (0x0020, 0x1208, "IS", "NumberOfStudyRelatedInstances"),
 }
@@ -830,6 +1408,18 @@ _SERIES_ONLY_QIDO_PARAMS = frozenset(
         "SeriesDate",
         "SeriesTime",
         "SeriesDescription",
+    }
+)
+
+# C-FIND COMPOSITE OBJECT INSTANCE (IMAGE) level: the query keys the server
+# accepts ONLY on its instance routes. `/studies/{s}/series/{se}` answers a
+# request carrying any of them with 400 ("unsupported search keys"), so they
+# must not travel with the series hop of an IMAGE-level walk.
+_INSTANCE_ONLY_QIDO_PARAMS = frozenset(
+    {
+        "SOPInstanceUID",
+        "SOPClassUID",
+        "InstanceNumber",
     }
 )
 
@@ -873,6 +1463,31 @@ _STUDY_IDENTITY_ATTRS = {
     "StudyInstanceUID": (0x0020, 0x000D),
 }
 
+# COMPOSITE OBJECT INSTANCE (IMAGE) level, PS3.4 Table C.6-4
+# (standard/ps3.4/image-level-C.6-4.json): Instance Number (0020,0013) is the
+# level's Required key, SOP Instance UID (0008,0018) its Unique key, SOP Class
+# UID (0008,0016) optional. The server's instance render carries exactly these
+# three plus the Study/Series UIDs it injects from context and
+# InstanceAvailability/RetrieveURL, so the map below needs no tag knowledge
+# the series map does not already have.
+QIDO_INSTANCE_KEY_TO_TAG = {
+    "00080016": (0x0008, 0x0016, "UI", "SOPClassUID"),
+    "00080018": (0x0008, 0x0018, "UI", "SOPInstanceUID"),
+    "00200013": (0x0020, 0x0013, "IS", "InstanceNumber"),
+}
+
+# Attributes stored in the series record that an IMAGE row carries as well:
+# PS3.4 Table C.6-4 leaves the other Series IE keys optional at this level, and
+# a viewer that walked STUDY -> SERIES -> IMAGE expects the series context on
+# the instance row. Only keys the server's series render supplies are listed.
+_INSTANCE_SERIES_CONTEXT = frozenset(
+    {
+        "00080060",  # Modality
+        "0008103E",  # SeriesDescription
+        "00200011",  # SeriesNumber
+    }
+)
+
 # C-FIND keyword -> QIDO query parameter.
 #
 # PS3.4 Study Root (C.6.2.1.2) REQUIRED matching keys: StudyDate, StudyTime,
@@ -903,6 +1518,12 @@ C_FIND_TO_QIDO = {
     "SeriesTime": "SeriesTime",
     "SeriesDescription": "SeriesDescription",
     "SOPInstanceUID": "SOPInstanceUID",
+    # PS3.4 Table C.6-4: the Composite Object Instance level's matching keys.
+    # SOPClassUID is optional there and InstanceNumber is its Required key, so
+    # an IMAGE-level request that names them must reach the server as a filter
+    # rather than be dropped (= match all).
+    "SOPClassUID": "SOPClassUID",
+    "InstanceNumber": "InstanceNumber",
 }
 
 def _extract_request_keywords(ds):
@@ -1011,6 +1632,39 @@ def _split_qido_params(ds):
             study_params[key] = val
     return study_params, series_params
 
+def _split_instance_qido_params(ds):
+    """Split an IMAGE-level C-FIND identifier into study/series/instance params.
+
+    Returns `(study_params, series_params, instance_params)` for the three QIDO
+    hops of an IMAGE-level query (PS3.4 C.4.1.3.1.1: match down the hierarchy
+    from the top level to the level named by QueryRetrieveLevel).
+
+    Three keys need care because the server scopes them to particular routes
+    (qido_pure.rs `parse_and_validate`):
+
+    - `Modality` is legal at the instance route but is a SERIES key in this
+      query (a C-FIND IMAGE request states it to narrow the walk, and the
+      series step applies it), so it stays on the series hop.
+    - `SeriesInstanceUID` is a series key everywhere except the instance
+      route, where it is foreign; it narrows the series hop and the instance
+      rows are already scoped to that one series.
+    - `SOPInstanceUID`, `SOPClassUID` and `InstanceNumber` are instance keys
+      the series route rejects with 400, so they never travel with the series
+      parameters.
+    """
+    all_params = _build_qido_params(ds)
+    study_params = {}
+    series_params = {}
+    instance_params = {}
+    for key, val in all_params.items():
+        if key in _INSTANCE_ONLY_QIDO_PARAMS:
+            instance_params[key] = val
+        elif key in _SERIES_ONLY_QIDO_PARAMS or key == "Modality":
+            series_params[key] = val
+        else:
+            study_params[key] = val
+    return study_params, series_params, instance_params
+
 # MWL (Modality Worklist) <-> UPS-RS workitem DICOMweb JSON keys.
 #
 # PS3.4 2026d Table K.6-1: the Modality Worklist Information Model is a FLAT,
@@ -1107,6 +1761,285 @@ MWL_TO_UPS_PARAM = {
     "ScheduledProcedureStepStartDate": "00404005",
 }
 
+# PS3.4 Table K.6-1 (standard/ps3.4/mwl-k.6-1-matching-keys.json) makes
+# Scheduled Procedure Step Start Time (0040,0003) a REQUIRED matching key of
+# the SPS item, with the rule "Single Value or Range". Omitting it turned a
+# 09:00-10:00 query into "match all": the bridge returned a 14:00 workitem
+# alongside the 09:30 one. It has no separate UPS parameter - the origin filters
+# on the combined workitem start instant (0040,4005) - so the time is folded
+# into that value together with the date.
+MWL_START_TIME_KEYWORD = "ScheduledProcedureStepStartTime"
+
+# PS3.4 Table K.6-1 lists Scheduled Performing Physician's Name (0040,0006) as
+# a matching key with the rule "Single Value or Wildcard". The UPS-RS workitem
+# search exposes no parameter for it, so it cannot be pushed to the origin -
+# but dropping it made the request match ALL workitems and a Jones procedure
+# came back for a `Smith*` query. It is carried here and applied as a local
+# wildcard filter over the response rows.
+MWL_PHYSICIAN_KEYWORD = "ScheduledPerformingPhysicianName"
+
+def _mwl_physician_matchers(ds):
+    """The Scheduled Performing Physician patterns the request asked for.
+
+    PS3.4 Table K.6-1 gives (0040,0006) the rule "Single Value or Wildcard",
+    where the wildcard is `*` (PS3.4 C.2.2.2.4) and `?` matches one character.
+    Each value is compiled once here, as a case-insensitive full match, and
+    shared by every candidate row.
+
+    Returns an empty tuple when the request states no physician, so the caller
+    skips the filter entirely.
+    """
+    import re as _re
+
+    patterns = []
+    for elem in _iter_mwl_request_elements(ds):
+        if elem.keyword != MWL_PHYSICIAN_KEYWORD:
+            continue
+        if elem.value is None:
+            continue
+        raw_values = (
+            elem.value
+            if isinstance(elem.value, (list, tuple, MultiValue))
+            else [elem.value]
+        )
+        for raw in raw_values:
+            pattern = str(raw or "").strip()
+            if not pattern:
+                continue
+            # `*` is any run and `?` exactly one character (PS3.4 C.2.2.2.4).
+            # Everything else is literal, so the value is quoted and only the
+            # two wildcard characters are translated - a name containing a
+            # regex metacharacter must not become a pattern.
+            translated = "".join(
+                ".*" if ch == "*" else "." if ch == "?" else _re.escape(ch)
+                for ch in pattern
+            )
+            try:
+                patterns.append(_re.compile(rf"\A{translated}\Z", _re.IGNORECASE))
+            except _re.error:
+                # An unparseable pattern cannot be honoured; keeping it would
+                # reject every row for a request the origin already answered.
+                continue
+    return tuple(patterns)
+
+def _mwl_physician_matches(stored, matchers):
+    """Whether a stored physician name satisfies at least one request pattern.
+
+    A row that carries no physician is KEPT: Type 2 permits an absent value,
+    and absence is not proof that the name differs from the query. A request
+    that states no physician (no matchers) keeps everything.
+    """
+    if not matchers:
+        return True
+    text = str(stored or "").strip()
+    if not text:
+        return True
+    return any(m.match(text) for m in matchers)
+
+def _mwl_start_datetime_bounds(ds):
+    """The SPS start DATE+TIME window the request asks for, or None.
+
+    PS3.4 Table K.6-1 defines (0040,0002) Start Date and (0040,0003) Start
+    Time as separate matching keys, but they describe ONE interval: July 5-7
+    at 10:00-18:00 includes a July 6 workitem at 22:00, because the time-of-day
+    window applies inside the date range, not on top of it. Filtering each key
+    independently dropped that workitem - the date query fetched it, then the
+    time-of-day filter discarded it because 22:00 is outside 10:00-18:00.
+
+    The combined window is expressed as an inclusive (low_dt, high_dt) pair of
+    YYYYMMDDHHMMSS strings so a stored (0040,4005) instant compares by plain
+    string ordering. A blank bound means unbounded on that side.
+
+    Returns None when the request states no date/time window at all, so the
+    caller skips local filtering entirely.
+    """
+    date_bounds = None
+    time_bounds = None
+    for elem in _iter_mwl_request_elements(ds):
+        if elem.keyword == "ScheduledProcedureStepStartDate" and date_bounds is None:
+            date_bounds = _mwl_date_bounds(elem.value)
+        elif elem.keyword == MWL_START_TIME_KEYWORD and time_bounds is None:
+            time_bounds = _mwl_time_bounds(elem.value)
+    if date_bounds is None and time_bounds is None:
+        return None
+
+    d_lo, d_hi = date_bounds if date_bounds is not None else ("", "")
+    t_lo, t_hi = time_bounds if time_bounds is not None else ("", "")
+
+    if not d_lo and not d_hi:
+        # TIME-ONLY request: the modality asked for a time of day on any
+        # date, so only the HHMMSS component is comparable. Returning
+        # date-prefixed bounds here would compare "2026..." against a bare
+        # "090000" and reject every row.
+        return ("T", t_lo, t_hi)
+
+    # Each side is built from the SAME kind of bound: a single date with a
+    # A date range with a time range is "EACH DAY in the range, WITHIN those
+    # hours" - not one continuous span from the first evening to the last.
+    # Concatenating the bounds (20260705210000..20260707230000) made a July 6
+    # workitem at 10:00 match a 21:00-23:00 request, because 10:00 on July 6
+    # lies between the two endpoints. The window is therefore carried as
+    # three parts: the date span, and the time-of-day span applied inside it.
+    if t_lo or t_hi:
+        return ("DR", d_lo, d_hi, t_lo, t_hi)
+    # Date only: the whole day, every day in the range.
+    return ("D", d_lo, d_hi, "", "")
+
+def _mwl_datetime_in_bounds(stored, bounds):
+    """Whether a stored (0040,4005) instant lies inside a combined window.
+
+    PS3.4 Table K.6-1 defines (0040,0002) Start Date and (0040,0003) Start
+    Time as ONE interval: the date range selects the days, and the time range
+    selects the hours WITHIN each of those days. July 5-7 at 21:00-23:00
+    therefore includes a July 6 workitem at 22:00 and excludes one at 10:00,
+    whereas comparing a single concatenated span accepted both.
+
+    A TIME-ONLY request compares the HHMMSS component alone, because its
+    bounds carry no date. A row without the attribute is kept: absence is not
+    a proven mismatch.
+    """
+    if bounds is None:
+        return True
+    text = str(stored or "").strip()
+    if len(text) < 8:
+        return True
+    # Pad the stored instant to the compared precision; a date-only stored
+    # value compares as the start of that day.
+    stamp = (text + "00000000000000")[:14]
+    kind = bounds[0]
+    if kind == "T":
+        _, low, high = bounds
+        hhmmss = stamp[8:14]
+        if low and hhmmss < low:
+            return False
+        if high and hhmmss > high:
+            return False
+        return True
+    _, d_lo, d_hi, t_lo, t_hi = bounds
+    day = stamp[:8]
+    # The DAY must be in the requested date range ...
+    if d_lo and day < d_lo:
+        return False
+    if d_hi and day > d_hi:
+        return False
+    # ... and the TIME OF DAY inside that day must be in the time range.
+    hhmmss = stamp[8:14]
+    if t_lo and hhmmss < t_lo:
+        return False
+    if t_hi and hhmmss > t_hi:
+        return False
+    return True
+
+def _mwl_time_bounds(value):
+    """A (0040,0003) TM match value as an inclusive ``(low, high)`` HHMMSS pair.
+
+    PS3.5 6.2 allows the short forms ``HH``, ``HHMM`` and ``HHMMSS``, and PS3.4
+    Table K.6-1 gives this key the rule "Single Value or Range". Both are
+    normalised to the six-digit form so a comparison against a stored time is
+    plain string ordering:
+
+      - ``0900``          -> ('090000', '090000')
+      - ``090000-100000`` -> ('090000', '100000')
+      - ``-100000``       -> ('', '100000')   (unbounded below)
+
+    Returns None when the value cannot be read, so the caller can decide
+    without guessing.
+    """
+
+    def _hm(part):
+        part = part.strip()
+        if not part:
+            return None
+        # PS3.5 6.2: TM is HH, HHMM or HHMMSS, each optionally followed by
+        # `.FFFFFF` fractional seconds. The fraction was rejected outright,
+        # so `093000.25-093000.75` - a legal range - yielded no bounds at all
+        # and the request ran WITHOUT a time filter, returning a 14:00
+        # workitem for a 09:30 request. The fraction is kept as its own
+        # six-digit string so the comparison stays plain string ordering
+        # against a stored instant that carries the same precision.
+        #
+        # The dot is split off FIRST: testing the whole component with
+        # `isdigit()` rejected every fractional value before the split could
+        # happen, which is the defect this branch exists to fix.
+        whole, _, frac = part.partition(".")
+        if not whole.isdigit() or len(whole) not in (2, 4, 6):
+            return None
+        if frac and not frac.isdigit():
+            return None
+        return (whole + "000000")[:6]
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "-" in text:
+        low, _, high = text.partition("-")
+        lo, hi = _hm(low), _hm(high)
+        if lo is None and hi is None:
+            return None
+        return (lo or "", hi or "")
+    single = _hm(text)
+    if single is None:
+        return None
+    return (single, single)
+
+def _mwl_date_bounds(value):
+    """A (0040,0002) DA match value as an inclusive ``(low, high)`` YYYYMMDD pair.
+
+    PS3.4 Table K.6-1 gives the key the rule "Single Value or Range", and
+    PS3.5 6.2 allows the ``YYYY.MM.DD`` form. Both are normalised to the
+    eight-digit dotted-free form so a comparison against a stored date is plain
+    string ordering:
+
+      - ``20260706``              -> ('20260706', '20260706')
+      - ``20260705-20260707``     -> ('20260705', '20260707')
+      - ``-20260707``             -> ('', '20260707')   (unbounded below)
+
+    Returns None when the value cannot be read, so the caller decides without
+    guessing.
+    """
+
+    def _day(part):
+        part = part.strip().replace(".", "")
+        if not part or not part.isdigit() or len(part) != 8:
+            return None
+        return part
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "-" in text:
+        low, _, high = text.partition("-")
+        lo, hi = _day(low), _day(high)
+        if lo is None and hi is None:
+            return None
+        return (lo or "", hi or "")
+    single = _day(text)
+    if single is None:
+        return None
+    return (single, single)
+
+def _mwl_time_in_bounds(stored, bounds):
+    """Whether a stored (0040,4005) instant satisfies an SPS start-time range.
+
+    The origin filters on the full instant; the modality expressed an interest
+    in a TIME OF DAY. This applies that part of the matching locally, before
+    the response limit, so a workitem outside the requested window never
+    consumes a Pending response.
+    """
+    if bounds is None:
+        return True
+    low, high = bounds
+    text = str(stored or "").strip()
+    if len(text) < 8:
+        return True
+    # (0040,4005) DT: YYYYMMDDHHMMSS...; the time component starts at index 8.
+    hhmmss = (text[8:14] + "000000")[:6]
+    if low and hhmmss < low:
+        return False
+    if high and hhmmss > high:
+        return False
+    return True
+
 def _mwl_date_to_ups_datetime(value):
     """Map a (0040,0002) DA match value onto the (0040,4005) DT grammar.
 
@@ -1133,14 +2066,43 @@ def _mwl_date_to_ups_datetime(value):
         low, _, high = text.partition("-")
         lo, hi = _day(low), _day(high)
         # Open-ended ranges keep their open end (the server treats an empty
-        # bound as unbounded).
+        # bound as unbounded). The two bounds are built INDEPENDENTLY: emitting
+        # the lower bound as a literal `000000` turned `-20261121` ("everything
+        # up to that day") into `000000-20261121235959`, which silently
+        # narrowed an unbounded window to one starting at midnight - the exact
+        # opposite of what the modality asked.
         if lo is None and hi is None:
             return text
-        return f"{lo or ''}000000-{hi or ''}235959" if (lo or hi) else text
+        lower = f"{lo}000000" if lo else ""
+        # PS3.5 6.2: DT may carry fractional seconds. `{day}235959` is the
+        # INSTANT 23:59:59, so a workitem scheduled at `{day}235959.500` sorts
+        # AFTER it and a single-day query silently omitted the last 999 ms of
+        # the day. The bound is the end of the final second, expressed with the
+        # maximum fraction so every instant inside 23:59:59 compares below it.
+        upper = f"{hi}235959.999999" if hi else ""
+        return f"{lower}-{upper}"
     day = _day(text)
     if day is None:
         return text
-    return f"{day}000000-{day}235959"
+    return f"{day}000000-{day}235959.999999"
+
+def _mwl_start_time_bounds(ds):
+    """The SPS start-time range the request asks for, or None.
+
+    Read from the same two levels `_build_mwl_params` reads: the top level and
+    the single item of (0040,0100). First statement wins, matching that
+    function's rule so the two cannot disagree about which value applies.
+    """
+    for elem in _iter_mwl_request_elements(ds):
+        if elem.keyword != MWL_START_TIME_KEYWORD:
+            continue
+        if elem.value is None:
+            continue
+        bounds = _mwl_time_bounds(elem.value)
+        if bounds is not None:
+            return bounds
+        return None
+    return None
 
 def _build_mwl_params(ds):
     """Build UPS-RS workitems query params from a C-FIND MWL request Dataset.
@@ -1182,6 +2144,31 @@ def _build_mwl_params(ds):
             params[param] = val
     return params
 
+def _json_pn_to_dimse(raw):
+    """A DICOMweb JSON Person Name back to its DIMSE `Alphabetic=Ideographic=Phonetic` form.
+
+    PS3.18 F.2.2 gives each populated component group its OWN property. Reading
+    only `Alphabetic` therefore dropped every non-alphabetic name: a PN whose
+    answer carried only `Ideographic` became the empty string, so the modality
+    received a nameless patient - and a PN with an ideographic part lost it.
+    The three groups are rejoined with the `=` separator in the order the VR
+    defines (PS3.5 6.2), preserving EMPTY leading groups so the modality can
+    still tell which group a value belongs to.
+    """
+    if not isinstance(raw, dict):
+        return str(raw)
+    groups = [
+        str(raw.get("Alphabetic", "") or ""),
+        str(raw.get("Ideographic", "") or ""),
+        str(raw.get("Phonetic", "") or ""),
+    ]
+    # Trailing empty groups are the default and carry no information, so only
+    # the populated span up to the last non-empty group is emitted. An entirely
+    # empty name stays an empty value rather than "==".
+    while groups and not groups[-1]:
+        groups.pop()
+    return "=".join(groups)
+
 def _safe_add_new(ds, group, elem, vr, val):
     """Add element to Dataset; fall back to direct assignment if tag exists (BR-014)."""
     try:
@@ -1217,11 +2204,7 @@ def _json_add_vr(ds, group, elem, vr, raw_value):
         else:
             raw_first = items[0]
             if vr == "PN":
-                # Person Name: prefer the Alphabetic component.
-                if isinstance(raw_first, dict):
-                    val = raw_first.get("Alphabetic", "")
-                else:
-                    val = str(raw_first)
+                val = _json_pn_to_dimse(raw_first)
             elif vr == "IS":
                 val = int(raw_first)
             elif vr == "TM":
@@ -1365,6 +2348,52 @@ def _json_to_dataset_series(json_obj, request_keywords, study_json=None):
             ident_elem = study_ds.get((group, elem))
             if ident_elem is not None:
                 _safe_add_new(ds, group, elem, ident_elem.VR, ident_elem.value)
+    return ds
+
+def _json_to_dataset_instance(
+    json_obj,
+    request_keywords,
+    study_uid,
+    series_uid,
+    study_json=None,
+    series_json=None,
+):
+    """QIDO-RS instance JSON -> an IMAGE-level pydicom Dataset.
+
+    PS3.4 Table C.6-4 / C.4.1.3.1.1 (standard/ps3.4/image-level-C.6-4.json):
+    every response Identifier carries all Unique Keys of the levels above, so
+    StudyInstanceUID and SeriesInstanceUID are injected from the walk's
+    context, and PatientName/PatientID plus the series context (Modality,
+    SeriesNumber, SeriesDescription) from the rows the walk already fetched.
+    The server's instance render carries none of those.
+
+    A row with NO SOPInstanceUID is not an IMAGE-level answer at all - it is
+    the relabelled study/series row the old fall-through produced, which the
+    SCU cannot use. The caller drops such a row before it is yielded; this
+    converter cannot invent the UID.
+    """
+    ds = _json_map_to_dataset(json_obj, QIDO_INSTANCE_KEY_TO_TAG)
+    # A missing UID on either axis would write a zero-length Unique Key, which
+    # a SCU reads as a real (empty) UID: absent is the honest form.
+    if study_uid:
+        _safe_add_new(ds, 0x0020, 0x000D, "UI", study_uid)
+    if series_uid:
+        _safe_add_new(ds, 0x0020, 0x000E, "UI", series_uid)
+    if study_json:
+        study_ds = _json_map_to_dataset(
+            study_json, {k: QIDO_KEY_TO_TAG[k] for k in PATIENT_LEVEL_KEYS}
+        )
+        for group, elem in _STUDY_IDENTITY_ATTRS.values():
+            src = study_ds.get((group, elem))
+            if src is not None:
+                _safe_add_new(ds, group, elem, src.VR, src.value)
+    if series_json:
+        series_ds = _json_map_to_dataset(series_json, QIDO_SERIES_KEY_TO_TAG)
+        for json_key in _INSTANCE_SERIES_CONTEXT:
+            group, elem, _vr, _kw = QIDO_SERIES_KEY_TO_TAG[json_key]
+            src = series_ds.get((group, elem))
+            if src is not None:
+                _safe_add_new(ds, group, elem, src.VR, src.value)
     return ds
 
 def _mwl_tail(value):
@@ -1588,11 +2617,31 @@ def _parse_n_action_rq(event):
     sop_list = []
     ref_seq = getattr(ds, "ReferencedSOPSequence", None)
     if ref_seq:
-        for item in ref_seq:
+        for number, item in enumerate(ref_seq, start=1):
             sop_class = str(getattr(item, "ReferencedSOPClassUID", ""))
             sop_uid = str(getattr(item, "ReferencedSOPInstanceUID", ""))
-            if sop_uid.strip():
-                sop_list.append((sop_class, sop_uid))
+            # PS3.4 J.3.2 makes both UIDs Type 1 in every item: an item that
+            # lacks either one does not identify an instance, so there is
+            # nothing the origin could be asked to commit.
+            #
+            # Silently skipping the item was the worst of the three options:
+            # with only that item present the parser returned an empty list and
+            # `handle_n_action` answered SUCCESS without registering any report,
+            # and in a mixed request the malformed item vanished while the SCU
+            # was told the whole set was accepted. Raising here sends the
+            # request down the existing refusal path, which is honest about a
+            # request the bridge cannot represent.
+            if not sop_class.strip():
+                raise ValueError(
+                    "N-ACTION-RQ: Referenced SOP Sequence item "
+                    f"{number} has no ReferencedSOPClassUID (0008,1150)"
+                )
+            if not sop_uid.strip():
+                raise ValueError(
+                    "N-ACTION-RQ: Referenced SOP Sequence item "
+                    f"{number} has no ReferencedSOPInstanceUID (0008,1155)"
+                )
+            sop_list.append((sop_class, sop_uid))
 
     return tx_uid, sop_list
 
@@ -1638,6 +2687,51 @@ Printer registry for C-PRINT (P22c).
 
 import logging
 
+class RegistryConfigError(RuntimeError):
+    """A custom registry file exists but yields nothing usable.
+
+    Distinct from "no file at all": a missing file is a supported deployment
+    (the built-ins are the documented fallback), while a file the operator
+    wrote and the loader could not use is a configuration error. Startup fails
+    on the latter rather than silently re-enabling what the file disables.
+    """
+
+def _strip_inline_comment(text):
+    """Remove a trailing `#` comment, honouring quoted scalars.
+
+    `name: "Film #2" # lobby` keeps its `#2`: the octothorpe inside a quoted
+    value is data, not the start of a comment. A blind `split("#", 1)` cut it
+    off, so the printer was registered as `Film`.
+
+    An unclosed quote is treated as ordinary text: a malformed line must not
+    swallow the rest of the file.
+    """
+    out = []
+    quote = ""
+    escaped = False
+    for ch in text:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and quote:
+            out.append(ch)
+            escaped = True
+            continue
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out).rstrip()
+
 # ---------------------------------------------------------------------------
 # _parse_simple_yaml  -  minimal YAML subset parser (0 dependencies)
 # ---------------------------------------------------------------------------
@@ -1662,10 +2756,31 @@ def _parse_simple_yaml(path):
             # Count leading spaces for indentation
             indent = len(line) - len(line.lstrip())
 
-            if indent == 0 and stripped.endswith(":"):
-                # Top-level section: "sop_classes:" or "printers:"
-                current_section = stripped[:-1].strip()
-                result[current_section] = {}
+            if indent == 0:
+                # Top-level section: "sop_classes:" or "printers:".
+                #
+                # The comment is stripped BEFORE the `endswith(":")` test, for
+                # the same reason as an entry header: `sop_classes: # local
+                # policy` ends on the comment, so the header was skipped and
+                # every entry below it was dropped on the floor. The loader
+                # then found no registry at all and fell back to the built-ins,
+                # re-enabling a class the operator had switched off.
+                header = _strip_inline_comment(stripped)
+                if header.endswith(":"):
+                    current_section = header[:-1].strip()
+                    result[current_section] = {}
+                    current_uid = None
+                    current_entry = {}
+                else:
+                    # Not a section this parser understands (e.g. `MR: &policy`
+                    # - a key with an anchor, not a section header). Treating
+                    # it as noise and carrying on left the PREVIOUS section and
+                    # entry active, so every field indented below it was written
+                    # onto the previous class: one unsupported line silently
+                    # rewrote its neighbour's `accept`.
+                    current_section = None
+                    current_uid = None
+                    current_entry = {}
             elif indent == 2:
                 # UID/name key: "  1.2.840...:". An inline comment after the
                 # colon ("  1.2.840...:  # MR") is documentation, not part of
@@ -1673,7 +2788,7 @@ def _parse_simple_yaml(path):
                 # the line ends on the comment, the header is skipped and the
                 # NEXT `accept:` line lands on the PREVIOUS UID - re-enabling
                 # a class the operator switched off.
-                header = stripped.split("#", 1)[0].rstrip()
+                header = _strip_inline_comment(stripped)
                 if not header.endswith(":"):
                     continue
                 current_uid = header[:-1].strip().strip("\"'")
@@ -1684,13 +2799,19 @@ def _parse_simple_yaml(path):
                 # Key: value: "    name: CT Image Storage"
                 key, _, value = stripped.partition(":")
                 key = key.strip()
+                if current_uid is None or not current_section:
+                    # Between a skipped header and the next valid one there is
+                    # no owning entry, so this field belongs to nobody. Writing
+                    # it anyway would mutate the last dictionary created - the
+                    # previous class - which is the corruption this parser must
+                    # not commit.
+                    continue
                 # An inline comment is documentation, not part of the value:
                 # `accept: false  # retired vendor` must stay a boolean, and a
-                # quoted value must compare without its quotes. Without the
-                # strip the comparison below sees "false  # retired vendor" and
-                # stores a truthy string, so a class marked as not accepted is
-                # accepted anyway.
-                value = value.split("#", 1)[0].strip().strip("\"'")
+                # quoted value must compare without its quotes. The comment is
+                # stripped OUTSIDE quotes only, so `name: "Film #2" # lobby`
+                # keeps its `#2`.
+                value = _strip_inline_comment(value.strip()).strip().strip("\"'")
                 if value.lower() == "true":
                     current_entry[key] = True
                 elif value.lower() == "false":
@@ -1707,7 +2828,10 @@ def _load_sop_registry(yaml_path="sop_classes.yaml"):
     """Load SOP class registry from YAML file (BR-009: no PyYAML dependency).
 
     Returns dict[uid -> dict] with keys: name, accept.
-    Falls back to built-in defaults if YAML is missing or unparseable.
+    A MISSING file falls back to the built-ins. Any other failure - unreadable,
+    undecodable, a parse error - raises `RegistryConfigError`: those are cases
+    where a file exists and was meant to be honoured, and silently installing
+    the built-ins would re-enable a class that file switches off.
     """
     try:
         data = _parse_simple_yaml(yaml_path)
@@ -1716,10 +2840,15 @@ def _load_sop_registry(yaml_path="sop_classes.yaml"):
         logging.info("[SOP-REG] Using built-in SOP defaults (no custom %s)", yaml_path)
         return _BUILTIN_SOP_CLASSES()
     except Exception as e:
-        logging.info(
-            "[SOP-REG] Using built-in SOP defaults: %s parse error - %s", yaml_path, e
-        )
-        return _BUILTIN_SOP_CLASSES()
+        # Not a missing file: the operator wrote a registry and the bridge
+        # could not read or understand it. Falling back to the built-ins is a
+        # silent change of ADMISSION policy - a class the file disables comes
+        # back enabled - so startup stops and names the fault instead.
+        raise RegistryConfigError(
+            f"{yaml_path}: custom SOP class registry cannot be read ({e}) - "
+            "refusing to fall back to the built-ins, which would re-enable a "
+            "class this file may disable"
+        ) from e
 
     if registry:
         # A file that parses but yields an entry without `accept` means the
@@ -1772,20 +2901,33 @@ def _load_sop_registry(yaml_path="sop_classes.yaml"):
             for uid in mistyped:
                 registry.pop(uid, None)
         if not registry:
-            logging.error(
-                "[SOP-REG] %s yielded no usable SOP class - using built-in defaults",
-                yaml_path,
+            # The file EXISTS and parsed, but nothing in it survived. Falling
+            # back to the built-ins here is the same silent-wrong-answer the
+            # per-entry rules above exist to prevent: an operator who wrote
+            # `accept: false` for the only class they described would get that
+            # class back, accepted, from the built-in table.
+            #
+            # A MISSING file still falls back (the historical, documented
+            # behaviour for a deployment with no custom registry); a present
+            # file that yields nothing is a configuration error, and startup
+            # says so instead of guessing.
+            raise RegistryConfigError(
+                f"{yaml_path}: a custom SOP class registry was found but no "
+                "entry in it is usable (missing or non-boolean `accept`) - "
+                "refusing to fall back to the built-ins, which would re-enable "
+                "a class this file disables"
             )
-            return _BUILTIN_SOP_CLASSES()
         logging.info(
             "[SOP-REG] Loaded %d SOP classes from %s", len(registry), yaml_path
         )
         return registry
 
-    logging.info(
-        "[SOP-REG] %s parsed to zero SOP classes - using built-in defaults", yaml_path
+    # A file that parses to zero entries is also a recognized-but-empty
+    # registry: the operator wrote a file and got nothing applied.
+    raise RegistryConfigError(
+        f"{yaml_path}: a custom SOP class registry was found but describes no "
+        "SOP class - refusing to fall back to the built-in defaults"
     )
-    return _BUILTIN_SOP_CLASSES()
 
 def _BUILTIN_SOP_CLASSES():
     """Return 13 built-in SOP classes  -  always available, no dependencies (CMP-006).
@@ -1907,7 +3049,6 @@ framing. Boundary is used ONLY for verification, not for finding part
 boundaries. This eliminates false boundary matches in binary pixel data.
 """
 
-import logging
 import os
 import tempfile
 from collections import namedtuple
@@ -1932,6 +3073,23 @@ DICM_MAGIC = b"DICM"
 DICM_OFFSET = 128
 DICM_MIN_SIZE = 132  # 128 + 4 magic bytes
 
+class MultipartFramingError(ValueError):
+    """The multipart stream ended before its closing delimiter (PS3.18 8.7.2).
+
+    A ValueError subclass so the existing `except ValueError` around the read
+    path still catches it; a distinct type so the resume driver can tell
+    "the rest never arrived" from "one part was unusable".
+    """
+
+class InvalidDicomPartError(ValueError):
+    """One part of a multipart/related DICOM response is not a DICOM file.
+
+    The response labelled the part `application/dicom` (PS3.18 8.7.2
+    Table 8.7.4-1), so a body without the PS3.10 7.1 DICM prefix is a defect
+    of the answer, not a part the client may silently skip: dropping it made
+    a partial transfer report as a complete one.
+    """
+
 # ---------------------------------------------------------------------------
 # P10 B2: DICOM magic bytes verification (defence in depth)
 # ---------------------------------------------------------------------------
@@ -1948,11 +3106,22 @@ def _parse_content_length(headers_bytes: bytes) -> int | None:
     """Extract Content-Length from MIME part headers.
 
     Returns int or None if header is missing or malformed.
+
+    Only an UNSIGNED DECIMAL is accepted. `int()` would have taken a leading
+    sign, and a negative length is not merely wrong - it inverts the slicing
+    arithmetic below: with `body_start + content_length == -1` the buffer-length
+    check passes and `buffer[a:-1]` returns everything up to the penultimate
+    byte, so a truncated part whose first 132 bytes happen to carry the DICM
+    prefix was handed to the sender as a valid instance. Digits only, no sign,
+    no whitespace inside.
     """
     for line in headers_bytes.split(b"\r\n"):
         if line.lower().startswith(b"content-length:"):
+            raw = line.split(b":", 1)[1].strip() if b":" in line else b""
+            if not raw or not raw.isdigit():
+                return None
             try:
-                return int(line.split(b":", 1)[1].strip())
+                return int(raw)
             except (ValueError, IndexError):
                 return None
     return None
@@ -1979,6 +3148,32 @@ def _parse_part_transfer_syntax(headers_bytes: bytes) -> str | None:
 # ---------------------------------------------------------------------------
 # P10 B1: Content-Length-based streaming multipart parser
 # ---------------------------------------------------------------------------
+def _normalise_content_length(buffer, body_start, declared, boundary_bytes):
+    """Body length with a separator CRLF excluded, when the origin counted it.
+
+    PS3.18 8.7.2 puts the transport separator OUTSIDE the part body, but a MIME
+    implementation that counts the CRLF into Content-Length is common. Both
+    forms are legal to receive; only one is legal to decode.
+
+    The decision is made from the framing, not from a config knob: a body-only
+    length leaves `\\r\\n--BOUNDARY` at the declared end, while a
+    separator-inclusive length leaves `\\r\\n--BOUNDARY` one CRLF EARLIER and
+    the two separator bytes at the declared end. Nothing is guessed beyond
+    which of those two byte patterns is actually present, and a buffer that
+    holds neither is left exactly as declared so the delimiter phase reports
+    the framing error itself.
+    """
+    end = body_start + declared
+    if end <= len(buffer):
+        if buffer.startswith(b"\r\n" + boundary_bytes, end):
+            return declared  # body-only (the normal convention)
+        if declared >= 2 and buffer.startswith(b"\r\n" + boundary_bytes, end - 2):
+            # The declared length counted the separator CRLF. Excluding it
+            # keeps the delimiter at the buffer head after the body slice,
+            # which is what every later phase expects.
+            return declared - 2
+    return declared
+
 def _stream_multipart_instances(
     response, chunk_size=65536, spill_threshold=SPILL_THRESHOLD
 ):
@@ -2042,12 +3237,97 @@ def _stream_multipart_instances(
     )  # \r\n\r\n--BOUNDARY\r\n
     final_delimiter = b"\r\n" + boundary_bytes + b"--"  # \r\n--BOUNDARY--
     final_delimiter_alt = b"\r\n\r\n" + boundary_bytes + b"--"  # \r\n\r\n--BOUNDARY--
+    # Bare forms: after a body whose declared length INCLUDED the separator
+    # CRLF, `_normalise_content_length` excludes it, so the boundary line sits
+    # at the head of the buffer with no leading CRLF at all. Without these the
+    # delimiter phase would report a framing error on a perfectly well-formed
+    # separator-inclusive stream.
+    next_delimiter_bare = boundary_bytes + b"\r\n"
+    final_delimiter_bare = boundary_bytes + b"--"
     len_next_delimiter = len(next_delimiter)
     len_next_delimiter_alt = len(next_delimiter_alt)
+
+    def _delimiter_status(buf):
+        """Classify the buffer head: 'next', 'final', 'partial', or 'invalid'.
+
+        A part body is followed by the boundary line and NOTHING else before
+        the next part's headers (PS3.18 8.7.2). Treating an unrecognised tail
+        as "more header lines" was the old behaviour: any bytes between two
+        parts that happened to contain a `Content-Length:` line let the parser
+        resume as if it had seen a delimiter, so a corrupted delimiter between
+        A and B produced BOTH parts and a normal return - the framing defect
+        was invisible.
+
+        'partial' means the buffer may still be a prefix of a delimiter and
+        more data is needed; every other unrecognised byte is 'invalid'.
+
+        The CLOSING delimiter is validated to the end of its line: PS3.18
+        8.7.2 delimits with `--BOUNDARY--` followed by optional transport
+        padding and CRLF (or end of stream). The old prefix test accepted
+        `--BOUNDARY--garbage\r\n` as a clean finish, so a stream whose closing
+        line was corrupted still reported a complete transfer.
+        """
+        for marker, is_final in (
+            (final_delimiter, True),
+            (final_delimiter_alt, True),
+            (final_delimiter_bare, True),
+            (next_delimiter, False),
+            (next_delimiter_alt, False),
+            (next_delimiter_bare, False),
+        ):
+            if not buf.startswith(marker):
+                continue
+            if not is_final:
+                return "next"
+            rest = buf[len(marker) :]
+            # Padding (MIME epilogue whitespace) then CRLF, or nothing at EOF.
+            stripped = rest.lstrip(b" \t")
+            if stripped.startswith(b"\r\n") or stripped.startswith(b"\n"):
+                return "final"
+            # Still arriving: the line is not terminated yet. A bare `\r` is
+            # the FIRST half of the CRLF terminator, not trailing garbage -
+            # treating it as invalid made a delimiter split between its two
+            # CRLF bytes a fatal framing error on a perfectly valid response.
+            if stripped in (b"", b"\r"):
+                return "partial"
+            return "invalid"
+        # Nothing matched. An EMPTY buffer is not a framing error: the body has
+        # just been consumed and the delimiter has not arrived yet. Reporting
+        # "invalid" here made every chunk boundary that fell exactly after a
+        # body a fatal framing error, so a valid response failed whenever the
+        # delimiter happened to start the next chunk.
+        if not buf:
+            return "partial"
+        # Is the buffer still a viable prefix of any marker?
+        for marker in (
+            final_delimiter,
+            final_delimiter_alt,
+            final_delimiter_bare,
+            next_delimiter,
+            next_delimiter_alt,
+            next_delimiter_bare,
+        ):
+            probe = buf[: len(marker)]
+            if probe and marker.startswith(probe):
+                return "partial"
+        return "invalid"
 
     buffer = b""
     part_index = 0
     preamble_skipped = False
+    # PS3.18 8.7.2: every part body is followed by the boundary, and the
+    # LAST one by the closing delimiter (--BOUNDARY--). Only that delimiter
+    # proves the origin said it was done; an origin that stops mid-stream
+    # otherwise looks exactly like a complete short answer.
+    closed = False
+    # Explicit DELIMITER phase. After a body is consumed the parser is not
+    # reading headers until it has seen and verified the boundary line that
+    # separates the parts - but the inner loop restarted at Phase 1 on every
+    # chunk, so a delimiter split across chunks (`\r\n--b` then `--\r\n`) was
+    # consumed as header text and then raised on a COMPLETE response. This flag
+    # keeps the parser in the delimiter phase until the line is fully
+    # classified.
+    awaiting_delimiter = False
     # W3 (0209) spill state for the oversized part currently being received.
     spill_file = None  # open temp file, None when no spill is active
     spill_path = None  # spill_file.name while active
@@ -2088,6 +3368,36 @@ def _stream_multipart_instances(
                 )
 
             while True:
+                # -- Delimiter phase: a body was just consumed ------------
+                # Stay here until the boundary line is fully classified. This
+                # is a PHASE, not a fall-through: restarting at header parsing
+                # treated a partially received delimiter as header text and
+                # then reported a complete response as truncated.
+                if awaiting_delimiter:
+                    verdict = _delimiter_status(buffer)
+                    if verdict == "final":
+                        closed = True
+                        return  # Clean finish
+                    if verdict == "next":
+                        advance = 0
+                        for marker, advance in (
+                            (next_delimiter, len_next_delimiter),
+                            (next_delimiter_alt, len_next_delimiter_alt),
+                            (next_delimiter_bare, len(next_delimiter_bare)),
+                        ):
+                            if buffer.startswith(marker):
+                                break
+                        buffer = buffer[advance:]
+                        awaiting_delimiter = False
+                        continue  # Next part's headers
+                    if verdict == "partial":
+                        break  # Wait for the rest of the delimiter line
+                    raise MultipartFramingError(
+                        "[STREAM] part "
+                        f"{part_index - 1} was not followed by a boundary "
+                        f"delimiter (PS3.18 8.7.2); next bytes {buffer[:32]!r}"
+                    )
+
                 # -- Phase 0: skip preamble, find first boundary ---------
                 if not preamble_skipped:
                     idx = buffer.find(first_delimiter)
@@ -2104,15 +3414,30 @@ def _stream_multipart_instances(
 
                 # Defence: empty headers (header_end == 0) means the \r\n\r\n
                 # at buffer start is a trailing CRLF from previous part body,
-                # NOT the start of a new part. Check for closing delimiter.
+                # NOT the start of a new part. Classify it as a delimiter; an
+                # unrecognised head is a framing error, not header text.
                 if header_end == 0:
-                    if buffer.startswith(final_delimiter_alt):
+                    verdict = _delimiter_status(buffer)
+                    if verdict == "final":
+                        closed = True
                         return  # Clean finish (trailing CRLF + closing delimiter)
-                    if buffer.startswith(next_delimiter_alt):
-                        buffer = buffer[len_next_delimiter_alt:]
+                    if verdict == "next":
+                        advance = 0
+                        for marker, advance in (
+                            (next_delimiter, len_next_delimiter),
+                            (next_delimiter_alt, len_next_delimiter_alt),
+                            (next_delimiter_bare, len(next_delimiter_bare)),
+                        ):
+                            if buffer.startswith(marker):
+                                break
+                        buffer = buffer[advance:]
                         continue  # Next part (trailing CRLF + next delimiter)
-                    # Not a delimiter  -  break and wait for more data
-                    break
+                    if verdict == "partial":
+                        break  # Wait for the rest of the delimiter line
+                    raise MultipartFramingError(
+                        "[STREAM] expected a boundary delimiter after part "
+                        f"{part_index - 1} (PS3.18 8.7.2); got {buffer[:32]!r}"
+                    )
 
                 headers_bytes = buffer[:header_end]
                 body_start = header_end + 4  # Skip \r\n\r\n
@@ -2127,6 +3452,23 @@ def _stream_multipart_instances(
                     )
                 # 3008 stored-first: per-part transfer-syntax parameter.
                 part_ts = _parse_part_transfer_syntax(headers_bytes)
+
+                # PS3.18 8.7.2 leaves the transport separator outside the
+                # part body, but a MIME implementation that counts the CRLF
+                # into Content-Length is common enough that the framing must
+                # survive it: consuming the separator as body bytes left the
+                # buffer starting at `--BOUNDARY--` with no leading CRLF, which
+                # matched neither closing pattern, and the instance was handed
+                # to the sender with two trailing bytes attached before the
+                # stream was reported truncated.
+                #
+                # Detected from the framing itself, at the DECLARED offset: if
+                # the bytes at `body_start + content_length` are the boundary
+                # line, the length was body-only; if they are the boundary
+                # line shifted by one CRLF, the length counted the separator.
+                content_length = _normalise_content_length(
+                    buffer, body_start, content_length, boundary_bytes
+                )
 
                 # W3: parts above the threshold spill to a temp file.
                 if spill_file is None and content_length > spill_threshold:
@@ -2185,28 +3527,25 @@ def _stream_multipart_instances(
                             os.unlink(part.path)
                         except OSError:
                             pass
-                    logging.warning(
-                        "[STREAM] Part %d: invalid DICOM (no magic bytes), skipping",
-                        part_index,
+                    # Conformance rule for what the origin promised: the
+                    # enclosing response declared this part `Content-Type:
+                    # application/dicom` (PS3.18 8.7.2 Table 8.7.4-1), and
+                    # PS3.10 7.1 requires the DICM prefix. An undecodable
+                    # part must not be indistinguishable from "there were
+                    # fewer parts": silence here reported Success for A while
+                    # B, which the origin claimed to have sent, went nowhere.
+                    raise InvalidDicomPartError(
+                        f"[STREAM] Part {part_index}: response declared "
+                        f"application/dicom but the body has no DICM magic "
+                        f"(PS3.10 7.1) - {len(check)} bytes checked"
                     )
 
-                # -- Phase 4: skip past next delimiter -----------------
-                # Content-Length is authoritative  -  body already extracted.
-                # Just find and skip the delimiter between parts.
-                if buffer.startswith(final_delimiter):
-                    return  # Clean finish
-                if buffer.startswith(final_delimiter_alt):
-                    return  # Clean finish (CRLF outside Content-Length)
-
-                if buffer.startswith(next_delimiter):
-                    buffer = buffer[len_next_delimiter:]
-                    continue  # Next part
-                if buffer.startswith(next_delimiter_alt):
-                    buffer = buffer[len_next_delimiter_alt:]
-                    continue  # Next part (CRLF outside Content-Length)
-
-                # Delimiter not in buffer yet  -  wait for next HTTP chunk
-                break
+                # The body is out. The next bytes MUST be a boundary line, and
+                # the delimiter phase above enforces that - nothing here is
+                # inferred, and the parser cannot fall back to header parsing
+                # while the line is still arriving.
+                awaiting_delimiter = True
+                continue
 
         # -- Flush: stream ended without final delimiter ----------------
         # W3: with a spill still active the oversized part never completed -
@@ -2226,12 +3565,31 @@ def _stream_multipart_instances(
                     dicom_body = buffer[body_start : body_start + content_length]
                     if _is_valid_dicom(dicom_body):
                         yield (dicom_body, part_index, part_ts)
+                    else:
+                        raise InvalidDicomPartError(
+                            f"[STREAM] Part {part_index}: response declared "
+                            f"application/dicom but the body has no DICM "
+                            f"magic (PS3.10 7.1)"
+                        )
                 elif content_length is None:
                     # Fallback: use whatever is left as body (no Content-Length header).
                     # Some non-standard DICOMweb implementations omit Content-Length.
                     body = buffer[body_start:].rstrip(b"\r\n")
                     if body and _is_valid_dicom(body):
                         yield (body, part_index, part_ts)
+
+        # PS3.18 8.7.2: the multipart body is terminated by the closing
+        # delimiter. Reaching EOF without it means the origin stopped early -
+        # half of part B never arrived. Returning normally here let the caller
+        # report Success for the parts that did arrive, so a truncated retrieve
+        # looked like a complete one (PS3.4 C.4.2: the C-MOVE-RSP status
+        # describes the WHOLE request). Raising hands the parts already
+        # delivered to the caller while it retries the remainder.
+        if not closed:
+            raise MultipartFramingError(
+                "[STREAM] multipart body ended before the closing delimiter "
+                f"(PS3.18 8.7.2); {part_index} part(s) received, stream truncated"
+            )
     finally:
         # W3: never leak a spill file - a truncated stream, a fatal parse
         # error or an early consumer exit all land here. A completed part
@@ -2257,13 +3615,13 @@ Contains graceful shutdown event, signal handler, logging setup with rotation,
 and C-STORE dataset size measurement.
 """
 
+import contextlib
 import hashlib
 import hmac
 import io
 import ipaddress
 import logging
 import os
-import signal
 import sys
 import tempfile
 import threading
@@ -2286,6 +3644,14 @@ def set_pid_path(path: str) -> None:
     global _pid_path
     _pid_path = path
 
+# Set by the signal handler and read by the shutdown monitor, which emits the
+# log line. A signal handler may not log: every logging handler serialises its
+# I/O behind a lock, so if a worker thread is blocked writing to a redirected
+# stderr the handler would wait for that lock here - BEFORE setting the event -
+# and the monitor would never observe SIGTERM. The handler therefore records
+# only the signal it saw.
+_signal_seen = []
+
 def _signal_handler(signum, frame):
     """Handle SIGTERM/SIGINT/SIGBREAK  -  initiate graceful shutdown (BR-007).
 
@@ -2293,12 +3659,31 @@ def _signal_handler(signum, frame):
     The ShutdownMonitor thread (started in main.py) bridges this flag
     to pynetdicom's event loop by calling ae.shutdown() from a regular
     thread context, which is safe (not async-signal-restricted).
+
+    Deliberately NO logging and NO `signal.Signals(signum).name` lookup that
+    could raise: `_shutdown_requested.set()` must run on every path, because a
+    handler that raises before it leaves the bridge ignoring the signal. The
+    monitor reports the signal once it observes the event.
     """
-    sig_name = signal.Signals(signum).name
-    logging.info("Received %s, initiating graceful shutdown...", sig_name)
+    try:
+        _signal_seen.append(signum)
+    except Exception:
+        pass
     _shutdown_requested.set()
     # That's it. Nothing else. No timers, no os._exit, no file I/O.
     # ShutdownMonitor thread handles the rest.
+
+def take_signal_seen():
+    """The signal number observed by the handler, or None (consumed once).
+
+    The monitor calls this after it sees `_shutdown_requested`, so the log line
+    is emitted from a normal thread context where blocking on a handler lock is
+    harmless.
+    """
+    try:
+        return _signal_seen.pop() if _signal_seen else None
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Bridge: configure logging with optional rotation
@@ -2514,6 +3899,13 @@ def normalize_host(host):
     mapped = getattr(addr, "ipv4_mapped", None)
     if mapped is not None:
         addr = mapped
+    # An unspecified address is the wildcard bind in ANY spelling. The literal
+    # test above only catches the compressed `0.0.0.0` and `::`; the expanded
+    # IPv6 form `0:0:0:0:0:0:0:0` reaches here unchanged and would compare
+    # unequal to the `::` that a peers.conf entry normally writes, so a
+    # configured wildcard peer failed to match a loopback caller.
+    if addr.is_unspecified:
+        return "127.0.0.1"
     # The whole loopback block is one machine: `::1`, `[::1]` and `127.0.0.1`
     # must compare equal or a peers.conf entry saying `localhost` disagrees
     # with an A-ASSOCIATE from `::1`.
@@ -2600,6 +3992,81 @@ _MASK_KEY_BYTES = 32
 _MASK_KEY_READ_ATTEMPTS = 3
 _MASK_KEY_READ_PAUSE_S = 0.01
 
+@contextlib.contextmanager
+def _mask_key_file_lock(root: str):
+    """Hold an INTERPROCESS exclusive lock over the mask-key directory.
+
+    `_mask_key_lock` only serialises threads of one process. Two bridge
+    processes sharing an outbox (a rolling restart, a supervisor that starts
+    the replacement before the old one exits) could each see a missing key,
+    each publish its own, and each cache a DIFFERENT one - so the same
+    PatientID masked to two different tokens and log correlation broke across
+    the restart. That is exactly when an operator is reading both logs.
+
+    The lock file is a sibling of the key, created on demand and left in
+    place: an unlink would race the next opener. Blocking, unlike the startup
+    lock - a producer here holds it for one `os.replace`, so waiting is
+    cheaper than the wrong answer.
+
+    A lock that cannot be taken is not fatal: the in-process lock still holds
+    and the file-level protocol below still picks a single winner. Losing
+    cross-process serialisation degrades to the old behaviour rather than
+    refusing to log.
+    """
+    lock_path = os.path.join(root, ".patient_id_mask.key.lock")
+    handle = None
+    try:
+        os.makedirs(root, exist_ok=True)
+        handle = open(lock_path, "a+b")
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            # LK_LOCK retries for ~10 s internally before raising; the file is
+            # one byte and the holder releases in microseconds.
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError as exc:
+        logging.debug("[MASK] cross-process key lock unavailable (%s)", exc)
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            handle = None
+    except Exception as exc:  # pragma: no cover - platform oddity
+        logging.debug("[MASK] cross-process key lock unusable (%s)", exc)
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            handle = None
+
+    try:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+
 def _publish_key(path: str, key: bytes) -> None:
     """Write `key` to `path` so no reader can ever observe a partial file.
 
@@ -2671,10 +4138,23 @@ def _mask_key() -> bytes:
         return key
 
 def _load_or_create_key() -> bytes:
-    """The load-or-repair sequence behind `_mask_key`, run under the lock."""
+    """The load-or-repair sequence behind `_mask_key`, run under the lock.
+
+    The whole sequence - read, validate, replace - runs under the interprocess
+    file lock, so only one process at a time can decide the key. Reading
+    before taking it was the race: a creator that paused between the
+    exclusive create and its rename let a second process time out on the
+    short file, publish its own key, and then have the first overwrite it,
+    leaving two live processes with different keys.
+    """
     root = _mask_key_dir_override or _outbox_root()
     path = os.path.join(root, ".patient_id_mask.key")
 
+    with _mask_key_file_lock(root):
+        return _load_or_create_key_locked(root, path)
+
+def _load_or_create_key_locked(root: str, path: str) -> bytes:
+    """Body of `_load_or_create_key`; the caller holds the file lock."""
     try:
         with open(path, "rb") as handle:
             existing = handle.read()
@@ -3095,15 +4575,23 @@ def record_cstore(assoc_id: int, study_uid: str, modality: str) -> bool:
     Returns True if this is the FIRST instance for this study_uid
     (caller should log INFO about new study).
     """
-    if not study_uid:
-        return False
-
     with _assoc_lock:
         info = _assoc_registry.get(assoc_id)
         if info is None:
             return False  # Association not tracked (should not happen)
 
+        # Count the instance even when the dataset names no study. A C-STORE
+        # always carries a SOP Instance UID, but the Study Instance UID is a
+        # separate element a nonconforming sender can omit; returning early
+        # left `instance_count` at zero, so the release log reported "no
+        # instances received" for an association that had stored several.
         info.instance_count += 1
+
+        # The study UID only decides whether a study bucket is updated. An
+        # unnamed study is counted but never bucketed: keying a bucket on ""
+        # would merge every anonymous instance into one phantom study.
+        if not study_uid:
+            return False
 
         if study_uid not in info.studies:
             info.studies[study_uid] = {
@@ -3218,9 +4706,11 @@ class CommitJob:
     """One N-ACTION Storage Commitment batch awaiting resolution."""
 
     __slots__ = (
+        "abandon_pending",
         "abandoned",
         "abandoned_at",
         "calling_ae",
+        "cleanup_pending",
         "deadline",
         "frozen_verdict",
         "host",
@@ -3231,6 +4721,7 @@ class CommitJob:
         "sops",
         "tx_uid",
         "verdict_persisted",
+        "verify_cursor",
     )
 
     def __init__(self, tx_uid, calling_ae, host, port, sops, deadline):
@@ -3264,6 +4755,23 @@ class CommitJob:
         self.abandoned = False
         # R10: when the row became abandoned (retention reference point).
         self.abandoned_at = 0.0
+        # Where the verification walk resumes. `pending` is a SET, so `list()`
+        # over it is not a stable order: a batch whose head never confirms
+        # re-probed the same SOPs every tick and the tail never got a turn.
+        # The cursor is the uid the next tick starts AT; it wraps to the head
+        # once the sorted order is exhausted, so an unconfirmed SOP is retried
+        # after every pending entry has had one.
+        self.verify_cursor = None
+        # The ABANDONED state has not reached the row yet (the write raised).
+        # The job is out of the working set but must not be eligible for
+        # retention: a restart would reload the row as ACTIVE and send the
+        # verdict the bridge already gave up on.
+        self.abandon_pending = False
+        # The verdict WAS delivered and the row delete failed. Kept out of the
+        # working set (it must never be reported again) and retried from the
+        # cleanup list, so a restart does not re-send a verdict the modality
+        # already received.
+        self.cleanup_pending = False
 
 class CommitTracker:
     """Tracks commitment batches; resolves and reports them asynchronously.
@@ -3312,6 +4820,11 @@ class CommitTracker:
         # them in `_jobs` made `pending_count()` grow for every dead peer.
         # Bounded by `purge_abandoned`.
         self._abandoned = {}
+        # Delivered batches whose row delete failed, and batches whose
+        # abandonment write failed. Kept out of `_jobs` because they must never
+        # be reported again - only their ROW needs another attempt.
+        self._cleanup = {}
+        self._abandon_pending = {}
         self._lock = threading.Lock()
         self._stop = shutdown if shutdown is not None else threading.Event()
         self._now = now  # injectable clock for tests
@@ -3344,7 +4857,9 @@ class CommitTracker:
                 "  deadline REAL NOT NULL,"
                 "  frozen TEXT,"  # JSON [ok, failed, event_type] or NULL
                 "  abandoned INTEGER NOT NULL DEFAULT 0,"
-                "  abandoned_at REAL NOT NULL DEFAULT 0"
+                "  abandoned_at REAL NOT NULL DEFAULT 0,"
+                "  report_attempts INTEGER NOT NULL DEFAULT 0,"
+                "  cleanup_pending INTEGER NOT NULL DEFAULT 0"
                 ")"
             )
             conn.commit()
@@ -3357,6 +4872,13 @@ class CommitTracker:
             ("frozen", "TEXT"),
             ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
             ("abandoned_at", "REAL NOT NULL DEFAULT 0"),
+            # Without the attempt count a restart handed a dead peer a fresh
+            # MAX_REPORT_ATTEMPTS budget, on the single commit worker.
+            ("report_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            # A delivered verdict whose row delete failed has to stay
+            # findable, or a restart re-sends a report the modality already
+            # received.
+            ("cleanup_pending", "INTEGER NOT NULL DEFAULT 0"),
         ):
             try:
                 with self._db.locked() as conn:
@@ -3379,10 +4901,11 @@ class CommitTracker:
         """
         restored = 0
         abandoned = 0
+        cleaned = 0
         with self._db.locked() as conn:
             rows = conn.execute(
                 "SELECT tx_uid, calling_ae, host, port, sops, pending, deadline,"
-                " frozen, abandoned, abandoned_at"
+                " frozen, abandoned, abandoned_at, report_attempts, cleanup_pending"
                 " FROM commit_jobs"
             ).fetchall()
         for (
@@ -3396,6 +4919,8 @@ class CommitTracker:
             frozen,
             abandoned_flag,
             abandoned_at,
+            report_attempts,
+            cleanup_flag,
         ) in rows:
             try:
                 sop_pairs = [_pair(item) for item in json.loads(sops)]
@@ -3415,6 +4940,15 @@ class CommitTracker:
                 # one that may contradict what the SCM was told.
                 job.frozen_verdict = _verdict_from_json(frozen)
                 job.verdict_persisted = job.frozen_verdict is not None
+                if cleanup_flag:
+                    # The verdict was DELIVERED and only the row delete failed.
+                    # Reloading it as active re-sent a report the modality
+                    # already acknowledged; the row is a cleanup chore, not a
+                    # commitment, so it goes straight to the retry list.
+                    job.cleanup_pending = True
+                    self._cleanup[job.tx_uid] = job
+                    cleaned += 1
+                    continue
                 if abandoned_flag:
                     # R10: an abandoned row stays abandoned. Reloading it as
                     # active would grant the dead peer another MAX_REPORT_ATTEMPTS
@@ -3425,6 +4959,9 @@ class CommitTracker:
                     # R10: the retention clock travels with the row; without
                     # it a reloaded batch read as age 0 and was never purged.
                     job.abandoned_at = float(abandoned_at or 0.0)
+                    job.report_attempts = max(
+                        int(report_attempts or 0), MAX_REPORT_ATTEMPTS
+                    )
                     self._abandoned[tx_uid] = job
                     abandoned += 1
                     continue
@@ -3439,6 +4976,10 @@ class CommitTracker:
                 )
                 continue
             self._jobs[tx_uid] = job
+            # The attempt count survives the restart. Restoring it as zero gave
+            # an unavailable peer a fresh MAX_REPORT_ATTEMPTS budget at every
+            # restart of an otherwise healthy bridge.
+            job.report_attempts = max(0, int(report_attempts or 0))
             restored += 1
         if restored:
             logging.warning(
@@ -3451,6 +4992,12 @@ class CommitTracker:
                 "[COMMIT] %d recovered batch(es) were already abandoned - their "
                 "verdicts can no longer be delivered and are kept for inspection",
                 abandoned,
+            )
+        if cleaned:
+            logging.warning(
+                "[COMMIT] %d recovered batch(es) were delivered but their row "
+                "delete failed - retrying the delete, NOT the report",
+                cleaned,
             )
 
     def purge_abandoned(self, max_age_sec=ABANDONED_RETENTION_SEC, now=None):
@@ -3467,6 +5014,12 @@ class CommitTracker:
         cutoff = (self._now() if now is None else now) - max_age_sec
         removed = 0
         with self._lock:
+            # A job whose abandonment write never landed is NOT in `_abandoned`
+            # and its row still says active. If it were swept by age here the
+            # verdict's only remaining trace would be gone while a restart
+            # could still re-deliver it, so it is excluded by construction:
+            # only `_abandoned` entries are candidates, and `_retry_settled_rows`
+            # moves a job there once the write succeeds.
             stale = [
                 tx
                 for tx, job in self._abandoned.items()
@@ -3510,8 +5063,9 @@ class CommitTracker:
             conn.execute(
                 "INSERT OR REPLACE INTO commit_jobs"
                 " (tx_uid, calling_ae, host, port, sops, pending, deadline,"
-                "  frozen, abandoned, abandoned_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  frozen, abandoned, abandoned_at, report_attempts,"
+                "  cleanup_pending)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job.tx_uid,
                     job.calling_ae,
@@ -3531,6 +5085,8 @@ class CommitTracker:
                     ),
                     1 if job.abandoned else 0,
                     float(getattr(job, "abandoned_at", 0.0)),
+                    int(job.report_attempts),
+                    1 if job.cleanup_pending else 0,
                 ),
             )
             conn.commit()
@@ -3584,6 +5140,18 @@ class CommitTracker:
                     f"Transaction UID {tx_uid} is already active - the SCU "
                     "must use a new UID for a new request"
                 )
+            # A settled batch's row write is still PENDING (its DELETE or its
+            # abandonment UPDATE failed and is retried by `_retry_settled_rows`).
+            # Accepting a registration now would let that retry land on top of
+            # the new row: the abandonment would overwrite an accepted
+            # transaction, or the cleanup DELETE would erase it, and a restart
+            # then lost the commitment the SCU had been told about. The UID is
+            # still owned by the old batch until its row write succeeds.
+            if tx_uid in self._abandon_pending or tx_uid in self._cleanup:
+                raise ValueError(
+                    f"Transaction UID {tx_uid} is still owned by a settled "
+                    "batch whose row write has not completed - retry later"
+                )
             self._persist(job)
             self._jobs[tx_uid] = job
 
@@ -3619,6 +5187,11 @@ class CommitTracker:
         R10: `abandoned_at` is stamped here, because this is the instant the
         row becomes eligible for retention - the job's own deadline may be days
         older than the moment the report budget finally ran out.
+
+        Returns True when the row now says "abandoned". A False return means an
+        ACTIVE row survived the give-up, which a restart would reload as a
+        commitment still to deliver - so the caller must keep the job in the
+        write-retry list rather than treat it as parked.
         """
         job.abandoned_at = self._now()
         try:
@@ -3626,10 +5199,13 @@ class CommitTracker:
         except Exception as e:
             logging.error(
                 "[COMMIT] tx=%s: undelivered verdict could not be recorded "
-                "(%s) - the row may be stale",
+                "(%s) - the row stays active and the write is retried without "
+                "another report",
                 job.tx_uid,
                 e,
             )
+            return False
+        return True
 
     def _resolve(self, job):
         """Send one N-EVENT-REPORT for the batch.
@@ -3682,10 +5258,152 @@ class CommitTracker:
             pass
         return True
 
+    def _verify_walk(self, job, verify_deadline):
+        """Probe `job.pending` from the resume cursor, within the budget.
+
+        PS3.4 J.3.3.1 makes the report the result, so a SOP the walk never
+        reached is reported as unconfirmed - "not stored" - which is a claim
+        the bridge has no evidence for. `pending` is a SET, so `list()` over it
+        is not a stable order and re-walking it from the start each tick
+        examined the same head forever whenever those SOPs did not confirm.
+
+        The walk therefore resumes at the cursor and wraps once: every pending
+        SOP gets a turn before any of them gets a second one.
+        """
+        ordered = sorted(job.pending)
+        if not ordered:
+            return
+        start = 0
+        if job.verify_cursor is not None:
+            # The next tick resumes AFTER the cursor, not at it: re-probing the
+            # boundary SOP costs one round trip per tick for nothing.
+            #
+            # The cursor is the FULL `(sop_class, sop_uid)` pair, i.e. the same
+            # key this list is sorted by. Resuming by UID alone lost every row
+            # the UID ordering disagreed with: with the budget consumed by
+            # (A, 9), no UID greater than "9" was found, the walk restarted at
+            # (A, 9) on every tick, and (B, 1) and (B, 2) were never probed
+            # before the deadline - so they were reported "not stored" without
+            # the bridge ever having asked.
+            for index, item in enumerate(ordered):
+                if item > job.verify_cursor:
+                    start = index
+                    break
+            else:
+                # Past the tail: wrap to the head, which is what retries the
+                # SOPs examined on earlier ticks.
+                start = 0
+        for offset in range(len(ordered)):
+            sop_item = ordered[(start + offset) % len(ordered)]
+            if self._now() >= verify_deadline:
+                logging.info(
+                    "[COMMIT] tx=%s: verification budget reached (%d left "
+                    "unverified) - resolving with what is known",
+                    job.tx_uid,
+                    len(job.pending),
+                )
+                break
+            # The cursor advances BEFORE the probe, so a probe that fails at
+            # the tail does not make the next tick start there again.
+            job.verify_cursor = sop_item
+            sop_class, sop_uid = sop_item
+            try:
+                confirmed = self._verify(sop_class, sop_uid)
+            except Exception as e:
+                logging.warning("[COMMIT] verify %s error: %s", sop_uid, e)
+                continue
+            if not confirmed:
+                continue
+            # A probe can start inside the window and observe the instance only
+            # AFTER it. Counting that as a confirmation tells the modality a
+            # SOP is committed when the batch's own deadline said otherwise -
+            # so the result is only applied if it arrived in time.
+            if self._now() > job.deadline and job.deadline <= verify_deadline:
+                logging.info(
+                    "[COMMIT] tx=%s: confirmation of %s arrived after the "
+                    "deadline - not counted",
+                    job.tx_uid,
+                    sop_uid,
+                )
+                continue
+            job.pending.discard(sop_item)
+        # A cursor past the last uid wraps on the next tick by the `for/else`
+        # above; clearing it here would restart mid-set instead.
+        if not job.pending:
+            job.verify_cursor = None
+
+    def _retry_settled_rows(self):
+        """Retry only the ROW writes for batches whose verdict is settled.
+
+        `_park_undelivered` and `_forget` both run after the job left `_jobs`,
+        and both can fail. Losing either left an ACTIVE row behind, which a
+        restart reloaded as a commitment still to deliver - so the modality was
+        sent the same verdict again, or one the bridge had already given up on.
+        """
+        with self._lock:
+            pending_abandon = list(self._abandon_pending.items())
+            pending_cleanup = list(self._cleanup.items())
+        for tx_uid, job in pending_abandon:
+            # The ownership test and the write are ONE locked step. Testing
+            # ownership outside the lock let `register()` accept the same UID
+            # between the two, and the retry's `_persist(job)` then replaced the
+            # NEW row with the old batch's abandoned one - the freshly accepted
+            # transaction was silently turned into an abandonment, and the SCU
+            # never received the verdict for the request it had just sent.
+            # `register()` refuses a UID that is still in `_abandon_pending`, so
+            # holding the lock across both is sufficient.
+            with self._lock:
+                try:
+                    # The report is NOT re-sent: only the row write is retried.
+                    self._persist(job)
+                except Exception as e:
+                    logging.error(
+                        "[COMMIT] tx=%s: abandonment still not recorded (%s) - "
+                        "the row stays active for now",
+                        tx_uid,
+                        e,
+                    )
+                    continue
+                self._abandon_pending.pop(tx_uid, None)
+                self._abandoned[tx_uid] = job
+            logging.error("[COMMIT] tx=%s: abandonment recorded on a retry", tx_uid)
+        for tx_uid, job in pending_cleanup:
+            # Ownership and the DELETE are ONE locked step. Checking the owner
+            # and releasing the lock let a `register()` for the same UID
+            # persist a NEW row in between, and the retry then deleted it - a
+            # restart lost an accepted transaction the SCU had already been
+            # told about. `register()` refuses a UID that is still in
+            # `_cleanup`, so holding the lock across both is sufficient.
+            with self._lock:
+                if tx_uid in self._jobs:
+                    self._cleanup.pop(tx_uid, None)
+                    logging.info(
+                        "[COMMIT] tx=%s was re-registered - dropping the "
+                        "pending row delete",
+                        tx_uid,
+                    )
+                    continue
+                try:
+                    self._forget(tx_uid)
+                except Exception as e:
+                    logging.error(
+                        "[COMMIT] tx=%s: row still not deleted (%s) - retried "
+                        "next tick, verdict NOT re-sent",
+                        tx_uid,
+                        e,
+                    )
+                    continue
+            with self._lock:
+                self._cleanup.pop(tx_uid, None)
+
     def _tick(self):
+        # Rows whose verdict is already settled: a delivered report whose row
+        # delete failed, and an abandonment that never reached the store. Both
+        # are OUT of `_jobs` (they must never be reported again), so they need
+        # this separate pass or nothing retries their write.
+        self._retry_settled_rows()
         with self._lock:
             jobs = list(self._jobs.values())
-        now = self._now()
         for job in jobs:
             # Verification is bounded: each `_verify` may be a network round
             # trip to the origin, and an unbounded walk over a large batch held
@@ -3700,23 +5418,13 @@ class CommitTracker:
             # `verify_budget_sec` of origin round trips per tick on the single
             # commit worker, for an answer nothing may use any more.
             verify_deadline = min(job.deadline, self._now() + self._verify_budget_sec)
-            to_verify = [] if job.frozen_verdict is not None else list(job.pending)
-            for sop_item in to_verify:
-                if self._now() >= verify_deadline:
-                    logging.info(
-                        "[COMMIT] tx=%s: verification budget reached (%d left "
-                        "unverified) - resolving with what is known",
-                        job.tx_uid,
-                        len(job.pending),
-                    )
-                    break
-                sop_class, sop_uid = sop_item
-                try:
-                    if self._verify(sop_class, sop_uid):
-                        job.pending.discard(sop_item)
-                except Exception as e:
-                    logging.warning("[COMMIT] verify %s error: %s", sop_uid, e)
-            if not job.pending or now >= job.deadline:
+            if job.frozen_verdict is None:
+                self._verify_walk(job, verify_deadline)
+            # The deadline test reads a FRESH clock. `now` captured at the top
+            # of the tick predates every report this tick sent, so a batch due
+            # while an earlier (slow) report was in flight looked expired here
+            # and was resolved as "everything unconfirmed" without a probe.
+            if not job.pending or self._now() >= job.deadline:
                 # CC3: the verdict is FROZEN on the first attempt. The report
                 # must describe the batch as it stood when the outcome was
                 # decided: recomputing it per attempt let a later successful
@@ -3758,6 +5466,27 @@ class CommitTracker:
                 # Retire the job only once its verdict was actually delivered:
                 # dropping it after a failed N-EVENT-REPORT lost the outcome
                 # the modality was waiting for.
+                #
+                # The attempt limit is enforced BEFORE `_resolve`, not after.
+                # `_reload()` can restore an active row whose persisted
+                # `report_attempts` already reached the limit - the process may
+                # have stopped between persisting attempt five and persisting
+                # the abandonment - and `_tick` used to send one more report
+                # before noticing. A row that has already spent its budget goes
+                # straight to the abandonment transition instead.
+                if job.report_attempts >= MAX_REPORT_ATTEMPTS:
+                    with self._lock:
+                        still_ours = self._jobs.get(job.tx_uid) is job
+                        if still_ours:
+                            del self._jobs[job.tx_uid]
+                            self._abandon_pending[job.tx_uid] = job
+                    logging.error(
+                        "[COMMIT] tx=%s: report attempt limit (%d) already "
+                        "spent - abandoning without another report",
+                        job.tx_uid,
+                        MAX_REPORT_ATTEMPTS,
+                    )
+                    continue
                 if self._resolve(job):
                     # R7/R9: the ownership test, the in-memory removal and the
                     # row delete are ONE locked transition. Releasing the lock
@@ -3773,17 +5502,31 @@ class CommitTracker:
                             # already delivered, and aborting the tick leaves
                             # the row behind, so the next restart reloads the
                             # batch and sends a SECOND report for a verdict
-                            # the modality already received.
+                            # the modality already received. The delete is
+                            # therefore retried from `_cleanup`, which carries
+                            # a flag on the row so a restart resumes it too.
                             try:
                                 self._forget(job.tx_uid)
                             except Exception as e:
+                                job.cleanup_pending = True
+                                self._cleanup[job.tx_uid] = job
                                 logging.error(
                                     "[COMMIT] tx=%s: verdict delivered but the "
-                                    "row could not be deleted (%s) - a restart "
-                                    "may re-send it once",
+                                    "row could not be deleted (%s) - the delete "
+                                    "is retried, the report is NOT re-sent",
                                     job.tx_uid,
                                     e,
                                 )
+                                try:
+                                    self._persist(job)
+                                except Exception as pe:
+                                    logging.error(
+                                        "[COMMIT] tx=%s: cleanup state not "
+                                        "recorded (%s) - a restart may re-send "
+                                        "the report once",
+                                        job.tx_uid,
+                                        pe,
+                                    )
                     if not still_ours:
                         # Re-registered while the report was in flight: the
                         # NEW job and its row belong to the new request.
@@ -3797,6 +5540,19 @@ class CommitTracker:
                         continue
                 else:
                     job.report_attempts += 1
+                    # The count is durable as it grows. Without it a restart
+                    # restored zero and handed an unavailable peer a FRESH
+                    # MAX_REPORT_ATTEMPTS budget at every restart.
+                    if self._db is not None:
+                        try:
+                            self._persist(job)
+                        except Exception as e:
+                            logging.error(
+                                "[COMMIT] tx=%s: attempt count not persisted "
+                                "(%s) - a restart resets the budget",
+                                job.tx_uid,
+                                e,
+                            )
                     if job.report_attempts >= MAX_REPORT_ATTEMPTS:
                         # The modality will never hear this verdict: retire
                         # the batch and say so at ERROR level. Keeping it
@@ -3828,8 +5584,17 @@ class CommitTracker:
                             if still_ours:
                                 job.abandoned = True
                                 del self._jobs[job.tx_uid]
-                                self._park_undelivered(job)
-                                self._abandoned[job.tx_uid] = job
+                                # The write can fail (disk full, locked store).
+                                # The job is already out of the working set, so
+                                # a failed write used to leave an ACTIVE row
+                                # that a restart re-delivered and that
+                                # `purge_abandoned` would never collect. It is
+                                # parked for a WRITE-ONLY retry instead.
+                                if not self._park_undelivered(job):
+                                    job.abandon_pending = True
+                                    self._abandon_pending[job.tx_uid] = job
+                                else:
+                                    self._abandoned[job.tx_uid] = job
                         if not still_ours:
                             # Re-registered while the verdict was being
                             # abandoned: the NEW job and its row belong to the
@@ -3905,6 +5670,15 @@ class CommitTracker:
         with self._lock:
             return len(self._abandoned)
 
+    def settled_write_count(self):
+        """Settled batches whose ROW write is still outstanding.
+
+        A delivered-but-undeleted row and an abandonment that never reached the
+        store. Both are retried without another N-EVENT-REPORT.
+        """
+        with self._lock:
+            return len(self._cleanup) + len(self._abandon_pending)
+
     def close(self):
         self._stop.set()
 
@@ -3926,7 +5700,7 @@ import json
 import logging
 import time
 import uuid
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 from pydicom import dcmwrite
@@ -3988,23 +5762,54 @@ def retry_after_seconds(headers, default=RETRY_AFTER_DEFAULT_SEC):
 # ---------------------------------------------------------------------------
 # Bridge: simple retry with fixed backoff (like Orthanc)
 # ---------------------------------------------------------------------------
-def _http_retry(request_func, max_retries=3, delay=2.0):
+def _http_retry(request_func, max_retries=3, delay=2.0, on_retry=None, deadline=None):
     """Execute HTTP request with fixed backoff  -  3 attempts, 2s delay.
 
     Retry on: 429, 5xx, timeouts, connection errors.
     No retry on: 4xx except 429 (client errors are permanent).
+
+    `on_retry` is called once per retried attempt. The shared helper serves
+    QIDO, WADO, Storage Commitment AND STOW, so it must not own the STOW
+    metric: incrementing `stow_retries` here counted a QIDO 503 followed by a
+    successful retry as a STOW retry even when no STOW POST ever happened, and
+    a QIDO-only deployment then reported STOW retry traffic it never generated.
+    Only the two STOW callers pass a counter.
+
+    `deadline` is an absolute `time.monotonic()` instant after which no FURTHER
+    attempt may start. httpx's `Timeout(total=...)` bounds each individual
+    connect/read/write/pool operation, not the elapsed time of the request, so
+    an origin that keeps trickling response bytes within the read timeout holds
+    a single POST alive far past the configured budget and the retry loop
+    cannot begin another attempt. Checking the deadline here bounds the NUMBER
+    of attempts in wall-clock terms; each caller additionally passes a
+    shrinking per-attempt timeout built from the same instant.
 
     Returns httpx.Response, including the final 5xx; raises the last
     transport exception (timeout / connection error).
     """
     last_exception = None
 
+    def _note_retry():
+        if on_retry is None:
+            return
+        try:
+            on_retry()
+        except Exception:
+            pass
+
     for attempt in range(max_retries + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            logging.warning(
+                "[RETRY] elapsed-time budget spent before attempt %d/%d",
+                attempt + 1,
+                max_retries + 1,
+            )
+            break
         try:
             resp = request_func()
             if resp.status_code == 429:
                 if attempt < max_retries:
-                    stow_retries.inc()
+                    _note_retry()
                     time.sleep(delay)
                     continue
                 return resp
@@ -4053,7 +5858,7 @@ def _http_retry(request_func, max_retries=3, delay=2.0):
             last_exception = e
 
         if attempt < max_retries:
-            stow_retries.inc()
+            _note_retry()
             time.sleep(delay)
 
     raise last_exception or Exception("Max retries exceeded")
@@ -4068,6 +5873,49 @@ class QidoMalformedBodyError(ValueError):
     nothing, whereas this means the answer could not be read at all.
     """
 
+# Text marker on a STOW verdict whose outcome is UNKNOWN rather than refused:
+# the origin answered 2xx and the bridge could not read its per-SOP verdict.
+# The outbox worker must retry such an item without counting an attempt - the
+# origin may hold it - instead of burning a retry on a guess.
+STOW_UNVERIFIED = "stow-verdict-unreadable"
+
+class QidoPage:
+    """One QIDO-RS answer: its rows plus whether the origin left more behind.
+
+    PS3.18 10.6.1.4: an origin may answer FEWER rows than the requested limit
+    and still warn that the search did not complete, so `len(rows)` alone can
+    never prove an answer exhaustive. The evidence is in the response HEADER,
+    which a bare list cannot carry - a C-FIND handler built on the list alone
+    reported Success (0x0000, "no further matches exist", PS3.4
+    Table C.4.1-1) for searches the origin had explicitly left unfinished.
+    """
+
+    __slots__ = ("rows", "more")
+
+    def __init__(self, rows, more):
+        self.rows = rows
+        self.more = more
+
+    def __iter__(self):
+        # Keeps `for row in answer` working where only the rows are wanted.
+        return iter(self.rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+    def __eq__(self, other):
+        # `answer == []` is how a caller states "no matches"; the continuation
+        # flag is metadata about the answer, not part of what it contains.
+        if isinstance(other, QidoPage):
+            return self.rows == other.rows
+        return self.rows == other
+
+    def __repr__(self):
+        return f"QidoPage({self.rows!r}, more={self.more!r})"
+
 def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     """QIDO-RS GET with retry wrapper. Auth by nginx.
 
@@ -4080,6 +5928,11 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     `qa_base_url`), not by a query parameter: the bridge is a universal
     DICOMweb client, so it must not depend on any one server's private
     parameter for this.
+
+    Returns a `QidoPage`: the row list plus whether the origin reported more
+    matches than it returned. A plain list would lose that (PS3.18 10.6.1.4),
+    and a module-level "last page" flag would leak between concurrent C-FIND
+    generators, which outlive the call that set it.
     """
     if limit is not None:
         params = dict(params)
@@ -4089,9 +5942,10 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     def _do_qido():
         client = httpx.Client(timeout=httpx.Timeout(http_timeout + 10.0), cert=tls)
         try:
+            # PS3.18 8.3.1: space travels as %20, '+' is a literal qp-special.
+            qs = urlencode(params, quote_via=quote, safe="")
             return client.get(
-                url,
-                params=params,
+                url + "?" + qs,
                 headers={"Accept": "application/dicom+json"},
             )
         finally:
@@ -4109,7 +5963,7 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     # answer a query and delivered nothing readable, which is the same failure
     # class as an HTML error page and must not read as "matched nothing".
     if resp.status_code == 204:
-        return []
+        return QidoPage([], False)
     if not resp.content:
         raise QidoMalformedBodyError(f"{url} answered 200 with an empty body")
     try:
@@ -4129,7 +5983,47 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
         raise QidoMalformedBodyError(
             f"{url} answered 200 with a JSON {type(body).__name__}, expected an array"
         )
-    return body
+    # PS3.18 10.6.1.4 / Annex F: each match is a DICOM JSON MODEL object. A
+    # `null` (or a string, or an array) is not a match, and letting it through
+    # moved the failure downstream - the row converters call `.items()` on it
+    # outside every C-FIND error handler. `[]` and 204 stay valid empty
+    # results; a WRONG row is an unreadable answer.
+    for position, row in enumerate(body):
+        if not isinstance(row, dict):
+            raise QidoMalformedBodyError(
+                f"{url} answered 200 with a {type(row).__name__} at row "
+                f"{position}, expected a JSON object"
+            )
+    return QidoPage(body, _qido_continuation(resp, body, limit))
+
+def _qido_continuation(resp, body, limit):
+    """Whether the origin says more matches exist beyond this page.
+
+    PS3.18 10.6.1.4: a QIDO-RS origin signals an incomplete answer either by
+    a Warning header carrying 299 ("The search did not fully complete") or by
+    returning exactly the number of matches that were asked for, which the
+    spec defines as possibly containing more. Both are treated the same way:
+    the answer is not known to be exhaustive.
+
+    A page SHORTER than the requested limit is exhaustive - the origin had the
+    room to send more and did not. With no limit there is no page size to
+    compare against, so only the Warning can say anything.
+    """
+    try:
+        warning = str(resp.headers.get("Warning", "") or "")
+    except (AttributeError, TypeError):
+        warning = ""
+    # The 299 warn-code is the first token of a Warning value, e.g.
+    # `299 origin "The search did not fully complete"`. Parse the CODE instead
+    # of searching the text: a substring test would also match 299 inside a
+    # message body or a longer warn-code such as 2990.
+    for field_value in warning.split(","):
+        token = field_value.strip().split(" ", 1)[0]
+        if token == "299":
+            return True
+    if limit is None:
+        return False
+    return len(body) >= int(limit)
 
 # ---------------------------------------------------------------------------
 # Bridge: WADO-RS metadata lookup with retry
@@ -4174,11 +6068,31 @@ _STC_REASON_MAP = {
     "0213": _STC_RESOURCE_LIMITATION,
 }
 
+# The full value set PS3.3 C.14.1.1 defines for Failure Reason (0008,1197).
+# A code outside it is a defect of the origin and is answered as 0x0110.
+_STC_ENUMERATED_REASONS = frozenset(
+    {
+        _STC_PROCESSING_FAILURE,
+        _STC_NO_SUCH_SOP,
+        _STC_RESOURCE_LIMITATION,
+        0x0122,  # Referenced SOP Class not supported
+        0x0119,  # Class / Instance conflict
+        0x0131,  # Duplicate SOP Instance
+    }
+)
+
 # Sentinel on the return value for "the origin has no Commit resource".
 # The caller logs the misconfiguration WARN; there is deliberately NO
 # fallback to the local path (a silent fallback would mask the wrong knob
 # forever).
 STC_NO_RESOURCE = "no_commit_resource"
+
+# Sentinel meaning "the origin accepted the request and has not decided yet".
+# PS3.18 13.4.3 defines 202 for exactly this: processed (accepted), not
+# completed. Reporting it as a verdict - in either direction - is a claim the
+# origin never made, so it is carried out as its own signal and the caller
+# retries the Check instead of answering the modality.
+STC_PENDING = "commit_pending"
 
 def _stc_commit_request(clarus_url, tx_uid, sop_list, http_timeout=30, tls=None):
     """POST one Storage Commitment request and map the verdict.
@@ -4245,6 +6159,19 @@ def _stc_commit_request(clarus_url, tx_uid, sop_list, http_timeout=30, tls=None)
         # not re-derived. ONE GET, and an idempotent answer is reported.
         return _stc_check_request(clarus_url, tx_uid, sop_list, http_timeout, tls=tls)
 
+    if status == 202:
+        # PS3.18 13.4.3: 202 Accepted means the origin TOOK the request and is
+        # still processing it - it is not a verdict, and it says nothing about
+        # any individual SOP. Mapping it to "all failed 0x0110" told the
+        # modality its instances were not committed while the origin was still
+        # deciding; the caller must keep the transaction pending and re-Check.
+        logging.info(
+            "[STC] commit tx=%s: HTTP 202 - origin still processing, "
+            "transaction stays pending",
+            tx_uid,
+        )
+        return [], [], STC_PENDING
+
     if status != 200:
         logging.warning(
             "[STC] commit tx=%s: HTTP %d -> all failed 0x0110 (%s)",
@@ -4293,6 +6220,18 @@ def _stc_check_request(clarus_url, tx_uid, sop_list, http_timeout=30, tls=None):
         )
         return [], _all_failed(sop_list), None
 
+    if resp.status_code == 202:
+        # Same rule as the Commit path: the origin has not finished processing
+        # this Transaction UID. Keeping the transaction pending is what makes
+        # the bounded re-Check happen; answering 0x0110 here reported a
+        # failure the origin never gave.
+        logging.info(
+            "[STC] check tx=%s: HTTP 202 - still processing, transaction stays "
+            "pending",
+            tx_uid,
+        )
+        return [], [], STC_PENDING
+
     if resp.status_code != 200:
         logging.warning(
             "[STC] check tx=%s: HTTP %d -> all failed 0x0110",
@@ -4321,37 +6260,81 @@ def _stc_map_verdict(payload, sop_list, tx_uid):
     Committed SOPs come from ReferencedSOPSequence (0008,1199); failed ones
     from FailedSOPSequence (0008,1198) with FailureReason (0008,1197). PS3.18
     F.2.3 maps US to a JSON Number, so the reason arrives as an integer and
-    `_stc_reason` resolves it to a DIMSE code. A SOP absent from BOTH
-    sequences is a protocol defect of the origin and is reported as
-    failed 0x0110 - the bridge reports, it does not guess.
-    """
-    committed = []
-    failed = []
-    seen = set()
+    `_stc_reason` resolves it to a DIMSE code.
 
+    The answer is projected onto the REQUEST. A Transaction UID identifies one
+    transaction (PS3.4 J.3.2), so the response may only speak about the SOPs
+    that were asked about: an origin that answers with a SOP the bridge never
+    submitted, or with a SOP that carries no verdict, was previously mapped
+    verbatim - SOP B committed and A failed for a request that named only A, or
+    BOTH verdicts recorded for A when the origin listed it in both sequences.
+    Each requested SOP therefore gets exactly ONE verdict, taken from the
+    response where it is unambiguous; anything else falls back to the
+    processing-failure code, which reports what is known instead of guessing.
+    """
+    requested = [(str(sop_class), str(sop_uid)) for sop_class, sop_uid in sop_list]
+    wanted = set(requested)
+
+    committed_pairs = []
+    failed_pairs = []
     for item in _stc_sequence_items(payload, _STC_REFERENCED_SOP_SEQUENCE):
         pair = _stc_pair(item)
         if pair is None:
             continue
-        seen.add(_stc_key(pair))
-        committed.append(pair)
-
+        committed_pairs.append(pair)
     for item in _stc_sequence_items(payload, _STC_FAILED_SOP_SEQUENCE):
         pair = _stc_pair(item)
         if pair is None:
             continue
-        reason = _stc_reason(item)
-        seen.add(_stc_key(pair))
-        failed.append((pair[0], pair[1], reason))
+        failed_pairs.append((pair[0], pair[1], _stc_reason(item)))
 
-    for sop_class, sop_uid in sop_list:
-        if (str(sop_class), str(sop_uid)) not in seen:
+    committed_keys = {_stc_key(p) for p in committed_pairs}
+    failed_by_key = {}
+    for sop_class, sop_uid, reason in failed_pairs:
+        failed_by_key.setdefault(_stc_key((sop_class, sop_uid)), reason)
+
+    # A response entry about a SOP that was never requested is not a verdict
+    # for this transaction; it is evidence the origin answered for a different
+    # one, and adopting it would report on an instance the modality did not ask
+    # about in this request.
+    for key in sorted(committed_keys | set(failed_by_key)):
+        if key not in wanted:
+            logging.warning(
+                "[STC] tx=%s: response names SOP %s which was not requested - "
+                "ignored",
+                tx_uid,
+                key[1],
+            )
+
+    committed = []
+    failed = []
+    for pair in requested:
+        key = _stc_key(pair)
+        in_committed = key in committed_keys
+        in_failed = key in failed_by_key
+        if in_committed and in_failed:
+            # Contradictory: the same SOP cannot be both stored and refused.
+            # The safe reading is the failure - reporting "committed" for an
+            # instance the origin also listed as failed would tell the modality
+            # its data is safe on the strength of an ambiguous answer.
+            logging.warning(
+                "[STC] tx=%s: SOP %s appears in BOTH sequences - reporting "
+                "the failure verdict",
+                tx_uid,
+                pair[1],
+            )
+            failed.append((pair[0], pair[1], failed_by_key[key]))
+        elif in_committed:
+            committed.append(pair)
+        elif in_failed:
+            failed.append((pair[0], pair[1], failed_by_key[key]))
+        else:
             logging.warning(
                 "[STC] tx=%s: SOP %s is in neither response sequence -> 0x0110",
                 tx_uid,
-                sop_uid,
+                pair[1],
             )
-            failed.append((sop_class, sop_uid, _STC_PROCESSING_FAILURE))
+            failed.append((pair[0], pair[1], _STC_PROCESSING_FAILURE))
 
     return committed, failed, None
 
@@ -4409,7 +6392,11 @@ def _stc_reason(item):
         code = int(text, 10)
     except (TypeError, ValueError):
         return _STC_PROCESSING_FAILURE
-    if 0 <= code <= 0xFFFF:
+    # PS3.3 C.14.1.1 enumerates the Failure Reason values; everything else is
+    # reported as the general processing failure. A bare range check here let
+    # a code the standard does not define (65535) travel to the modality as a
+    # DIMSE reason the bridge promised to normalise.
+    if code in _STC_ENUMERATED_REASONS:
         return code
     return _STC_PROCESSING_FAILURE
 
@@ -4476,15 +6463,20 @@ class StowBodyNotJsonObject(ValueError):
 def _stow_body_dict(response_text):
     """Parse a STOW-RS body and return the JSON object it must contain.
 
-    Returns None when the body is empty or not JSON at all (the caller treats
-    that as "no failure report"). Raises `StowBodyNotJsonObject` when the body
-    IS JSON but is not an object - a list or a scalar - because silently
-    returning [] there reported a malformed answer as a clean one.
+    Returns None only for an EMPTY body, which PS3.18 10.5.2 permits (the
+    response may be delivered with no content to report). Anything else that
+    is not a JSON object raises `StowBodyNotJsonObject`: a 2xx whose verdict
+    cannot be read states nothing about the instances, and answering "no
+    failures" for it acknowledged a result nobody reported.
     """
+    if response_text is None or not str(response_text).strip():
+        return None
     try:
         body = json.loads(response_text)
-    except (json.JSONDecodeError, TypeError):
-        return None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise StowBodyNotJsonObject(
+            f"STOW-RS body is not JSON ({len(str(response_text))} bytes)"
+        )
     if not isinstance(body, dict):
         raise StowBodyNotJsonObject(
             f"STOW-RS body is {type(body).__name__}, not a JSON object"
@@ -4513,6 +6505,39 @@ def _stow_seq_value(tag, seq_item):
             f"failed-SOP item({tag}) Value is {type(values).__name__}, not a list"
         )
     return values
+
+def _stow_referenced_uids(response_text):
+    """SOP Instance UIDs the origin explicitly ACCOUNTED FOR in a STOW answer.
+
+    Reads the Referenced SOP Sequence (0008,1199) - the instances the origin
+    reports having stored - so a 202 can be reconciled against the batch
+    instead of being read as "no failures, therefore everything is stored"
+    (PS3.18 10.5.3). A body the bridge cannot read yields an empty set, which
+    makes every SOP unaccounted: an unreadable verdict is not a delivered one.
+    """
+    try:
+        body = _stow_body_dict(response_text)
+    except StowBodyNotJsonObject:
+        return set()
+    if body is None:
+        return set()
+    seq = body.get("00081199")
+    if not isinstance(seq, dict):
+        return set()
+    items = seq.get("Value")
+    if not isinstance(items, list):
+        return set()
+    uids = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            values = _stow_seq_value("00081155", item.get("00081155", {}))
+        except StowBodyNotJsonObject:
+            continue
+        if values and isinstance(values[0], str) and values[0].strip():
+            uids.add(values[0].strip())
+    return uids
 
 def _parse_stow_failures_all(response_text):
     """Parse STOW-RS JSON for ALL failed SOPs (0008,1198 Failed SOP Sequence).
@@ -4561,6 +6586,19 @@ def _parse_stow_failures_all(response_text):
         # 00081155 = Referenced SOP Instance UID (PS3.18 sec.10.5.2.1)
         ref_sops = _stow_seq_value("00081155", item.get("00081155", {}))
         ref_sop = ref_sops[0] if ref_sops else "?"
+        # The UID must be a non-empty STRING before it becomes an identity.
+        # A `Value` holding an object or an array was returned as-is, and the
+        # batch dictionary keyed by SOP UID then raised TypeError on the
+        # unhashable value - which the caller's generic handler mapped to a
+        # permanent 0xC000 for EVERY live SOP, including ones the origin had
+        # already stored. An unreadable verdict is not a refusal, so it takes
+        # the retryable path (`StowBodyNotJsonObject` -> 0xA700 / UNVERIFIED).
+        if not isinstance(ref_sop, str) or not ref_sop.strip():
+            raise StowBodyNotJsonObject(
+                "00081155 Value[0] is "
+                f"{type(ref_sop).__name__}, not a non-empty SOP Instance UID"
+            )
+        ref_sop = ref_sop.strip()
 
         failures.append(
             {
@@ -4650,8 +6688,23 @@ def stow_single_instance(
     # requests(timeout=30) only covers connect+read, not total elapsed time.
     # httpx.Timeout(N) covers the entire request lifecycle.
     total_timeout = http_timeout + 10
+    # Absolute budget for the whole STOW attempt sequence. `httpx.Timeout()`
+    # bounds each operation, so a slow origin that keeps sending response data
+    # inside the read timeout can hold one POST open well past the budget; the
+    # deadline is what bounds the attempt in wall-clock terms.
+    deadline = time.monotonic() + total_timeout
     base = dicomweb_base(clarus_url)
     stow_url = f"{base}/studies"
+
+    def _attempt_timeout():
+        """Per-attempt httpx timeout, shrunk to whatever budget is left.
+
+        A fixed per-operation timeout on every attempt let a sequence of
+        near-timeout attempts total far more than the configured budget. Each
+        attempt is bounded by the REMAINING time, so the sequence cannot.
+        """
+        remaining = max(1.0, deadline - time.monotonic())
+        return httpx.Timeout(remaining)
 
     # P30: Keep-Alive  -  reuse client for connection persistence (x2 throughput).
     # Without Keep-Alive: TCP-handshake (~30-100ms) on every slice.
@@ -4671,7 +6724,7 @@ def stow_single_instance(
                 },
             )
         # Fallback: create+close client per request (backward compat)
-        _c = httpx.Client(timeout=httpx.Timeout(total_timeout), cert=tls)
+        _c = httpx.Client(timeout=_attempt_timeout(), cert=tls)
         try:
             return _c.post(
                 stow_url,
@@ -4688,7 +6741,7 @@ def stow_single_instance(
             _c.close()
 
     try:
-        resp = _http_retry(_do_stow)
+        resp = _http_retry(_do_stow, on_retry=stow_retries.inc, deadline=deadline)
         # Bridge: STOW requests counter by HTTP status
         stow_requests.labels(status=str(resp.status_code)).inc()
         sop_uid = str(getattr(dataset, "SOPInstanceUID", "?"))
@@ -4701,8 +6754,13 @@ def stow_single_instance(
             try:
                 rejection = _parse_stow_failures(resp.text, sop_uid)
             except StowBodyNotJsonObject as e:
+                # PS3.18 10.5.2: a 2xx states that the request was processed,
+                # not that the instance was stored. An unreadable verdict means
+                # the outcome is UNKNOWN, and the marker tells the outbox worker
+                # so - retrying costs one re-send, while a guessed failure marks
+                # an instance undelivered that the origin may already hold.
                 logging.error("[STOW-RS] malformed response body: %s", e)
-                return (0xA700, resp.status_code, str(e))
+                return (0xA700, resp.status_code, f"{STOW_UNVERIFIED}: {e}")
             if rejection:
                 logging.error(
                     "[STOW-RS] Server rejected SOP %s: %s - check clarus-server logs",
@@ -4710,6 +6768,25 @@ def stow_single_instance(
                     rejection["reason"],
                 )
                 return (0xA700, resp.status_code, rejection["reason"])
+
+            # PS3.18 10.5.3: a 202 says the request was ACCEPTED, and its
+            # per-SOP verdict is what states what became of the instance. An
+            # empty failure list is not that verdict - a bodiless 202 leaves
+            # the outcome unknown. Reporting 0x0000 there claimed the instance
+            # was stored on the strength of a status that never said so.
+            if resp.status_code == 202 and sop_uid not in _stow_referenced_uids(
+                resp.text
+            ):
+                logging.error(
+                    "[STOW-RS] HTTP 202 without a per-SOP verdict for %s - "
+                    "reporting it unverified, not stored",
+                    sop_uid,
+                )
+                return (
+                    0xA700,
+                    resp.status_code,
+                    f"{STOW_UNVERIFIED}: no per-SOP verdict on 202",
+                )
 
             logging.debug("-> STOW-RS: %d OK (SOP: %s)", resp.status_code, sop_uid)
             return (0x0000, resp.status_code, "OK")
@@ -4773,20 +6850,33 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
 
     boundary = f"BOUNDARY_{uuid.uuid4().hex[:16]}"
     total_timeout = http_timeout + 10
+    # Same elapsed-time budget as the single-instance path: `httpx.Timeout()`
+    # bounds each operation, not the request, so the deadline is what stops a
+    # trickling origin from holding one POST open past the budget.
+    deadline = time.monotonic() + total_timeout
     base = dicomweb_base(clarus_url)
     stow_url = f"{base}/studies"
 
+    def _attempt_timeout():
+        remaining = max(1.0, deadline - time.monotonic())
+        return httpx.Timeout(remaining)
+
     body = bytearray()
-    pre_failed = []
-    for sop_uid, ds, raw_bytes in payloads:
+    # R4: re-serialization is per-SOP work and can raise on ONE bad instance
+    # (an invalid value for its VR). Outside this guard that exception escaped
+    # before the function returned the `(results, retry_after)` tuple it
+    # promises, so the whole batch had no outcome and the retry re-sent every
+    # other SOP with it. A failed part is reported as 0xC000 (this instance is
+    # unwritable) and the rest of the batch still goes.
+    #
+    # Verdicts live in a list INDEXED BY INPUT POSITION, not a pre-failed list
+    # plus a live list: emitting the failures first and the delivered ones
+    # after it returned the batch out of order (`[B failure, A success]` for
+    # `[A, B]`), which this function promises never to do.
+    verdicts = [None] * len(payloads)
+    live_indexes = []
+    for position, (sop_uid, ds, raw_bytes) in enumerate(payloads):
         if raw_bytes is None:
-            # R4: re-serialization is per-SOP work and can raise on ONE bad
-            # instance (an invalid value for its VR). Outside this guard that
-            # exception escaped before the function returned the `(results,
-            # retry_after)` tuple it promises, so the whole batch had no
-            # outcome and the retry re-sent every other SOP with it. A failed
-            # part is reported as 0xC000 (this instance is unwritable) and the
-            # rest of the batch still goes.
             try:
                 _ensure_stow_ts(ds)
                 buf = io.BytesIO()
@@ -4798,7 +6888,7 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     sop_uid,
                     e,
                 )
-                pre_failed.append((sop_uid, 0xC000, None, f"Serialize error: {e}"))
+                verdicts[position] = (sop_uid, 0xC000, None, f"Serialize error: {e}")
                 continue
         else:
             dicom_bytes = raw_bytes
@@ -4806,16 +6896,21 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
         body += b"Content-Type: application/dicom\r\n\r\n"
         body += dicom_bytes
         body += b"\r\n"
+        live_indexes.append(position)
     body += b"--" + boundary.encode("ascii") + b"--\r\n"
 
-    failed_uids = {entry[0] for entry in pre_failed}
-    live_payloads = [
-        (uid, ds, raw) for uid, ds, raw in payloads if uid not in failed_uids
-    ]
-    if not live_payloads:
+    def _emit(default_status, http_status, msg_by_uid=None):
+        """Fill the remaining verdict slots, in payload order."""
+        for position in live_indexes:
+            uid = payloads[position][0]
+            msg = (msg_by_uid or {}).get(uid, default_status[1])
+            verdicts[position] = (uid, default_status[0], http_status, msg)
+        return verdicts
+
+    if not live_indexes:
         # Every part was unwritable: nothing to POST, and the caller still gets
         # the promised tuple with the per-SOP verdicts.
-        return pre_failed, None
+        return verdicts, None
 
     headers = {
         "Content-Type": (
@@ -4831,7 +6926,7 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 content=bytes(body),
                 headers=headers,
             )
-        _c = httpx.Client(timeout=httpx.Timeout(total_timeout), cert=tls)
+        _c = httpx.Client(timeout=_attempt_timeout(), cert=tls)
         try:
             return _c.post(
                 stow_url,
@@ -4842,31 +6937,29 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
             _c.close()
 
     try:
-        resp = _http_retry(_do_stow)
+        resp = _http_retry(_do_stow, on_retry=stow_retries.inc, deadline=deadline)
         stow_requests.labels(status=str(resp.status_code)).inc()
 
         if resp.status_code in (200, 201, 202):
-            # Per-SOP outcome: server may reject a subset (0008,1198) in a 2xx.
+            # PS3.18 10.5.2: a 2xx says the request was PROCESSED, not that
+            # every instance in it was STORED. The per-SOP verdict lives in
+            # the Failed SOP Sequence, so an answer the bridge cannot read is
+            # an UNKNOWN outcome - the origin may have kept SOP A and refused
+            # SOP B (10.5.1.1.1) - and must be retried, never acknowledged.
             try:
                 failed = _parse_stow_failures_all(resp.text)
             except StowBodyNotJsonObject as e:
-                # PS3.18 10.5.2: the response must be a DICOM JSON object. A
-                # list or scalar body states nothing about the batch, so it is
-                # a server-side reject, not a clean answer - and it must be
+                # A list or scalar body states nothing about the batch. It is
                 # returned in the SAME `(results, retryafter)` shape as every
                 # other outcome, or the caller unpacks two values from a
                 # three-tuple and dies with ValueError.
                 logging.error("[STOW-RS] malformed batch response body: %s", e)
                 return (
-                    pre_failed
-                    + [
-                        (uid, 0xA700, resp.status_code, f"Malformed response: {e}")
-                        for uid, _ds, _raw in live_payloads
-                    ],
+                    _emit((0xA700, f"{STOW_UNVERIFIED}: {e}"), resp.status_code),
                     None,
                 )
             failed_by_uid = {f["sop_uid"]: f["reason"] for f in failed}
-            sent = {uid for uid, _ds, _raw in live_payloads}
+            sent = {payloads[p][0] for p in live_indexes}
             # PS3.18 10.5: a rejection the server reported for a SOP the client
             # did not send means the two sides disagree about the batch. Marking
             # every sent SOP as delivered would claim a success nobody stated,
@@ -4879,29 +6972,62 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     len(unmatched),
                 )
                 return (
-                    pre_failed
-                    + [
-                        (uid, 0xA700, resp.status_code, "Unmatched failure response")
-                        for uid, _ds, _raw in live_payloads
-                    ],
+                    _emit((0xA700, "Unmatched failure response"), resp.status_code),
                     None,
                 )
-            results = list(pre_failed)
-            for sop_uid, ds, raw_bytes in live_payloads:
+            for position in live_indexes:
+                sop_uid = payloads[position][0]
                 if sop_uid in failed_by_uid:
-                    results.append(
-                        (sop_uid, 0xA700, resp.status_code, failed_by_uid[sop_uid])
+                    verdicts[position] = (
+                        sop_uid,
+                        0xA700,
+                        resp.status_code,
+                        failed_by_uid[sop_uid],
                     )
                 else:
-                    results.append((sop_uid, 0x0000, resp.status_code, "OK"))
+                    verdicts[position] = (sop_uid, 0x0000, resp.status_code, "OK")
             if failed:
                 logging.error(
                     "[STOW-RS] Batch: %d/%d SOPs rejected by server - "
                     "will re-send individually on retry",
                     len(failed),
-                    len(live_payloads),
+                    len(live_indexes),
                 )
-            return results, None
+            # PS3.18 10.5.3: on a 202 the origin reports what it did WITH A
+            # PER-SOP VERDICT. An empty failure list is not that proof - a 202
+            # with no body, or one naming only some of the batch, leaves the
+            # rest in an UNKNOWN state. Acknowledging them as stored claimed a
+            # success the origin never stated, so anything the response did not
+            # explicitly account for is reported UNVERIFIED (retryable) rather
+            # than delivered. The 200 compatibility path is unchanged: there
+            # the origin has completed the request and "no failures" is its
+            # complete answer.
+            if resp.status_code == 202:
+                referenced = _stow_referenced_uids(resp.text)
+                unaccounted = [
+                    payloads[p][0]
+                    for p in live_indexes
+                    if payloads[p][0] not in failed_by_uid
+                    and payloads[p][0] not in referenced
+                ]
+                if unaccounted:
+                    logging.error(
+                        "[STOW-RS] HTTP 202 without a per-SOP verdict for "
+                        "%d/%d SOP(s) - reporting them unverified, not "
+                        "stored",
+                        len(unaccounted),
+                        len(live_indexes),
+                    )
+                    for position in live_indexes:
+                        sop_uid = payloads[position][0]
+                        if sop_uid in unaccounted:
+                            verdicts[position] = (
+                                sop_uid,
+                                0xA700,
+                                resp.status_code,
+                                f"{STOW_UNVERIFIED}: no per-SOP verdict on 202",
+                            )
+            return verdicts, None
 
         # / Disk full  -  whole batch retryable.
         # 2908: _http_retry does NOT retry 507; backoff comes from the
@@ -4914,56 +7040,30 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 backoff,
             )
             msg = f"Disk full - retry after {backoff}s"
-            return (
-                pre_failed + [(uid, 0xA700, 507, msg) for uid, _, _ in live_payloads],
-                backoff,
-            )
+            return _emit((0xA700, msg), 507), backoff
 
         # non-2xx  -  whole batch shares one outcome.
         dimse_status, _, msg = _http_status_to_dimse(resp.status_code)
-        return (
-            pre_failed
-            + [
-                (uid, dimse_status, resp.status_code, msg)
-                for uid, _, _ in live_payloads
-            ],
-            None,
-        )
+        return _emit((dimse_status, msg), resp.status_code), None
     except httpx.ConnectError:
         logging.warning("-> STOW-RS: CONNECTION REFUSED")
         stow_requests.labels(status="error").inc()
-        return (
-            pre_failed
-            + [
-                (uid, 0xA700, None, "Connection refused") for uid, _, _ in live_payloads
-            ],
-            None,
-        )
+        return _emit((0xA700, "Connection refused"), None), None
     except httpx.TimeoutException:
         logging.warning("-> STOW-RS: TOTAL TIMEOUT after %.0fs", total_timeout)
         stow_requests.labels(status="error").inc()
-        return (
-            pre_failed
-            + [(uid, 0xA700, None, "Total timeout") for uid, _, _ in live_payloads],
-            None,
-        )
+        return _emit((0xA700, "Total timeout"), None), None
     except httpx.TransportError as e:
         # Transient mid-request transport break (Read/Write/RemoteProtocol):
         # retryable, so 0xA700 per SOP, not the permanent 0xC000.
         logging.warning("-> STOW-RS: TRANSPORT ERROR (%s)", e)
         stow_requests.labels(status="error").inc()
-        return (
-            pre_failed + [(uid, 0xA700, None, str(e)) for uid, _, _ in live_payloads],
-            None,
-        )
+        return _emit((0xA700, str(e)), None), None
     except Exception as e:
         logging.warning("-> STOW-RS: ERROR (%s)", e)
         logging.debug("-> STOW-RS: Full traceback follows:", exc_info=True)
         stow_requests.labels(status="error").inc()
-        return (
-            pre_failed + [(uid, 0xC000, None, str(e)) for uid, _, _ in live_payloads],
-            None,
-        )
+        return _emit((0xC000, str(e)), None), None
 
 # ---------------------------------------------------------------------------
 # Bridge: http_server
@@ -4991,7 +7091,7 @@ from pydicom.datadict import dictionary_VR, keyword_dict
 # rewrites this line when it assembles clbridge.py; in the source tree the
 # value is the placeholder, which is also the honest answer for a bundle cut
 # outside a repository.
-BUNDLE_STAMP = "ff04e0db"
+BUNDLE_STAMP = "351976c7"
 
 # Per-socket-operation deadline for a request. A print job is a JSON body with
 # base64 images on a LAN, so 30 s is far beyond any legitimate transfer while
@@ -5102,6 +7202,24 @@ class _UnknownPrintAttribute(ValueError):
 # was written.
 _NUMERIC_VRS = frozenset({"US", "SS", "UL", "SL", "UV", "SV", "IS", "DS", "FL", "FD"})
 
+# The BINARY numeric VRs: their value is packed as an integer/float, so
+# pydicom's writer requires a NUMBER and rejects a string outright. The string
+# VRs (IS, DS) are decimal text on the wire and must stay strings.
+_BINARY_NUMERIC_VRS = frozenset({"US", "SS", "UL", "SL", "UV", "SV"})
+
+# PS3.5 Table 6.2-1: the inclusive range of each binary integer VR. US/UL/UV
+# are unsigned, SS/SL/SV signed. A value outside its VR's range cannot be
+# encoded at all, so it is refused here rather than failing inside pydicom
+# with an exception the caller cannot act on.
+_BINARY_NUMERIC_RANGES = {
+    "US": (0, 2**16 - 1),
+    "UL": (0, 2**32 - 1),
+    "UV": (0, 2**64 - 1),
+    "SS": (-(2**15), 2**15 - 1),
+    "SL": (-(2**31), 2**31 - 1),
+    "SV": (-(2**63), 2**63 - 1),
+}
+
 def _print_attr_value(vr, value):
     """One attribute value, typed for the VR the dictionary gave the tag.
 
@@ -5112,7 +7230,26 @@ def _print_attr_value(vr, value):
     a strict SCP reads the element with the wrong value type. Numbers pass
     through untouched and pydicom's own converter applies the VR's rules;
     everything else keeps the historical string form.
+
+    A numeric STRING for a BINARY numeric VR is converted and range-checked:
+    the documented `"1"` form is valid input, but the binary writer packs an
+    integer and cannot encode text, so passing the string through produced an
+    element pydicom refused to write. IS/DS keep their string form - they are
+    decimal text on the wire and pydicom encodes them as such.
     """
+    if vr in _BINARY_NUMERIC_VRS and isinstance(value, str):
+        text = value.strip()
+        try:
+            # `int(text, 0)` would accept "0x10"; DICOM values are decimal.
+            parsed = int(text, 10)
+        except (TypeError, ValueError):
+            raise ValueError(f"{vr} value {value!r} is not an integer")
+        lo, hi = _BINARY_NUMERIC_RANGES[vr]
+        if not (lo <= parsed <= hi):
+            raise ValueError(
+                f"{vr} value {parsed} is outside the encodable range {lo}..{hi}"
+            )
+        return parsed
     if (
         vr in _NUMERIC_VRS
         and isinstance(value, (int, float))
@@ -5401,7 +7538,16 @@ class BridgeHTTPHandler(BaseHTTPRequestHandler):
             # The head budget ran out. 408 says what happened; dropping the
             # connection silently leaves the peer with no answer at all.
             self.close_connection = True
+            # `BaseHTTPRequestHandler.send_error` writes the status line and
+            # headers ONLY when `request_version` looks like HTTP/1.x. A head
+            # timeout escapes before `parse_request` sets that field, so it is
+            # still the stdlib's HTTP/0.9 default here and the peer received a
+            # bare body with no status line - i.e. not a 408 at all. The
+            # request version is genuinely unknown at this point, so answer as
+            # HTTP/1.0: no keep-alive to honour, no chunking to negotiate.
             try:
+                if str(self.request_version) not in ("HTTP/1.0", "HTTP/1.1"):
+                    self.request_version = "HTTP/1.0"
                 self.send_error(408, "Request header timed out")
             except OSError:
                 pass
@@ -5734,10 +7880,13 @@ class PartPrefetcher:
 
     Usage:
         pref = PartPrefetcher(_stream_multipart_instances(resp)).start()
-        for dicom_bytes, idx in pref:
+        for part, idx, part_ts in pref:
             ... send ...
         # On early exit (cancel / shutdown / fatal error):
         pref.stop()
+
+    The source yields the three fields `_stream_multipart_instances` produces;
+    unpacking two raised ValueError on the very first part.
     """
 
     def __init__(self, source, max_parts=DEFAULT_PREFETCH_PARTS, on_stop=None):
@@ -5745,6 +7894,13 @@ class PartPrefetcher:
         self._source = source
         self._error = None
         self._stop = threading.Event()
+        # Guards the once-only claim of `_on_stop`. `stop()` is idempotent and
+        # can be called from both the sender and the shutdown path, so two
+        # calls used to start two close threads against the SAME response - a
+        # second `close()` re-entering urllib3 while the first is still waiting
+        # on the socket read.
+        self._on_stop_lock = threading.Lock()
+        self._on_stop_claimed = False
         # Called ONCE by `stop()` BEFORE the join. The reader may be blocked
         # inside the source (an `iter_content` on a slow or half-open HTTP
         # response), where no queue drain can reach it; closing the response
@@ -5764,20 +7920,43 @@ class PartPrefetcher:
                     # the queue cannot show it to the drain.
                     self._discard(item)
                     break
-                # Blocks when the queue is full - this is the backpressure.
-                self._q.put(item)
-                if self._stop.is_set():
-                    # Paired with the check above: a stop that landed while
-                    # we were blocked in put() is seen HERE, before the source
-                    # is asked for one more item that nothing would consume.
-                    break
+                # `put_nowait` in a bounded wait loop rather than a bare
+                # `put`: a bare put parks the reader until a slot frees, and
+                # `stop()` only frees one slot per drain pass. A reader that
+                # parked AFTER the stop check could therefore publish its part
+                # after the final drain had run, leaving a spill file that no
+                # one would ever unlink. Here the stop flag is re-checked every
+                # 50 ms, so the reader always gets out on its own, and the item
+                # it was holding is discarded rather than queued.
+                while True:
+                    try:
+                        self._q.put(item, timeout=0.05)
+                        break
+                    except queue.Full:
+                        if self._stop.is_set():
+                            self._discard(item)
+                            return
         except Exception as e:  # surface a reader failure to the sender
             self._error = e
         finally:
-            try:
-                self._q.put(_EOF)
-            except Exception:
-                pass
+            # The EOF sentinel must NEVER be dropped. It is the only thing that
+            # ends the sender's `get()`, so a sentinel lost to a full queue
+            # blocks the drain forever - the reader has finished, nothing more
+            # will ever arrive, and the C-MOVE hangs instead of ending.
+            #
+            # Waits on the queue rather than on a bounded timeout, but the wait
+            # is always finite: either a sender drains a slot, or `stop()`
+            # clears the flag and the loop gives up. On give-up the drain is
+            # already gone, which is exactly what the abandoned sentinel means.
+            while True:
+                try:
+                    self._q.put(_EOF, timeout=0.05)
+                    break
+                except queue.Full:
+                    if self._stop.is_set():
+                        break
+                except Exception:
+                    break
 
     def start(self):
         """Start the reader thread. Returns self."""
@@ -5785,7 +7964,7 @@ class PartPrefetcher:
         return self
 
     def __iter__(self):
-        """Yield `(dicom_bytes, idx)` as the reader produces them, in order."""
+        """Yield `(part, idx, part_ts)` as the reader produces them, in order."""
         while True:
             item = self._q.get()
             if item is _EOF:
@@ -5833,19 +8012,50 @@ class PartPrefetcher:
         in `put`, while a reader blocked inside the source (iterating a slow
         or half-open response) is only reachable by closing what it reads.
         Without the callback every early exit waited out the whole 5 s join.
+
+        The callback itself runs on its OWN daemon thread. Closing an HTTP
+        response can wait for the read that is in flight to return, which is
+        exactly the stall this method exists to escape: run inline, a blocked
+        `resp.close()` sat outside the join bound and held `stop()` (and the
+        resume path behind it) until the socket read ended. On a helper thread
+        the join bound is the only bound, and the close finishes whenever the
+        read does.
         """
         self._stop.set()
-        if self._on_stop is not None:
-            try:
-                self._on_stop()
-            except Exception:
-                pass
+        if self._claim_on_stop():
+            closer = threading.Thread(
+                target=self._run_on_stop, name="cmove-prefetch-close", daemon=True
+            )
+            closer.start()
         self._drain()
         if self._thread.is_alive():
             self._thread.join(timeout=5.0)
             if self._thread.is_alive():
                 logging.warning("[B1-prefetch] reader thread did not exit in 5s")
         self._drain()
+
+    def _claim_on_stop(self):
+        """True exactly once, for the first caller that has an `on_stop`.
+
+        The claim is taken under a lock rather than by testing a flag, because
+        `stop()` legitimately runs on more than one thread: the sender's early
+        exit and the shutdown path can both call it, and both would otherwise
+        start their own close thread.
+        """
+        if self._on_stop is None:
+            return False
+        with self._on_stop_lock:
+            if self._on_stop_claimed:
+                return False
+            self._on_stop_claimed = True
+            return True
+
+    def _run_on_stop(self):
+        """Run the close callback; its failure must not kill the helper."""
+        try:
+            self._on_stop()
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Bridge: move_jobs
@@ -5918,6 +8128,49 @@ def _migrate_move_jobs(conn):
         conn.execute(
             "ALTER TABLE move_jobs ADD COLUMN request_sop_uid TEXT NOT NULL DEFAULT ''"
         )
+    # The peers.conf KEY the destination was matched under. For a CIDR entry
+    # that is the subnet ("192.168.1.0/24"), not the client IP the association
+    # actually goes to: `scp_targets` is keyed by that configured host, so
+    # recording success/failure against the client IP updated no row and a
+    # subnet-backed peer never accumulated (or cleared) its failure streak.
+    if "registry_host" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN registry_host TEXT NOT NULL DEFAULT ''"
+        )
+    # SOP instance UIDs this job has DELIVERED, newline-joined, written as the
+    # peer acknowledges each one. The pass's returned list is the other carrier
+    # and a raising pass never produces it, so without this column a mid-stream
+    # exception wiped the resume skip set and the resumed pass re-sent instances
+    # the destination already held.
+    if "delivered_sops" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN delivered_sops TEXT NOT NULL DEFAULT ''"
+        )
+
+    # Instances the destination ACCEPTED with a C-STORE Warning (PS3.4 B.2.3.1)
+    # across every pass. They are delivered, so they are not in failed_sops -
+    # but Table C.4-2 gives "sub-operations completed with warnings" its own
+    # status (0xB000), and the reactor builds that response, not the worker.
+    if "warning_count" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN warning_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+    # One row per DELIVERED SOP. The `delivered_sops` TEXT column above holds
+    # the same information as a newline-joined blob, and each acknowledgement
+    # read it, split it, appended and wrote the WHOLE value back under the
+    # shared DB lock: a 5000-instance study did 12.5 M string copies while
+    # blocking every progress poll and every other worker's claim. A child
+    # table makes one acknowledgement one INSERT, and the primary key makes a
+    # duplicate acknowledgement idempotent without a read-modify-write.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS move_job_delivered ("
+        "  job_id INTEGER NOT NULL,"
+        "  sop_uid TEXT NOT NULL,"
+        "  sop_class TEXT NOT NULL DEFAULT '',"
+        "  PRIMARY KEY (job_id, sop_uid)"
+        ")"
+    )
 
 def _migrate_scp_targets(conn):
     """Migrate scp_targets from single PK (ae_title) to composite (ae_title, host).
@@ -6042,6 +8295,7 @@ class MoveJobManager:
                 "  failed_instances INTEGER DEFAULT 0,"
                 "  error_message TEXT,"
                 "  failed_sops TEXT NOT NULL DEFAULT '',"
+                "  warning_count INTEGER NOT NULL DEFAULT 0,"
                 "  created_at INTEGER NOT NULL,"
                 "  updated_at INTEGER NOT NULL,"
                 "  attempts INTEGER DEFAULT 0,"
@@ -6075,6 +8329,8 @@ class MoveJobManager:
         request_level="",
         request_series_uid="",
         request_sop_uid="",
+        registry_host="",
+        claimable=True,
     ):
         """Create a new pending C-MOVE job. Returns job id.
 
@@ -6086,26 +8342,40 @@ class MoveJobManager:
         request_level/request_series_uid/request_sop_uid: the Query/Retrieve
         scope of the request (PS3.4 C.4.2.1.2), stored for the same reason -
         a SERIES-level C-MOVE must not retrieve the whole study.
+        registry_host: the peers.conf key the destination matched under. For a
+        CIDR entry this is the SUBNET while `target_host` is the client IP the
+        association goes to; SCP health is recorded against the key.
+        claimable: when False the row is inserted as 'held', which no worker
+        picks. A multi-scope request publishes all of its jobs this way and
+        then calls `release_held_jobs()`, so no worker can start the first
+        scope while the handler is still submitting the rest (a second insert
+        that then failed left a job already sending while the SCU got an
+        error, and the worker could observe `is_job_cancelled()` as False
+        before the cancel callback was installed).
         """
         now = int(time.time())
+        initial_status = "pending" if claimable else "held"
         with self._db.locked() as conn:
             cur = conn.execute(
                 "INSERT INTO move_jobs"
                 " (study_uid, move_dest_ae, target_host, target_port,"
                 "  status, created_at, updated_at, expose_rejected,"
-                "  request_level, request_series_uid, request_sop_uid)"
-                " VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                "  request_level, request_series_uid, request_sop_uid,"
+                "  registry_host)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     study_uid,
                     move_dest_ae,
                     target_host,
                     target_port,
+                    initial_status,
                     now,
                     now,
                     1 if expose_rejected else 0,
                     str(request_level or ""),
                     str(request_series_uid or ""),
                     str(request_sop_uid or ""),
+                    str(registry_host or target_host or ""),
                 ),
             )
             conn.commit()
@@ -6138,6 +8408,32 @@ class MoveJobManager:
         except Exception:
             return 0
 
+    def release_held_jobs(self, job_ids):
+        """Make `held` rows claimable. Returns how many were released.
+
+        The publication step of a multi-scope C-MOVE request: every scope is
+        inserted as 'held' (see `create_job`), the request's cancellation
+        state is installed, and only then are all of them made pending
+        together. A single UPDATE is the barrier - no worker can observe a
+        partial set, and no scope can start before the request is ready.
+        """
+        ids = [int(i) for i in job_ids if i is not None]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._db.locked() as conn:
+            cur = conn.execute(
+                f"UPDATE move_jobs SET status = 'pending'"
+                f" WHERE status = 'held' AND id IN ({placeholders})",
+                ids,
+            )
+            conn.commit()
+            released = cur.rowcount or 0
+        if released:
+            with self._cond:
+                self._cond.notify_all()
+        return released
+
     def _select_pending(self):
         """The pending-row SELECT used by `pick_pending_job`.
 
@@ -6153,13 +8449,21 @@ class MoveJobManager:
                 " ORDER BY created_at ASC"
             ).fetchall()
 
-    def pick_pending_job(self, timeout=5.0, skip=None):
-        """Atomically pick one pending job.
+    def pick_pending_job(self, timeout=5.0, skip=None, reserve=None, release=None):
+        """Atomically pick one pending job, optionally RESERVING its peer.
 
-        `skip(host, port, ae) -> bool` marks rows that must not be claimed
-        yet (a peer another worker is streaming to). A skipped row stays
-        pending and visible to the other workers; when every pending row is
-        skipped the caller waits exactly as for an empty queue.
+        `reserve(host, port, ae) -> bool` is a non-blocking claim of the peer
+        (a per-peer gate in the worker). It runs while the pick is still a
+        candidate, BEFORE the row is claimed: a peer that cannot be reserved is
+        skipped, so the caller never holds a claimed job it cannot start. That
+        is what keeps two workers from claiming two jobs for the same peer and
+        leaving a job for a DIFFERENT peer unserved behind a blocking wait.
+
+        A candidate that is claimed but then found gone (another worker won the
+        race) releases its reservation through `release`, so the gate is not
+        leaked by the losing thread.
+
+        `skip(host, port, ae) -> bool` remains as an advisory filter.
 
         Returns dict or None.
         """
@@ -6181,45 +8485,111 @@ class MoveJobManager:
                         return None
                     continue
 
-            row = rows[0]
-            job_id = row[0]
-            now = int(time.time())
-            with self._db.locked() as conn:
-                row2 = conn.execute(
-                    "SELECT id, study_uid, move_dest_ae, attempts,"
-                    " target_host, target_port, expose_rejected,"
-                    " request_level, request_series_uid, request_sop_uid"
-                    " FROM move_jobs WHERE status = 'pending' AND id = ?",
-                    (job_id,),
-                ).fetchone()
-                if not row2:
-                    continue  # Another worker claimed it
+            claimed = None
+            for row in rows:
+                if reserve is not None and not reserve(
+                    row[4] or "", row[5] or 0, row[2] or ""
+                ):
+                    # Another worker holds this peer: leave the row pending and
+                    # look at the next one, so a job for a different peer is
+                    # still served by THIS worker.
+                    continue
+                # The claim can RAISE - a SQLite error while the row is being
+                # updated - and an exception escaping here skipped `release`,
+                # leaking the peer reservation for the life of the process. The
+                # leaked gate then made every other worker skip that peer, and
+                # because the raise also escaped the worker loop's SELECT the
+                # worker itself died. Every unsuccessful claim therefore
+                # releases, and a claim error is retried against the next
+                # candidate instead of killing the worker.
+                try:
+                    claimed = self._claim_row(row[0])
+                except Exception as claim_err:
+                    logging.error(
+                        "[MOVE-JOBS] claim of job %s failed (%s) - releasing "
+                        "the peer reservation and trying the next candidate",
+                        row[0],
+                        claim_err,
+                    )
+                    claimed = None
+                    if release is not None:
+                        try:
+                            release(row[4] or "", row[5] or 0, row[2] or "")
+                        except Exception:
+                            pass
+                    continue
+                if claimed is not None:
+                    return claimed
+                # Lost the claim race: hand the reservation back.
+                if release is not None:
+                    release(row[4] or "", row[5] or 0, row[2] or "")
+            # Every candidate was either busy or lost: wait like an empty queue.
+            with self._cond:
+                if not self._cond.wait(timeout=timeout):
+                    return None
 
-                conn.execute(
-                    "UPDATE move_jobs SET status = 'in_progress',"
-                    " updated_at = ?, attempts = attempts + 1"
-                    " WHERE id = ?",
-                    (now, job_id),
-                )
-                conn.commit()
-                return {
-                    "id": job_id,
-                    "study_uid": row2[1],
-                    "move_dest_ae": row2[2],
-                    "attempts": row2[3],
-                    "target_host": row2[4],
-                    "target_port": row2[5],
-                    # The worker outlives the association that queued the job,
-                    # so which base URL to stream from has to come from the
-                    # row. Omitting it here silently sent every QA job to
-                    # clarus_url, i.e. the sequester was never lifted.
-                    "expose_rejected": int(row2[6] or 0),
-                    # PS3.4 C.4.2.1.2: the scope travels with the job for the
-                    # same reason - the worker no longer has the event.
-                    "request_level": str(row2[7] or ""),
-                    "request_series_uid": str(row2[8] or ""),
-                    "request_sop_uid": str(row2[9] or ""),
-                }
+    def job_has_live_worker(self, job_id):
+        """True when `job_id` may still be read by a worker.
+
+        That is 'in_progress' (a worker owns it now) AND 'pending' (no worker
+        has claimed it yet, but one can, and it must observe a cancel that was
+        latched before it started). Only a TERMINAL job has nobody left to
+        read the latch: installing one there leaves a callback in the registry
+        that no worker would ever clear.
+        """
+        try:
+            with self._db.locked() as conn:
+                row = conn.execute(
+                    "SELECT status FROM move_jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+            return bool(row) and row[0] in ("pending", "in_progress")
+        except Exception:
+            return False
+
+    def _claim_row(self, job_id):
+        """Claim `job_id` for this worker, or None when another worker won it."""
+        now = int(time.time())
+        with self._db.locked() as conn:
+            row2 = conn.execute(
+                "SELECT id, study_uid, move_dest_ae, attempts,"
+                " target_host, target_port, expose_rejected,"
+                " request_level, request_series_uid, request_sop_uid,"
+                " registry_host"
+                " FROM move_jobs WHERE status = 'pending' AND id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row2:
+                return None  # Another worker claimed it
+
+            conn.execute(
+                "UPDATE move_jobs SET status = 'in_progress',"
+                " updated_at = ?, attempts = attempts + 1"
+                " WHERE id = ? AND status = 'pending'",
+                (now, job_id),
+            )
+            conn.commit()
+            return {
+                "id": job_id,
+                "study_uid": row2[1],
+                "move_dest_ae": row2[2],
+                "attempts": row2[3],
+                "target_host": row2[4],
+                "target_port": row2[5],
+                # The worker outlives the association that queued the job,
+                # so which base URL to stream from has to come from the
+                # row. Omitting it here silently sent every QA job to
+                # clarus_url, i.e. the sequester was never lifted.
+                "expose_rejected": int(row2[6] or 0),
+                # PS3.4 C.4.2.1.2: the scope travels with the job for the
+                # same reason - the worker no longer has the event.
+                "request_level": str(row2[7] or ""),
+                "request_series_uid": str(row2[8] or ""),
+                "request_sop_uid": str(row2[9] or ""),
+                # The peers.conf key, NOT the connection address: for a
+                # CIDR peer the two differ and SCP health is keyed by the
+                # former.
+                "registry_host": str(row2[10] or row2[4] or ""),
+            }
 
     def requeue_job_without_retry(self, job_id):
         """Return a claimed job to pending without charging it an attempt (R9).
@@ -6274,8 +8644,47 @@ class MoveJobManager:
                 return (0, 0, "unknown")
             return (row[0], row[1], row[2])
 
+    def add_job_delivered_sop(self, job_id, sop_uid, sop_class=""):
+        """Record one DELIVERED SOP instance (and its class) for the job.
+
+        Written as the peer acknowledges each instance, not at the end of the
+        pass: the pass's own list is lost when it raises, and the resume uses
+        this record to skip what has already arrived.
+
+        ONE INSERT into the child table. `INSERT OR IGNORE` keyed on
+        (job_id, sop_uid) makes a duplicate acknowledgement idempotent without
+        reading the previous value, so an acknowledgement costs the same
+        whether the study holds ten instances or ten thousand.
+        """
+        if not sop_uid:
+            return
+        with self._db.locked() as conn:
+            row = conn.execute(
+                "SELECT id FROM move_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                # The job row was already retired; recording a delivery for a
+                # row that no longer exists would resurrect nothing.
+                return
+            conn.execute(
+                "INSERT OR IGNORE INTO move_job_delivered"
+                " (job_id, sop_uid, sop_class) VALUES (?, ?, ?)",
+                (job_id, str(sop_uid), str(sop_class or "")),
+            )
+            conn.commit()
+
+    def get_job_delivered_sops(self, job_id):
+        """`[(sop_class, sop_uid), ...]` recorded as delivered for this job."""
+        with self._db.locked() as conn:
+            rows = conn.execute(
+                "SELECT sop_class, sop_uid FROM move_job_delivered"
+                " WHERE job_id = ? ORDER BY rowid",
+                (job_id,),
+            ).fetchall()
+        return [(str(r[0] or ""), str(r[1])) for r in rows]
+
     def set_job_failed_sops(self, job_id, uids):
-        """Record the (0008,0058) Failed SOP Instance UID List for a job.
+        """Store the (0008,0058) Failed SOP Instance UID List for a job.
 
         newline-joined UIDs of the slices that were attempted but not
         delivered. Read back by the C-MOVE generator so the final
@@ -6290,6 +8699,38 @@ class MoveJobManager:
                 (text, now, job_id),
             )
             conn.commit()
+
+    def set_job_warning_count(self, job_id, count):
+        """Record how many instances the destination accepted WITH a warning.
+
+        PS3.4 B.2.3.1: a C-STORE Warning means the SCP stored the instance, so
+        those UIDs are delivered and never belong in the failed tail. They are
+        still not plain successes: PS3.4 Table C.4-2 reserves 0xB000 for
+        "sub-operations completed with warnings", so the tally has to survive
+        the worker that computed it - the reactor builds the final response.
+        """
+        try:
+            value = max(0, int(count or 0))
+        except (TypeError, ValueError):
+            value = 0
+        now = int(time.time())
+        with self._db.locked() as conn:
+            conn.execute(
+                "UPDATE move_jobs SET warning_count = ?, updated_at = ? WHERE id = ?",
+                (value, now, job_id),
+            )
+            conn.commit()
+
+    def get_job_warning_count(self, job_id):
+        """The warning tally recorded by `set_job_warning_count`. 0 if unset."""
+        try:
+            with self._db.locked() as conn:
+                row = conn.execute(
+                    "SELECT warning_count FROM move_jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception:
+            return 0
 
     def get_job_failed_sops(self, job_id):
         """Return the (0008,0058) Failed SOP Instance UID list for a job."""
@@ -6399,6 +8840,20 @@ class MoveJobManager:
             port,
         )
 
+    def _lookup_target(self, ae_title, host):
+        """(host, port) stored for the exact (ae_title, host) key, or None.
+
+        Read in its own lock: `reload_peers_from_file` calls this BEFORE
+        delegating the upsert to `register_peer`, which acquires the same
+        lock, so the existing row cannot be read while the upsert lock is held.
+        """
+        with self._db.locked() as conn:
+            row = conn.execute(
+                "SELECT host, port FROM scp_targets WHERE ae_title = ? AND host = ?",
+                (ae_title, host),
+            ).fetchone()
+        return (row[0], row[1]) if row else None
+
     # --- SCP peer lookup with subnet support --------------------
 
     def lookup_scp(self, ae_title, client_ip=None):
@@ -6472,6 +8927,12 @@ class MoveJobManager:
 
         Respects lazyload_peers_interval. Composite key (ae_title, host)
          -  multiple entries per AE (CIDR + exact) are preserved.
+
+        Per-entry upsert delegates to `register_peer`, the single INSERT path:
+        the reload used to run its own INSERT OR REPLACE here, so the two
+        write paths drifted (register_peer's "one exact entry per AE"
+        semantics were not applied by the file path). The file-sync half
+        (removing peers the file no longer names) stays here.
         """
         if self.lazyload_peers_interval > 0:
             elapsed = time.time() - self._last_peers_reload
@@ -6479,43 +8940,40 @@ class MoveJobManager:
                 return 0
 
         self._last_peers_reload = time.time()
-        new_count = 0
+        parsed = list(parse_peers_conf(peers_file))
+        if not parsed:
+            # An EMPTY parse result must not delete anything: a file mid-save,
+            # a truncated write or a crash leaves a config that parses to zero
+            # peers, and treating that as "every peer was removed" silently
+            # unregistered the whole peer table.
+            logging.warning(
+                "[PEER] %s parsed to no peers - keeping the existing table "
+                "(a truncated or empty file must not wipe routing)",
+                peers_file,
+            )
+            return 0
+
         seen = set()
+        new_count = 0
+        for ae_title, host, port in parsed:
+            seen.add((ae_title, host))
+            existing = self._lookup_target(ae_title, host)
+            if existing == (host, port):
+                # Unchanged entry: leave the row ALONE. `register_peer` writes
+                # `consecutive_failures = 0`, so re-registering an identical
+                # peer wiped its failure streak - a peer that had failed twice
+                # (one short of the eviction threshold) started again from
+                # zero at every reload, so the configured threshold was never
+                # reached and a dead destination kept receiving jobs.
+                continue
+            new_count += 1
+            self.register_peer(ae_title, host, port)
+
+        # A peer removed from peers.conf is gone from the operator's view,
+        # so routing to the stale row was a destination the config no
+        # longer names. Deleting by (ae_title, host) keeps a peer that is
+        # still listed under a different port.
         with self._db.locked() as conn:
-            for ae_title, host, port in parse_peers_conf(peers_file):
-                seen.add((ae_title, host))
-                row = conn.execute(
-                    "SELECT host, port FROM scp_targets"
-                    " WHERE ae_title = ? AND host = ?",
-                    (ae_title, host),
-                ).fetchone()
-                existing = (row[0], row[1]) if row else None
-                if existing is None or existing != (host, port):
-                    now = int(time.time())
-                    conn.execute(
-                        "INSERT OR REPLACE INTO scp_targets"
-                        " (ae_title, host, port, last_seen, consecutive_failures)"
-                        " VALUES (?, ?, ?, ?, 0)",
-                        (ae_title, host, port, now),
-                    )
-                    new_count += 1
-            # A peer removed from peers.conf is gone from the operator's view,
-            # so routing to the stale row was a destination the config no
-            # longer names. Deleting by (ae_title, host) keeps a peer that is
-            # still listed under a different port.
-            #
-            # An EMPTY parse result is the one case that must not delete
-            # anything: a file mid-save, a truncated write or a crash leaves a
-            # config that parses to zero peers, and treating that as "every
-            # peer was removed" silently unregistered the whole peer table.
-            if not seen:
-                logging.warning(
-                    "[PEER] %s parsed to no peers - keeping the existing table "
-                    "(a truncated or empty file must not wipe routing)",
-                    peers_file,
-                )
-                conn.commit()
-                return 0
             stale = [
                 (ae, host)
                 for ae, host in conn.execute("SELECT ae_title, host FROM scp_targets")
@@ -6789,12 +9247,113 @@ class OutboxQueue:
         # is reused until something claims the queue empty or publishes a new
         # item (see dequeue's comment). None = must re-read the directory.
         self._pending_meta_cache = None
+        # Admission reservations (hard byte budget): bytes and file names that
+        # a publisher has been ALLOWED to write but has not finished publishing
+        # yet. Without them the check is check-then-act across producers - two
+        # enqueues of two large instances each see the same headroom and both
+        # are admitted.
+        self._reserved_bytes = 0
+        self._reserved_names = set()
+        # Bytes reserved per file name. Kept so a failed publish returns the
+        # EXACT amount it reserved; recomputing it from the dataset later would
+        # charge a different number, and the difference accumulates.
+        self._reserved_amounts = {}
+        self._pending_bytes_cache = None
+        # EXACT byte ledger for pending/ (see `_pending_bytes_total`). Kept in
+        # step with every transition that publishes, claims, moves or deletes a
+        # blob, so admission never has to walk the directory: the walk cost one
+        # `getsize` per pending blob on EVERY admitted C-STORE, twice, while
+        # holding the lock - quadratic filesystem work on a large backlog.
+        # `None` means "not yet measured"; the first admission or startup
+        # reconciles it with a walk.
+        self._pending_bytes = None
         # Sync from what's already on disk (survives restart).
         self._sync_pending_count()
 
     def _publish_guard_for(self, sop_uid):
         """The guard serialising publishers of `sop_uid`."""
         return self._publish_guards.for_key(sop_uid)
+
+    @staticmethod
+    def _filename_for(path):
+        """The bare file name a reservation is keyed by."""
+        return os.path.basename(path)
+
+    @staticmethod
+    def _incoming_bytes(dataset):
+        """Upper-bound size estimate for admission, from the dataset itself.
+
+        Measured from the sum of the element lengths rather than a serialised
+        copy: pydicom 3.0.1's `Dataset` has NO `to_bytes()`, so the previous
+        implementation raised and returned 0 for EVERY input - the admission
+        check then reserved nothing and only the post-write check applied, which
+        is exactly the check-then-act the budget exists to prevent.
+
+        The estimate only has to be non-negative and roughly right; the hard
+        limit still runs against the bytes that actually land.
+        """
+        try:
+            total = 0
+            for elem in dataset:
+                # `elem.length` is 0 until the element has been encoded, so
+                # every value in a freshly built dataset would count as
+                # nothing. Measure the VALUE, which is what the write does.
+                try:
+                    size = len(elem.value)
+                except TypeError:
+                    size = 0
+                total += size
+            # Per-element headers: tag, VR and length. 8 bytes is the Explicit
+            # VR short form (PS3.5 7.1.2), the smallest a value header can be.
+            return total + 8 * max(1, len(dataset))
+        except Exception:
+            return 0
+
+    def _release_reservation(self, dcm_path, reserved):
+        """Give back an admission reservation that never became an item.
+
+        Releases BOTH halves: the file name and the byte charge it was
+        admitted with. Releasing only the name left the bytes counted, so
+        repeated failures of a large instance exhausted the budget even after
+        every failed blob had been removed.
+        """
+        if not reserved:
+            return
+        name = self._filename_for(dcm_path)
+        with self._pending_lock:
+            if name in self._reserved_names:
+                self._reserved_names.discard(name)
+                # The charge is recorded per name so the exact amount comes
+                # back, never an estimate recomputed from a mutated dataset.
+                self._reserved_bytes = max(
+                    0, self._reserved_bytes - self._reserved_amounts.pop(name, 0)
+                )
+
+    def _pending_bytes_total(self):
+        """Pending bytes including in-flight reservations.
+
+        Callers hold `_pending_lock`, so this must not re-enter it. The value
+        comes from the ledger, never from a directory walk: the walk used to
+        run twice per admitted C-STORE (once here, once in the log line) and
+        cost one `getsize` per pending blob, which is quadratic filesystem work
+        when the backlog is large - exactly when admission matters.
+        """
+        if self._pending_bytes is None:
+            # First use after construction, or after recovery invalidated it.
+            # This is the ONLY walk on the admission path, and it happens once.
+            self._pending_bytes = self._pending_bytes_walk()
+        return self._pending_bytes + self._reserved_bytes
+
+    def _ledger_add(self, delta):
+        """Add `delta` to the pending-byte ledger. Callers hold the lock.
+
+        A delta against an unmeasured ledger leaves it unmeasured, so the next
+        admission measures reality instead of trusting a partial sum.
+        """
+        if self._pending_bytes is None:
+            return
+        self._pending_bytes = max(0, self._pending_bytes + delta)
+        self._pending_bytes_cache = None
 
     def _set_pending_gauge(self):
         """Push the in-memory pending count to this queue's Prometheus gauge.
@@ -6854,6 +9413,40 @@ class OutboxQueue:
     def _mods_path(self, dir_, sop_uid):
         return os.path.join(dir_, f"{self._safe_uid(sop_uid)}.mods")
 
+    def _audit_path(self, dir_, sop_uid):
+        """Marker saying this item's blob REQUIRES its `.mods` sidecar.
+
+        Written before the blob and before `.meta`, and only ever for a
+        modified instance. Recovery uses it to prove that the audit trail it is
+        about to publish alongside a blob is really there: without the marker,
+        a crash between the `.dcm` rename and the `.mods` write was
+        indistinguishable from an instance that simply had no modifications,
+        so the sweep adopted it and `dequeue()` delivered it as raw bytes -
+        the destination then stored the NEW patient fields with no Modified
+        Attributes Sequence, i.e. a different record from the one this bridge
+        documents.
+        """
+        return os.path.join(dir_, f"{self._safe_uid(sop_uid)}.audit")
+
+    def _is_published(self, dir_, sop_uid):
+        """True when `dir_` holds a COMPLETE publication of this SOP.
+
+        "Complete" means the `.meta` ready-marker is present, not merely that
+        a `.dcm` is. The `.meta` is written LAST on every publish path, so its
+        presence is the only durable proof that the blob and its audit sidecar
+        were both finished. A bare `.dcm` is an interrupted publication whose
+        bytes may be truncated and whose `.mods` may never be written; treating
+        it as "the instance is in the queue" is what let a re-C-STORE be
+        acknowledged as a duplicate while the queue held nothing deliverable,
+        and what let a half-written blob be claimed as soon as the sweep gave
+        it a `.meta` of its own.
+        """
+        return os.path.isfile(self._meta_path(dir_, sop_uid))
+
+    def _audit_required(self, dir_, sop_uid):
+        """True when the marker says this blob needs its `.mods` sidecar."""
+        return os.path.isfile(self._audit_path(dir_, sop_uid))
+
     def _is_undelivered(self, sop_uid):
         """True when the SOP is already parked in undelivered/.
 
@@ -6903,7 +9496,16 @@ class OutboxQueue:
     # -- modifications sidecar -----------------------------------------
 
     def _write_mods_sidecar(self, sop_uid, modifications):
-        """Write FR-001 audit trail sidecar (best-effort)."""
+        """Write the FR-001 audit sidecar. Returns True when it is on disk.
+
+        Publication is a DECISION, not a best-effort side effect: `.meta` is
+        what makes an item ready, and `dequeue()` uses the presence of `.mods`
+        to decide whether to apply the audit trail at all. A missing `.mods`
+        therefore turned a modified instance into a raw-bytes passthrough
+        carrying the NEW patient fields with no Modified Attributes Sequence -
+        the destination stored a different record from the one the bridge
+        documents. The caller must roll back rather than publish it.
+        """
         try:
             mods_json = []
             for tag, old_val, new_val in modifications:
@@ -6918,8 +9520,10 @@ class OutboxQueue:
                 self._mods_path(self._pending, sop_uid),
                 json.dumps(mods_json),
             )
+            return True
         except Exception as e:
-            logging.warning("[OUTBOX] Failed to write .mods for %s: %s", sop_uid, e)
+            logging.error("[OUTBOX] Failed to write .mods for %s: %s", sop_uid, e)
+            return False
 
     @staticmethod
     def read_mods_sidecar(blob_path):
@@ -6965,17 +9569,83 @@ class OutboxQueue:
         dcm_path = self._dcm_path(self._pending, sop_uid)
 
         # Dedup and publish are one critical section per SOP Instance UID:
-        # the `isfile` scan is check-then-act, so it is only a decision when
-        # nothing else can create the file between the scan and the write.
+        # the scan is check-then-act, so it is only a decision when nothing
+        # else can create the file between the scan and the write.
+        #
+        # The test is COMPLETED publication (`_is_published` = the `.meta`
+        # ready-marker), not the presence of a `.dcm`. A bare blob is an
+        # interrupted publish: its bytes may be truncated and its audit `.mods`
+        # may never have been written, so answering "duplicate, 0x0000" told
+        # the modality the instance was safely queued while the queue held
+        # nothing it could deliver. The stale parts are cleared here so this
+        # publish can proceed.
         guard = self._publish_guard_for(sop_uid)
+        reserved = False
         with guard:
             for d in [self._pending, self._in_progress, self._done]:
-                if os.path.isfile(self._dcm_path(d, sop_uid)):
+                if self._is_published(d, sop_uid):
                     logging.info(
                         "[OUTBOX] SOP %s already in queue - duplicate, 0x0000",
                         sop_uid,
                     )
                     return "duplicate"
+
+            # No committed publication anywhere: whatever is left under this
+            # UID is debris from a failed or interrupted attempt and MUST NOT
+            # survive into the new one. A stale `.audit` marker, in
+            # particular, would mark THIS publish as audit-required and make
+            # its own `.mods` mandatory even for an unmodified re-send.
+            for d in [self._pending, self._in_progress]:
+                for stale in (
+                    self._dcm_path(d, sop_uid),
+                    self._mods_path(d, sop_uid),
+                    self._audit_path(d, sop_uid),
+                    self._meta_path(d, sop_uid),
+                ):
+                    try:
+                        os.unlink(stale)
+                    except OSError:
+                        pass
+
+            # Step 0: admission. The queue slot and the byte budget are both
+            # reserved HERE, before a byte is written, and released on every
+            # failure path below. Without the byte check the enqueue path
+            # published whatever the instance size limit allowed: with 400 MiB
+            # pending against a 500 MiB budget, a 150 MiB instance brought the
+            # queue to 550 MiB and the C-STORE still answered 0x0000. The
+            # reservation makes check-then-publish atomic across producers,
+            # which is what a limit has to be.
+            incoming = self._incoming_bytes(dataset)
+            with self._pending_lock:
+                # In-flight slots count against the queue cap. Checking only
+                # `_pending_count` let two producers both see the last free
+                # slot before either incremented it, so a `max_queue` of one
+                # accepted two instances.
+                if self.max_queue and (
+                    self._pending_count + len(self._reserved_names) >= self.max_queue
+                ):
+                    logging.warning(
+                        "[OUTBOX] Queue full (%d) - refusing %s",
+                        self.max_queue,
+                        sop_uid,
+                    )
+                    return False
+                if self.max_queue_bytes and (
+                    self._pending_bytes_total() + incoming > self.max_queue_bytes
+                ):
+                    logging.warning(
+                        "[OUTBOX] Byte budget %d exceeded (pending %d + %d) - "
+                        "refusing %s",
+                        self.max_queue_bytes,
+                        self._pending_bytes_total(),
+                        incoming,
+                        sop_uid,
+                    )
+                    return False
+                self._reserved_bytes += incoming
+                self._reserved_names.add(self._filename_for(dcm_path))
+                self._reserved_amounts[self._filename_for(dcm_path)] = incoming
+                reserved = True
 
             # Step 1: Write DICOM blob (atomic).
             _ensure_file_meta(dataset)
@@ -6989,11 +9659,93 @@ class OutboxQueue:
                     os.unlink(tmp)
                 except OSError:
                     pass
+                self._release_reservation(dcm_path, reserved)
                 return False
 
-            # Step 2: Write modifications sidecar (best-effort, BEFORE .meta).
+            # The reservation used an ESTIMATE; this is the hard limit on the
+            # bytes that actually landed. A dataset that could not be measured
+            # up front therefore still cannot overrun the budget.
+            if self.max_queue_bytes:
+                try:
+                    real_size = os.path.getsize(dcm_path)
+                except OSError:
+                    real_size = 0
+                with self._pending_lock:
+                    # The reservation is this item's charge; replacing it with
+                    # the real size keeps every other item and every other
+                    # in-flight reservation exactly as it was.
+                    over = (
+                        self._pending_bytes_total() - max(0, incoming) + real_size
+                        > self.max_queue_bytes
+                    )
+                if over:
+                    logging.warning(
+                        "[OUTBOX] Byte budget %d exceeded by the real blob "
+                        "(%d) - refusing %s",
+                        self.max_queue_bytes,
+                        real_size,
+                        sop_uid,
+                    )
+                    try:
+                        os.unlink(dcm_path)
+                    except OSError:
+                        pass
+                    self._release_reservation(dcm_path, reserved)
+                    return False
+
+            # Step 2: audit sidecar - REQUIRED when the instance was modified
+            # (FR-001), written BEFORE .meta. Optional otherwise.
+            #
+            # The MARKER goes down before the sidecar, so a crash between the
+            # two leaves evidence that this blob needs audit data. Recovery
+            # reads it and refuses to adopt the blob; without it the blob is
+            # indistinguishable from an unmodified one.
             if modifications:
-                self._write_mods_sidecar(sop_uid, modifications)
+                try:
+                    self._atomic_write(
+                        self._audit_path(self._pending, sop_uid),
+                        json.dumps({"required": True}),
+                    )
+                except Exception as e:
+                    logging.error(
+                        "[OUTBOX] Cannot record the audit requirement for %s: %s "
+                        "- refusing the instance rather than publishing it "
+                        "without provable audit data",
+                        sop_uid,
+                        e,
+                    )
+                    for orphan in (
+                        dcm_path,
+                        self._mods_path(self._pending, sop_uid),
+                        self._audit_path(self._pending, sop_uid),
+                    ):
+                        try:
+                            os.unlink(orphan)
+                        except OSError:
+                            pass
+                    self._release_reservation(dcm_path, reserved)
+                    return False
+            if modifications and not self._write_mods_sidecar(sop_uid, modifications):
+                # Publishing now would produce an instance whose audit trail
+                # does not exist: `dequeue()` sees no `.mods`, delivers the
+                # blob as raw bytes, and the destination receives the new
+                # patient fields with no record of the change.
+                logging.error(
+                    "[OUTBOX] .mods failed for %s - rolling back the unready "
+                    "blob so the sender retries",
+                    sop_uid,
+                )
+                for orphan in (
+                    dcm_path,
+                    self._mods_path(self._pending, sop_uid),
+                    self._audit_path(self._pending, sop_uid),
+                ):
+                    try:
+                        os.unlink(orphan)
+                    except OSError:
+                        pass
+                self._release_reservation(dcm_path, reserved)
+                return False
 
             # Step 3: Write metadata (LAST  -  signals "this item is ready").
             now = time.time()
@@ -7021,15 +9773,32 @@ class OutboxQueue:
                     sop_uid,
                     e,
                 )
-                for orphan in (dcm_path, self._mods_path(self._pending, sop_uid)):
+                for orphan in (
+                    dcm_path,
+                    self._mods_path(self._pending, sop_uid),
+                    self._audit_path(self._pending, sop_uid),
+                ):
                     try:
                         os.unlink(orphan)
                     except OSError:
                         pass
+                self._release_reservation(dcm_path, reserved)
                 return False
 
         with self._pending_lock:
             self._pending_count += 1
+            # The item is on disk and counted: the reservation becomes the
+            # real pending byte, so the two never double-count it. The charge
+            # that lands in the ledger is the REAL blob size, not the estimate:
+            # the estimate exists only to make the pre-write check possible.
+            self._reserved_bytes = max(0, self._reserved_bytes - incoming)
+            self._reserved_names.discard(self._filename_for(dcm_path))
+            self._reserved_amounts.pop(self._filename_for(dcm_path), None)
+            try:
+                published = os.path.getsize(dcm_path)
+            except OSError:
+                published = max(0, incoming)
+            self._ledger_add(published)
         self._set_pending_gauge()
 
         logging.debug("[OUTBOX] Enqueued SOP %s", sop_uid)
@@ -7116,17 +9885,27 @@ class OutboxQueue:
                 return "duplicate"
 
         # Queue-full: drop-newest (best-effort, never backpressure primary).
-        if self.max_queue and self._pending_count >= self.max_queue:
-            logging.warning(
-                "[OUTBOX] Forward queue full (%d) - dropping %s "
-                "(primary 0x0000 unchanged)",
-                self.max_queue,
-                sop_uid,
-            )
-            self._inc_forward_dropped()
-            return "full"
+        # Checked and RESERVED under the count lock: reading the count here and
+        # incrementing it further down let two producers both see one free slot
+        # and both publish, so the forward queue exceeded its cap.
+        with self._pending_lock:
+            if self.max_queue and self._pending_count >= self.max_queue:
+                logging.warning(
+                    "[OUTBOX] Forward queue full (%d) - dropping %s "
+                    "(primary 0x0000 unchanged)",
+                    self.max_queue,
+                    sop_uid,
+                )
+                self._inc_forward_dropped()
+                return "full"
+            self._pending_count += 1
 
         dcm_path = self._dcm_path(self._pending, sop_uid)
+
+        def _unreserve():
+            with self._pending_lock:
+                self._pending_count = max(0, self._pending_count - 1)
+            self._set_pending_gauge()
 
         # Step 1: hardlink/copy the primary blob into forward/pending.
         #
@@ -7146,11 +9925,36 @@ class OutboxQueue:
                     sop_uid,
                 )
                 self._inc_forward_dropped()
+                _unreserve()
                 return False
 
-        # Step 2: audit sidecar (best-effort, BEFORE .meta).
-        if modifications:
-            self._write_mods_sidecar(sop_uid, modifications)
+        # Step 2: audit sidecar (BEFORE .meta).
+        #
+        # REQUIRED when the instance carries modifications, exactly as in the
+        # primary path: publishing without it makes `dequeue()` apply no audit
+        # trail and forward the modified dataset as raw bytes, so the second
+        # archive stores a different record from the one this bridge keeps.
+        # The mirror is dropped rather than published incomplete; the PRIMARY
+        # C-STORE result and its blob are untouched.
+        if modifications and not self._write_mods_sidecar(sop_uid, modifications):
+            logging.error(
+                "[OUTBOX] Forward .mods failed for %s - dropping the mirror "
+                "rather than forwarding it without its audit trail "
+                "(primary 0x0000 unchanged)",
+                sop_uid,
+            )
+            for orphan in (
+                dcm_path,
+                self._mods_path(self._pending, sop_uid),
+                self._audit_path(self._pending, sop_uid),
+            ):
+                try:
+                    os.unlink(orphan)
+                except OSError:
+                    pass
+            self._inc_forward_dropped()
+            _unreserve()
+            return False
 
         # Step 3: metadata LAST  -  signals "this item is ready" to the worker.
         now = time.time()
@@ -7161,12 +9965,34 @@ class OutboxQueue:
             "last_error": None,
         }
         meta_path = self._meta_path(self._pending, sop_uid)
-        self._atomic_write(meta_path, json.dumps(meta))
+        try:
+            self._atomic_write(meta_path, json.dumps(meta))
+        except Exception as e:
+            # A blob with no `.meta` is not an item: it makes a later mirror
+            # attempt read as a duplicate (so the SOP is never forwarded) or
+            # lets recovery adopt it as a new one. Roll the mirror back, as the
+            # primary enqueue does. The PRIMARY blob and its acknowledgement
+            # are untouched - this queue owns only the copy it just made.
+            logging.error(
+                "[OUTBOX] Forward .meta failed for %s: %s - removing the "
+                "unready mirror",
+                sop_uid,
+                e,
+            )
+            for orphan in (
+                dcm_path,
+                self._mods_path(self._pending, sop_uid),
+                self._audit_path(self._pending, sop_uid),
+            ):
+                try:
+                    os.unlink(orphan)
+                except OSError:
+                    pass
+            self._inc_forward_dropped()
+            _unreserve()
+            return False
         # A published item must be visible to the very next dequeue.
         self._pending_meta_cache = None
-
-        with self._pending_lock:
-            self._pending_count += 1
         self._set_pending_gauge()
 
         logging.debug("[OUTBOX] Forward-enqueued SOP %s", sop_uid)
@@ -7225,11 +10051,24 @@ class OutboxQueue:
         # yield nothing, so a newly ready retry is still found on the next
         # call.
         metas = self._pending_meta_cache
+        from_cache = metas is not None
         if metas is None:
             metas = self._scan_pending_metas(self._list_pending_names())
             self._pending_meta_cache = metas
 
-        # Find the first READY item in age order.
+        # Find the first READY item in age order. Rows walked past are RETIRED
+        # from the cache (see below): without that, every dequeue restarted at
+        # the head of the same list and re-opened the metadata of every
+        # already-claimed item, turning a drain of n into n^2/2 failed opens.
+        #
+        # `retired` counts rows that are GONE (claimed, unreadable, or holding
+        # a dangling ready-marker), and only those may leave the cache. Rows
+        # that are merely NOT YET DUE end the walk but stay: they are still
+        # queue members, they become claimable on their own clock, and this
+        # listing is the only record of when. Dropping them lost every pending
+        # retry in the backlog to a single walk, so the queue drained and then
+        # stayed empty for as long as the retry backoff.
+        retired = 0
         for _mtime, name in metas:
             # `name` is the ESCAPED form on disk; unescape before any path
             # helper re-escapes it, or `1.2%2F3.meta` would be looked up as
@@ -7241,21 +10080,58 @@ class OutboxQueue:
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
             except (json.JSONDecodeError, OSError):
+                retired += 1
                 continue
 
             next_retry = meta.get("next_retry_at", 0)
             retry_count = meta.get("retry_count", 0)
-            if next_retry > now or retry_count >= self.MAX_RETRIES:
+            if retry_count >= self.MAX_RETRIES:
+                # Exhausted: this row will never be claimable again, so it must
+                # not stop the scan for the healthy rows behind it. It is left
+                # in place for `recover_stuck`, which parks it.
+                retired += 1
+                continue
+            if next_retry > now:
+                # Not due yet: stop here and keep this row and every row after
+                # it in the cache. They are queue members on their own clock,
+                # and this listing is the only record of when they come due.
+                break
+
+            # A `.meta` promises a COMPLETE publication: the blob finished
+            # writing and, when the marker is present, its `.mods` sidecar was
+            # written too. Claiming on the metadata alone delivered whatever
+            # bytes happened to be on disk - a truncated blob from an
+            # interrupted publish, or a modified instance whose audit trail
+            # was never written. Both are settled as a delivery failure so the
+            # retry path owns them, rather than being handed to the drain.
+            dcm_ready = self._dcm_path(self._pending, uid)
+            if not os.path.isfile(dcm_ready):
+                retired += 1
+                continue
+            if self._audit_required(self._pending, uid) and not os.path.isfile(
+                self._mods_path(self._pending, uid)
+            ):
+                logging.error(
+                    "[OUTBOX] SOP %s is marked audit-required but its .mods "
+                    "is missing - not delivering it without the audit trail",
+                    uid,
+                )
+                retired += 1
                 continue
 
             # Atomic claim: move ALL files for this UID to in_progress/.
-            dcm = self._dcm_path(self._pending, uid)
+            dcm = dcm_ready
             mods = self._mods_path(self._pending, uid)
+            audit = self._audit_path(self._pending, uid)
 
             try:
                 os.rename(dcm, self._dcm_path(self._in_progress, uid))
                 if os.path.isfile(mods):
                     os.rename(mods, self._mods_path(self._in_progress, uid))
+                # The marker travels with the item: recovery reads it there to
+                # prove the audit trail it publishes is the one required.
+                if os.path.isfile(audit):
+                    os.rename(audit, self._audit_path(self._in_progress, uid))
                 os.rename(meta_path, self._meta_path(self._in_progress, uid))
                 # `rename` preserves the mtime the blob got when it was
                 # ENQUEUED, but `recover_stuck` reads that mtime as "how long
@@ -7273,13 +10149,34 @@ class OutboxQueue:
                 break
             except OSError:
                 # Another worker claimed it (or file removed)  -  skip.
+                retired += 1
                 continue
 
+        # Retire the rows this call walked past, so the next dequeue does not
+        # re-open metadata for items it has already proven unclaimable. Only a
+        # listing that came FROM the cache is retired: mutating a freshly
+        # scanned list could drop the only ready row of a single-item queue.
+        #
+        # The slice stops BEFORE the first DEFERRED row. A deferred item is not
+        # retired from the queue, only from this pass: everything before it is
+        # provably gone (claimed, unreadable, dangling), everything from it
+        # onward must be looked at again, because one of those rows is the
+        # retry that is about to become due. Removing the tail here is what
+        # `:839` was about - the old slice started at `retired + 1`, which is
+        # one row PAST the item the walk actually stopped on, and every
+        # not-yet-due retry behind it went with the cache.
+        if from_cache and retired:
+            self._pending_meta_cache = metas[retired:]
+
         if sop_uid is None:
-            # Nothing in the cached listing was claimable: a new item or a
-            # newly ready retry may have appeared since it was taken, so the
-            # next call re-reads the directory.
-            self._pending_meta_cache = None
+            # Nothing was claimable. Keep the surviving tail: it is the only
+            # record of which retries exist and when they come due. Discarding
+            # it re-walked the whole backlog on every idle poll (one stat per
+            # item, forever) AND, when the tail was dropped, forgot the retries
+            # entirely. Only a listing with nothing left in it is dropped, so
+            # the next call re-reads the directory.
+            if not self._pending_meta_cache:
+                self._pending_meta_cache = None
             return (None, None, None, None)
 
         # Read DICOM from claimed file.
@@ -7318,16 +10215,35 @@ class OutboxQueue:
     # -- delivery status -----------------------------------------------
 
     def mark_delivered(self, sop_uid):
-        """Mark SOP as successfully delivered."""
+        """Mark SOP as successfully delivered.
+
+        The terminal transition runs under the same per-UID publication guard
+        `delivered()` reads under. Without it the reader could observe the
+        blob already out of `in_progress/` and its `.meta` still there (or the
+        reverse), so a concurrent Storage Commitment query judged a delivered
+        instance undelivered, or an undelivered one finished.
+        """
+        with self._publish_guard_for(sop_uid):
+            self._mark_delivered_locked(sop_uid)
+
+    def _mark_delivered_locked(self, sop_uid):
+        """Body of `mark_delivered`; the caller holds the publication guard."""
         # A previous delivery attempt may have exhausted its retries and left
         # undelivered/{uid}.dcm behind. If a LATER attempt of the SAME SOP
         # succeeds, that stale marker must go: delivered() checks undelivered/
         # FIRST, so the saved instance would otherwise keep reading as a
-        # Storage Commitment failure forever.
-        try:
-            os.unlink(self._dcm_path(self._undelivered, sop_uid))
-        except OSError:
-            pass
+        # Storage Commitment failure forever. The marker and its companions go
+        # together, or `delivered()` finds the `.meta` of the failed attempt.
+        for stale in (
+            self._dcm_path(self._undelivered, sop_uid),
+            self._meta_path(self._undelivered, sop_uid),
+            self._audit_path(self._undelivered, sop_uid),
+            self._mods_path(self._undelivered, sop_uid),
+        ):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
 
         # Find which dir the SOP is in (normally in_progress/, but allow pending/ for test flexibility).
         dir_ = self._in_progress
@@ -7336,6 +10252,13 @@ class OutboxQueue:
         dcm = self._dcm_path(dir_, sop_uid)
         meta = self._meta_path(dir_, sop_uid)
         mods = self._mods_path(dir_, sop_uid)
+
+        # Measure BEFORE the files move: after a cleanup unlink the size is
+        # gone, and after a rename it belongs to done/ rather than pending/.
+        try:
+            released = os.path.getsize(dcm)
+        except OSError:
+            released = 0
 
         if self.cleanup:
             for p in [dcm, meta, mods]:
@@ -7355,9 +10278,23 @@ class OutboxQueue:
                     os.rename(mods, self._mods_path(self._done, sop_uid))
                 except OSError:
                     pass
+            # The audit marker travels with the item into done/. Leaving it in
+            # the source directory let the NEXT publish of this UID read as
+            # audit-required even though it carried no modifications.
+            if os.path.isfile(self._audit_path(dir_, sop_uid)):
+                try:
+                    os.rename(
+                        self._audit_path(dir_, sop_uid),
+                        self._audit_path(self._done, sop_uid),
+                    )
+                except OSError:
+                    pass
 
         with self._pending_lock:
             self._pending_count = max(0, self._pending_count - 1)
+            # The blob left pending/ for good (deleted, or moved to done/),
+            # so its bytes leave the admission ledger with it.
+            self._ledger_add(-released)
         self._set_pending_gauge()
         logging.debug("[OUTBOX] Delivered SOP %s", sop_uid)
 
@@ -7373,15 +10310,30 @@ class OutboxQueue:
         and the origin's verdict.
 
         Read-side only - the worker is the single writer of this state.
-        Checks undelivered/ FIRST: a SOP that exhausted its retries must
-        never read as delivered.
+        Checks undelivered/ and the live directories under the SAME per-UID
+        guard the worker transitions hold: two separate reads let a SOP parked
+        BETWEEN them read as absent from both, so a failed instance reported
+        itself delivered and Storage Commitment told the modality a SOP was
+        saved that the archive had rejected.
+
+        The guard also makes the answer a genuine transition point. `park_blob`
+        moves only the `.dcm`, so "the blob is not in a live directory" is not
+        enough: an item in the middle of a requeue has its blob in `done/` and
+        its `.meta` still in `pending/`. Any part of a publication under the
+        live directories - blob, ready-marker, audit marker or sidecar - means
+        the queue still holds this SOP.
         """
-        if os.path.isfile(self._dcm_path(self._undelivered, sop_uid)):
-            return False
-        for dir_ in (self._pending, self._in_progress):
-            if os.path.isfile(self._dcm_path(dir_, sop_uid)):
-                return False
-        return True
+        with self._publish_guard_for(sop_uid):
+            for d in (self._undelivered, self._pending, self._in_progress):
+                for p in (
+                    self._dcm_path(d, sop_uid),
+                    self._meta_path(d, sop_uid),
+                    self._audit_path(d, sop_uid),
+                    self._mods_path(d, sop_uid),
+                ):
+                    if os.path.isfile(p):
+                        return False
+            return True
 
     def mark_failed(self, sop_uid, error):
         """Mark delivery as failed. Retry with backoff.
@@ -7504,13 +10456,39 @@ class OutboxQueue:
             dcm = self._dcm_path(self._in_progress, sop_uid)
         dst = self._dcm_path(self._undelivered, sop_uid)
 
+        # The terminal move decides the ACCOUNTING. Moving the sidecars and
+        # decrementing the counters after a FAILED blob move left the original
+        # blob in pending/ with no `.meta` beside it - recovery then adopted it
+        # as a fresh orphan with zero retries and no audit trail, and the
+        # undelivered counter had been bumped for an item that never reached
+        # the terminal state.
+        if not os.path.isfile(dcm):
+            # The blob already left the queue by another path: there is nothing
+            # to park, but the counter must follow reality or the queue reports
+            # an item it does not own and never recovers on its own.
+            logging.critical(
+                "[OUTBOX] Nothing to move to undelivered for %s - dropping its "
+                "pending accounting",
+                sop_uid,
+            )
+            with self._pending_lock:
+                self._pending_count = max(0, self._pending_count - 1)
+            self._set_pending_gauge()
+            return False
         try:
             shutil.move(dcm, dst)
             logging.critical("[OUTBOX] SOP %s moved to UNDELIVERED: %s", sop_uid, dst)
         except OSError as e:
+            # Leave the sidecars and the counters ALONE: the item is still a
+            # live entry and the next sweep must retry the move WITH its
+            # `.meta`.
             logging.critical(
-                "[OUTBOX] Failed to move %s to undelivered: %s", sop_uid, e
+                "[OUTBOX] Failed to move %s to undelivered: %s - keeping its "
+                "retry state and accounting for a later attempt",
+                sop_uid,
+                e,
             )
+            return False
 
         # Carry the audit sidecars WITH the blob. `.mods` is the record of what
         # the bridge changed (Modified Attributes Sequence material) and `.meta`
@@ -7550,6 +10528,7 @@ class OutboxQueue:
             undelivered_counter.inc()
         except Exception:
             pass
+        return True
 
     # -- recovery ------------------------------------------------------
 
@@ -7571,6 +10550,8 @@ class OutboxQueue:
         cutoff = now if force else now - STUCK_ITEM_TIMEOUT
         recovered = 0
         undelivered_count = 0
+        # Orphans whose audit marker has no sidecar: counted, never adopted.
+        quarantined = 0
 
         # Category 1: stuck in_progress -> pending.
         try:
@@ -7584,7 +10565,11 @@ class OutboxQueue:
                 dcm_path = os.path.join(self._in_progress, name)
                 try:
                     if os.path.getmtime(dcm_path) < cutoff:
-                        for ext in [".dcm", ".meta", ".mods"]:
+                        # The `.audit` marker travels with the item: dropping it
+                        # on the way back to pending/ erased the proof that the
+                        # blob needs its `.mods`, and the next claim then
+                        # delivered a modified instance as raw bytes.
+                        for ext in [".dcm", ".meta", ".mods", ".audit"]:
                             src = os.path.join(self._in_progress, safe_uid + ext)
                             dst = os.path.join(self._pending, safe_uid + ext)
                             if os.path.isfile(src):
@@ -7621,6 +10606,23 @@ class OutboxQueue:
                             continue
                     except OSError:
                         continue
+                    # A blob that declares it needs audit data must HAVE it.
+                    # Adopting it otherwise publishes an instance whose
+                    # Modified Attributes Sequence never existed, and
+                    # `dequeue()` would deliver the modified dataset as raw
+                    # bytes - a different record from the one this bridge
+                    # documents. Quarantine instead of adopting.
+                    if os.path.isfile(self._audit_path(self._pending, uid)) and not (
+                        os.path.isfile(self._mods_path(self._pending, uid))
+                    ):
+                        quarantined += 1
+                        logging.error(
+                            "[OUTBOX] Orphan %s requires audit data but its "
+                            ".mods is missing - NOT adopting it; left in "
+                            "pending/ for an operator",
+                            uid,
+                        )
+                        continue
                     now_ts = time.time()
                     meta = {
                         "created_at": now_ts,
@@ -7656,8 +10658,12 @@ class OutboxQueue:
                 if meta.get("retry_count", 0) >= self.MAX_RETRIES:
                     dcm = self._dcm_path(self._pending, uid)
                     if os.path.isfile(dcm):
-                        self.move_to_undelivered(uid)
-                        undelivered_count += 1
+                        # Count only an item that actually moved. A False
+                        # return means the blob is still live and will be
+                        # tried again, so reporting it as moved overstates
+                        # both the log line and the recovered tuple.
+                        if self.move_to_undelivered(uid):
+                            undelivered_count += 1
         except OSError:
             pass
 
@@ -7700,6 +10706,17 @@ class OutboxQueue:
         cached = getattr(self, "_pending_bytes_cache", None)
         if cached is not None and now - cached[0] < 1.0:
             return cached[1]
+        total = self._pending_bytes_walk()
+        self._pending_bytes_cache = (now, total)
+        return total
+
+    def _pending_bytes_walk(self):
+        """Uncached size of pending/, lock-free (see `pending_bytes`).
+
+        The admission gate adds in-flight reservations on top of this, under
+        the pending lock, so a producer that has been admitted but has not
+        finished writing still occupies its budget.
+        """
         total = 0
         try:
             names = os.listdir(self._pending)
@@ -7712,7 +10729,6 @@ class OutboxQueue:
                 total += os.path.getsize(os.path.join(self._pending, name))
             except OSError:
                 continue
-        self._pending_bytes_cache = (now, total)
         return total
 
     def _over_byte_budget(self, incoming_bytes):
@@ -7726,17 +10742,50 @@ class OutboxQueue:
         return self.pending_bytes() + max(0, incoming_bytes) > self.max_queue_bytes
 
     def _sync_pending_count(self):
-        """Recalculate pending count from FS (startup / recovery only)."""
+        """Recalculate the pending count from the filesystem (startup / recovery).
+
+        The invariant is `_pending_count` = blobs the queue still OWNS, i.e.
+        pending/ plus in_progress/. Recovery runs outside the workers, so the
+        snapshot and the assignment happen under the same lock `enqueue`
+        increments under: taking the count outside the lock and assigning it
+        inside erased any publication that landed in between, and the queue
+        then under-reported permanently. In-progress blobs are counted because
+        `mark_delivered` is what subtracts them.
+        """
         # The directory was just swept: the cached listing is stale.
         self._pending_meta_cache = None
+        self._pending_bytes_cache = None
         try:
-            count = sum(1 for n in os.listdir(self._pending) if n.endswith(".dcm"))
+            names = os.listdir(self._pending)
         except OSError:
-            count = 0
+            names = []
+        count = sum(1 for n in names if n.endswith(".dcm"))
+        try:
+            claimed = sum(
+                1 for n in os.listdir(self._in_progress) if n.endswith(".dcm")
+            )
+        except OSError:
+            claimed = 0
+        # Recovery is where the ledger is TRUSTED again: every path that moves
+        # a blob without going through `enqueue`/`mark_delivered` (recovery
+        # adopting an orphan, a manual `cleanup`, an operator moving files)
+        # lands here, so the walk below is the authority.
+        #
+        # The snapshot is reconciled against every publication that is still
+        # IN FLIGHT, under the lock: the listing above is a read of the
+        # filesystem taken without one, so an enqueue that reserved its slot
+        # and is still writing has no `.dcm` yet and would be erased by the
+        # assignment - the queue then under-reported for the rest of the
+        # process life. The reservations are the only place those publications
+        # are visible, so they are ADDED to the measured count rather than
+        # assumed to be included in it.
+        measured = self._pending_bytes_walk()
         with self._pending_lock:
-            self._pending_count = count
+            self._pending_count = count + claimed + len(self._reserved_names)
+            self._pending_bytes = measured + self._reserved_bytes
+            self._pending_bytes_cache = None
         self._set_pending_gauge()
-        return count
+        return self._pending_count
 
     def next_retry_wait_sec(self):
         """Return seconds until the next SOP is ready for retry, or 5.0 if empty.
@@ -8073,7 +11122,17 @@ class HealthChecker:
         return (False, 0xA700, self._last_reason or "server unhealthy")
 
     def dead_seconds(self) -> float:
-        """Return seconds since last successful health check (0 if healthy)."""
+        """Return seconds since last successful health check (0 if healthy).
+
+        Uses the same predicate as `is_healthy()`: a disabled checker is not
+        reporting an outage, so it must not report outage TIME either. In
+        `probe` mode a 503 followed by a 404 exits the poller and reopens
+        STOW admission, but the healthy Event is left as the 503 left it -
+        reading the Event alone reported an "outage" that grew for the life of
+        the process, long after the bridge had decided the server was fine.
+        """
+        if self._disabled_until_restart:
+            return 0.0
         if self._server_healthy.is_set():
             return 0.0
         return time.monotonic() - self._last_ok_time
@@ -8180,7 +11239,13 @@ class HealthChecker:
                 self._server_healthy.set()
                 self._consecutive_failures = 0
                 self._last_ok_time = time.monotonic()
-                return was_dead
+                # The gate is open again, so the outage it was recording is
+                # over. Returning `was_dead` left the flag set, and the NEXT
+                # 503 then took the "already down" path - no new-outage
+                # warning, so an operator saw one outage where the log
+                # recorded two (503 then 401 then 503), with the second one
+                # unannounced.
+                return False
             self._on_unhealthy(f"Server returned HTTP {resp.status_code}", was_dead)
             return True
         except requests.exceptions.Timeout:
@@ -8239,6 +11304,7 @@ CRIT-002: extracted common _handle_qido_search() to eliminate ~60 lines of dupli
 """
 
 import logging
+from collections import Counter
 from urllib.parse import quote
 
 import httpx
@@ -8445,6 +11511,7 @@ def _handle_qido_search(
     tls=None,
     expose_rejected=False,
     qa_url="",
+    row_filter=None,
 ):
     """Common C-FIND handler: QIDO-RS search -> DIMSE Pending responses.
 
@@ -8494,7 +11561,7 @@ def _handle_qido_search(
             limit=qido_limit,
             tls=tls,
         )
-        if not isinstance(results, list):
+        if not isinstance(results, (list, QidoPage)):
             results = []
     except httpx.HTTPStatusError as exc:
         # Status class decides the refusal: 4xx is the BRIDGE's own bad
@@ -8539,7 +11606,31 @@ def _handle_qido_search(
 
     count = 0
     truncated = False
+    # PS3.18 10.6.1.4: the origin can answer fewer rows than the page size and
+    # still report the search incomplete. 0x0000 states that no further
+    # matches exist (PS3.4 Table C.4.1-1), so an answer the origin left
+    # unfinished must be reported as 0xB001 instead. Only a `QidoPage` carries
+    # that flag; a plain list (a caller that built its own pages) says nothing.
+    incomplete = isinstance(results, QidoPage) and results.more
     for result in results:
+        # PS3.7 9.3.2: a C-CANCEL can arrive at ANY time, and the SCU expects
+        # the next response to be 0xFE00. Checking only at the top of a study
+        # meant a multi-row answer kept sending Pending responses after the
+        # SCU had already cancelled - each one a write the SCU no longer
+        # reads. The rows already sent are retained in the metric.
+        if getattr(event, "is_cancelled", False):
+            find_responses.labels(type=log_label).inc(count)
+            yield 0xFE00, None
+            return
+        if _shutdown_requested.is_set():
+            find_responses.labels(type=log_label).inc(count)
+            yield 0xC000, None
+            return
+        # A matching key the origin cannot filter on is applied here, BEFORE
+        # the response limit, so a non-matching row never consumes a Pending
+        # response (PS3.4 Table K.6-1 matching rule).
+        if row_filter is not None and not row_filter(result):
+            continue
         # Bridge: C-FIND response limit guard
         if max_responses and count >= max_responses:
             truncated = True
@@ -8557,21 +11648,53 @@ def _handle_qido_search(
         yield 0xFF00, row_ds
         count += 1
 
-    # Bridge: final status when truncated  -  0xB001 (Warning).
-    # PS3.4 Table C.4.1-1: "Matching terminated due to number of matches
-    # encountered. Subsequent request may return additional matches."
-    # This is a STANDARD C-FIND status. Every DIMSE-compatible viewer
-    # (Weasis, MicroDICOM, Orthanc) is required to handle it.
-    # pynetdicom knows this status  -  no "Unknown status" warning.
-    # Bridge: count C-FIND responses sent. The counter is incremented BEFORE
-    # the final yield: the SCP stops iterating a generator as soon as it reads
-    # a non-Pending status, so anything after that yield never runs and the
-    # metric would always report zero.
+    # Bridge: final status when truncated.
+    #
+    # 0xB001 ("matching terminated due to number of matches encountered") is
+    # NOT defined for Query/Retrieve by PS3.4 Table C.4.1-1 nor for MWL by
+    # Table K.4-1, so it is not a status this SCP may choose to send. A search
+    # the bridge could not finish is a refusal, not a success and not a
+    # warning: 0xA700 (Refused: Out of Resources) is the defined status for
+    # "the SCP could not complete this request", and it also tells the SCU
+    # that retrying - with a narrower query - is meaningful.
+    #
+    # PS3.7 9.3.2: a C-CANCEL received during the HTTP request is only
+    # observable AFTER it, so the cancel check has to sit between the request
+    # and this terminal status; otherwise the SCU is told "success" for a
+    # search it already abandoned.
     find_responses.labels(type=log_label).inc(count)
-    if truncated:
-        yield 0xB001, None
+    if getattr(event, "is_cancelled", False):
+        yield 0xFE00, None
+        return
+    if truncated or incomplete:
+        yield 0xA700, None
     else:
         yield 0x0000, None
+
+def _patient_group_key(study_row):
+    """Grouping key of a study row in the patient fold.
+
+    A study with a PatientID groups by that ID. A study without one
+    (anonymous) cannot be asserted to belong to any other (PS3.4 C.6.1.1.2
+    note: Patient ID is the grouping key), so it is its own group. The
+    ("", id(study_row)) key keeps anonymous rows apart while staying distinct
+    from a real PatientID; the id is stable because the pre-fold pass and the
+    fold walk the same row list.
+    """
+    patient_id = _json_first_value(study_row, "00100020") or ""
+    return patient_id if patient_id else ("", id(study_row))
+
+def _int_or_zero(value):
+    """DICOMweb JSON integer-string -> int; 0 when absent or unparsable.
+
+    NumberOfStudyRelatedSeries/Instances arrive as IS strings, and the server
+    may omit the key entirely. 0 is the neutral term of the fold: a study
+    with no count adds nothing to the patient total.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 def _handle_patient_level(
     event,
@@ -8630,7 +11753,7 @@ def _handle_patient_level(
             limit=None,
             tls=tls,
         )
-        if not isinstance(study_rows, list):
+        if not isinstance(study_rows, (list, QidoPage)):
             study_rows = []
     except httpx.HTTPStatusError as exc:
         # Same classifier as the other handlers: 4xx is this query's fault,
@@ -8653,6 +11776,23 @@ def _handle_patient_level(
         yield 0xA700, None
         return
 
+    # PS3.4 C.6.1.1.2: NumberOfPatientRelated* are TOTALS over the patient's
+    # studies, series and instances - not one study's own counts. The fold
+    # emits a row while walking, and the first study of a patient cannot know
+    # how many more follow, so the totals are computed in one pass FIRST.
+    counts = Counter()
+    series_sums = {}
+    instance_sums = {}
+    for study_row in study_rows:
+        key = _patient_group_key(study_row)
+        counts[key] += 1
+        series_sums[key] = series_sums.get(key, 0) + _int_or_zero(
+            _json_first_value(study_row, "00201206")
+        )
+        instance_sums[key] = instance_sums.get(key, 0) + _int_or_zero(
+            _json_first_value(study_row, "00201208")
+        )
+
     count = 0
     truncated = False
     seen = set()
@@ -8665,10 +11805,7 @@ def _handle_patient_level(
             find_responses.labels(type="patient").inc(count)
             yield 0xC000, None
             return
-        patient_id = _json_first_value(study_row, "00100020") or ""
-        # An empty PatientID identifies nobody, so it never merges: give each
-        # such study a key of its own instead of a shared "" bucket.
-        group_key = patient_id if patient_id else object()
+        group_key = _patient_group_key(study_row)
         if group_key in seen:
             continue
         seen.add(group_key)
@@ -8680,13 +11817,26 @@ def _handle_patient_level(
             )
             break
         row_ds = _json_to_dataset_patient(study_row)
+        # The three Patient-level counters (0020,1200/1202/1204) are the
+        # fold's own totals, not values read off a study row, so they are
+        # added here as IS after the study row is projected to the level.
+        row_ds.add_new((0x0020, 0x1200), "IS", counts[group_key])
+        row_ds.add_new((0x0020, 0x1202), "IS", series_sums[group_key])
+        row_ds.add_new((0x0020, 0x1204), "IS", instance_sums[group_key])
         _stamp_cfind_response(event, row_ds)
         yield 0xFF00, row_ds
         count += 1
 
     find_responses.labels(type="patient").inc(count)
+    # PS3.7 9.3.2 and the same rule as the common handler: a cancel that
+    # arrived during the HTTP request is only visible here, before the
+    # terminal status. 0xB001 is not defined for Query/Retrieve either, so an
+    # incomplete answer is the defined refusal 0xA700.
+    if getattr(event, "is_cancelled", False):
+        yield 0xFE00, None
+        return
     if truncated:
-        yield 0xB001, None
+        yield 0xA700, None
     else:
         yield 0x0000, None
 
@@ -8709,12 +11859,27 @@ def _handle_patient_root(
     Root already applies - a patient-root SERIES query used to fall through
     to the study path and relabel study rows as SERIES, so the SCU received
     rows with no SeriesInstanceUID.
+    IMAGE level: three-step series search (study -> series -> instances), the
+    same routing Study Root applies - PS3.4 Table C.6-4 defines the Composite
+    Object Instance level for both models.
     """
     level = (
         str(getattr(event.identifier, "QueryRetrieveLevel", "") or "").strip().upper()
     )
     if level == "SERIES":
         yield from _handle_series_search(
+            event,
+            clarus_url,
+            verbose,
+            max_responses,
+            http_timeout,
+            tls,
+            expose_rejected=expose_rejected,
+            qa_url=qa_url,
+        )
+        return
+    if level == "IMAGE":
+        yield from _handle_image_search(
             event,
             clarus_url,
             verbose,
@@ -8738,12 +11903,11 @@ def _handle_patient_root(
         )
         return
     if level not in ("", "STUDY"):
-        # R5: IMAGE (and anything unrecognised) has no study-level equivalent.
-        # Falling through relabelled study rows with QueryRetrieveLevel=IMAGE
-        # and no SOPInstanceUID, which the SCU cannot use - and the server
-        # drops a return key it cannot honour, so the rows looked plausible.
-        # PS3.4 C.4.1.1.4 / PS3.7: the honest answer is Identifier Does Not
-        # Match SOP Class. Same refusal the PATIENT branch above already makes.
+        # R5: an unrecognised level has no study-level equivalent. Falling
+        # through relabelled study rows with that level and no SOPInstanceUID,
+        # which the SCU cannot use - and the server drops a return key it
+        # cannot honour, so the rows looked plausible. PS3.4 C.4.1.3.1 / PS3.7:
+        # the honest answer is Error: Data Set does not match SOP Class.
         yield 0xA900, None
         return
     yield from _handle_qido_search(
@@ -8774,9 +11938,9 @@ def _handle_study_root(
     STUDY level (or level absent): GET /studies - unchanged.
     SERIES level (31.08, MicroDicom series search): two-step search
     (study -> per-study series), see _handle_series_search.
-    IMAGE level is NOT implemented: such a query is refused with 0xA900.
-    It used to fall through to the study-level path, which relabelled study
-    rows as IMAGE with no SOPInstanceUID - rows the SCU cannot use.
+    IMAGE level: three-step search (study -> series -> instances), see
+    _handle_image_search. PS3.4 C.6.2.1.4 assigns the Study Root the same
+    Composite Object Instance level as the Patient Root.
     """
     level = (
         str(getattr(event.identifier, "QueryRetrieveLevel", "") or "").strip().upper()
@@ -8793,8 +11957,21 @@ def _handle_study_root(
             qa_url=qa_url,
         )
         return
+    if level == "IMAGE":
+        yield from _handle_image_search(
+            event,
+            clarus_url,
+            verbose,
+            max_responses,
+            http_timeout,
+            tls,
+            expose_rejected=expose_rejected,
+            qa_url=qa_url,
+        )
+        return
     if level not in ("", "STUDY"):
-        # R5: see _handle_patient_root - IMAGE has no study-row equivalent.
+        # R5: see _handle_patient_root - an unrecognised level has no
+        # study-row equivalent.
         yield 0xA900, None
         return
     yield from _handle_qido_search(
@@ -8840,20 +12017,27 @@ def _handle_series_search(
     study_params, series_params = _split_qido_params(ds)
     base = service_base_url(clarus_url, qa_url, expose_rejected)
     # One row beyond the limit keeps the local truncation guard reachable
-    # (PS3.4 Table C.4.1-1: B001 means further matches exist).
+    # (PS3.4 Table C.4.1-1: further matches exist).
     qido_limit = max_responses + 1 if max_responses else None
 
     # ---- step a: studies ----
+    #
+    # The response budget limits MATCHING DESCENDANTS, not parent rows. A
+    # SERIES query with a limit of one used to ask for two studies and then
+    # stop, so a match in the third study was never looked at - the limit was
+    # silently applied to the level above the one it describes. Parents are
+    # therefore paged until the walk finds an extra matching series or runs
+    # out of studies.
     studies_url = f"{base}/studies"
     try:
         study_rows = _qido_request(
             studies_url,
             study_params,
             http_timeout,
-            limit=qido_limit,
+            limit=None,
             tls=tls,
         )
-        if not isinstance(study_rows, list):
+        if not isinstance(study_rows, (list, QidoPage)):
             study_rows = []
     except httpx.HTTPStatusError as exc:
         # Status class decides the refusal: 4xx is this query's fault
@@ -8895,6 +12079,10 @@ def _handle_series_search(
     # transfer that reported 0x0000 ("complete, no matches") while matches sit
     # beyond the cap tells the SCU the study set is empty when it is not.
     study_cap_hit = qido_limit is not None and len(study_rows) >= qido_limit
+    # An origin can leave the study set unfinished on its own (`more`), e.g.
+    # when its configured page is smaller than this walk asked for. The rows
+    # beyond that page are unknown, so the answer cannot be called complete.
+    origin_more = isinstance(study_rows, QidoPage) and study_rows.more
     if not study_by_uid:
         # Empty step (a) -> empty result, per the prompt.
         yield 0x0000, None
@@ -8902,7 +12090,12 @@ def _handle_series_search(
 
     # ---- step b: per-study series ----
     count = 0
-    truncated = False
+    # PS3.4 Table C.4.1-1: 0xB001 states that FURTHER MATCHES EXIST. Reaching the
+    # response cap alone does not prove that - the studies not yet walked may
+    # contain no matching series at all. So the walk keeps going after the cap
+    # until it either finds one extra matching descendant (then it really can
+    # say "more matches exist") or runs out of parents.
+    extra_match = False
     for study_uid, study_row in study_by_uid.items():
         # A C-CANCEL from the SCU, or a bridge shutdown, must stop a broad
         # SERIES walk: each iteration can block for http_timeout and the walk
@@ -8918,12 +12111,14 @@ def _handle_series_search(
             yield 0xC000, None
             return
         if max_responses and count >= max_responses:
-            truncated = True
+            # Stop EMITTING; keep checking the remaining studies, because only
+            # an extra matching descendant makes 0xB001 a true statement. The
+            # series loop below sees the spent budget and stops yielding.
             logging.warning(
-                "[C-FIND] Response limit reached (%d). Results truncated.",
+                "[C-FIND] Response limit reached (%d). Checking for further "
+                "matches.",
                 max_responses,
             )
-            break
         series_url = f"{base}/studies/{quote(study_uid, safe='')}/series"
         try:
             series_rows = _qido_request(
@@ -8933,7 +12128,7 @@ def _handle_series_search(
                 limit=qido_limit,
                 tls=tls,
             )
-            if not isinstance(series_rows, list):
+            if not isinstance(series_rows, (list, QidoPage)):
                 series_rows = []
         except httpx.HTTPStatusError as exc:
             # Status class decides the refusal: 4xx is this query's fault
@@ -8960,12 +12155,20 @@ def _handle_series_search(
             yield 0xA700, None
             return
         for row in series_rows:
+            # Same rule as the common loop: a cancel that arrived during the
+            # HTTP call must stop the OUTPUT, not wait for the next study.
+            if getattr(event, "is_cancelled", False):
+                find_responses.labels(type="series").inc(count)
+                yield 0xFE00, None
+                return
+            if _shutdown_requested.is_set():
+                find_responses.labels(type="series").inc(count)
+                yield 0xC000, None
+                return
             if max_responses and count >= max_responses:
-                truncated = True
-                logging.warning(
-                    "[C-FIND] Response limit reached (%d). " "Results truncated.",
-                    max_responses,
-                )
+                # Same rule as the parent loop: one more matching series is
+                # enough to justify 0xB001, and nothing else is.
+                extra_match = True
                 break
             row_ds = _json_to_dataset_series(
                 row,
@@ -8975,16 +12178,290 @@ def _handle_series_search(
             _stamp_cfind_response(event, row_ds)
             yield 0xFF00, row_ds
             count += 1
-        if truncated:
+        if extra_match:
             break
 
     # Counted before the terminal yield for the same reason as the study
     # handler: nothing after a non-Pending status is ever executed.
     find_responses.labels(type="series").inc(count)
-    if truncated or study_cap_hit:
-        yield 0xB001, None
+    if getattr(event, "is_cancelled", False):
+        yield 0xFE00, None
+        return
+    # 0xB001 is not a defined Query/Retrieve status (PS3.4 Table C.4.1-1), so
+    # an answer the bridge could not complete is the defined refusal 0xA700.
+    #
+    # An origin-imposed page limit counts: the origin answered paged rows and
+    # said `more`, so the studies beyond it were never walked even though the
+    # bridge's own cap was never reached (PS3.18 10.6.1.4).
+    if extra_match or study_cap_hit or origin_more:
+        yield 0xA700, None
     else:
         yield 0x0000, None
+
+def _image_qido_error(url, params, exc):
+    """Log and classify one failed hop of an IMAGE-level walk.
+
+    Shared by the three steps so each of them refuses for the same reason the
+    study/series handlers do (PS3.18 10.6; the status class decides): 4xx is
+    this query's fault (0xC000), 5xx and 429 are transient upstream conditions
+    the SCU should retry (0xA700), and a broken transport is transient too.
+    Returns the DIMSE status to yield.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        # R14: 429 is upstream rate-limiting and is transient, so the shared
+        # classifier decides rather than a bare `>= 500` threshold.
+        logging.warning(
+            "[C-FIND] QIDO HTTP %d: %s?%s",
+            exc.response.status_code,
+            url,
+            _masked_query(params),
+        )
+        dimse, _code, _desc = _http_status_to_dimse(exc.response.status_code)
+        return dimse
+    if isinstance(exc, QidoMalformedBodyError):
+        # R16: an unreadable 2xx body is a transient upstream failure, not an
+        # empty result.
+        logging.warning("[C-FIND] QIDO malformed response: %s", exc)
+        return 0xA700
+    # Transport errors only (ReadError / ConnectError / Timeout): transient,
+    # so 0xA700 rather than a 0xC000 that reads as a permanent refusal.
+    logging.warning("[C-FIND] QIDO error: connection failed")
+    return 0xA700
+
+def _handle_image_search(
+    event,
+    clarus_url,
+    verbose,
+    max_responses,
+    http_timeout=30,
+    tls=None,
+    expose_rejected=False,
+    qa_url="",
+):
+    """C-FIND at COMPOSITE OBJECT INSTANCE (IMAGE) level: three-step QIDO walk.
+
+    PS3.4 C.4.1.3.1.1 (Hierarchical Search Method): start at the top level and
+    match down until the level named by QueryRetrieveLevel is reached, so the
+    walk is study -> series -> instances of the requested series, each hop
+    carrying that level's own matching keys (`_split_instance_qido_params`).
+    PS3.4 Table C.6-4 / C.6.2.1.4 (standard/ps3.4/image-level-C.6-4.json)
+    defines the same instance level for both Query/Retrieve models.
+
+    A row without SOPInstanceUID is dropped rather than yielded: that was the
+    defect 0xA900 used to paper over - study rows relabelled as IMAGE look
+    plausible to the SCU but cannot be retrieved. Every row that does go out
+    carries QueryRetrieveLevel=IMAGE (C.4.1.1.3.2), the Unique Keys of the
+    levels above and the instance's own SOP Instance UID.
+
+    This is the baseline hierarchical search, not the relational extension
+    (C.4.1.2.2.1): every study comes back from step (a) because a baseline
+    request may omit the study Unique Key, and every series of a matched
+    study is walked. A SeriesInstanceUID in the identifier narrows step (b) to
+    that one series, so the common "instances of one series" query is three
+    requests. Rows merge into ONE 0xFF00 stream and max_responses applies to
+    the TOTAL, with 0xB001 when the cap cuts matches off.
+    """
+    ds = event.identifier
+    request_keywords = _extract_request_keywords(ds)
+    logging.info(
+        "[C-FIND] image keywords: %s",
+        ", ".join(sorted(request_keywords)) if request_keywords else "(none)",
+    )
+    study_params, series_params, instance_params = _split_instance_qido_params(ds)
+    base = service_base_url(clarus_url, qa_url, expose_rejected)
+    # One row beyond the limit keeps the local truncation guard reachable
+    # (PS3.4 Table C.4.1-1: B001 means further matches exist).
+    qido_limit = max_responses + 1 if max_responses else None
+
+    # ---- step a: studies ----
+    studies_url = f"{base}/studies"
+    try:
+        study_rows = _qido_request(
+            studies_url, study_params, http_timeout, limit=None, tls=tls
+        )
+        if not isinstance(study_rows, (list, QidoPage)):
+            study_rows = []
+    except (httpx.HTTPError, QidoMalformedBodyError) as exc:
+        yield _image_qido_error(studies_url, study_params, exc), None
+        return
+
+    study_by_uid = {}
+    for row in study_rows:
+        study_uid = _json_first_value(row, "0020000D")
+        if study_uid:
+            study_by_uid[study_uid] = row
+    # Same cap detection as the series walk: one row more than the caller's
+    # limit means studies were never walked, so the answer is already
+    # incomplete and 0x0000 would claim otherwise.
+    study_cap_hit = qido_limit is not None and len(study_rows) >= qido_limit
+    # Same rule as the series walk: an origin-imposed page limit on the study
+    # hop leaves studies unvisited, so the answer is incomplete even though
+    # this walk never reached its own cap.
+    origin_more = isinstance(study_rows, QidoPage) and study_rows.more
+    if not study_by_uid:
+        yield 0x0000, None
+        return
+
+    count = 0
+    truncated = False
+    # Same rule as the SERIES walk (PS3.4 Table C.4.1-1): the cap alone does not
+    # prove another match exists, so the walk keeps checking parents until it
+    # finds one. `extra_match` is what justifies reporting an incomplete answer.
+    extra_match = False
+    # Set when an ORIGIN page limit (not this bridge's cap) left rows unseen.
+    origin_more = False
+    for study_uid, study_row in study_by_uid.items():
+        # A C-CANCEL or a shutdown must stop the walk: each iteration can
+        # block for http_timeout. Mirror the series walk's metric bookkeeping
+        # (nothing after a non-Pending yield is ever executed).
+        if getattr(event, "is_cancelled", False):
+            find_responses.labels(type="image").inc(count)
+            yield 0xFE00, None
+            return
+        if _shutdown_requested.is_set():
+            find_responses.labels(type="image").inc(count)
+            yield 0xC000, None
+            return
+        if max_responses and count >= max_responses and not truncated:
+            # Emitting stops; the check for a further match does not.
+            truncated = True
+            logging.warning(
+                "[C-FIND] Response limit reached (%d). Checking for further "
+                "matches.",
+                max_responses,
+            )
+
+        # ---- step b: series of this study ----
+        series_url = f"{base}/studies/{quote(study_uid, safe='')}/series"
+        try:
+            series_rows = _qido_request(
+                series_url, dict(series_params), http_timeout, limit=qido_limit, tls=tls
+            )
+            if not isinstance(series_rows, (list, QidoPage)):
+                series_rows = []
+        except (httpx.HTTPError, QidoMalformedBodyError) as exc:
+            yield _image_qido_error(series_url, series_params, exc), None
+            return
+
+        for series_row in series_rows:
+            series_uid = _json_first_value(series_row, "0020000E")
+            # An unnamed series cannot be walked: the instance route is keyed
+            # by it, and a row without it carries no Unique Key of its level.
+            if not series_uid:
+                continue
+            # A cancel can arrive while the previous series was being read.
+            if getattr(event, "is_cancelled", False):
+                find_responses.labels(type="image").inc(count)
+                yield 0xFE00, None
+                return
+            if max_responses and count >= max_responses:
+                # A series not yet walked is a candidate for a further match,
+                # but it is only a MATCH once an instance inside it matches.
+                # Fetch it and let the instance loop decide.
+                truncated = True
+            # ---- step c: instances of this series ----
+            #
+            # A shutdown that began during the series request must stop the
+            # walk HERE, before another instance request goes out. Only the
+            # outermost study loop used to check the flag, so a shutdown could
+            # still emit rows and issue instance requests for the same study.
+            if _shutdown_requested.is_set():
+                find_responses.labels(type="image").inc(count)
+                yield 0xC000, None
+                return
+            instances_url = (
+                f"{base}/studies/{quote(study_uid, safe='')}"
+                f"/series/{quote(series_uid, safe='')}/instances"
+            )
+            try:
+                instance_rows = _qido_request(
+                    instances_url,
+                    dict(instance_params),
+                    http_timeout,
+                    limit=qido_limit,
+                    tls=tls,
+                )
+                if not isinstance(instance_rows, (list, QidoPage)):
+                    instance_rows = []
+            except (httpx.HTTPError, QidoMalformedBodyError) as exc:
+                yield _image_qido_error(instances_url, instance_params, exc), None
+                return
+            # Shutdown or cancel that arrived DURING the instance request: the
+            # rows it returned must not be emitted, and no further request may
+            # go out for this study.
+            if _shutdown_requested.is_set():
+                find_responses.labels(type="image").inc(count)
+                yield 0xC000, None
+                return
+            if isinstance(instance_rows, QidoPage) and instance_rows.more:
+                # The origin answered only its own page of instances and said
+                # so. Treating that as a complete answer tells the SCU the
+                # search found everything, when rows beyond the page were
+                # never even offered.
+                origin_more = True
+            for row in instance_rows:
+                if not _json_first_value(row, "00080018"):
+                    # PS3.4 C.6.1.1.5: SOP Instance UID is the level's Unique
+                    # key. Without it the row is not an instance match at all.
+                    logging.warning(
+                        "[C-FIND] instance row without SOPInstanceUID dropped"
+                    )
+                    continue
+                # A cancel during the instance read must stop the output.
+                if getattr(event, "is_cancelled", False):
+                    find_responses.labels(type="image").inc(count)
+                    yield 0xFE00, None
+                    return
+                if max_responses and count >= max_responses:
+                    # THIS is a matching descendant the bridge will not send: it
+                    # is the fact 0xB001 asserts.
+                    extra_match = True
+                    break
+                row_ds = _json_to_dataset_instance(
+                    row,
+                    request_keywords,
+                    study_uid,
+                    series_uid,
+                    study_row,
+                    series_row,
+                )
+                _stamp_cfind_response(event, row_ds)
+                yield 0xFF00, row_ds
+                count += 1
+            if extra_match:
+                break
+        if extra_match:
+            break
+
+    # Counted before the terminal yield for the same reason as the study
+    # handler: nothing after a non-Pending status is ever executed.
+    find_responses.labels(type="image").inc(count)
+    if getattr(event, "is_cancelled", False):
+        yield 0xFE00, None
+        return
+    # Same rule as the series walk: 0xB001 is undefined for Query/Retrieve, so
+    # an incomplete answer is 0xA700, and an origin-imposed page limit on any
+    # hop means rows beyond it were never walked.
+    if extra_match or study_cap_hit or origin_more:
+        yield 0xA700, None
+    else:
+        yield 0x0000, None
+
+def _mwl_row_in_time_window(row, bounds):
+    """Whether a workitem row's start instant lies inside the requested window.
+
+    Reads the workitem's Combined Scheduled Procedure Step Start DateTime
+    (0040,4005) and compares the DATE AND TIME together: PS3.4 Table K.6-1
+    defines (0040,0002) and (0040,0003) as one interval, so a July 6 workitem
+    at 22:00 belongs to "July 5-7 at 10:00-18:00" (see
+    `_mwl_start_datetime_bounds`). A row without the attribute is kept:
+    absence is not a proven mismatch, and dropping it would hide a workitem
+    the modality may still want.
+    """
+    stamp = _json_first_value(row, "00404005")
+    if not stamp:
+        return True
+    return _mwl_datetime_in_bounds(stamp, bounds)
 
 def _handle_mwl(event, clarus_url, verbose, max_responses, http_timeout=30, tls=None):
     """C-FIND MWL -> UPS-RS workitems (Stage 3: real MWL key mapping).
@@ -8996,18 +12473,152 @@ def _handle_mwl(event, clarus_url, verbose, max_responses, http_timeout=30, tls=
     complete worklist entry.
     """
     params = _build_mwl_params(event.identifier)
-    yield from _handle_qido_search(
+    # PS3.4 Table K.6-1 makes Scheduled Procedure Step Start Date (0040,0002)
+    # and Start Time (0040,0003) a SINGLE interval: July 5-7 at 10:00-18:00
+    # includes a July 6 workitem at 22:00. UPS-RS has no parameter for a time
+    # of day - the origin filters the combined workitem start instant - so the
+    # window is applied HERE, before the response limit, with the date and
+    # time bounds combined rather than as two independent filters.
+    time_bounds = _mwl_start_datetime_bounds(event.identifier)
+    # PS3.4 Table K.6-1 also makes Scheduled Performing Physician's Name
+    # (0040,0006) a matching key with "Single Value or Wildcard", and the
+    # UPS-RS workitem search has no parameter for it - so it is applied
+    # locally over the candidate rows, exactly like the time window.
+    physician_matchers = _mwl_physician_matchers(event.identifier)
+    yield from _mwl_search(
         event,
         clarus_url,
         verbose,
         max_responses,
         http_timeout,
         params,
-        "mwl",
-        url_path="workitems",
-        json_to_ds=_json_to_dataset_mwl,
+        time_bounds,
         tls=tls,
+        physician_matchers=physician_matchers,
     )
+
+# Candidate page size for the MWL walk, in units of `max_responses`. Two
+# pages' worth is the smallest window that can prove "no more matches": the
+# walk stops as soon as it has one row beyond the cap, and a page that the
+# local filter rejects in full has to be followed by another.
+_MWL_PAGE_FACTOR = 4
+
+def _mwl_search(
+    event,
+    clarus_url,
+    verbose,
+    max_responses,
+    http_timeout,
+    params,
+    time_bounds,
+    tls=None,
+    physician_matchers=(),
+):
+    """MWL search whose response limit counts MATCHING rows, not candidates.
+
+    PS3.4 Table K.6-1 puts the matching rule on the worklist row, but the
+    date/time window can only be applied locally (UPS-RS has no time-of-day
+    parameter), so the origin's rows are CANDIDATES. Asking for exactly
+    `max_responses + 1` candidates and filtering afterwards cannot recover a
+    matching row the bridge never fetched: with a limit of one, two in-window
+    candidates that fall outside the window hide a third that matches.
+
+    So the walk pages the origin while it has room for another match, and
+    stops only when it finds one extra matching row (proving more exist) or
+    the origin runs out. That is the same rule the SERIES and IMAGE walks use
+    for their parent hops.
+    """
+    base = service_base_url(clarus_url, "", False)
+    url = f"{base}/workitems"
+    want = max_responses or 0
+    page = max(1, want * _MWL_PAGE_FACTOR) if want else None
+    offset = 0
+    count = 0
+    # One matching row beyond the cap is the evidence that further matches
+    # exist; without it the answer is complete and reports Success.
+    extra_match = False
+    seen_offsets = set()
+
+    while True:
+        if getattr(event, "is_cancelled", False):
+            find_responses.labels(type="mwl").inc(count)
+            yield 0xFE00, None
+            return
+        if _shutdown_requested.is_set():
+            find_responses.labels(type="mwl").inc(count)
+            yield 0xC000, None
+            return
+        page_params = dict(params)
+        try:
+            results = _qido_request(
+                url,
+                page_params,
+                http_timeout,
+                limit=page,
+                offset=offset,
+                tls=tls,
+            )
+            if not isinstance(results, (list, QidoPage)):
+                results = []
+        except (httpx.HTTPError, QidoMalformedBodyError) as exc:
+            yield _image_qido_error(url, params, exc), None
+            return
+
+        for row in results:
+            # A cancel can arrive while the origin is answering.
+            if getattr(event, "is_cancelled", False):
+                find_responses.labels(type="mwl").inc(count)
+                yield 0xFE00, None
+                return
+            if time_bounds is not None and not _mwl_row_in_time_window(
+                row, time_bounds
+            ):
+                continue
+            if not _mwl_physician_matches(
+                _json_first_value(row, "00400006"), physician_matchers
+            ):
+                continue
+            if want and count >= want:
+                # A MATCHING row the bridge will not send: this is the fact
+                # that makes the answer incomplete.
+                extra_match = True
+                break
+            row_ds = _json_to_dataset_mwl(
+                row, _extract_mwl_request_keywords(event.identifier)
+            )
+            yield 0xFF00, row_ds
+            count += 1
+        if extra_match:
+            break
+
+        if page is None:
+            # No cap: the single unpaged answer was the whole result.
+            break
+        if len(results) < page:
+            # The origin had nothing left to give: the answer is complete.
+            break
+        origin_more = isinstance(results, QidoPage) and results.more
+        offset += page
+        if offset in seen_offsets:
+            # A page that does not advance would loop forever.
+            break
+        seen_offsets.add(offset)
+        if origin_more and offset == page:
+            # The origin flagged the first page as unfinished but still
+            # returned a full page: keep walking rather than trust the flag
+            # alone. Any later page that is short ends the loop above.
+            continue
+
+    find_responses.labels(type="mwl").inc(count)
+    if getattr(event, "is_cancelled", False):
+        yield 0xFE00, None
+        return
+    # 0xA700 is the defined refusal for an answer the bridge could not
+    # complete; 0xB001 is not defined for MWL (PS3.4 Table K.4-1).
+    if extra_match:
+        yield 0xA700, None
+    else:
+        yield 0x0000, None
 
 # ---------------------------------------------------------------------------
 # Bridge: handlers/cstore
@@ -9046,6 +12657,44 @@ def set_max_concurrent_cstore(n: int) -> None:
     global _MAX_CONCURRENT_CSTORE, _cstore_semaphore
     _MAX_CONCURRENT_CSTORE = n
     _cstore_semaphore = threading.Semaphore(n)
+
+# ---------------------------------------------------------------------------
+# Study -> PatientID guard (C-STORE, synchronous)
+# ---------------------------------------------------------------------------
+# The outbox is fire-and-forget: C-STORE answers 0x0000 right after enqueue,
+# before the STOW verdict exists, so the server's patient-conflict refusal
+# (409 -> 0xC000) never reaches the modality. The bridge must therefore refuse
+# a study it already holds under a DIFFERENT non-empty PatientID,
+# synchronously, BEFORE the enqueue. The map is bounded (eviction of the
+# oldest entry on overflow): an unbounded dict would grow one entry per
+# StudyInstanceUID for the process lifetime - a memory DoS on a long-running
+# forwarder.
+_STUDY_PATIENT_CAP = 1_000_000
+_study_patient_lock = threading.Lock()
+_study_patient_map = {}  # study_uid -> patient_id (insertion-ordered)
+
+def _study_patient_get(study_uid):
+    """Return the PatientID this bridge holds for a study, or None."""
+    with _study_patient_lock:
+        return _study_patient_map.get(study_uid)
+
+def _study_patient_put(study_uid, patient_id):
+    """Record a study's PatientID after a SUCCESSFUL enqueue.
+
+    Insertion order makes the first key the oldest; on overflow the oldest is
+    evicted. The map is a guard cache, not an archive - an evicted study is
+    simply no longer guarded, which is the honest degradation of a bound.
+    """
+    with _study_patient_lock:
+        if study_uid in _study_patient_map:
+            _study_patient_map[study_uid] = patient_id
+            return
+        if len(_study_patient_map) >= _STUDY_PATIENT_CAP:
+            # dict preserves insertion order, so the first key is the oldest;
+            # plain dict.popitem() removes the NEWEST (LIFO), which is wrong
+            # for an eviction-by-age bound.
+            _study_patient_map.pop(next(iter(_study_patient_map)))
+        _study_patient_map[study_uid] = patient_id
 
 # ---------------------------------------------------------------------------
 # PROD-HARDENING: Unified backpressure  -  single function for outbox
@@ -9249,18 +12898,32 @@ def _fix_cp1251_krakozyabry(ds):
                 run = 0
         return False
 
-    # Short-name exception:
-    # Korean surnames transcribed in Cyrillic (for example the 2-3 character
-    # transliterations of Ho, Yu, Lee and Kim) are 1-4 chars, all Cyrillic, but
-    # never form a >=3 run in isolation. Without this exception a radiology
-    # department whose staff include Korean-Russian colleagues would see those
-    # names garbled in the viewer.
-    def _is_all_cyrillic(text):
-        return (
-            len(text) >= 1
-            and len(text) <= 4
-            and all(ch in _CYRILLIC_BLOCK for ch in text)
-        )
+    def _cyrillic_dominates(text):
+        """Whether the Cyrillic content is the body of the value, not an island.
+
+        A genuine cp1251 mojibake is Cyrillic throughout, because the whole
+        value was Russian text. Text that merely CONTAINS a Cyrillic run - a
+        Latin-1 value whose box-drawing bytes happen to decode into letters -
+        keeps most of its Latin letters and spaces, so the Cyrillic share is
+        small. Half is the threshold: it separates "this value IS Cyrillic"
+        from "this value mentions something Cyrillic", and it is loose enough
+        that a mixed value such as `Иванов Ivanov` still repairs.
+
+        Whitespace, digits and punctuation are not counted either way, so a
+        short Cyrillic surname inside a long ASCII description does not pass on
+        the strength of the description's own length.
+        """
+        letters = 0
+        cyrillic = 0
+        for ch in text:
+            if ch in _CYRILLIC_BLOCK:
+                cyrillic += 1
+                letters += 1
+            elif ch.isalpha():
+                letters += 1
+        if letters == 0:
+            return False
+        return cyrillic * 2 >= letters
 
     def _cp1251_fix_one(value):
         """Repair one text value. Returns (new_value, examined).
@@ -9297,14 +12960,31 @@ def _fix_cp1251_krakozyabry(ds):
 
         fixed = raw_bytes.decode("cp1251", errors="replace")
 
-        # Only accept the fix if the result contains >=3 consecutive Cyrillic
-        # characters OR is a short all-Cyrillic name (1-4 chars, no long run).
-        if (
-            fixed != value
-            and not _has_cyrillic_run(fixed, 3)
-            and not _is_all_cyrillic(fixed)
-        ):
-            return value, True
+        # A repair needs INDEPENDENT evidence, which is what a Cyrillic run is:
+        # three consecutive Cyrillic letters cannot arise by accident from
+        # valid Latin-1 text. The former short-name rule ("1-4 characters, all
+        # Cyrillic") had no such force - a two-character Latin-1 name decodes
+        # into two Cyrillic letters often enough that the bridge rewrote valid
+        # ISO_IR 100 text and then relabelled the data set ISO_IR 192 on the
+        # strength of it.
+        #
+        # A Cyrillic run is NECESSARY but not SUFFICIENT. Single-byte Latin-1
+        # text built from the box-drawing/box-shade range decodes into a solid
+        # Cyrillic run too: `├Й├Й├Й Industries` (a real ISO_IR 100 value) becomes
+        # `ЩйЩйЩй Industries` under cp1251, passes the run test, and would have
+        # been forwarded as UTF-8 - silently altering declared Latin-1 text that
+        # was never mojibake. So the run must also be a MEANINGFUL proportion of
+        # the value rather than a token inside otherwise-ordinary Latin text,
+        # and the declared charset must not already be trustworthy.
+        if fixed != value:
+            if not _has_cyrillic_run(fixed, 3):
+                return value, True
+            if not _cyrillic_dominates(fixed):
+                # A Cyrillic island in Latin text: leave the declared Latin-1
+                # alone. Rewriting it is the alteration this guard exists to
+                # prevent, and a genuinely misencoded Russian name is
+                # Cyrillic throughout, not three letters inside a word.
+                return value, True
         return fixed, True
 
     fixed_any = False
@@ -9599,7 +13279,15 @@ def handle_c_store(
         except Exception as fm_err:
             logging.warning("[C-STORE] Cannot attach file_meta: %s", fm_err)
 
-        sop_uid = str(getattr(ds, "SOPInstanceUID", ""))
+        # The SOP Instance UID is read from the VALUE, not from `str()` of the
+        # element: an element present with a null value yields the string
+        # "None", which is non-empty and slipped past the missing-UID guard
+        # below - so the instance was persisted under a UID literally named
+        # "None" and the modality received 0x0000 for a dataset that carries no
+        # Type 1 identifier (PS3.3 C.12.1.1.2). Read the raw value and require
+        # a non-blank string.
+        _sop_uid_value = getattr(ds, "SOPInstanceUID", None)
+        sop_uid = "" if _sop_uid_value is None else str(_sop_uid_value).strip()
         study_uid = str(getattr(ds, "StudyInstanceUID", ""))
         patient = str(getattr(ds, "PatientName", "unknown"))
 
@@ -9728,6 +13416,22 @@ def handle_c_store(
             logging.error("Validation failed: %s - returning 0xC000", e)
             return 0xC000
 
+        # Synchronous study->PatientID guard: the outbox answers 0x0000 before
+        # the STOW verdict exists, so the server's patient-conflict refusal
+        # (409 -> 0xC000) can never reach this modality. Refuse a study the
+        # bridge already holds under a DIFFERENT non-empty PatientID BEFORE
+        # the enqueue; the rule mirrors the origin's `study_patient_conflict`,
+        # and an empty PatientID is Type 2 "not stated" - never a conflict.
+        _pid = str(getattr(ds, "PatientID", "") or "").strip()
+        _stored_pid = _study_patient_get(study_uid)
+        if _pid and _stored_pid and _stored_pid != _pid:
+            logging.warning(
+                "[C-STORE] Study %s already held under a different patient - "
+                "refusing 0xC000",
+                study_uid[:50] if study_uid else "?",
+            )
+            return 0xC000
+
         # "Don't do heavy work on the hot path. Accept bytes -> return
         # Success -> done. Everything else happens in the background."
 
@@ -9742,7 +13446,10 @@ def handle_c_store(
                     "[C-STORE] SOP %s already in outbox (duplicate) - 0x0000 Success",
                     sop_uid,
                 )
-                return 0x0000  # Success  -  idempotent, already persisted
+                # Still a coercion warning when THIS request carried
+                # modifications: the duplicate is the stored instance, and the
+                # status describes the answer to the request in hand.
+                return 0xB000 if mods else 0x0000
             if not ok:
                 logging.error(
                     "[C-STORE] Outbox enqueue failed for %s (SOP: %s) - returning 0xA700",
@@ -9752,6 +13459,22 @@ def handle_c_store(
                 return 0xA700  # Out of Resources  -  transient, sender should retry
 
             status = 0x0000  # Success  -  SOP persisted in outbox, will be delivered
+            # PS3.4 B.4: a coercion of an identifying attribute is a Warning,
+            # not a plain Success. The instance WAS accepted and stored, so the
+            # status stays in the warning range - but answering 0x0000 told the
+            # modality (and every audit downstream of it) that the data set it
+            # sent is exactly the one that was stored, when the bridge had
+            # replaced its Patient ID. 0xB000 is the defined "coercion"
+            # warning; without the changes the plain Success stands.
+            if mods:
+                status = 0xB000
+
+            # Record the study's PatientID only AFTER a successful enqueue: a
+            # failed enqueue must not poison the map (the study was not
+            # accepted), and the guard above already ran on the pre-enqueue
+            # state.
+            if _pid:
+                _study_patient_put(study_uid, _pid)
 
             # -- 0409 forwarder hook ----------------------------------
             # Best-effort DIMSE->DIMSE mirror to a SECOND (non-authoritative)
@@ -9794,6 +13517,36 @@ def handle_c_store(
             logging.warning(
                 "[C-STORE] No queue configured - falling back to sync forward"
             )
+            # `sanitize_dataset` ran with write_audit=False, on the assumption
+            # that an outbox worker would apply the audit trail from `mods`
+            # before the STOW. On THIS path there is no worker: the dataset goes
+            # out immediately, so the coercion of an empty Patient ID reached
+            # the origin with no Modified Attributes Sequence and no record of
+            # the original value anywhere. The audit is therefore applied
+            # inline, here, before the send - the deferred form is only correct
+            # where something is actually deferred TO.
+            if mods:
+                try:
+                    for tag, old, _new in mods:
+                        record_modification(
+                            ds,
+                            tag,
+                            old,
+                            reason="COERCE",
+                            modifying_system=bridge_ae_title,
+                        )
+                except Exception as audit_err:
+                    # Without the audit trail the forwarded record no longer
+                    # matches what this bridge documents, so the instance is
+                    # refused instead of stored anonymously.
+                    logging.error(
+                        "[C-STORE] Cannot record the coercion audit for %s "
+                        "(%s) - refusing the instance rather than forwarding "
+                        "it without provable audit data",
+                        sop_uid,
+                        audit_err,
+                    )
+                    return 0xC000
             status, http_status, reason = stow_single_instance(
                 ds,
                 clarus_url,
@@ -9808,6 +13561,8 @@ def handle_c_store(
                     _dimse_status_name(status),
                     reason,
                 )
+            elif _pid:
+                _study_patient_put(study_uid, _pid)
 
         # Bridge: translation duration observation
         translation_duration.observe(time.monotonic() - start_time)
@@ -9822,6 +13577,635 @@ def handle_c_store(
 def handle_c_echo(event):
     """Handle C-ECHO (Verification)."""
     return 0x0000  # Success
+
+# ---------------------------------------------------------------------------
+# Bridge: handlers/mpps
+# ---------------------------------------------------------------------------
+
+"""Clarus Bridge - MPPS translator (DIMSE N-CREATE/N-SET -> DICOMweb MPPS).
+
+PS3.18 section 15 serves Modality Performed Procedure Step over DICOMweb and
+maps it onto the DIMSE operations one-to-one: Create (15.4) is
+`POST /modality-performed-procedure-steps/{mppsUID}`, Update (15.5) is the
+SAME URI with the mandatory `update` query parameter - the only thing that
+distinguishes the two transactions - and Retrieve (15.6, N-GET) is optional
+for the origin server and is not translated here.
+
+The bridge holds no MPPS state: the origin server owns the record and its
+state machine (PS3.4 F.7). Every parse and transport path answers with a DIMSE
+status, never raises into the association reactor.
+"""
+
+import json
+import logging
+from urllib.parse import quote
+
+import httpx
+from pydicom.dataset import Dataset
+from pydicom.multival import MultiValue
+
+# PS3.4 Table F.7.2-1 (standard/ps3.4/mpps-f.7.2.1-attribute-table.json): every
+# attribute the translator reads, with the VR the standard fixes for it. The
+# VR is never guessed from a value's shape - a UID- or date-shaped string
+# assigned the wrong VR makes the origin reject the whole body.
+MPPS_ATTR_TAGS = {
+    # SOP Common (PS3.3 C.3.3.1) - written by the translator, not forwarded.
+    "00080016": (0x0008, 0x0016, "UI"),
+    "00080018": (0x0008, 0x0018, "UI"),
+    # Patient / study keys.
+    "00080005": (0x0008, 0x0005, "CS"),
+    "00100010": (0x0010, 0x0010, "PN"),
+    "00100020": (0x0010, 0x0020, "LO"),
+    "00100030": (0x0010, 0x0030, "DA"),
+    "00100040": (0x0010, 0x0040, "CS"),
+    "00080050": (0x0008, 0x0050, "SH"),
+    # Procedure keys.
+    "00080060": (0x0008, 0x0060, "CS"),
+    "00400241": (0x0040, 0x0241, "AE"),
+    "00400242": (0x0040, 0x0242, "SH"),
+    "00400243": (0x0040, 0x0243, "SH"),
+    "00400244": (0x0040, 0x0244, "DA"),
+    "00400245": (0x0040, 0x0245, "TM"),
+    "00400250": (0x0040, 0x0250, "DA"),
+    "00400251": (0x0040, 0x0251, "TM"),
+    "00400252": (0x0040, 0x0252, "CS"),
+    "00400253": (0x0040, 0x0253, "SH"),
+    "00400254": (0x0040, 0x0254, "LO"),
+}
+
+MPPS_SOP_CLASS_UID = "1.2.840.10008.3.1.2.3.3"
+
+_STATUS = "00400252"
+STATUS_IN_PROGRESS = "IN PROGRESS"
+STATUS_COMPLETED = "COMPLETED"
+STATUS_DISCONTINUED = "DISCONTINUED"
+
+# PS3.4 F.7.2.1: "the SCU shall only send the N-CREATE request with Performed
+# Procedure Step Status (0040,0252) set to IN PROGRESS. The SCP shall accept
+# N-CREATE only if the value is IN PROGRESS; otherwise it shall return Failure
+# Status 0106H 'Invalid Attribute Value' with an Attribute List." The same code
+# is what PS3.7 lists for an out-of-range enumerated value on N-SET.
+_INVALID_ATTRIBUTE_VALUE = 0x0106
+
+# PS3.18 Table F.2.3-1: the VRs whose JSON type is a Number. The binary
+# integer VRs are packed as integers on the wire; IS is decimal text that also
+# maps to Number. FD/FL are the real-valued pair.
+_INTEGER_VRS = frozenset({"US", "SS", "UL", "SL", "UV", "SV", "IS"})
+_FLOAT_VRS = frozenset({"FD", "FL"})
+
+# PS3.7 (standard/ps3.7/status-codes.json, service "mpps"):
+#   0x0110 Processing Failure       - the request will never succeed
+#   0x0111 Duplication SOP Instance - the UID is already in use
+#   0x0112 No Such SOP Instance     - the instance N-SET addresses does not exist
+#   0x0120 Missing Attribute        - a Type 1 attribute is absent
+#   0x0121 Missing Attribute Value  - present but empty
+#   0x0213 Resource Limitation      - the origin cannot take the work right now
+_PROCESSING_FAILURE = 0x0110
+_DUPLICATE_INSTANCE = 0x0111
+_NO_SUCH_INSTANCE = 0x0112
+_MISSING_ATTRIBUTE = 0x0120
+_MISSING_ATTRIBUTE_VALUE = 0x0121
+_RESOURCE_LIMITATION = 0x0213
+
+class _Refusal(Exception):
+    """A DIMSE refusal decided while parsing, carrying the status to answer."""
+
+    def __init__(self, status, reason):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
+
+# ---------------------------------------------------------------------------
+# DIMSE data set -> DICOMweb JSON
+# ---------------------------------------------------------------------------
+def _json_value(vr, value):
+    """One element value as a DICOMweb JSON `Value` entry (PS3.18 F.2.3).
+
+    Table F.2.3-1 fixes the JSON type per VR: PN is a component-group object,
+    and a numeric VR written as a JSON Number must stay a Number. A sequence
+    is not handled here - its items are Data Sets, recursed into by
+    `_element_json`.
+    """
+    if vr == "PN":
+        return _pn_json(value)
+    if vr in _INTEGER_VRS:
+        # Integer binary VRs plus IS: the JSON type is Number. `UL` and the
+        # other binary integer VRs were falling through to `str()`, so a
+        # forwarded `UL` of 7 became "7" - a different JSON type from what the
+        # VR allows, and one an origin validating against Table F.2.3-1
+        # rejects. A value that will not parse stays as text rather than
+        # raising: it is legal on the wire for IS, and for a binary VR it can
+        # only come from a nonconforming source.
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
+    if vr in _FLOAT_VRS:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+def _pn_json(value):
+    """A PN value as its component-GROUP object (PS3.18 F.2.2).
+
+    A Person Name is three component groups separated by `=`: Alphabetic,
+    Ideographic and Phonetic. Annex F.2.2 gives each populated group its OWN
+    property, so folding the whole value into `Alphabetic` (which is what a
+    plain `str(value)` of `Yamada^Tarou=...==...` produced) made the origin
+    read the two extra groups as part of the alphabetic name - and a name that
+    has ONLY an ideographic group was published as an alphabetic one.
+
+    Leading groups are kept even when empty, as `str()` preserves the
+    separators, so the origin can still identify which group a value belongs
+    to. A value with no separator is a single alphabetic group.
+    """
+    text = str(value)
+    groups = text.split("=")
+    names = ("Alphabetic", "Ideographic", "Phonetic")
+    out = {}
+    for name, group in zip(names, groups):
+        if group:
+            out[name] = group
+    return out if out else {"Alphabetic": ""}
+
+def _element_json(elem):
+    """One DICOM element as a DICOMweb JSON attribute object (PS3.18 F.2.2).
+
+    A zero-length attribute is written as an object with NO `Value`: F.2.5
+    says an attribute that is present in DICOM but empty "shall be preserved in
+    the DICOM JSON attribute object containing no Value, BulkDataURI or
+    InlineBinary". Writing `{"Value": [""]}` would instead assert that ONE
+    value exists and that it is the empty string - a different statement.
+    """
+    vr = elem.VR
+    value = elem.value
+    if vr == "SQ":
+        items = [_dataset_json(item) for item in (value or [])]
+        return {"vr": vr, "Value": items} if items else {"vr": vr}
+    if value is None:
+        return {"vr": vr}
+    values = value if isinstance(value, (list, tuple, MultiValue)) else [value]
+    # Value Length 0 is the same statement as "no value", and F.2.5 writes it
+    # as an object with no `Value`. `{"Value": [""]}` would assert that ONE
+    # value exists and that it is the empty string - pydicom hands over both
+    # forms (an empty list for a sequence, an empty string for a text VR), so
+    # both are folded here.
+    rendered = [
+        None if item in (None, "") else _json_value(vr, item) for item in values
+    ]
+    if not any(r is not None for r in rendered):
+        # Every position is empty: F.2.5 says the attribute is written with no
+        # `Value` at all, which is what the caller checks for.
+        return {"vr": vr}
+    return {"vr": vr, "Value": rendered}
+
+def _dataset_json(ds):
+    """A full Data Set as a DICOMweb JSON object, tags in ascending order."""
+    return {
+        f"{elem.tag.group:04X}{elem.tag.element:04X}": _element_json(elem)
+        for elem in sorted(ds, key=lambda e: e.tag)
+    }
+
+# ---------------------------------------------------------------------------
+# Validation of the untrusted request
+# ---------------------------------------------------------------------------
+def _read_dataset(event, attr):
+    """Read the event's request data set, or refuse.
+
+    pydicom decodes a Data Set DEFERRED, so a body with broken element encoding
+    only raises when an element is first touched. Walking the set here turns
+    that into a documented 0x0110 Processing Failure instead of an exception
+    escaping the handler into the association reactor.
+    """
+    try:
+        ds = getattr(event, attr)
+    except AttributeError:
+        raise _Refusal(_MISSING_ATTRIBUTE, f"request carries no {attr}") from None
+    if ds is None:
+        raise _Refusal(_MISSING_ATTRIBUTE, f"request carries no {attr}")
+    try:
+        for _elem in ds:
+            pass
+    except Exception as e:
+        raise _Refusal(_PROCESSING_FAILURE, f"{attr} could not be decoded: {e}") from e
+    return ds
+
+def _text(ds, tag):
+    """The stripped string value of one element; None when absent or empty."""
+    elem = ds.get(MPPS_ATTR_TAGS[tag][:2])
+    if elem is None or elem.value is None:
+        return None
+    text = str(elem.value).strip()
+    return text or None
+
+def _item_text(item, tag, name, series_number, ref_number=None):
+    """A Type 1 value inside a sequence item, or a refusal naming the item."""
+    elem = item.get(tag)
+    text = (
+        str(elem.value).strip() if elem is not None and elem.value is not None else ""
+    )
+    if text:
+        return text
+    where = f"Performed Series Sequence item {series_number}"
+    if ref_number is not None:
+        where += f", Referenced Image Sequence item {ref_number}"
+    raise _Refusal(_MISSING_ATTRIBUTE, f"{where} has no {name}")
+
+def _check_performed_series(ds, final=False):
+    """Validate Performed Series Sequence (0040,0340) item shape.
+
+    PS3.4 Table F.7.2-1 makes Series Instance UID (0020,000E) Type 1 inside
+    every item, and puts the (0008,1150)/(0008,1155) reference pair in the
+    NESTED Referenced Image Sequence (0008,1140), not on the item itself. The
+    origin server stores whatever it is sent, so an item without its series UID
+    would create a record no consumer can attribute to a series - refused here,
+    while the offending SCU is still on the wire to be told.
+
+    `final` says the update moves the step to COMPLETED/DISCONTINUED, where
+    PS3.4 F.7.2.2 stops allowing "no series yet": an empty item is then a
+    defect rather than the wire encoding of an absent sequence.
+    """
+    seq = ds.get((0x0040, 0x0340))
+    if seq is None or seq.value is None:
+        return
+    # PS3.4 F.7.2.2 requires a NON-EMPTY Performed Series Sequence once the
+    # status becomes COMPLETED/DISCONTINUED. An explicitly empty sequence is
+    # not "the attribute was omitted": it states that no series was performed,
+    # which contradicts the final status. Letting it through posted an empty
+    # sequence to an origin that stores whatever it is sent, so the study
+    # ended up with a completed MPPS and no performed series at all.
+    #
+    # Omission stays legal on a PARTIAL update (a valid series may already be
+    # stored by the origin), so only the explicit-empty case is refused here.
+    if final and len(seq.value) == 0:
+        raise _Refusal(
+            _MISSING_ATTRIBUTE_VALUE,
+            "Performed Series Sequence (0040,0340) is empty; a final status "
+            "requires at least one performed series (PS3.4 F.7.2.2)",
+        )
+    for number, item in enumerate(seq.value, start=1):
+        if not isinstance(item, Dataset):
+            raise _Refusal(
+                _PROCESSING_FAILURE,
+                f"Performed Series Sequence item {number} is not a Data Set",
+            )
+        # PS3.4 F.7.2-1 makes Performed Series Sequence (0040,0340) Type 2 at
+        # N-CREATE: it may be empty because the series has not been performed
+        # yet. A zero-length item is the wire encoding of "no series", and it
+        # carries no Type 1 Series Instance UID to enforce - skip it instead of
+        # refusing a conformant N-CREATE that has not acquired anything yet.
+        #
+        # The same skip is NOT correct on a FINAL N-SET: PS3.4 F.7.2.2 requires
+        # a non-empty Performed Series Sequence once the status becomes
+        # COMPLETED/DISCONTINUED, so an item present but empty there is a
+        # malformed update, not "no series". `final` selects the rule.
+        if len(item) == 0:
+            if final:
+                raise _Refusal(
+                    _MISSING_ATTRIBUTE,
+                    f"Performed Series Sequence item {number} is empty; a final "
+                    "status requires a Series Instance UID (0020,000E)",
+                )
+            continue
+        _item_text(item, (0x0020, 0x000E), "Series Instance UID (0020,000E)", number)
+        ref_seq = item.get((0x0008, 0x1140))
+        if ref_seq is None or ref_seq.value is None:
+            continue
+        for ref_number, ref in enumerate(ref_seq.value, start=1):
+            if not isinstance(ref, Dataset):
+                raise _Refusal(
+                    _PROCESSING_FAILURE,
+                    f"Referenced Image Sequence item {ref_number} of performed "
+                    f"series {number} is not a Data Set",
+                )
+            _item_text(
+                ref,
+                (0x0008, 0x1150),
+                "Referenced SOP Class UID (0008,1150)",
+                number,
+                ref_number,
+            )
+            _item_text(
+                ref,
+                (0x0008, 0x1155),
+                "Referenced SOP Instance UID (0008,1155)",
+                number,
+                ref_number,
+            )
+
+def _check_status_for_create(ds):
+    """An N-CREATE body must carry IN PROGRESS (PS3.4 F.7.2.1)."""
+    status = _text(ds, _STATUS)
+    if status is None:
+        raise _Refusal(
+            _MISSING_ATTRIBUTE,
+            "Performed Procedure Step Status (0040,0252) is missing or empty",
+        )
+    # The comparison is EXACT, not case-folded. PS3.4 F.7.2.1 defines the
+    # value as the enumerator `IN PROGRESS`, and the DICOM CS VR is
+    # case-sensitive for defined terms; accepting `in progress` and then
+    # posting it unchanged sent the origin a value it may reject or store as
+    # an unknown term. The request is refused at the DIMSE boundary instead.
+    if status != STATUS_IN_PROGRESS:
+        raise _Refusal(
+            _INVALID_ATTRIBUTE_VALUE,
+            "Performed Procedure Step Status must be IN PROGRESS at N-CREATE "
+            f"(PS3.4 F.7.2.1), got '{status}'",
+        )
+
+def _check_status_for_update(ds):
+    """An N-SET body may carry a status, but only one of the three legal ones.
+
+    The value that goes to the origin is the NORMALISED one (`_normalise_status`
+    is called by the caller): a set that compared IN PROGRESS only after
+    upper-casing used to forward the lower-case spelling unchanged, so the
+    origin received a status it may not accept while the bridge had already
+    validated it as legal.
+    """
+    status = _text(ds, _STATUS)
+    if status is None:
+        # N-SET is a partial update (PS3.4 F.7.2.2): omitting the attribute
+        # keeps the stored status, so this is not an error.
+        return None
+    upper = status.upper()
+    if upper not in (
+        STATUS_IN_PROGRESS,
+        STATUS_COMPLETED,
+        STATUS_DISCONTINUED,
+    ):
+        raise _Refusal(
+            _INVALID_ATTRIBUTE_VALUE,
+            f"Invalid Performed Procedure Step Status '{status}' (0040,0252)",
+        )
+    return upper
+
+def _normalise_status(ds, normalised):
+    """Write the validated status back so the origin sees the legal spelling.
+
+    Only a value the validator already accepted is rewritten, and only when the
+    element is present: an absent status stays absent, keeping the N-SET
+    partial-update semantics intact. A present-but-EMPTY status is REMOVED - it
+    is the wire encoding of "no value", and forwarding it as `[""]` asserted a
+    status the SCU never supplied.
+    """
+    tag = MPPS_ATTR_TAGS[_STATUS][:2]
+    elem = ds.get(tag)
+    if elem is None:
+        return
+    if normalised is None:
+        del ds[tag]
+        return
+    elem.value = normalised
+
+def _invalid_status_attribute_list(ds):
+    """The Attribute List returned with an Invalid Attribute Value refusal.
+
+    PS3.4 F.7.2.1: the SCP shall return status 0106H "with an Attribute List"
+    for an N-CREATE whose status is not IN PROGRESS. The offending attribute is
+    Performed Procedure Step Status (0040,0252) itself, so the list names that
+    attribute rather than echoing the request - the SCU already knows the rest
+    of what it sent, and the point of the list is to identify the offender.
+
+    A single-element Data Set in DIMSE encoding terms; pynetdicom encodes it
+    into the response's Attribute List identifier region. Built here rather
+    than reused from the request because the refused value must NOT travel
+    back as if it were accepted.
+    """
+    out = Dataset()
+    out.PerformedProcedureStepStatus = STATUS_IN_PROGRESS
+    return out
+
+def _body(ds, mpps_uid):
+    """The DICOMweb request body for a validated DIMSE data set.
+
+    The SOP Common pair comes from the translator, not from the client's data
+    set: DIMSE carries the instance UID as a command field (PS3.7 10.1.5.1 /
+    10.3.5), so a data set that also names a DIFFERENT UID is describing an
+    object it is not addressing. The command field wins.
+    """
+    body = _dataset_json(ds)
+    body["00080016"] = {"vr": "UI", "Value": [MPPS_SOP_CLASS_UID]}
+    body["00080018"] = {"vr": "UI", "Value": [mpps_uid]}
+    return body
+
+# ---------------------------------------------------------------------------
+# HTTP -> DIMSE status
+# ---------------------------------------------------------------------------
+def _http_dimse_status(status_code, on_conflict, on_missing):
+    """Map the origin's HTTP answer onto a DIMSE status.
+
+    PS3.18 Table 15.4.3-1 enumerates the Create answers: 201 Created, 400 Bad
+    Request, 409 Conflict ("the provided MPPS UID is already in use"), 503
+    Service Unavailable. Update answers 200 on success and 404 when the
+    instance is unknown.
+    """
+    if 200 <= status_code < 300:
+        return 0x0000
+    if status_code == 409:
+        return on_conflict
+    if status_code == 404:
+        return on_missing
+    if status_code in (429, 503):
+        # The origin is asking to be retried. Both listed values are the
+        # enumerated "come back later" failure; 0xA700 is a C-STORE/C-FIND
+        # warning and is not a legal MPPS status.
+        return _RESOURCE_LIMITATION
+    return _PROCESSING_FAILURE
+
+def _mpps_url(clarus_url, mpps_uid, update):
+    """`{base}/modality-performed-procedure-steps/{mppsUID}` (+ `?update`).
+
+    `safe=""` per segment: a UID is one path element, so `/`, `?` and `#`
+    inside it must not change which resource the POST addresses (PS3.18 10.1
+    resource paths). `update` is the query parameter PS3.18 15.5 makes
+    mandatory for the Update transaction - without it the same URI addresses
+    the Create transaction instead.
+    """
+    base = dicomweb_base(clarus_url)
+    url = f"{base}/modality-performed-procedure-steps/{quote(mpps_uid, safe='')}"
+    return url + "?update" if update else url
+
+def _push(label, url, body, mpps_uid, http_timeout, tls):
+    """POST one transaction and answer ``(http_status, None)`` or ``(None, why)``.
+
+    No retry here on purpose: an N-CREATE/N-SET runs inside the DIMSE reactor
+    while the modality waits on one request, and a repeated Create after a
+    timeout the origin actually processed would come back 409 on the second
+    attempt - a duplicate reported for an instance that exists BECAUSE of the
+    first. A failure is answered as a failure and the modality decides.
+
+    The response body is not read: neither transaction returns an attribute the
+    bridge forwards (Create/Update answer a render of the stored record), and
+    the context-managed client releases the connection either way.
+    """
+    try:
+        client = httpx.Client(timeout=httpx.Timeout(http_timeout + 10.0), cert=tls)
+        try:
+            resp = client.post(
+                url,
+                content=json.dumps(body).encode("utf-8"),
+                headers={
+                    "Accept": "application/dicom+json",
+                    "Content-Type": "application/dicom+json",
+                },
+            )
+        finally:
+            client.close()
+    except httpx.TimeoutException as e:
+        return None, f"origin timeout ({e})"
+    except httpx.HTTPError as e:
+        return None, f"transport error {type(e).__name__}: {e}"
+    return resp.status_code, None
+
+def _calling_ae(event):
+    """The calling AE Title for the log line; '' when the event carries none."""
+    try:
+        return str(event.assoc.requestor.ae_title)
+    except Exception:
+        return ""
+
+def _request_uid(event, attr, label):
+    """The instance UID from the DIMSE command field, or a refusal.
+
+    N-CREATE carries the Affected SOP Instance UID (0000,1000) and N-SET the
+    Requested SOP Instance UID (0000,1001) (PS3.7 10.1.5.1 / 10.3.5). Neither
+    is a data set attribute, so a data set cannot substitute for one; both live
+    on the request primitive, which `event.request` is.
+    """
+    try:
+        uid = getattr(event.request, attr)
+    except AttributeError:
+        uid = None
+    text = str(uid).strip() if uid is not None else ""
+    if not text:
+        raise _Refusal(_MISSING_ATTRIBUTE, f"{label} carries no {attr}")
+    return text
+
+def _handle(event, clarus_url, label, uid_attr, ds_attr, update, http_timeout, tls):
+    """Shared body of N-CREATE and N-SET: validate, POST, map the answer.
+
+    `uid_attr` is the request primitive's own field: N-CREATE reads the
+    Affected SOP Instance UID and N-SET the Requested SOP Instance UID (PS3.7
+    10.1.5.1 / 10.3.5). `update` selects the transaction, because PS3.18 15.5
+    distinguishes Create from Update ONLY by the `update` query parameter on an
+    otherwise identical URI - so the choice is a parameter of one code path,
+    never two paths that could drift apart.
+    """
+    if _shutdown_requested.is_set():
+        return 0xC000, None
+    ds = None
+    try:
+        mpps_uid = _request_uid(event, uid_attr, label)
+        ds = _read_dataset(event, ds_attr)
+        if update:
+            normalised = _check_status_for_update(ds)
+            # The validator upper-cases for its comparison; the origin must
+            # receive the same legal spelling, not the raw one.
+            _normalise_status(ds, normalised)
+            _check_performed_series(
+                ds,
+                final=normalised in (STATUS_COMPLETED, STATUS_DISCONTINUED),
+            )
+        else:
+            _check_status_for_create(ds)
+            _check_performed_series(ds)
+        body = _body(ds, mpps_uid)
+    except _Refusal as refusal:
+        logging.warning(
+            "[%s] MPPS refused 0x%04X: %s", label, refusal.status, refusal.reason
+        )
+        # PS3.4 F.7.2.1 requires the Invalid Attribute Value refusal on
+        # N-CREATE to be accompanied by an Attribute List identifying the
+        # offending attribute. Answering the bare status leaves a conformant
+        # SCU with no way to learn WHICH attribute was wrong.
+        #
+        # Only 0x0106 qualifies: the other refusals this handler raises are
+        # missing/undecodable data, where no attribute list is defined.
+        if refusal.status == _INVALID_ATTRIBUTE_VALUE and not update and ds is not None:
+            return refusal.status, _invalid_status_attribute_list(ds)
+        return refusal.status, None
+    except Exception as e:
+        # A refusal with an evidence-free traceback would escape into the
+        # association reactor, so every other parse surprise is answered as
+        # the documented Processing Failure.
+        logging.error("[%s] unexpected parse error: %s", label, e)
+        logging.debug("[%s] Full traceback follows:", label, exc_info=True)
+        return _PROCESSING_FAILURE, None
+
+    status_code, error = _push(
+        label,
+        _mpps_url(clarus_url, mpps_uid, update),
+        body,
+        mpps_uid,
+        http_timeout,
+        tls,
+    )
+    if status_code is None:
+        logging.warning(
+            "[%s] MPPS %s: %s -> 0x%04X", label, mpps_uid, error, _PROCESSING_FAILURE
+        )
+        return _PROCESSING_FAILURE, None
+
+    # A 409 on Create is the "UID already in use" case PS3.18 Table 15.4.3-1
+    # names; on Update it cannot mean a duplicate instance (the MPPS already
+    # exists), so it falls through to the general refusal.
+    status = _http_dimse_status(
+        status_code,
+        on_conflict=_DUPLICATE_INSTANCE if not update else _PROCESSING_FAILURE,
+        on_missing=_PROCESSING_FAILURE if not update else _NO_SUCH_INSTANCE,
+    )
+    log = logging.info if status == 0x0000 else logging.warning
+    # N-CREATE carries the Affected SOP Instance UID, N-SET the Requested one,
+    # so the same log line names the field this request actually used.
+    log(
+        "[%s] MPPS %s=%s from %s: HTTP %d -> 0x%04X",
+        label,
+        uid_attr,
+        mpps_uid,
+        _calling_ae(event),
+        status_code,
+        status,
+    )
+    return status, None
+
+def handle_n_create(event, clarus_url, http_timeout=30, tls=None):
+    """N-CREATE-RQ -> PS3.18 15.4 Create. Returns (status, None).
+
+    A created instance is acknowledged with no Attribute List: the record the
+    origin stored IS the result, and echoing the request back would let an
+    attribute the origin rejected travel back as if it had been accepted.
+    """
+    return _handle(
+        event,
+        clarus_url,
+        "N-CREATE",
+        "AffectedSOPInstanceUID",
+        "attribute_list",
+        update=False,
+        http_timeout=http_timeout,
+        tls=tls,
+    )
+
+def handle_n_set(event, clarus_url, http_timeout=30, tls=None):
+    """N-SET-RQ -> PS3.18 15.5 Update. Returns (status, None).
+
+    The Modification List is a PARTIAL data set: PS3.4 F.7.2.2 merges it onto
+    the stored instance, so nothing here demands a Type 1 attribute that the
+    creation already supplied. Only the status value and the shape of a
+    sequence that IS present are checked.
+    """
+    return _handle(
+        event,
+        clarus_url,
+        "N-SET",
+        "RequestedSOPInstanceUID",
+        "modification_list",
+        update=True,
+        http_timeout=http_timeout,
+        tls=tls,
+    )
 
 # ---------------------------------------------------------------------------
 # Bridge: handlers/naction
@@ -10209,6 +14593,26 @@ _assoc_module.LOGGER.error = _patched_assoc_error
 # ---------------------------------------------------------------------------
 # Bridge: C-MOVE  -  extract MoveDestination from C-MOVE-RQ
 # ---------------------------------------------------------------------------
+def _scoped_uid_values(ds, keyword):
+    """Every usable value of a scoped identifier key, in request order.
+
+    PS3.4 C.4.2.1.2 lists SeriesInstanceUID and SOPInstanceUID as single-value
+    keys, but a sender may still put several values in one identifier, and
+    PS3.4 Annex C.4.2 permits UID-list matching at the SERIES and IMAGE levels.
+    Narrowing such a request to its first value silently dropped the rest: the
+    bridge then answered Success for data it never sent.
+    """
+    raw = getattr(ds, keyword, None)
+    if raw is None:
+        return []
+    if isinstance(raw, (str, bytes)):
+        values = [str(raw).strip()]
+    elif hasattr(raw, "__iter__"):
+        values = [str(v).strip() for v in raw if v is not None and str(v).strip()]
+    else:
+        values = [str(raw).strip()]
+    return [v for v in values if v]
+
 def _parse_scoped_uid(ds, keyword, tag_text):
     """One SINGLE-VALUE scoped UID from the C-MOVE identifier.
 
@@ -10217,24 +14621,18 @@ def _parse_scoped_uid(ds, keyword, tag_text):
     request can still carry several values. `str()` on a pydicom MultiValue
     renders the Python list ("['1.2.3', '1.2.4']"), which then becomes a path
     segment of the WADO-RS GET - an unroutable URL, a 404 and a failed job for
-    what was a legitimate request. Only the first value is used (the level
-    scopes ONE series / ONE instance); a value list is truncated rather than
-    collapsed into a string, and an unusable value is refused.
+    what was a legitimate request.
+
+    A value LIST is no longer truncated: `_scoped_uid_values` returns every
+    value and the caller scopes one job per entry. This accessor answers the
+    single-value case (no duplicates, one entry) and refuses a rendered
+    container, which is the only remaining ambiguity.
     """
-    raw = getattr(ds, keyword, None)
-    if raw is None:
-        return ""
-    # pydicom's MultiValue is NOT a list/tuple subclass, so an isinstance test
-    # alone let it reach `str(raw)` and rendered "['1.2.3', '1.2.4']" into the
-    # URL path. Iterating on "has __iter__ and is not a str" covers both the
-    # decoded wire form and a plain container.
-    if not isinstance(raw, (str, bytes)) and hasattr(raw, "__iter__"):
-        values = [str(v).strip() for v in raw if v is not None and str(v).strip()]
-    else:
-        values = [str(raw).strip()]
-    values = [v for v in values if v]
+    values = _scoped_uid_values(ds, keyword)
     if not values:
         return ""
+    if len(values) > 1:
+        raise ValueError(f"C-MOVE-RQ: invalid {keyword} ({tag_text})")
     value = values[0]
     if "[" in value or "]" in value or "," in value:
         # A rendered container reached here (a caller stringified it before
@@ -10293,15 +14691,19 @@ def _parse_c_move_rq(event):
     # transferred every instance of the study to a viewer that asked for one
     # series. The identifier carries SeriesInstanceUID (0020,000E) at SERIES
     # and additionally SOPInstanceUID (0008,0018) at IMAGE.
+    #
+    # Both keys are UID-LIST matchable at these levels (PS3.4 Annex C.4.2), so
+    # the values are returned as LISTS: the caller scopes one job per value and
+    # the single-UID path is just the one-element case.
     level = str(getattr(ds, "QueryRetrieveLevel", "") or "").strip().upper()
-    series_uid = _parse_scoped_uid(ds, "SeriesInstanceUID", "0020,000E")
-    sop_instance_uid = _parse_scoped_uid(ds, "SOPInstanceUID", "0008,0018")
+    series_uids = _scoped_uid_values(ds, "SeriesInstanceUID")
+    sop_uids = _scoped_uid_values(ds, "SOPInstanceUID")
 
-    if level == "SERIES" and not series_uid:
+    if level == "SERIES" and not series_uids:
         raise ValueError(
             "C-MOVE-RQ: SERIES level without SeriesInstanceUID (0020,000E)"
         )
-    if level == "IMAGE" and not (series_uid and sop_instance_uid):
+    if level == "IMAGE" and not (series_uids and sop_uids):
         raise ValueError(
             "C-MOVE-RQ: IMAGE level without SeriesInstanceUID and "
             "SOPInstanceUID (0020,000E / 0008,0018)"
@@ -10312,7 +14714,56 @@ def _parse_c_move_rq(event):
         # for (PS3.4 Table C.4-2 'Unable to process').
         raise ValueError(f"C-MOVE-RQ: unsupported QueryRetrieveLevel {level!r}")
 
-    return study_uids, str(move_dest), level, series_uid, sop_instance_uid
+    # A rendered container in a value list is a malformed identifier: refuse it
+    # here rather than let "['1.2.3', '1.2.4']" reach a URL path.
+    for value in series_uids + sop_uids:
+        if any(ch in value for ch in "[]'\""):
+            raise ValueError(f"C-MOVE-RQ: invalid scoped UID {value!r}")
+
+    return study_uids, str(move_dest), level, series_uids, sop_uids
+
+# One C-MOVE-RQ may scope several studies (Weasis sends a list) and, at the
+# SERIES/IMAGE levels, several series or instance UIDs (PS3.4 Annex C.4.2
+# permits UID-list matching). Each becomes its own job, because a job carries
+# ONE scope and the worker no longer has the event. The cap bounds the work a
+# single request can queue on this bridge; a request over it is refused with a
+# stated reason rather than partially honoured, which would drop scopes
+# silently.
+_MAX_SCOPED_JOBS = 64
+
+def _scope_cardinality(level, series_uids, sop_uids):
+    """How many retrieval scopes a request names, WITHOUT expanding them.
+
+    `_request_scopes` materialises the series-by-instance product for an IMAGE
+    request, so a request naming 1000 series and 1000 instances allocated a
+    million tuples before the caller's cap could reject it. The count is
+    arithmetic on the input lengths, so the cap can be applied first and the
+    allocation only ever happens for a request that fits.
+    """
+    if level == "IMAGE":
+        return len(series_uids) * len(sop_uids)
+    if level == "SERIES":
+        return len(series_uids)
+    return 1
+
+def _request_scopes(level, series_uids, sop_uids):
+    """`[(series_uid, sop_uid), ...]` - one entry per retrieval scope.
+
+    STUDY scopes the whole study, so it carries neither key (the study UID
+    already scopes it). IMAGE pairs each requested instance with its series
+    and, when the sender gives several series for one instance list, every
+    combination that can be addressed. SERIES carries one entry per series.
+
+    Callers must check `_scope_cardinality` first: this function allocates the
+    full product.
+    """
+    if level == "IMAGE":
+        return [
+            (series_uid, sop_uid) for series_uid in series_uids for sop_uid in sop_uids
+        ]
+    if level == "SERIES":
+        return [(series_uid, "") for series_uid in series_uids]
+    return [("", "")]
 
 def _json_loads(payload):
     """json.loads over bytes/str - no new dependency, no external stream."""
@@ -10578,7 +15029,7 @@ def _preflight_study_ts_by_class(
     try:
         series_url = f"{base}/studies/{_quote(study_uid, safe='')}/series"
         series_rows = _qido_request(series_url, {}, http_timeout, limit=None, tls=tls)
-        if not isinstance(series_rows, list):
+        if not isinstance(series_rows, (list, QidoPage)):
             raise ValueError("series QIDO did not return a JSON list")
     except (_httpx.HTTPError, ValueError, KeyError, TypeError):
         logging.debug(
@@ -10605,6 +15056,9 @@ def _preflight_study_ts_by_class(
     result = {}
     probed = 0
     missed = 0
+    # Set when a series was probed by a SINGLE instance: the class map then
+    # samples the series rather than enumerating it (see the probe below).
+    sampled_class_coverage = False
     for suid in series_uids:
         if _over_budget():
             # Circuit breaker only. With per-instance probes a 4.0 s budget
@@ -10625,7 +15079,7 @@ def _preflight_study_ts_by_class(
                 f"/series/{_quote(suid, safe='')}/instances"
             )
             inst_rows = _qido_request(inst_url, {}, http_timeout, limit=None, tls=tls)
-            if not isinstance(inst_rows, list) or not inst_rows:
+            if not isinstance(inst_rows, (list, QidoPage)) or not inst_rows:
                 missed += 1
                 continue
             sop_uid = ""
@@ -10640,6 +15094,18 @@ def _preflight_study_ts_by_class(
                     # acquisitions, but this one already removes the whole
                     # reason the pre-flight was failing.
                     break
+            # A series can hold MORE THAN ONE SOP class (a mixed acquisition,
+            # or an SR written into an image series). One probed instance
+            # therefore proves only that ONE class is present, so the class map
+            # this study reports is a SAMPLE, not an inventory. The association
+            # then has no context for a class the probe never saw, and refetch
+            # cannot repair that: refetch can only choose among contexts the
+            # association already accepted.
+            #
+            # The probe stays single (its cost is why it exists); the flag
+            # below records that the walk's class coverage is unproven, so the
+            # registry still supplies classes the sample could not rule out.
+            sampled_class_coverage = True
             if not sop_uid:
                 missed += 1
                 continue
@@ -10691,10 +15157,27 @@ def _preflight_study_ts_by_class(
                 continue
             sop_class = _json_first_value(inst, "00080016")
             ts_uid = _json_first_value(inst, "00020010")
-            if sop_class and ts_uid:
-                result.setdefault(sop_class, set()).add(ts_uid)
-    # drop empty classes
-    result = {k: v for k, v in result.items() if v}
+            if not sop_class:
+                continue
+            # The class is the fact that matters: it is KNOWN to be in the
+            # study, so the proposal must carry it or the instances are
+            # undeliverable whatever the syntax says. The stored syntax only
+            # refines the proposal.
+            #
+            # Keeping the two together (the old rule: both or neither) meant a
+            # sender that omits group 0002 - which standard DICOMweb metadata
+            # MAY, PS3.18 10.4.4 only requires the dataset attributes - silently
+            # dropped its class from the map. The association then never
+            # proposed that class, so a passthrough origin could not deliver it
+            # and no transcoding could recover it either: there was no context
+            # to accept on.
+            bucket = result.setdefault(sop_class, set())
+            if ts_uid:
+                bucket.add(ts_uid)
+    # A class whose stored syntax never appeared keeps its EMPTY set: it is
+    # still known to be in the study, so `_associate_for_move` proposes its
+    # baseline pair and the per-instance refetch can find a target from the
+    # server's capability list. Dropping it here is what made the class vanish.
     n_classes = len(result)
     n_ts = sum(len(v) for v in result.values())
     logging.info(
@@ -10719,11 +15202,10 @@ def _preflight_study_ts_by_class(
         )
         _cache_evict(_preflight_cache, time.monotonic())
     # `partial` is what decides the registry fill-in: a walk that missed a
-    # series has an INCOMPLETE class map, so the registry supplies the classes
-    # it could not learn. A COMPLETE walk already lists the study's real class
-    # set (PS3.18 10.4.4 metadata is per-instance), and adding the registry to
-    # it only spends the 128-context budget on classes the study does not hold.
-    partial = bool(missed) or probed != len(series_uids)
+    # series, or whose per-series sample could not prove the series' class
+    # set, has an INCOMPLETE class map, so the registry supplies the classes
+    # it could not learn.
+    partial = bool(missed) or probed != len(series_uids) or sampled_class_coverage
     return result, partial
 
 # ---------------------------------------------------------------------------
@@ -10819,7 +15301,7 @@ def _study_sop_uids(
     except Exception:
         return None
     series_uids = []
-    if isinstance(series_rows, list):
+    if isinstance(series_rows, (list, QidoPage)):
         for row in series_rows:
             if isinstance(row, dict):
                 s = _json_first_value(row, "0020000E")
@@ -10856,7 +15338,7 @@ def _study_sop_uids(
             inst_rows = _qido_request(inst_url, {}, http_timeout, limit=None, tls=tls)
         except Exception:
             return None
-        if not isinstance(inst_rows, list):
+        if not isinstance(inst_rows, (list, QidoPage)):
             return None
         for inst in inst_rows:
             if not isinstance(inst, dict):
@@ -11020,15 +15502,22 @@ def handle_c_move(
             study_uids,
             move_dest_ae,
             request_level,
-            request_series_uid,
-            request_sop_uid,
+            request_series_uids,
+            request_sop_uids,
         ) = _parse_c_move_rq(event)
     except ValueError as e:
         # An unhonourable level (SERIES without a series UID, an unknown
         # level) arrives here: refusing is right, because falling back to
         # whole-study retrieval would send the viewer data it did not ask for.
+        #
+        # The refusal is 0x0110 (Processing Failure) with NO address yield.
+        # The old path yielded 0xC000 as the destination pair, which
+        # pynetdicom 3.0.4 reads as (address, port): the port was None, so it
+        # answered 0xA801 "Move Destination unknown" instead - a wrong status
+        # for a malformed request, and the honest one is only reachable by
+        # yielding the status first.
         logging.warning("[C-MOVE] Parse error: %s", e)
-        yield 0xC000, None
+        yield 0x0110, None
         return
 
     if peers_file:
@@ -11051,6 +15540,14 @@ def handle_c_move(
     # destination is the calling client itself (subnet match, PS3.4 sec.C.4.2.2).
     # Without substitution _associate_for_move would get the CIDR string and
     # silently fail to associate.
+    #
+    # The REGISTRY key and the CONNECTION address are kept apart: replacing
+    # `target_host` wholesale made every later `record_scp_success/failure`
+    # name the client IP, while `scp_targets` is keyed by the configured host,
+    # so a subnet-backed peer never had its failure streak updated (an exact
+    # `(ae_title, host)` UPDATE matched no row). The client IP is used to
+    # connect; the configured key is what gets recorded.
+    registry_host = target_host
     if "/" in target_host:
         logging.info(
             "[C-MOVE] Move Destination %s: CIDR host %s is informational - "
@@ -11091,10 +15588,77 @@ def handle_c_move(
         yield 0xA801, None
         return
 
-    # create a job for EACH StudyInstanceUID in the request.
-    # Weasis sends multiple StudyUIDs in one C-MOVE-RQ  -  process them all.
+    # create a job for EACH requested scope.
+    #
+    # Weasis sends multiple StudyUIDs in one C-MOVE-RQ - process them all.
+    # A SERIES- or IMAGE-level request can carry several SeriesInstanceUID /
+    # SOPInstanceUID values too (PS3.4 Annex C.4.2 permits UID-list matching
+    # at both levels), and narrowing that to the first value queued one series
+    # while the final response still said Success for the others.
+    #
+    # The number of jobs is capped by `_MAX_SCOPED_JOBS` so one request cannot
+    # queue an unbounded amount of work on this bridge; the excess is refused
+    # LOUDLY rather than dropped, because a silent drop is the defect.
+    # The cap is checked TWICE, and the order matters:
+    #   1. on the cardinality, computed from the input lengths, so an absurd
+    #      request is refused before `_request_scopes` allocates the
+    #      series-by-instance product (1000 x 1000 tuples used to be built
+    #      first and rejected afterwards);
+    #   2. on the study-multiplied plan, because one request can name several
+    #      studies as well as several scopes.
+    scope_count = _scope_cardinality(
+        request_level, request_series_uids, request_sop_uids
+    )
+    if study_uids:
+        scope_count *= len(study_uids)
+    if scope_count > _MAX_SCOPED_JOBS:
+        logging.warning(
+            "[C-MOVE] Request scopes %d retrievals (%d studies x %d scope "
+            "values) - over the %d limit, refusing the whole request",
+            scope_count,
+            len(study_uids),
+            scope_count // max(1, len(study_uids)),
+            _MAX_SCOPED_JOBS,
+        )
+        yield 0xC000, _failure_dataset(
+            [],
+            error_comment=(
+                f"Unable to process: request scopes {scope_count} retrievals, "
+                f"over the {_MAX_SCOPED_JOBS} limit"
+            ),
+        )
+        return
+
+    scope_pairs = _request_scopes(request_level, request_series_uids, request_sop_uids)
+    if not study_uids or not scope_pairs:
+        yield 0x0110, None
+        return
+
+    planned = [
+        (study, series_uid, sop_uid)
+        for study in study_uids
+        for series_uid, sop_uid in scope_pairs
+    ]
+    if len(planned) > _MAX_SCOPED_JOBS:
+        logging.warning(
+            "[C-MOVE] Request scopes %d retrievals (%d studies x %d scope "
+            "values) - over the %d limit, refusing the whole request",
+            len(planned),
+            len(study_uids),
+            len(scope_pairs),
+            _MAX_SCOPED_JOBS,
+        )
+        yield 0xC000, _failure_dataset(
+            [],
+            error_comment=(
+                f"Unable to process: request scopes {len(planned)} retrievals, "
+                f"over the {_MAX_SCOPED_JOBS} limit"
+            ),
+        )
+        return
+
     job_ids = []
-    for study_uid in study_uids:
+    for study_uid, series_uid, sop_uid in planned:
         job_id = move_jobs.create_job(
             study_uid,
             move_dest_ae,
@@ -11102,24 +15666,33 @@ def handle_c_move(
             target_port,
             expose_rejected=expose_rejected,
             request_level=request_level,
-            request_series_uid=request_series_uid,
-            request_sop_uid=request_sop_uid,
+            request_series_uid=series_uid,
+            request_sop_uid=sop_uid,
+            registry_host=registry_host,
+            # HELD, not pending: no worker may start the first scope while the
+            # rest of this request is still being inserted and its
+            # cancellation state is not installed yet. Released in one UPDATE
+            # below, after the callbacks are in place.
+            claimable=False,
         )
         job_ids.append(job_id)
         logging.info(
-            "[C-MOVE] Job #%d created for Study %s -> %s (level=%s)",
+            "[C-MOVE] Job #%d created for Study %s%s%s -> %s (level=%s)",
             job_id,
             study_uid,
+            f" series {series_uid}" if series_uid else "",
+            f" instance {sop_uid}" if sop_uid else "",
             move_dest_ae,
             request_level or "STUDY",
         )
 
     logging.info(
-        "[C-MOVE] Move Destination: %s -> %s:%d, Studies: %d (%s)",
+        "[C-MOVE] Move Destination: %s -> %s:%d, Studies: %d, jobs: %d (%s)",
         move_dest_ae,
         target_host,
         target_port,
         len(study_uids),
+        len(job_ids),
         ", ".join(study_uids),
     )
 
@@ -11163,6 +15736,15 @@ def handle_c_move(
     for job_id in job_ids:
         move_jobs.set_job_cancel_callback(job_id, _is_cancelled)
 
+    # PUBLICATION BARRIER. Every scope above was inserted as 'held'. Nothing
+    # could claim one; the cancellation callback above is the last piece of
+    # request state a worker reads. Releasing in a single UPDATE means a worker
+    # either sees no row at all or a row whose cancel callback is already
+    # installed - never the first scope of a request that is still being
+    # built, and never a job that reports is_job_cancelled() == False because
+    # the callback had not been registered yet.
+    move_jobs.release_held_jobs(job_ids)
+
     def _clear_callbacks():
         # Terminal cleanup: the callback closes over `event` (and through it
         # the association). Leaving it in the registry keeps the whole
@@ -11180,7 +15762,23 @@ def handle_c_move(
         # reactor already answered Cancel. The latch answers True forever and
         # holds NO reference to `event`: the worker reads "cancelled", stops,
         # and removes the latch itself in its own finally.
+        #
+        # Only jobs that still have a WORKER get a latch. A job the reactor
+        # just marked finished (or one that finished on its own) has nobody
+        # left to read it, and a job nobody ever claimed has no worker to
+        # stop - installing a latch there left an entry in the callback
+        # registry that nothing would ever remove.
         for job_id in job_ids:
+            try:
+                _c, _t, status = move_jobs.get_job_progress(job_id)
+            except Exception:
+                status = None
+            if status in ("success", "failed", "cancelled"):
+                move_jobs.clear_job_callback(job_id)
+                continue
+            if not move_jobs.job_has_live_worker(job_id):
+                move_jobs.clear_job_callback(job_id)
+                continue
             move_jobs.set_job_cancel_callback(job_id, lambda: True)
 
     # yield 1: (addr, port)  -  pynetdicom primes store_assoc
@@ -11201,7 +15799,40 @@ def handle_c_move(
                 continue
         return out
 
+    def _scan_jobs():
+        """`(completed, failed_tally, all_finished, any_failed)` right now.
+        poll: a job can finish between an earlier snapshot and the timeout
+        branch, and a stale zero-completed snapshot then answered 0xC000
+        ("nothing delivered") for a transfer that had just completed.
+
+        `failed_tally` is the number of instances the finished jobs accounted
+        for as NOT delivered. It is what the final response reports, because
+        pynetdicom copies the yielded count into
+        NumberOfFailedSuboperations and NumberOfCompletedSuboperations.
+        """
+        completed_total = 0
+        failed_tally = 0
+        finished = True
+        failed_job = False
+        for job_id in job_ids:
+            c, t, status = move_jobs.get_job_progress(job_id)
+            completed_total += c
+            if status not in ("success", "failed"):
+                finished = False
+            else:
+                failed_tally += max(0, t - c)
+                if status == "failed":
+                    failed_job = True
+        return completed_total, failed_tally, finished, failed_job
+
     def _finish_jobs_cancelled():
+        # LATCH FIRST, then finish. `finish_job` makes the row terminal, and a
+        # terminal job has no reader left - latching afterwards therefore
+        # looked at a finished row and skipped every job, so each worker's
+        # `is_job_cancelled()` read False and kept streaming the study
+        # (including its Storage Commitment) after the SCU had been told the
+        # move was cancelled.
+        _latch_cancelled()
         for job_id in job_ids:
             if move_jobs.finish_job(
                 job_id, success=False, error_message="Cancelled by SCU"
@@ -11209,7 +15840,6 @@ def handle_c_move(
                 # Count only when THIS call finished the job: the worker can
                 # finish it first, and a second counter bump would double-count.
                 move_jobs_counter.labels(status="failed").inc()
-        _latch_cancelled()
 
     # yield 2+: hold the DIMSE dialog (0.5 s DB poll, bounded by
     # move_poll_timeout) until every job is terminal  -  the final response is
@@ -11237,20 +15867,15 @@ def handle_c_move(
     #
     # sends 0x0000 Success and stops reading, so yielding 0 before an honest
     # 0xB000/0xC000 replaced the failure with Success. The count is therefore
-    # derived from what the jobs actually did:
+    # the tally the WORKERS produced (see below), and it is only ever 0 for a
+    # confirmed all-success transfer.
     #
-    #     completed_total >= expected_total (and expected_total > 0) -> 0
-    #         every attempted instance was delivered: 0x0000 is truthful and
-    #         pynetdicom opens NO move-destination association (the 0909
-    #         policy, one association fewer per C-MOVE);
-    #     otherwise -> max(1, expected_total)
-    #         a non-zero count opens the move-destination association before
-    #         the status is read. That is accepted deliberately: if that
-    #         association fails, pynetdicom answers 0xA801 ("move destination
-    #         unreachable"), a truthful report - while 0x0000 on a failed
-    #         transfer is not.
-    #
-    # Evidence: tmp/1111_cmove_yield_probe.py (pynetdicom 3.0.4).
+    # pynetdicom counts the sub-operations per Pending response. Because the
+    # bridge performs the stores on its OWN association, a Pending yield is
+    # never emitted, so the framework's counters are whatever this generator
+    # hands it as the initial count minus nothing - which makes that number the
+    # one the SCU reads as "failed" and "completed". That is why it is the real
+    # tally and not the study size.
     while True:
         if _is_cancelled():
             _finish_jobs_cancelled()
@@ -11263,18 +15888,7 @@ def handle_c_move(
             return
 
         # Aggregate terminal state across all jobs
-        total_completed = 0
-        expected_total = 0
-        all_finished = True
-        any_failed = False
-        for job_id in job_ids:
-            completed, total, status = move_jobs.get_job_progress(job_id)
-            total_completed += completed
-            expected_total += total
-            if status not in ("success", "failed"):
-                all_finished = False
-            if status == "failed":
-                any_failed = True
+        total_completed, failed_tally, all_finished, any_failed = _scan_jobs()
 
         # 0 is reserved for a CONFIRMED all-success transfer. On a failure path
         # the counters cannot prove completeness: `_stream_and_send_study`
@@ -11283,14 +15897,31 @@ def handle_c_move(
         # and then lost the association. A 0 there makes pynetdicom send 0x0000
         # Success and stop reading, and the 0xB000/0xC000 never reaches the
         # viewer. Keep the dialog open with a non-zero count.
-        failure_count = max(1, expected_total)
-
+        #
+        # The count handed to pynetdicom is the tally the WORKERS produced, not
+        # the study's size: the framework counts sub-operations itself and
+        # writes its counters into the final RSP, and since the bridge does the
+        # storing on its own association the framework performs none of them.
+        # `failed_tally` carries the undelivered instances so a partial move
+        # reports both sides honestly instead of "N failed, 0 completed".
+        failure_extra = failed_tally
         if all_finished:
             if any_failed:
                 failed_uids = _agg_failed_uids()
                 # Two yields, not one tuple: the reactor protocol is a bare
                 # sub-operation count followed by (status, identifier).
-                yield failure_count
+                #
+                # The count is the number of instances the WORKERS accounted
+                # for, not the study's size. pynetdicom counts the
+                # sub-operations itself (`store_results`) and writes its own
+                # numbers into the final RSP - and since the bridge delivers
+                # over its own association, the framework performs NONE of the
+                # stores, so a count of N made the SCU read "N failed, 0
+                # completed" for a transfer that had in fact delivered most of
+                # them. Yielding the real tally keeps the response honest while
+                # still being non-zero, which is what keeps the dialog open for
+                # the status yield below.
+                yield max(1, total_completed + failure_extra)
                 if total_completed == 0:
                     # Zero sub-operations completed: B000 ("Sub-operations
                     # Complete") would be a lie - say Failure (PS3.4 Table
@@ -11306,9 +15937,11 @@ def handle_c_move(
                     # C.4-2) + (0008,0058) Failed SOP Instance UID List.
                     yield 0xB000, _failure_dataset(failed_uids)
             else:
-                # All jobs succeeded: 0 sub-operations -> pynetdicom sends
-                # the final 0000 immediately and opens NO store_assoc
-                # (service_class.py:2136-2143 returns before the associate).
+                # All jobs succeeded. Yield 0 sub-operations: pynetdicom
+                # short-circuits to 0x0000 and opens NO move-destination
+                # association (which would raise, since the SCP AE has no
+                # requested contexts). A non-zero count made pynetdicom open
+                # store_assoc and answer 0xC515.
                 yield 0
             _clear_callbacks()
             return
@@ -11335,6 +15968,26 @@ def handle_c_move(
             # would keep sending and then rewrite the row to success. The
             # cancel state is what the worker already polls per instance.
             _cancel_state.cancelled = True
+            # Re-read the terminal state AFTER the timeout transitions: a job
+            # may have finished successfully between the snapshot above and
+            # here, and the earlier zero-completion view then answered 0xC000
+            # ("nothing delivered") for a transfer that just completed.
+            (
+                _completed_after,
+                _failed_after,
+                _finished_after,
+                _any_failed_after,
+            ) = _scan_jobs()
+            if _finished_after and not _any_failed_after:
+                # Every job completed on its own before the timeout landed.
+                logging.warning(
+                    "[C-MOVE] Move poll timeout (%ds) expired, but every job "
+                    "finished successfully - reporting Success",
+                    move_poll_timeout,
+                )
+                yield 0
+                _clear_callbacks()
+                return
             logging.warning(
                 "[C-MOVE] Move poll timeout (%ds) expired: %d job(s) still "
                 "unfinished (%s) - finished as failed, final status %s.",
@@ -11345,11 +15998,11 @@ def handle_c_move(
                     if timed_out_jobs
                     else "(none)"
                 ),
-                "0xC000" if total_completed == 0 else "0xB000",
+                "0xC000" if _completed_after == 0 else "0xB000",
             )
-            yield failure_count
+            yield max(1, _completed_after + _failed_after)
             failed_uids = _agg_failed_uids()
-            if total_completed == 0:
+            if _completed_after == 0:
                 # Nothing delivered before the poll timeout -> Failure, not a
                 # "sub-operations complete" Warning (PS3.4 Table C.4-2).
                 yield 0xC000, _failure_dataset(
@@ -11689,6 +16342,17 @@ def _proposed_ts_per_class(sop_registry):
 # the Storage Commitment context proposed on the main association.
 _MAX_CONTEXTS = 128
 
+# Bytes read from the head of a refetched instance to locate its file meta
+# group. A Part 10 preamble plus group 0002 is tens of bytes; 64 KiB is a
+# whole-megabyte-plus margin that still never pulls a dataset into memory.
+_FILE_META_PROBE = 64 * 1024
+
+# Bounded copy size for rebuilding a refetched instance behind a length-changing
+# file-meta prefix. One MiB keeps the copy at the same footprint as the download
+# loop above and never scales with the instance, which is the point: the refetch
+# path must not allocate in proportion to the blob it is rewriting.
+_TAIL_COPY_CHUNK = 1024 * 1024
+
 def _trim_optional_ts(num_classes, has_sc, optional_tokens):
     """Return the subset of optional tokens that fit the 128-context budget.
 
@@ -11754,6 +16418,28 @@ class _AssocGateAborted(Exception):
         self.host = host
         self.port = port
         self.ae_title = ae_title
+
+def _try_reserve_peer(host, port, ae_title):
+    """Reserve the peer for THIS thread without blocking; True on success.
+
+    The reservation is what makes "do not park a worker on a peer another
+    worker just claimed" enforceable: it is one atomic test-and-set under the
+    gate lock, so two workers cannot both observe the peer free and then claim
+    two jobs for it. The winner claims a job immediately afterwards; the loser
+    leaves the row pending and looks at another peer, so a job for a DIFFERENT
+    peer is never left unserved behind a blocking wait.
+
+    Re-entrant for the owning thread, counted like `_job_gate_enter`, so a
+    resume path that reserves again unwinds with the matching exits.
+    """
+    key = (host, port, ae_title)
+    me = threading.get_ident()
+    with _ASSOC_GATE_LOCK:
+        owner = _ASSOC_BUSY.get(key)
+        if owner is not None and owner[0] != me:
+            return False
+        _ASSOC_BUSY[key] = (me, owner[1] + 1) if owner else (me, 1)
+        return True
 
 def _job_gate_enter(host, port, ae_title, give_up=None):
     """Serialise concurrent jobs toward the same peer (busy exclusion).
@@ -11830,13 +16516,9 @@ def _job_gate_enter(host, port, ae_title, give_up=None):
 def _peer_is_busy(host, port, ae_title):
     """True when another thread holds the gate for this peer (R9).
 
-    The worker pool picks a job BEFORE it takes the gate, so with two workers
-    one of them could claim a second job for a peer the other one is already
-    streaming to and then sit blocked in the gate. That job is invisible to
-    the queue (already claimed) while it waits, and a different viewer's job
-    behind it waits too - a long transfer can push the second request past the
-    modality's own timeout. Asking before claiming keeps a gate-blocked job in
-    pending, where the other workers can see it.
+    An advisory read only: it is NOT the claim. `_try_reserve_peer` is what a
+    worker must go through, because a read followed by a separate claim lets
+    two workers both see the peer free.
     """
     key = (host, port, ae_title)
     with _ASSOC_GATE_LOCK:
@@ -12019,7 +16701,8 @@ def _associate_for_move(
     # known to be in the study, so dropping it makes the move silently
     # incomplete. The registry fill-in classes (CM7) are the ones dropped.
     budget = _MAX_CONTEXTS - 1  # Storage Commitment slot
-    protected = set(study_ts_by_class.keys()) if has_preflight else set()
+    observed = set(study_ts_by_class.keys()) if has_preflight else set()
+    protected = set(observed)
     if len(protected) * 2 > budget:
         logging.warning(
             "[C-MOVE] %d class(es) known to be in the study need %d baseline "
@@ -12032,7 +16715,28 @@ def _associate_for_move(
     while sum(len(v) for v in proposals.values()) > budget:
         candidates = [uid for uid in proposals if uid not in protected]
         if not candidates:
-            raise RuntimeError("presentation-context budget cannot fit")
+            # Every remaining class is one the pre-flight actually observed, so
+            # dropping one would make the move silently incomplete. The
+            # baselines still do not fit, which means the study itself has more
+            # SOP classes than 128 PCIDs can carry (PS3.8 7.1.1.13). Keep the
+            # proposal within the limit rather than raising: the classes that
+            # survive are still delivered, and the drop is logged as the
+            # incompleteness it is. Raising here failed the whole move for a
+            # study wide enough to trip this - the SCU got a Failure with no
+            # instance transferred at all.
+            while sum(len(v) for v in proposals.values()) > budget:
+                dropped_cls = list(proposals)[-1]
+                dropped_ts = proposals.pop(dropped_cls)
+                protected.discard(dropped_cls)
+                logging.error(
+                    "[C-MOVE] 128-context budget (PS3.8 7.1.1.13): study needs "
+                    "more SOP classes than one association can propose - "
+                    "dropped OBSERVED class %s (%d TS contexts); its "
+                    "instances cannot be delivered",
+                    dropped_cls,
+                    len(dropped_ts),
+                )
+            break
         dropped_cls = candidates[-1]
         dropped_ts = proposals.pop(dropped_cls)
         logging.info(
@@ -12051,7 +16755,78 @@ def _associate_for_move(
         if cls_uid in survivors
         for tok in toks
     ]
-    kept_tokens = set(_trim_optional_ts(len(survivors), True, flat))
+    # ORDER MATTERS: the whole-class drop above runs first, and the STORED
+    # syntaxes of classes the pre-flight proved are in scope are reserved
+    # before any speculative token is considered. The old order let a registry
+    # guess take the last free slot and then trimmed away the stored syntax of
+    # a class KNOWN to be in the study - invisible on a transcoding origin,
+    # fatal on a passthrough one, where it is the only form that can be sent.
+    reserved = [tok for tok in flat if tok[2] == "stored"]
+    speculative = [tok for tok in flat if tok[2] != "stored"]
+    # Storage Commitment is always requested on this association.
+    _room = (_MAX_CONTEXTS - 1) - (2 * len(survivors)) - len(reserved)
+    if _room >= len(speculative):
+        kept_tokens = set(reserved) | set(speculative)
+    elif _room <= 0:
+        if speculative:
+            logging.warning(
+                "[C-MOVE] 128-context budget: %d stored syntax(es) reach the "
+                "limit - dropping %d speculative context(s)",
+                len(reserved),
+                len(speculative),
+            )
+        # PS3.8 7.1.1.13 caps PCIDs at 128, and the Storage Commitment context
+        # is one of them. The stored syntaxes the pre-flight actually observed
+        # are what makes a passthrough origin deliverable, so they OUTRANK the
+        # registry fill-in classes: drop speculative classes first, and only
+        # trim a stored syntax when the budget is exhausted even without them.
+        # The baseline pair of every surviving class stays - EVRLE/IVRLE are
+        # the refetch targets, so a class with neither cannot be recovered.
+        _cap = _MAX_CONTEXTS - 1
+        while len(reserved) + 2 * len(survivors) > _cap:
+            drop_candidates = [uid for uid in proposals if uid not in protected]
+            if not drop_candidates:
+                # Every remaining class is observed. Failing here would refuse
+                # the whole move, so trim a stored syntax instead - the same
+                # overflow guard, one level down.
+                break
+            dropped_cls = drop_candidates[-1]
+            dropped_ts = proposals.pop(dropped_cls)
+            survivors.discard(dropped_cls)
+            # The class is gone from the proposal, so its stored token must go
+            # with it: leaving it in `reserved` would spend a context on a
+            # class no longer requested and could overflow the very budget this
+            # loop is protecting.
+            reserved = [tok for tok in reserved if tok[0] != dropped_cls]
+            logging.info(
+                "[C-MOVE] 128-context budget: dropped speculative class %s "
+                "(%d TS contexts) to keep %d observed stored syntax(es)",
+                dropped_cls,
+                len(dropped_ts),
+                len(reserved),
+            )
+        _stored_room = max(0, _cap - (2 * len(survivors)))
+        if len(reserved) > _stored_room:
+            logging.warning(
+                "[C-MOVE] 128-context budget: %d stored syntax(es) exceed the "
+                "%d slot(s) left after %d class baseline(s) - keeping the "
+                "first %d in canonical order",
+                len(reserved),
+                _stored_room,
+                len(survivors),
+                _stored_room,
+            )
+            reserved = reserved[:_stored_room]
+        kept_tokens = set(reserved)
+    else:
+        logging.info(
+            "[C-MOVE] 128-context budget: kept %d speculative context(s) of "
+            "%d after reserving %d stored syntax(es)",
+            int(_room),
+            len(speculative),
+            len(reserved),
+        )
+        kept_tokens = set(reserved) | set(speculative[: int(_room)])
     for tok in flat:
         if tok in kept_tokens:
             sop_uid, ts_uid, _kind = tok
@@ -12655,6 +17430,9 @@ def _stream_and_send_study(
     passthrough = 0
     transcoded = 0
     refetched = 0
+    # Instances the peer ACCEPTED with a Warning status (PS3.4 B.2.3.1). They
+    # count as delivered - the SCP holds them - so they are not in `failed`.
+    warned = 0
     sent_sop_uids = []
     # 0709: every SOP instance UID this job attempted, so the failed set
     # (seen minus delivered) feeds the (0008,0058) Failed SOP Instance UID
@@ -12666,7 +17444,18 @@ def _stream_and_send_study(
         the driver requested it via `_report_lost` (test_spill unpacks the
         historical 7 elements and does not set `_report_lost`). The
         (0008,0058) tail is computed here from the current seen/delivered
-        sets so the helper has no forward dependency."""
+        sets so the helper has no forward dependency.
+
+        The C-STORE warning tally is NOT part of this tuple: it is persisted
+        here (see `set_job_warning_count`) because widening a return value that
+        the tests and two call sites unpack positionally turned a repair into a
+        contract break. The worker already owns `move_jobs` and `job_id`, so it
+        can record the tally itself.
+        """
+        try:
+            move_jobs.set_job_warning_count(job_id, warned)
+        except Exception:
+            logging.debug("[C-MOVE] Job #%s: warning count not recorded", job_id)
         _d = {u for _c, u in sent_sop_uids if u}
         _f = sorted(u for u in seen_sop_uids if u not in _d)
         base = (completed, failed, total, sent_sop_uids, _f, cancelled, no_common)
@@ -12740,10 +17529,26 @@ def _stream_and_send_study(
             )
         ),
     )
-    resp = requests.get(
-        url, headers=headers, timeout=http_timeout, stream=True, cert=tls
-    )
-    resp.raise_for_status()
+    resp = None
+    try:
+        resp = requests.get(
+            url, headers=headers, timeout=http_timeout, stream=True, cert=tls
+        )
+        resp.raise_for_status()
+    except requests.RequestException as _get_err:
+        # The status check runs before a single body byte is read, so nothing
+        # will ever close this response for us: the pooled connection stays
+        # checked out for the life of the process and every later WADO GET
+        # opens another one. Release it before the failure propagates.
+        logging.warning(
+            "[C-MOVE] WADO-RS GET failed for study %s: %s", study_uid, _get_err
+        )
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        raise
 
     # B1 (2508): a reader thread prefetches the streamed multipart parts into a
     # bounded FIFO while this sender loop C-STORE-s them - the serial pipeline
@@ -12809,12 +17614,14 @@ def _stream_and_send_study(
             actual_ts,
             refetch_ts,
         )
+        r2 = None
         try:
             r2 = requests.get(
                 inst_url,
                 headers={"Accept": f"application/dicom; transfer-syntax={refetch_ts}"},
                 timeout=http_timeout,
                 cert=tls,
+                stream=True,
             )
             r2.raise_for_status()
         except requests.RequestException as rf_err:
@@ -12824,21 +17631,118 @@ def _stream_and_send_study(
                 sop_uid,
                 rf_err,
             )
+            # `raise_for_status()` raises BEFORE the streaming body is read, so
+            # the pooled socket this response holds is never returned by
+            # `iter_content` reaching EOF. Without this close the connection
+            # stayed checked out of the pool for the life of the process, and
+            # every subsequent refetch opened another one.
+            if r2 is not None:
+                try:
+                    r2.close()
+                except Exception:
+                    pass
             failed += 1
             return None
-        new_bytes = r2.content
-        with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as _f2:
-            _f2.write(
-                _ensure_file_meta_bytes(
-                    new_bytes,
-                    sop_class_uid,
-                    sop_uid,
-                    refetch_ts,
-                )
+        # The replacement is written STRAIGHT to a managed temp file in bounded
+        # chunks. Reading it into `r2.content` first buffered the whole instance
+        # in memory and bypassed the spill threshold the study stream respects:
+        # a large spilled instance needing a different transfer syntax cost
+        # exactly the memory the spill exists to avoid.
+        #
+        # `_ensure_file_meta_bytes` needs the LEADING bytes to locate the
+        # dataset, so the group-0002 prefix is rewritten once the whole file is
+        # on disk: the replacement header is written over the old one and the
+        # remainder of the file follows untouched when the length is unchanged.
+        # A length change is handled by a BOUNDED copy of the retained tail
+        # into a second temp file - reading the instance back to do it defeated
+        # the spill this whole path exists to respect.
+        _rtmp = None
+        _rtmp2 = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as _f2:
+                _rtmp = _f2.name
+            _prefix = b""
+            _written = 0
+            with open(_rtmp, "wb") as _out:
+                try:
+                    for chunk in r2.iter_content(1024 * 1024):
+                        if not chunk:
+                            continue
+                        if len(_prefix) < _FILE_META_PROBE:
+                            _prefix += chunk[: _FILE_META_PROBE - len(_prefix)]
+                        _out.write(chunk)
+                        _written += len(chunk)
+                finally:
+                    try:
+                        r2.close()
+                    except Exception:
+                        pass
+            if _written == 0:
+                raise ValueError("empty refetch body")
+            _fixed = _ensure_file_meta_bytes(
+                _prefix, sop_class_uid, sop_uid, refetch_ts
             )
-            _rtmp = _f2.name
+            if _fixed != _prefix:
+                # Only the prefix changed. When its LENGTH is unchanged the
+                # dataset behind it is already correct in place.
+                if len(_fixed) == len(_prefix):
+                    with open(_rtmp, "r+b") as _out:
+                        _out.seek(0)
+                        _out.write(_fixed)
+                else:
+                    # Length-changing prefix: build the replacement in a second
+                    # file from the new prefix plus the tail, copied in bounded
+                    # chunks. `_out.read()` loaded the entire instance into
+                    # memory to move a few bytes of header, which defeated
+                    # spilling for exactly the large instances it protects.
+                    _rtmp2 = _rtmp + ".fixed"
+                    with open(_rtmp, "rb") as _src, open(_rtmp2, "wb") as _dst:
+                        _dst.write(_fixed)
+                        _src.seek(len(_prefix))
+                        while True:
+                            _buf = _src.read(_TAIL_COPY_CHUNK)
+                            if not _buf:
+                                break
+                            _dst.write(_buf)
+                    try:
+                        _os.replace(_rtmp2, _rtmp)
+                    except OSError:
+                        _os.unlink(_rtmp2)
+                        _rtmp2 = None
+                        raise
+                    _rtmp2 = None
+        except Exception as _wf:
+            # A failed write or copy must not leave a partial file behind: the
+            # unlink below only runs on the success path. Both temp files are
+            # released here, because the second is created before the copy that
+            # can fail.
+            logging.warning(
+                "[C-MOVE] Instance %d (%s): refetched bytes could not be "
+                "written (%s)",
+                idx,
+                sop_uid,
+                _wf,
+            )
+            for _p in (_rtmp, _rtmp2):
+                if _p:
+                    _unlink_quiet(_p)
+            failed += 1
+            return None
         try:
             _t0 = time.perf_counter()
+            # C-CANCEL can arrive during the download above, after the
+            # per-instance check that preceded this instance. Sending now would
+            # open a new C-STORE after the SCU has been told the move stopped
+            # (PS3.4 C.4.2.3: no further sub-operations once cancelled).
+            if _shutdown_requested.is_set() or move_jobs.is_job_cancelled(job_id):
+                logging.info(
+                    "[C-MOVE] Instance %d (%s): cancelled after the refetch - "
+                    "not sending the replacement",
+                    idx,
+                    sop_uid,
+                )
+                failed += 1
+                return None
             status = assoc.send_c_store(_rtmp)
         except Exception as rs_err:
             logging.warning(
@@ -12849,10 +17753,8 @@ def _stream_and_send_study(
             )
             status = None
         finally:
-            try:
-                _os.unlink(_rtmp)
-            except OSError:
-                pass
+            if _rtmp:
+                _unlink_quiet(_rtmp)
         try:
             cstore_outbound_duration.labels(peer=ae_label(peer_ae)).observe(
                 time.perf_counter() - _t0
@@ -13035,22 +17937,46 @@ def _stream_and_send_study(
 
                 # Pass-through: raw bytes -> temp file -> pynetdicom reads directly.
                 # No dcmread(), no write_dataset(). Bytes untouched.
-                with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as _f:
-                    _f.write(
-                        _ensure_file_meta_bytes(
-                            dicom_bytes,
-                            sop_class_uid,
-                            sop_uid,
-                            actual_ts,
-                        )
-                    )
-                    if spill_path is not None:
-                        # W3 (0209): append the spilled excess from disk in
-                        # 1 MiB chunks - the spill file is never read whole.
-                        with open(spill_path, "rb") as _src:
-                            shutil.copyfileobj(_src, _f, 1024 * 1024)
-                    _tmp_path = _f.name
+                #
+                # Creation, writing, sending and unlinking are ONE cleanup
+                # scope: the old shape only unlinked after the send file had
+                # been built, so a filesystem that filled during the spill copy
+                # left a partial `.dcm` behind for the life of the process.
+                _tmp_path = None
                 try:
+                    with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as _f:
+                        _tmp_path = _f.name
+                        _f.write(
+                            _ensure_file_meta_bytes(
+                                dicom_bytes,
+                                sop_class_uid,
+                                sop_uid,
+                                actual_ts,
+                            )
+                        )
+                        if spill_path is not None:
+                            # W3 (0209): append the spilled excess from disk in
+                            # 1 MiB chunks - the spill file is never read whole.
+                            with open(spill_path, "rb") as _src:
+                                shutil.copyfileobj(_src, _f, 1024 * 1024)
+                    # The job can be cancelled or stopped while the instance is
+                    # being fetched or its send file built - work that can take
+                    # as long as the transfer itself. The check at the top of the
+                    # loop happened BEFORE it, so a cancel arriving in between
+                    # still started a new C-STORE.
+                    if (
+                        move_jobs.is_job_cancelled(job_id)
+                        or _shutdown_requested.is_set()
+                    ):
+                        logging.warning(
+                            "[C-MOVE] Job #%d cancelled/stopping before C-STORE "
+                            "of instance %d",
+                            job_id,
+                            idx + 1,
+                        )
+                        prefetch.stop()
+                        resp.close()
+                        return _out(cancelled=True)
                     if decision == "send_as_is":
                         # Stored TS accepted for this class -> main association.
                         _t0 = time.perf_counter()
@@ -13190,7 +18116,8 @@ def _stream_and_send_study(
                         resp.close()
                         return _out(lost=True)
                 finally:
-                    _unlink_quiet(_tmp_path)
+                    if _tmp_path:
+                        _unlink_quiet(_tmp_path)
                     if spill_path is not None:
                         _unlink_quiet(spill_path)
 
@@ -13237,13 +18164,63 @@ def _stream_and_send_study(
                     # Bridge: track successfully sent SOPs for Storage Commitment
                     if sop_uid:
                         sent_sop_uids.append((sop_class_uid, sop_uid))
+                        # Also on the JOB, immediately: this list is what the
+                        # resume skips, and a pass that raises never returns
+                        # its local copy - so an acknowledged instance was
+                        # re-sent on the resumed pass.
+                        try:
+                            move_jobs.add_job_delivered_sop(
+                                job_id, sop_uid, sop_class_uid
+                            )
+                        except Exception:
+                            logging.debug(
+                                "[C-MOVE] Job #%d: delivered SOP not recorded",
+                                job_id,
+                            )
                 else:
-                    failed += 1
-                    logging.warning(
-                        "[C-MOVE] C-STORE failed for instance %d: status=%s",
-                        idx + 1,
-                        _dimse_status_name(status.Status),
-                    )
+                    _st = int(status.Status or 0)
+                    if 0xB000 <= _st <= 0xBFFF:
+                        # PS3.4 B.2.3.1: a Warning status means the SCP ACCEPTED
+                        # the instance and stored it, having coerced one or more
+                        # elements. Counting it failed listed the SOP as
+                        # undelivered, made the move answer 0xC000, and re-sent
+                        # it on resume - while the peer already holds it.
+                        # Warnings are tracked on their own counter.
+                        warned += 1
+                        completed += 1
+                        if sent_via_refetch:
+                            transcoded += 1
+                        else:
+                            passthrough += 1
+                        try:
+                            cstore_warnings.labels(peer=ae_label(peer_ae)).inc()
+                        except Exception:
+                            pass
+                        if sop_uid:
+                            sent_sop_uids.append((sop_class_uid, sop_uid))
+                            try:
+                                move_jobs.add_job_delivered_sop(
+                                    job_id, sop_uid, sop_class_uid
+                                )
+                            except Exception:
+                                logging.debug(
+                                    "[C-MOVE] Job #%d: delivered SOP not recorded",
+                                    job_id,
+                                )
+                        logging.warning(
+                            "[C-MOVE] C-STORE warning for instance %d: status=%s "
+                            "- instance stored by the peer, counted as "
+                            "acknowledged",
+                            idx + 1,
+                            _dimse_status_name(_st),
+                        )
+                    else:
+                        failed += 1
+                        logging.warning(
+                            "[C-MOVE] C-STORE failed for instance %d: status=%s",
+                            idx + 1,
+                            _dimse_status_name(_st),
+                        )
             except (requests.RequestException, OSError, ValueError, KeyError) as e:
                 failed += 1
                 if spill_path is not None:
@@ -13381,6 +18358,36 @@ def _release_or_abort(assoc, timeout=3.0):
 # ---------------------------------------------------------------------------
 # Bridge: execute a single C-MOVE job: stream -> send -> finish
 # ---------------------------------------------------------------------------
+# Delivered UIDs recovered from the job record carry no SOP class when the
+# class was never recorded (an older row): the class is only needed for the
+# C-STORE context, which is already negotiated, so an empty string is harmless
+# there. Storage Commitment is skipped for such an entry, because a
+# Referenced SOP Class that was never observed must not be invented.
+_SOP_CLASS_UNKNOWN = ""
+
+def _delivered_sops_of(move_jobs, job_id):
+    """`[(sop_class, sop_uid), ...]` the job has already delivered, or None.
+
+    Read back after a pass raised: the pass's return value is the only other
+    carrier of this set, and a raise never produces one. `None` means the
+    record could not be read, so the caller keeps its aggregate fallback.
+    """
+    getter = getattr(move_jobs, "get_job_delivered_sops", None)
+    if getter is None:
+        return None
+    try:
+        return [(cls or _SOP_CLASS_UNKNOWN, uid) for cls, uid in getter(job_id)]
+    except Exception:
+        return None
+
+def _job_total_of(move_jobs, job_id):
+    """Instances the job has observed so far (0 when unreadable)."""
+    try:
+        _c, total, _s = move_jobs.get_job_progress(job_id)
+        return int(total or 0)
+    except Exception:
+        return 0
+
 def _execute_cmove_job(
     job_id,
     study_uid,
@@ -13406,6 +18413,7 @@ def _execute_cmove_job(
     request_level="",
     request_series_uid="",
     request_sop_uid="",
+    registry_host="",
 ):
     """Execute C-MOVE: stream study from Clarus, send instances to target SCP.
 
@@ -13423,6 +18431,13 @@ def _execute_cmove_job(
     """
     # Bridge: target_host/target_port come from job (resolved in handle_c_move).
     # No re-lookup needed  -  subnet resolution happened at C-MOVE time.
+    #
+    # `registry_host` is the peers.conf key the destination matched under. For
+    # a CIDR peer it is the SUBNET, while target_host is the client IP the
+    # association goes to; `scp_targets` is keyed by the former, so SCP health
+    # is recorded against it. A legacy job (no column) falls back to the
+    # connection address, which is what it recorded before.
+    health_host = registry_host or target_host
     if not target_host or not target_port:
         # Legacy job without target info  -  fall back to lookup
         if peers_file:
@@ -13492,7 +18507,7 @@ def _execute_cmove_job(
         except RuntimeError as e:
             logging.error("[C-MOVE] %s", e)
             logging.debug("[C-MOVE] Association traceback:", exc_info=True)
-            move_jobs.record_scp_failure(move_dest_ae, host=target_host)
+            move_jobs.record_scp_failure(move_dest_ae, host=health_host)
             if move_jobs.finish_job(job_id, success=False, error_message=str(e)):
                 move_jobs_counter.labels(status="failed").inc()
             return
@@ -13562,26 +18577,35 @@ def _execute_cmove_job(
             no_common_ts = _nc1
             resumed_lost = _lost1
         except Exception:
-            # A mid-stream raise does not undo what was already delivered. The
-            # counters live in `_c1`/`_f1`/`_t1` only once the call RETURNS, so
-            # resetting them to zero here threw away the progress pass 1 had
-            # made: the job then finished reporting 0 delivered and 0 failed
-            # for a study that had, in fact, moved. Read the partial counters
-            # back off the job record and keep them so the failure propagates
-            # with an honest tally.
+            # A mid-stream raise does not undo what was already delivered.
+            #
+            # The counters and the delivered UID list live in the pass's return
+            # value, which a raise never produces - so rebuilding the resume
+            # state from `get_job_progress` kept only AGGREGATE numbers and the
+            # skip set came back EMPTY. The resumed pass then re-sent instances
+            # the destination had already acknowledged. The per-instance
+            # accounting is recovered from the job's own delivered list
+            # instead; the aggregate counters remain the fallback for a job
+            # whose list is unreadable.
             logging.error(
                 "[C-MOVE] Job #%d: pass 1 raised mid-stream - preserving the "
                 "progress counted so far",
                 job_id,
             )
-            try:
-                # (completed_instances, total_instances, status), the same
-                # counters the 0xFF00 poll reports and the final RSP sums.
-                _c1, _t1, _ = move_jobs.get_job_progress(job_id)
-                _f1 = max(0, _t1 - _c1)
-            except Exception:
-                _c1, _f1, _t1 = 0, 0, 0
-            sent_sop_uids = []
+            recovered = _delivered_sops_of(move_jobs, job_id)
+            if recovered is not None:
+                sent_sop_uids = list(recovered)
+                _c1 = len(recovered)
+                _t1 = max(_c1, _job_total_of(move_jobs, job_id))
+                _f1 = 0
+            else:
+                try:
+                    # (completed_instances, total_instances, status), the same
+                    # counters the 0xFF00 poll reports and the final RSP sums.
+                    _c1, _t1, _ = move_jobs.get_job_progress(job_id)
+                    _f1 = max(0, _t1 - _c1)
+                except Exception:
+                    _c1, _f1, _t1 = 0, 0, 0
             _fs1 = []
             cancelled = False
             no_common_ts = False
@@ -13657,12 +18681,26 @@ def _execute_cmove_job(
                         qa_url=qa_url,
                     )
                     _c2, _f2, _t2, _s2, _fs2, _ca2, _nc2, _lost2 = r2
-                    # Union the delivered sets.
-                    sent_sop_uids = list(_s1) + list(_s2)
+                    # Merge pass 2 into what is ALREADY accumulated, never
+                    # into `_s1`: when pass 1 raised, `_s1` was never assigned
+                    # and this expression raised UnboundLocalError, which the
+                    # `except` below swallowed - so B was reported failed even
+                    # though the destination acknowledged it.
+                    sent_sop_uids = list(sent_sop_uids) + list(_s2)
                     cancelled = cancelled or _ca2
                     no_common_ts = no_common_ts or _nc2
                     resumed_lost = _lost2  # second loss => GIVE_UP below
                 except Exception:
+                    # The resumed pass may have delivered instances before it
+                    # raised, and a raise never produces a return value. Read
+                    # the job's own delivered journal so those
+                    # acknowledgements are not reported as failures.
+                    recovered2 = _delivered_sops_of(move_jobs, job_id)
+                    if recovered2 is not None:
+                        known = {u for _c, u in sent_sop_uids if u}
+                        sent_sop_uids = list(sent_sop_uids) + [
+                            (None, u) for u in recovered2 if u not in known
+                        ]
                     resumed_lost = True
 
         if resumed_lost:
@@ -13685,10 +18723,31 @@ def _execute_cmove_job(
         # `_t2` was never assigned - the binding stays inside the `try` that
         # raised, so it is read through a default instead of a NameError.
         _obs_total_p2 = (locals().get("_t2", 0) or 0) if not no_common_ts else 0
+        # What the passes OBSERVED as undelivered. This is evidence from the
+        # transfer itself and outranks the cached enumeration, which can be
+        # STALE: the WADO stream may hold instances the cache does not (a study
+        # that grew between the enumeration and the stream), and the peer can
+        # reject one of those. Reconciling only against the cache reported
+        # Success for a job that really left an instance behind.
+        observed_failed = {u for u in (set(_fs1) | set(_fs2)) if u}
+        observed_failed -= delivered
         if study_sop_uids is not None and study_sop_uids:
             study_uids_set = set(study_sop_uids)
-            total = len(study_uids_set)
-            ordered_uids = study_sop_uids
+            # The cache fixes the ORDER and the baseline of the tail, and the
+            # observed failures extend BOTH membership and total: an instance
+            # the cache never listed but the peer refused is part of the
+            # result, or the report claims a completeness the transfer did not
+            # have.
+            # The cache fixes the ORDER and the baseline of the tail, the
+            # delivered set and the observed failures extend BOTH membership
+            # and total. A UID the cache never listed but the transfer
+            # delivered is part of the result too: excluding it made the total
+            # smaller than the completed count on a study that grew between the
+            # enumeration and the stream.
+            total = len(study_uids_set | observed_failed | delivered)
+            ordered_uids = list(study_sop_uids) + sorted(
+                u for u in observed_failed if u not in study_uids_set
+            )
         else:
             # No authoritative list (degradation): total = largest pass total.
             # Pass 2 is included ONLY when it actually ran: a resumed job that
@@ -13696,9 +18755,9 @@ def _execute_cmove_job(
             # GET, and ignoring that total reported 0 failures for a job whose
             # GIVE_UP is the one thing we know about it (PS3.4 C.4.2.1.4.2:
             # the final status must be honest about undelivered instances).
-            total = max(_obs_total_p1, _obs_total_p2, completed)
+            total = max(_obs_total_p1, _obs_total_p2, completed, len(observed_failed))
             ordered_uids = None
-        if study_sop_uids is not None and study_sop_uids:
+        if ordered_uids is not None:
             failed_sop_uids = [u for u in ordered_uids if u not in delivered]
         else:
             # Degrade to the per-attempt failed sets when present, else [].
@@ -13772,6 +18831,12 @@ def _execute_cmove_job(
             move_jobs.update_job_progress(job_id, completed, failed, total)
         except Exception as e:
             logging.debug("[C-MOVE] reconciled progress write failed: %s", e)
+
+        # A C-STORE Warning means the peer STORED the instance (PS3.4
+        # B.2.3.1), so those UIDs stay out of the failed/undelivered tail. The
+        # tally itself is recorded by `_stream_and_send_study` as it goes (see
+        # `set_job_warning_count`), because the reactor - not this function -
+        # builds the final C-MOVE-RSP that reports 0xB000 for them.
 
         if no_common_ts:
             # No common transfer syntax: the job ends failed with zero slices
@@ -13851,7 +18916,7 @@ def _execute_cmove_job(
         # the RuntimeError catch above) touches the consecutive-failure
         # counter (D3, spec task #1).
         if failed == 0 and total > 0:
-            move_jobs.record_scp_success(move_dest_ae, host=target_host)
+            move_jobs.record_scp_success(move_dest_ae, host=health_host)
 
         # -- Finish job --
         job_success = failed == 0 and total > 0
@@ -13942,20 +19007,30 @@ def _cmove_worker(
         logging.info("[C-MOVE] Worker-%d started", worker_id)
 
         while not _shutdown_requested.is_set():
-            # Bridge: pick next pending job, LIMIT 1, skipping a peer another
-            # worker is already streaming to. Claiming a busy peer's job and
-            # handing it back parked every OTHER pending job behind it (the
-            # handback kept the row's created_at, so the next pick took the
-            # same busy peer again) and burned an UPDATE+commit twice a
-            # second for the whole transfer. Skipping at pick time leaves the
-            # row pending for the other workers to see.
-            job = move_jobs.pick_pending_job(
-                skip=lambda host, port, ae: bool(host)
-                and bool(port)
-                and _peer_is_busy(host, int(port), ae),
-            )
+            # Bridge: pick next pending job, LIMIT 1, RESERVING its peer
+            # atomically.
+            #
+            # The reservation is the claim test, not a peek: an earlier design
+            # read "is the peer busy?" and then claimed the row as two steps,
+            # so two workers could both find the peer free and claim two jobs
+            # for it - one then parked in the gate while a job for a DIFFERENT
+            # peer sat unserved. A failed reservation hands the row back
+            # WITHOUT charging an attempt, so a busy peer never burns a job's
+            # retry budget.
+            job = None
+            while job is None and not _shutdown_requested.is_set():
+                job = move_jobs.pick_pending_job(
+                    timeout=1.0,
+                    reserve=lambda host, port, ae: (
+                        _try_reserve_peer(host, int(port), ae)
+                        if host and port
+                        else True
+                    ),
+                    release=lambda host, port, ae: (
+                        _job_gate_exit(host, int(port), ae) if host and port else None
+                    ),
+                )
             if job is None:
-                # pick_pending_job() already waited via Condition
                 continue
 
             job_id = job["id"]
@@ -14010,6 +19085,7 @@ def _cmove_worker(
                     request_level=job.get("request_level", ""),
                     request_series_uid=job.get("request_series_uid", ""),
                     request_sop_uid=job.get("request_sop_uid", ""),
+                    registry_host=job.get("registry_host", ""),
                 )
             except Exception as e:
                 logging.error(
@@ -14021,6 +19097,21 @@ def _cmove_worker(
                 if move_jobs.finish_job(job_id, success=False, error_message=str(e)):
                     move_jobs_counter.labels(status="failed").inc()
             finally:
+                # Release the PICKER's reservation too.
+                #
+                # `pick_pending_job` reserved this peer at depth 1 and
+                # `_execute_cmove_job` took the same gate at depth 2 (it is
+                # re-entrant), then released only ITS OWN acquisition on the
+                # way out. The depth-1 claim therefore stayed in `_ASSOC_BUSY`
+                # for the life of the process, so every other worker saw that
+                # peer as permanently busy and skipped its jobs - one job per
+                # peer was the effective concurrency limit, and the leak grew
+                # with every peer tried.
+                _job_gate_exit(
+                    job.get("target_host", ""),
+                    int(job.get("target_port", 0) or 0),
+                    move_dest_ae,
+                )
                 # Bridge: clear cancel callback after job completes
                 move_jobs.clear_job_callback(job_id)
 
@@ -14244,25 +19335,30 @@ def send_n_event_report(
             _release_or_abort(assoc, timeout=2.0)
             continue
 
-        # The context alone does not prove the role: an SCP that accepts the
-        # abstract syntax but DECLINES the role item leaves the requestor as
-        # plain SCU (PS3.7 D.3.3.4), and the report would then never be
-        # accepted.
+        # The abstract syntax present in the accepted set is what the
+        # presentation context negotiation actually granted, and it is the only
+        # thing `send_n_event_report()` selects its context by.
         #
-        # `as_scp` is the ACCEPTOR's answer, not ours (pynetdicom
-        # PresentationContext.as_scp: "True if the association Acceptor can
-        # act as SCP for the current context"). The bridge is the N-EVENT
-        # requestor, i.e. the SCU of that service, so what it needs is a peer
-        # that will act as SCP - which is exactly `as_scp`. Testing `as_scu`
-        # here would check the wrong side of the association and reject a
-        # correct peer.
+        # `as_scp` is NOT a usable precondition here. It reports the Role
+        # Selection outcome, and Role Selection is OPTIONAL (PS3.7 D.3.3.4):
+        # an SCP that accepts the Storage Commitment context and simply omits
+        # the role item leaves `as_scp` False while the context is perfectly
+        # usable. Rejecting on that closed the association before the report
+        # was even sent, so a conformant peer never received a report the
+        # library would have delivered. The N-EVENT-REPORT RESPONSE is the
+        # authority on delivery, and it is checked after the send.
+        #
+        # `accepted_contexts` only ever holds contexts the acceptor ACCEPTED
+        # (PS3.8 9.3.3: a rejected context is reported in the A-ASSOCIATE-AC
+        # and is not in this list), so membership is the whole test.
         sc_accepted = any(
-            str(ctx.abstract_syntax) == StorageCommitmentPushModel and ctx.as_scp
+            str(ctx.abstract_syntax) == StorageCommitmentPushModel
             for ctx in assoc.accepted_contexts
         )
         if not sc_accepted:
             last_err = (
-                f"SCP {calling_ae} did not grant the SCP role for storage commitment"
+                f"SCP {calling_ae} did not accept a storage commitment "
+                "presentation context"
             )
             logging.warning("[N-EVENT] %s", last_err)
             _release_or_abort(assoc, timeout=2.0)
@@ -14393,6 +19489,7 @@ from http.server import ThreadingHTTPServer
 from pydicom.uid import ImplicitVRLittleEndian
 from pynetdicom import AE, _config, evt
 from pynetdicom.sop_class import (
+    ModalityPerformedProcedureStep,
     ModalityWorklistInformationFind,
     PatientRootQueryRetrieveInformationModelFind,
     PatientRootQueryRetrieveInformationModelMove,
@@ -14457,7 +19554,8 @@ def _parse_args():
         "--config",
         default=_default_config,
         help="Path to configuration file (default: clbridge.conf "
-        "in script directory)",
+        "in the SCRIPT/EXECUTABLE directory, NOT the current working "
+        "directory - pass --config ./clbridge.conf to read the one here)",
     )
     # --regenerate-uids for tests/anonymization (NOT in config - too dangerous for prod)
     parser.add_argument(
@@ -14488,6 +19586,14 @@ def _populate_args(cfg):
     # endpoint. Empty port = off, which leaves the bridge with exactly one AE.
     args.expose_port = cfg.get_int("server", "expose_port", default=None)
     args.expose_ae_title = cfg.get("server", "expose_ae_title", default="CLBRIDGE_QA")
+    # [server] require_known_peers: refuse an inbound association whose
+    # Calling AE Title is not listed in peers.conf. Default ON - the allowlist
+    # is the deployment's own peer list, and an unknown caller is either a
+    # typo or an unauthorised peer. A deployment whose modalities cannot be
+    # enumerated in the file turns it off; nothing else changes.
+    args.require_known_peers = cfg.get_bool(
+        "server", "require_known_peers", default=True
+    )
 
     # [dicomweb]
     # 2908: single clarus_url knob (replaces host/clarus_port, NO fallback).
@@ -14498,6 +19604,13 @@ def _populate_args(cfg):
     # query parameter: the bridge must work against any DICOMweb server, and a
     # Clarus-only parameter would make it useless elsewhere.
     args.qa_url = cfg.get("dicomweb", "qa_url", default="").strip().rstrip("/")
+    # A relative mTLS path in the config file means "next to that file". Passing
+    # it through verbatim made the certificate resolvable only from the working
+    # directory the service manager happened to choose, so a restart from a
+    # different cwd silently failed to load the key pair.
+    _cfg_path = getattr(cfg, "path", None) or getattr(cfg, "config_path", None)
+    tls_cert = resolve_config_path(tls_cert, _cfg_path)
+    tls_key = resolve_config_path(tls_key, _cfg_path)
     args.tls_client_cert = tls_cert
     args.tls_client_key = tls_key
     args.tls_pair = (tls_cert, tls_key) if tls_cert and tls_key else None
@@ -14671,6 +19784,26 @@ def _validate_config(cfg):
         eport != port,
         f"server.expose_port {eport} must differ from server.port",
     )
+    # [server] require_known_peers: a boolean knob. get_bool maps anything it
+    # does not recognise to False, which would silently DISARM the inbound
+    # allowlist - so a value that is neither a known truthy nor a known falsy
+    # spelling is a startup error rather than a quiet downgrade.
+    _knob = cfg.get("server", "require_known_peers")
+    if _knob is not None and _knob.strip().lower() not in (
+        "true",
+        "1",
+        "yes",
+        "on",
+        "false",
+        "0",
+        "no",
+        "off",
+    ):
+        check(
+            False,
+            f"server.require_known_peers {_knob!r} is not a boolean "
+            "(true/false, 1/0, yes/no, on/off)",
+        )
 
     # DICOMweb
     # 2908: clarus_url validated fail-fast (scheme, host, legacy-key removal,
@@ -15122,8 +20255,8 @@ def _pid_is_alive(pid: int) -> bool:
         # The process exists but belongs to another user.
         return True
 
-def _write_pid_file(path: str) -> None:
-    """Layer 3: atomic PID file via O_EXCL.
+def _write_pid_file(path: str) -> bool:
+    """Layer 3: atomic PID file via O_EXCL. Returns True when the file is OURS.
 
     Order: platform default (/var/run on Linux, next to the script
     elsewhere); if not writable, fall back next to the script; if
@@ -15132,6 +20265,12 @@ def _write_pid_file(path: str) -> None:
 
     The FATAL path exits via os._exit(1) because _write_pid_file is
     called from _fatal_pid_error.
+
+    A False return is the only signal that the create failed for a reason the
+    caller can work around (a permission or space error, NOT a live foreign
+    pid). The old signature returned None on every path, so the caller could
+    not tell "written" from "gave up" and reported a path it did not own to
+    the shutdown path, which then deleted a file it had never created.
     """
     pid = str(os.getpid())
     try:
@@ -15159,7 +20298,7 @@ def _write_pid_file(path: str) -> None:
                     path,
                     e2,
                 )
-                return
+                return False
         else:
             try:
                 old_pid_int = int(old_pid)
@@ -15204,7 +20343,7 @@ def _write_pid_file(path: str) -> None:
                         path,
                         e,
                     )
-                    return
+                    return False
     except OSError as e:
         # PermissionError is an OSError. NOT fatal: the service must start.
         logging.warning(
@@ -15212,10 +20351,35 @@ def _write_pid_file(path: str) -> None:
             path,
             e,
         )
-        return
-    with os.fdopen(fd, "w") as f:
-        f.write(pid)
+        return False
+    # The write and the close can fail too, and a buffered write reports its
+    # error from `close()` inside the `with` block, not from `os.open`. An
+    # exception escaping here aborted startup instead of falling back to the
+    # next candidate location. The record this call created is removed on the
+    # way out so a later instance does not read a truncated pid as stale-but-
+    # live; `True` is returned only once the full record is on disk.
+    #
+    # The file object is gone BEFORE the unlink: on Windows an open handle
+    # makes `os.remove` fail with a sharing violation, which is how the first
+    # version of this guard left the very record it meant to delete.
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(pid)
+            f.flush()
+            os.fsync(f.fileno())
+    except (OSError, ValueError) as e:
+        logging.warning(
+            "[WARN] Cannot write PID file %s: %s. Continuing without it.",
+            path,
+            e,
+        )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
     logging.info("[PID] %s written (pid=%s)", path, pid)
+    return True
 
 def _acquire_pid_file(port: int) -> str:
     """Resolve, write and register the PID file. Returns the path in use.
@@ -15256,10 +20420,16 @@ def _acquire_pid_file(port: int) -> str:
                 candidate,
             )
             continue
-        # A live foreign pid inside _write_pid_file exits the process; a
-        # stale one is overwritten and we return that same path.
-        _write_pid_file(candidate)
-        return candidate
+        # A live foreign pid inside _write_pid_file exits the process; a stale
+        # one is overwritten and True is returned. A False means THIS candidate
+        # could not be taken, so the next one is tried instead of reporting a
+        # path the process does not own.
+        if _write_pid_file(candidate):
+            return candidate
+        logging.warning(
+            "[WARN] PID file %s could not be acquired; trying the next location.",
+            candidate,
+        )
 
     logging.warning(
         "[WARN] No writable PID file location found (tried: %s). "
@@ -15267,6 +20437,148 @@ def _acquire_pid_file(port: int) -> str:
         ", ".join(candidates),
     )
     return ""
+
+# ---------------------------------------------------------------------------
+# Startup ownership lock - one instance per DIMSE port, OS-backed
+# ---------------------------------------------------------------------------
+# The PID file is a RECORD, not a lock: it is created empty and filled two
+# lines later, so a second process that reads it in that window sees an empty
+# file, calls it stale, and replaces it. Both then reach
+# `_init_components()` - and its `recover_in_progress_jobs()` rewrites the
+# shared database - before either listener binds. The port probes do not close
+# that window either: they are separate checks, and both processes can pass
+# them.
+#
+# The lock below is the OS's own answer to "who owns this name", held for the
+# life of the process and released by the kernel if the process dies. It is
+# taken BEFORE recovery and released only at exit, so no second instance can
+# reach the database while the first is starting up.
+_startup_lock_handle = None
+
+def _acquire_startup_lock(port: int) -> bool:
+    """Take the exclusive per-port startup lock. False when another instance holds it.
+
+    POSIX: `flock(LOCK_EX | LOCK_NB)` on a lock file beside the PID file.
+    Windows: `msvcrt.locking` on the first byte, which is exclusive and
+    non-blocking.
+
+    Non-blocking on purpose: a second instance must FAIL FAST with a clear
+    message rather than queue behind the first and start when it stops.
+
+    The handle is kept in a module global so it stays open for the process
+    lifetime; the kernel drops it on any exit, including SIGKILL, which is what
+    makes a crash self-healing where a plain PID file is not.
+    """
+    global _startup_lock_handle
+    candidates = []
+    default = _default_pid_path(port)
+    fallback = _fallback_pid_path(port)
+    candidates.append(default + ".lock")
+    if fallback != default:
+        candidates.append(fallback + ".lock")
+
+    for lock_path in candidates:
+        directory = os.path.dirname(lock_path) or "."
+        if not os.path.isdir(directory) or not os.access(directory, os.W_OK):
+            continue
+        try:
+            handle = open(lock_path, "a+b")
+        except OSError as e:
+            logging.debug("[STARTUP-LOCK] cannot open %s: %s", lock_path, e)
+            continue
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            logging.error(
+                "[FATAL] Another clbridge instance owns %s - refusing to "
+                "start a second one on this DIMSE port.",
+                lock_path,
+            )
+            return False
+        except Exception as e:  # pragma: no cover - platform oddity
+            handle.close()
+            logging.debug("[STARTUP-LOCK] %s unusable: %s", lock_path, e)
+            continue
+        _startup_lock_handle = handle
+        logging.info("[STARTUP-LOCK] %s acquired", lock_path)
+        return True
+
+    # No writable location: the PID-file policy already WARNs and runs without
+    # it, and refusing to start would break deployments that run from a
+    # read-only image. The lock is the stronger guard; say clearly that it is
+    # not in use.
+    logging.warning(
+        "[STARTUP-LOCK] no writable lock location - starting WITHOUT the "
+        "exclusive startup guard"
+    )
+    return True
+
+# ---------------------------------------------------------------------------
+# Persistent-state lock - one owner per STATE DIRECTORY, whatever the ports
+# ---------------------------------------------------------------------------
+# The startup lock above is keyed by DIMSE port, which answers "who serves this
+# port". It does NOT answer "who owns this database": two instances can take
+# different ports - and therefore different locks - while pointing at the same
+# `sop_index_dir`, and `_init_components` then calls
+# `recover_in_progress_jobs()` on the SAME move_jobs.db. The second instance
+# resets the first's in-progress jobs to pending, both claim them, and the same
+# instances are delivered twice.
+#
+# This lock is keyed by the resolved state directory and is held only across
+# startup, which is the window where recovery rewrites shared state. It is
+# deliberately separate from the port lock: running two bridges with distinct
+# ports AND distinct state stays supported.
+_state_lock_handle = None
+
+def _acquire_state_lock(state_dir: str) -> bool:
+    """Take a non-blocking exclusive lock on `state_dir`. False when held.
+
+    Held for the process lifetime, like the port lock: the OS drops it on any
+    exit, so a crash cannot leave the state directory permanently locked.
+    """
+    global _state_lock_handle
+    lock_path = os.path.join(state_dir, ".clbridge-state.lock")
+    try:
+        handle = open(lock_path, "a+b")
+    except OSError as e:
+        logging.warning(
+            "[STATE-LOCK] cannot open %s: %s - starting WITHOUT the state "
+            "lock; two instances sharing this directory could reset each "
+            "other's in-progress jobs",
+            lock_path,
+            e,
+        )
+        return True
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        logging.error(
+            "[FATAL] Another clbridge instance owns the state directory %s - "
+            "refusing to start a second one against the same move_jobs.db.",
+            state_dir,
+        )
+        return False
+    _state_lock_handle = handle
+    logging.info("[STATE-LOCK] %s acquired", lock_path)
+    return True
 
 # ---------------------------------------------------------------------------
 # _start_background_services - HTTP server, C-MOVE workers, cleanup
@@ -15502,11 +20814,27 @@ def _start_background_services(
 
     stc_presence = bool(getattr(args, "storage_commitment_presence", False))
 
+    class _CommitStillPending(Exception):
+        """The origin accepted the commitment request and has not decided yet.
+
+        Raised from `_resolve_stc` so the tracker treats this tick as "nothing
+        delivered": the batch stays in its working set and is asked again,
+        rather than reporting a verdict the origin never produced (PS3.18
+        13.4.3).
+        """
+
     def _resolve_stc(job):
         """Ask the origin ONCE and report its verdict verbatim (true-mode).
 
         Only wired in true-mode; false-mode leaves `resolve` unset so the
         tracker runs its own heuristic, byte-for-byte as before.
+
+        Raises `_CommitStillPending` when the origin answers 202: PS3.18 13.4.3
+        says that means "accepted, not yet decided", so there is no verdict to
+        report and the batch must stay in the tracker. `_resolve` treats a
+        raised exception as "not delivered", which is exactly the desired
+        outcome here - the next tick asks again - whereas reporting would have
+        invented an answer the origin never gave.
         """
         committed, failed, sentinel = _stc_commit_request(
             args.clarus_url,
@@ -15515,6 +20843,8 @@ def _start_background_services(
             http_timeout=args.http_timeout,
             tls=args.tls_pair,
         )
+        if sentinel == STC_PENDING:
+            raise _CommitStillPending(job.tx_uid)
         if sentinel == STC_NO_RESOURCE:
             # The WARN already named the misconfiguration; there is
             # deliberately no fallback to the local path.
@@ -15861,6 +21191,19 @@ def _outbox_worker(
                     except Exception:
                         pass
             else:
+                # PS3.18 10.5.2: a 2xx that the bridge could not read states
+                # nothing about the instance - the origin may hold it. That is
+                # not a refusal and must not consume a retry, or a delivery
+                # nothing proved wrong reaches undelivered/. Requeue and let
+                # the next pass re-send it.
+                if msg and STOW_UNVERIFIED in msg:
+                    outbox.requeue(uid, msg)
+                    logging.warning(
+                        "[OUTBOX-WORKER] SOP %s: STOW verdict unreadable - "
+                        "returned to pending without a retry bump",
+                        uid,
+                    )
+                    continue
                 outbox.mark_failed(uid, msg or "Unknown error")
                 _delivered_total += 1
                 _delivered_failed += 1
@@ -16037,6 +21380,49 @@ def _outbox_worker(
                 with _progress_lock:
                     _last_progress = time.time()
                 result = _dequeue_safe()
+                # The health verdict may have flipped DURING the idle wait, and
+                # the check at the top of the loop cannot see it: the wait put
+                # us past that check. This applies to BOTH outcomes below - a
+                # dequeue that returned an SOP from another study goes on to
+                # flush the buffered batch at the study boundary, which charged
+                # a retry per item for a guaranteed failure the same way an idle
+                # flush did. So the verdict is read once, here, before either
+                # path can send a STOW.
+                if health_checker is not None and not health_checker.is_healthy():
+                    logging.warning(
+                        "[OUTBOX-WORKER] Server went down during the idle "
+                        "wait with %d buffered item(s) - returning them to "
+                        "pending instead of flushing",
+                        len(_batch),
+                    )
+                    for _uid, _ds, _bp, _raw, _mod in list(_batch):
+                        try:
+                            outbox.requeue(_uid, "server down")
+                        except Exception as e:
+                            logging.error(
+                                "[OUTBOX-WORKER] Could not return %s to " "pending: %s",
+                                _uid,
+                                e,
+                            )
+                    _batch = []
+                    _batch_study = None
+                    _batch_bytes = 0
+                    _batch_started_at = 0.0
+                    # The item dequeue just claimed was taken AFTER the server
+                    # went down, so it has not failed either - give it back
+                    # unburned rather than carrying it into a doomed send.
+                    if result[0] is not None:
+                        try:
+                            outbox.requeue(result[0], "server down")
+                        except Exception as e:
+                            logging.error(
+                                "[OUTBOX-WORKER] Could not return %s to pending: %s",
+                                result[0],
+                                e,
+                            )
+                        result = (None, None, None, None)
+                    outbox_pending_files.set(outbox.pending_count())
+                    continue
                 if result[0] is None:
                     _deliver_batch()
                     continue
@@ -16074,6 +21460,14 @@ def _outbox_worker(
         sop_uid, ds, blob_path, raw_bytes = result
         # ds is already a pydicom Dataset from dequeue() -- no dcmread needed.
 
+        # The queue is no longer idle the moment an item is CLAIMED, not when a
+        # later flush happens to observe pending work. A steady trickle of one
+        # SOP per study always emptied the queue before each flush, so
+        # `pending == 0` held on every drain with `_queue_was_empty` already
+        # True: the summaries never ran and `_study_stats` grew by one entry per
+        # study for the life of the process.
+        _queue_was_empty = False
+
         # Study context for batching + INFO-level delivery logging.
         try:
             _study_uid = str(getattr(ds, "StudyInstanceUID", ""))
@@ -16083,6 +21477,28 @@ def _outbox_worker(
         # Study boundary HARD: never mix studies in one batch. Switch flushes.
         if _batch and _study_uid != _batch_study:
             _deliver_batch()
+            # The flush can set `_pause_until` (a 507 with Retry-After). The
+            # item just dequeued belongs to the NEXT study and is not part of
+            # that failed batch, but appending it here and then meeting the
+            # byte limit sent another STOW immediately - straight through the
+            # backoff the server just asked for. It goes back to pending
+            # UNBURNED: nothing about this item failed.
+            if _pause_until > time.time():
+                logging.warning(
+                    "[OUTBOX-WORKER] 507 pause began during the study switch - "
+                    "returning %s to pending unburned",
+                    sop_uid,
+                )
+                try:
+                    outbox.requeue(sop_uid, "retry-after pause")
+                except Exception as e:
+                    logging.error(
+                        "[OUTBOX-WORKER] Could not return %s to pending: %s",
+                        sop_uid,
+                        e,
+                    )
+                outbox_pending_files.set(outbox.pending_count())
+                continue
 
         if _study_uid and _study_uid != _current_study:
             _current_study = _study_uid
@@ -16241,6 +21657,14 @@ _FORWARD_BATCH_MAX_SOP = 20
 _FORWARD_BATCH_WINDOW_S = 0.5
 _FORWARD_PAUSE_S = 5.0
 
+# PS3.4 Table B.2-1: the C-STORE WARNING statuses. The set is ENUMERATED, not
+# the 0xB000..0xBFFF range: the status space is not a range, and accepting
+# undefined codes there reported an instance as archived on a code the standard
+# does not define. 0xB000 and 0xB006 mean the instance was stored with a
+# coercion or a discarded element; 0xB007 means it was NOT stored as sent, so it
+# stays on the failure path.
+_CSTORE_WARNING_STATUSES = frozenset({0xB000, 0xB006})
+
 def _forward_blob_pair(raw_bytes):
     """Read (sop_class_uid, stored_ts_uid) from a stored DICOM file's meta.
 
@@ -16267,12 +21691,24 @@ def _forward_blob_size(blob_path):
     except OSError:
         return 0
 
+# True when the last `_forward_open_assoc` call reached the peer and the
+# peer rejected every proposed presentation context. Reset on every call.
+_LAST_OPEN_REFUSED = False
+
 def _forward_open_assoc(
     calling_ae, dest_ae, host, port, pairs, network_timeout, dimse_timeout, acse_timeout
 ):
     """Open ONE association carrying one requested context per distinct
-    (sop_class, stored_ts) pair of the batch. Returns an
-    established association or None on any failure."""
+    (sop_class, stored_ts) pair of the batch. Returns the established
+    association, or None on any failure.
+
+    On None, `_LAST_OPEN_REFUSED` says whether the peer ANSWERED and rejected
+    every proposed context (a capability verdict) or was never reached at all
+    (a transport failure). The distinction is published here rather than in the
+    return value because every caller and every test treats this function as
+    "association or None", and widening that tuple would have changed a contract
+    nothing else in the module needs.
+    """
     ae = AE(ae_title=calling_ae)
     ae.network_timeout = network_timeout
     ae.acse_timeout = acse_timeout
@@ -16284,15 +21720,30 @@ def _forward_open_assoc(
     for sop_class, ts_uid in sorted(pairs):
         if sop_class and ts_uid:
             ae.add_requested_context(sop_class, ts_uid)
+    global _LAST_OPEN_REFUSED
+    _LAST_OPEN_REFUSED = False
     try:
         assoc = ae.associate(host, port, ae_title=dest_ae)
     except Exception:
         return None
     if not assoc.is_established:
+        # The peer ANSWERED and refused everything it was offered: every
+        # proposed presentation context was rejected, so no A-ASSOCIATE-AC was
+        # sent. `is_established` is False for this AND for a silent/refused
+        # peer, and an unreachable peer also reports is_aborted - so the
+        # refusal evidence is taken ONLY from rejected_contexts, which is
+        # populated from the A-ASSOCIATE-RJ/AC result and stays empty when no
+        # response ever arrived.
+        refused = False
+        try:
+            refused = bool(getattr(assoc, "rejected_contexts", None) or [])
+        except Exception:
+            refused = False
         try:
             assoc.release()
         except Exception:
             pass
+        _LAST_OPEN_REFUSED = refused
         return None
     # Counted only once the association is actually established: a refused
     # association is not an association made.
@@ -16312,6 +21763,7 @@ def _forward_process_batch(
     network_timeout,
     dimse_timeout,
     acse_timeout,
+    settled=None,
 ):
     """Deliver ONE already-claimed batch of forward items over a single
     association.
@@ -16322,16 +21774,18 @@ def _forward_process_batch(
                each ALREADY atomically claimed into forward/in_progress via
                dequeue() (so mark_delivered/mark_failed/requeue know the mover).
         dest_ae/host/port/calling_ae/timeouts: association parameters.
+        settled: set the CALLER owns for THIS call. Every UID whose queue
+               transition this call completed is added to it. It is passed in
+               rather than published as a function attribute because an
+               attribute outlives the call: a batch that raised before the
+               `finally` left the previous batch's set in place, and the
+               caller then skipped a UID that was due for retry. A per-call
+               set also survives an exception, which is exactly when the
+               caller needs it.
 
     Returns True if the association was usable (even if individual RSPs were
     non-zero); False if the association could NOT be established at all, in
     which case the CALLER requeues the whole batch (no retry burn) and pauses.
-
-    `_forward_process_batch.handled` carries the UIDs this call already
-    settled (delivered / failed / requeued) before returning False for a lost
-    association. The caller requeues only the items NOT in that set: the ones
-    after the loss were never attempted on the wire, and the ones before it
-    must not be requeued twice.
 
     Per instance it READS every C-STORE-RSP: 0x0000 -> mark_delivered;
     a non-zero RSP -> mark_failed (backoff, then undelivered at max retries);
@@ -16344,7 +21798,7 @@ def _forward_process_batch(
     reproducible everywhere, and keeps the wire test's exact-order pin valid.
     """
     items = sorted(items, key=lambda item: item[0])
-    self_handled = set()
+    self_handled = settled if settled is not None else set()
 
     # Items that lost their sop_class / stored_ts cannot be proposed over any
     # negotiated context. They used to be silently dropped from `pairs` while
@@ -16364,10 +21818,19 @@ def _forward_process_batch(
                 uid,
             )
             forward_failed_total.inc()
+            # Same rule as the context-rejection path: settled only on a
+            # successful transition, so a failed one is left to recovery.
             try:
                 forward_outbox.mark_failed(uid, "missing sop_class/stored_ts")
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.error(
+                    "[FORWARD] SOP %s: cannot record the failure (%s) - "
+                    "leaving it for recovery",
+                    uid,
+                    exc,
+                )
+                continue
+            self_handled.add(uid)
     if not sendable:
         # Nothing sendable remained; every item was already failed above, so
         # the batch is terminal (not retryable).
@@ -16383,6 +21846,37 @@ def _forward_process_batch(
         dimse_timeout,
         acse_timeout,
     )
+    if assoc is None and _LAST_OPEN_REFUSED:
+        # The peer answered and rejected every context: a capability verdict.
+        # Charging the batch against its retry budget is what stops an
+        # incompatible SOP class from being re-proposed forever; the items
+        # reach undelivered/ and the operator sees them.
+        logging.warning(
+            "[FORWARD] %s at %s:%s rejected every proposed context - "
+            "charging the retry budget for %d item(s)",
+            dest_ae,
+            host,
+            port,
+            len(sendable),
+        )
+        for uid, _sop_class, _stored_ts, _blob_path in sendable:
+            forward_failed_total.inc()
+            # Settled only when the transition actually happened. Recording the
+            # UID unconditionally let a raising `mark_failed` count as handled,
+            # so the caller never requeued the item and it stayed in
+            # in_progress/ with no retry and no verdict.
+            try:
+                forward_outbox.mark_failed(uid, "all presentation contexts rejected")
+            except Exception as exc:
+                logging.error(
+                    "[FORWARD] SOP %s: cannot record the context rejection "
+                    "(%s) - leaving it for recovery",
+                    uid,
+                    exc,
+                )
+                continue
+            self_handled.add(uid)
+        return True
     if assoc is None:
         logging.warning(
             "[FORWARD] Cannot associate with %s at %s:%s - batch %d requeued, "
@@ -16424,8 +21918,14 @@ def _forward_process_batch(
                 forward_failed_total.inc()
                 try:
                     forward_outbox.mark_failed(uid, "context not covered")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.error(
+                        "[FORWARD] SOP %s: cannot record the context verdict "
+                        "(%s) - leaving it for recovery",
+                        uid,
+                        exc,
+                    )
+                    continue
                 self_handled.add(uid)
                 continue
 
@@ -16443,6 +21943,12 @@ def _forward_process_batch(
             # wire.
             _send_path = blob_path
             _mods_extra = None
+            # The temp file this re-serialization creates, recorded at CREATION.
+            # `_mods_extra` is only assigned after `save_as` succeeds, so a
+            # `save_as` that raised part-way left a file holding patient data,
+            # in the outbox directory, with nothing referencing it - neither
+            # the failure branch below nor the `finally` could find it.
+            _tmp_send_path = None
             try:
                 _mods_json = forward_outbox.read_mods_sidecar(blob_path)
             except Exception:
@@ -16467,6 +21973,7 @@ def _forward_process_batch(
                         suffix=".dcm", delete=False, dir=_os_fwd.path.dirname(blob_path)
                     )
                     _fh.close()
+                    _tmp_send_path = _fh.name
                     _fds.save_as(_fh.name, enforce_file_format=True)
                     _send_path = _fh.name
                     _mods_extra = _fh.name
@@ -16478,6 +21985,15 @@ def _forward_process_batch(
                         uid,
                         mods_err,
                     )
+                    # A partial file from the failed write holds patient data.
+                    if _tmp_send_path:
+                        try:
+                            import os as _os_fwd_part
+
+                            _os_fwd_part.unlink(_tmp_send_path)
+                        except OSError:
+                            pass
+                        _tmp_send_path = None
                     _send_path = blob_path
                     _mods_extra = None
                     _blob_size = _forward_blob_size(blob_path)
@@ -16509,6 +22025,24 @@ def _forward_process_batch(
                     )
                 except Exception:
                     pass
+                # The association is the batch's transport. Once it is gone,
+                # every remaining send raises the same way: the loop used to
+                # requeue each item in turn and then return True, so the worker
+                # treated the batch as settled and retried WITHOUT the
+                # association-failure pause - hammering a peer that had already
+                # closed on us. Returning False hands the whole unsettled batch
+                # back for requeue-and-pause, while the items already settled
+                # above stay settled because they are in `self_handled`.
+                try:
+                    still_up = bool(assoc.is_established)
+                except Exception:
+                    still_up = False
+                if not still_up:
+                    logging.warning(
+                        "[FORWARD] association closed during the batch - "
+                        "abandoning the rest for a paused retry"
+                    )
+                    return False
                 self_handled.add(uid)
                 continue
             finally:
@@ -16548,12 +22082,30 @@ def _forward_process_batch(
             # WAS stored. Treating 0xB000/0xB006/0xB007 as a failure marked a
             # delivered instance failed, retried it, and eventually parked it in
             # undelivered/ while the destination held it all along.
-            if (
-                rsp_status == 0x0000
-                or (0xB000 <= (rsp_status or 0) <= 0xBFFF)
-                or rsp_status in (0x0001, 0x0107)
-            ):
-                forward_outbox.mark_delivered(uid)
+            #
+            # The set is ENUMERATED, not the whole 0xB000..0xBFFF range: PS3.4
+            # Table B.2-1 defines exactly 0xB000 (coercion), 0xB006 (element
+            # discarded) and 0xB007 (data set does not match SOP class) as
+            # C-STORE warnings - and 0xB007 in particular means the instance was
+            # NOT stored as sent. Treating an undefined status in that range as
+            # delivered told the modality (and the forward channel) that an
+            # instance was archived on the strength of a code the standard does
+            # not define, so anything unrecognised stays on the failure path.
+            if rsp_status == 0x0000 or rsp_status in _CSTORE_WARNING_STATUSES:
+                # Settled only when the transition actually happened: recording
+                # the UID unconditionally let a raising mark_delivered count as
+                # handled, so the caller never requeued the item and it stayed
+                # in in_progress/ with no retry and no verdict.
+                try:
+                    forward_outbox.mark_delivered(uid)
+                except Exception as exc:
+                    logging.error(
+                        "[FORWARD] SOP %s: cannot record the delivery (%s) - "
+                        "leaving it for recovery",
+                        uid,
+                        exc,
+                    )
+                    continue
                 self_handled.add(uid)
                 forward_delivered_total.inc()
                 try:
@@ -16576,10 +22128,18 @@ def _forward_process_batch(
                 if not getattr(assoc, "is_established", False):
                     logging.warning(
                         "[FORWARD] association lost before SOP %s - handing "
-                        "back the rest of the batch uncharged",
+                        "back the rest of the batch uncharged, %s included",
+                        uid,
                         uid,
                     )
-                    self_handled.add(uid)
+                    # This SOP's C-STORE-RSP never arrived and its claim is
+                    # still open: it must go back to pending/ with the unsent
+                    # items, NOT be reported as settled. Settling it left the
+                    # claimed blob in in_progress/ for the 300 s reaper, so a
+                    # SOP that only needed a re-send waited out the stuck
+                    # sweep - and if the destination was reachable again by
+                    # then, the reaper's requeue was the only thing that saved
+                    # it. Earlier UIDs are legitimately settled and stay so.
                     return False
                 # Association still up: this one instance produced no answer.
                 # Requeueing it for free let a single instance that always
@@ -16604,7 +22164,19 @@ def _forward_process_batch(
                 # move_to_undelivered internally (outbox.py semantics).
                 msg = str(rsp_status)
                 forward_failed_total.inc()
-                forward_outbox.mark_failed(uid, f"C-STORE {msg}")
+                # Same rule as every other transition in this loop: a failed
+                # mark_failed is left for recovery rather than counted as
+                # settled.
+                try:
+                    forward_outbox.mark_failed(uid, f"C-STORE {msg}")
+                except Exception as exc:
+                    logging.error(
+                        "[FORWARD] SOP %s: cannot record the rejection (%s) - "
+                        "leaving it for recovery",
+                        uid,
+                        exc,
+                    )
+                    continue
                 self_handled.add(uid)
                 logging.warning("[FORWARD] SOP %s rejected: %s", uid, msg)
         if delivered_any:
@@ -16614,10 +22186,9 @@ def _forward_process_batch(
                 pass
         return True
     finally:
-        # Published for the caller's requeue path (see the docstring): the
-        # UIDs this call already settled, whether it returned True or gave up
-        # on a lost association.
-        _forward_process_batch.handled = self_handled
+        # `settled` is the caller's set (see the docstring): whether this call
+        # returns True, gives up on a lost association or raises, the UIDs it
+        # already transitioned are visible to the recovery path.
         try:
             assoc.release()
         except Exception:
@@ -16681,6 +22252,12 @@ def _forward_worker(
         # thing draining the forward queue, so losing it leaves claimed items
         # in forward/in_progress and forwarding silently stops until restart.
         # Treat an escape as an association-level failure (requeue, no burn).
+        #
+        # The settlement set is created HERE, per batch, and handed in: it must
+        # describe this call only. Reading it off the function (`handled`) meant
+        # an exception before the `finally` re-published it left the PREVIOUS
+        # batch's UIDs in place, and recovery then skipped a SOP that was due
+        # for retry.
         handled = set()
         try:
             assoc_ok = _forward_process_batch(
@@ -16693,8 +22270,8 @@ def _forward_worker(
                 network_timeout,
                 dimse_timeout,
                 acse_timeout,
+                settled=handled,
             )
-            handled = set(getattr(_forward_process_batch, "handled", set()))
         except Exception as e:
             logging.error(
                 "[FORWARD] batch processing raised %s: %s - requeueing %d item(s)",
@@ -16734,6 +22311,7 @@ def _register_handlers(
     commit_tracker=None,
     forward_outbox=None,
     expose_rejected=False,
+    allowlist_titles=(),
 ):
     """Register DIMSE event handlers. Returns list of (event, handler) tuples.
 
@@ -16741,6 +22319,10 @@ def _register_handlers(
     Rejected Instances AE builds its own set with the flag on, every other AE
     uses the default. It only affects the QIDO/WADO query the C-FIND and
     C-MOVE handlers issue - the DIMSE behaviour is identical.
+
+    `allowlist_titles` is the calling-AE allowlist the owning AE was armed
+    with (empty when the filter is off); it only feeds the warning handler,
+    because the refusal itself happens in the AE's negotiation.
     """
     # Bridge: verbose HTTP logging when DEBUG level is active
     verbose = args.log_level == "DEBUG"
@@ -16853,7 +22435,15 @@ def _register_handlers(
         )
 
     def on_n_action(event):
-        yield from handle_n_action(
+        # pynetdicom 3.0.4 unpacks the EVT_N_ACTION handler's return value as a
+        # `(status, dataset)` pair:
+        #     usr_status, ds = cast(UserReturnType, user_response)
+        # (service_class.py, _n_action_scp). `handle_n_action` is a plain
+        # function that RETURNS that pair, so `yield from` here turned this
+        # adapter into a GENERATOR and handed pynetdicom a generator object to
+        # unpack - a Storage Commitment request could never complete. The
+        # contract is a pair, so the adapter returns a pair.
+        return handle_n_action(
             event,
             args.clarus_url,
             verbose,
@@ -16865,6 +22455,26 @@ def _register_handlers(
             ),
             tls=args.tls_pair,
             stc_presence=stc_presence,
+        )
+
+    # MPPS (PS3.18 section 15): the two DIMSE operations that write a performed
+    # procedure step are translated into the two DICOMweb transactions. Nothing
+    # is answered from local state - the origin server owns the record - so the
+    # handlers only need the DICOMweb base URL, the timeout and the mTLS pair.
+    def on_n_create(event):
+        return handle_n_create(
+            event,
+            args.clarus_url,
+            http_timeout=args.http_timeout,
+            tls=args.tls_pair,
+        )
+
+    def on_n_set(event):
+        return handle_n_set(
+            event,
+            args.clarus_url,
+            http_timeout=args.http_timeout,
+            tls=args.tls_pair,
         )
 
     # DIMSE association lifecycle handlers.
@@ -16899,12 +22509,37 @@ def _register_handlers(
             pass
         register_assoc_released(assoc_id)
 
+    # T1 (21.11): PS3.8 9.3.2.2 negotiated maximum PDU length.
+    #
+    # The REAL bound is `GuardedDUL` (inbound_guard.py), installed at
+    # EVT_CONN_OPEN: it reads the six-byte header and refuses before reading
+    # the body, so an oversized P-DATA-TF never enters memory and never
+    # reaches DIMSE. The EVT_PDU_RECV handler is the dispatch-level backstop
+    # for a PDU that arrives by a path where no guarded provider was
+    # installed.
+    #
+    # T3 (21.11): the calling-AE allowlist is decided in ONE place
+    # (`make_calling_ae_guard`) and BOTH the warning and the A-ASSOCIATE-RJ
+    # come from it. pynetdicom's own require_calling_aet is deliberately not
+    # used: it compares case-sensitively, so it would refuse a peer the
+    # warning reports as known.
+    #
+    # All three handlers come from clean_code.inbound_guard so the wire tests
+    # drive the same code the bridge runs.
     handlers = [
+        (evt.EVT_CONN_OPEN, install_guarded_dul),
+        (
+            evt.EVT_REQUESTED,
+            make_calling_ae_guard(allowlist_titles),
+        ),
+        (evt.EVT_PDU_RECV, make_pdu_ceiling_handler()),
         (evt.EVT_C_STORE, on_c_store),
         (evt.EVT_C_ECHO, on_c_echo),
         (evt.EVT_C_FIND, on_c_find),
         (evt.EVT_C_MOVE, on_c_move),
         (evt.EVT_N_ACTION, on_n_action),
+        (evt.EVT_N_CREATE, on_n_create),
+        (evt.EVT_N_SET, on_n_set),
         (evt.EVT_ACCEPTED, on_assoc_accepted),
         (evt.EVT_RELEASED, on_assoc_released),
         (evt.EVT_ABORTED, on_assoc_released),  # Same cleanup as release
@@ -16913,8 +22548,92 @@ def _register_handlers(
     return handlers
 
 # ---------------------------------------------------------------------------
+# T3: inbound calling-AE allowlist from peers.conf
+# ---------------------------------------------------------------------------
+def _load_calling_ae_allowlist(peers_file, enabled):
+    """Distinct AE titles named in peers.conf, or [] when the knob is off.
+
+    Read at START-UP only, and read through the same parser the C-MOVE
+    destination uses (`parse_peers_conf`), so a peer is written once and both
+    directions agree on what an entry means. A CIDR row names the same AE as an
+    exact row, so the titles are de-duplicated.
+
+    Start-up is deliberate: the guard is consulted while the A-ASSOCIATE-RQ is
+    being negotiated, when the peer is not yet allowed to do anything, and it
+    reads from a plain tuple bound into the handler. Teaching the lazyloaded
+    peer table to feed it would mean mutating that tuple from the reload
+    thread mid-negotiation. A peer added to peers.conf therefore takes effect
+    on restart, which is the same contract the C-MOVE destination list already
+    has for a NEW peer.
+
+    No file, or a file that names nobody, yields [] - "no filter". The ARMED
+    case is handled by the caller, which refuses to start: `require_known_peers`
+    with an empty allowlist is a configuration hole, and pynetdicom only
+    restricts Calling AE Titles when the list is non-empty, so leaving the knob
+    on would read as "filtered" while nothing was filtered.
+    """
+    if not enabled or not peers_file:
+        return []
+
+    titles = []
+    seen = set()
+    for ae_title, _host, _port in parse_peers_conf(peers_file):
+        key = normalise_ae_title(ae_title)
+        if key and key not in seen:
+            seen.add(key)
+            titles.append(key)
+    return titles
+
+def _apply_calling_ae_allowlist(target_ae, args):
+    """Bind the inbound calling-AE allowlist onto `target_ae`.
+
+    Extracted from `_init_dimse_ae` so the fail-closed rule is reachable from a
+    test without building a whole SCP AE.
+
+    An armed filter (`require_known_peers=true`) with an empty allowlist is a
+    startup error, not a warning: pynetdicom only restricts Calling AE Titles
+    when the list is non-empty, so starting would produce an OPEN listener
+    while the config and the log both read as "filtered". The explicit opt-out
+    is `require_known_peers=false`.
+
+    Returns the titles bound onto `target_ae` (empty when no filter is armed), so
+    the caller can reuse them for the QA AE and the handler wiring.
+    """
+    _peers_file = getattr(args, "peers_file", None)
+    _required = bool(getattr(args, "require_known_peers", False))
+    _allowed_calling_aets = _load_calling_ae_allowlist(_peers_file, _required)
+    if _allowed_calling_aets:
+        target_ae.require_calling_aet = list(_allowed_calling_aets)
+        logging.info(
+            "[PEER] Inbound calling-AE allowlist active: %d title(s) from %s",
+            len(_allowed_calling_aets),
+            _peers_file,
+        )
+    elif _required:
+        raise RuntimeError(
+            f"require_known_peers is on but {_peers_file or '(no peers_file)'} "
+            "lists no AE titles - refuse to start an unfiltered listener"
+        )
+    return _allowed_calling_aets
+
+# ---------------------------------------------------------------------------
 # SCP AE construction: contexts + handlers + shutdown monitor
 # ---------------------------------------------------------------------------
+def _is_addr_in_use(exc):
+    """True when `exc` is a bind conflict rather than a generic start failure.
+
+    A port already held is an OPERATOR problem (another instance, a stray
+    listener) and deserves its own message; anything else is a bridge fault.
+    """
+    import errno
+
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in (
+        errno.EADDRINUSE,
+        10048,  # WSAEADDRINUSE on Windows
+    ):
+        return True
+    return "address already in use" in str(exc).lower()
+
 def _init_dimse_ae(
     args,
     sop_index,
@@ -16937,6 +22656,30 @@ def _init_dimse_ae(
     # default is False - any Called AE Title would be accepted, which let a
     # misconfigured peers.conf loop C-MOVE back into the bridge's own SCP.
     ae.require_called_aet = True
+    # T3 (21.11): calling-AE allowlist.
+    #
+    # The REFUSAL is pynetdicom's (`ae.require_calling_aet`): it answers with a
+    # real A-ASSOCIATE-RJ through its own state machine, which is the one path
+    # that actually puts the PDU on the wire.
+    #
+    # The COMPARISON is ours: pynetdicom compares case-sensitively
+    # (acse.py:330-334), so a peer announcing `ct_room` against `CT_ROOM`
+    # would be refused while a case-insensitive warning called it known.
+    # `make_calling_ae_guard` folds the received title in place on
+    # EVT_REQUESTED, before negotiation compares it, so one rule decides both
+    # the warning and the rejection. Titles here are already folded by
+    # `_load_calling_ae_allowlist`.
+    #
+    # The list comes from peers.conf, the SAME file the C-MOVE destination and
+    # the N-EVENT requestor already resolve through, so a peer is configured in
+    # one place. An armed knob with no titles is a startup error - see
+    # `_apply_calling_ae_allowlist`.
+    #
+    # Both values are read defensively: _init_dimse_ae is also called with a
+    # hand-built args object, where a missing knob must mean "no filter"
+    # rather than an AttributeError that leaves the bridge unable to build its
+    # AE at all.
+    _allowed_calling_aets = _apply_calling_ae_allowlist(ae, args)
     # DIMSE timeouts - from config [dimse] (inbound - outbound).
     # Inbound: bridge as SCP - C-STORE from modality, C-FIND from viewer.
     # inbound_network_timeout: 0 = disabled (SCP should wait for client, ).
@@ -17031,6 +22774,13 @@ def _init_dimse_ae(
         target_ae.add_supported_context(
             StorageCommitmentPushModel, ImplicitVRLittleEndian
         )
+        # PS3.4 F.7: the MPPS SOP Class is proposed with Implicit VR Little
+        # Endian, the transfer syntax its data set is defined over. Without a
+        # supported context an A-ASSOCIATE requesting MPPS alone is rejected
+        # outright, so a modality cannot open its association at all.
+        target_ae.add_supported_context(
+            ModalityPerformedProcedureStep, ImplicitVRLittleEndian
+        )
         target_ae.add_supported_context(
             StudyRootQueryRetrieveInformationModelMove, ImplicitVRLittleEndian
         )
@@ -17053,6 +22803,7 @@ def _init_dimse_ae(
         health_checker,
         commit_tracker=commit_tracker,
         forward_outbox=forward_outbox,
+        allowlist_titles=_allowed_calling_aets,
     )
 
     # QA AE (AIRA 57.2.1 Expose Rejected Instances). A DIMSE association has
@@ -17076,6 +22827,12 @@ def _init_dimse_ae(
         expose_ae.acse_timeout = ae.acse_timeout
         expose_ae.dimse_timeout = ae.dimse_timeout
         expose_ae.maximum_associations = args.max_associations
+        # The QA AE is a second inbound listener: it owes the same PDU ceiling
+        # and the same calling-AE allowlist as the ordinary one, for the same
+        # reasons and against the same peers.conf. Both come from the shared
+        # handler list below; the allowlist titles are canonical, so the
+        # EVT_REQUESTED folding applies here unchanged.
+        expose_ae.require_calling_aet = list(_allowed_calling_aets)
         _register_contexts(expose_ae)
         expose_handlers = _register_handlers(
             args,
@@ -17087,6 +22844,7 @@ def _init_dimse_ae(
             commit_tracker=commit_tracker,
             forward_outbox=forward_outbox,
             expose_rejected=True,
+            allowlist_titles=_allowed_calling_aets,
         )
     elif args.expose_port:
         logging.warning(
@@ -17125,18 +22883,45 @@ def _init_dimse_ae(
             args.expose_port,
         )
 
-        def _serve_expose():
-            try:
-                expose_ae.start_server(
-                    (args.bridge_host, args.expose_port),
-                    block=True,
-                    evt_handlers=expose_handlers,
+        # BIND the QA listener HERE, synchronously, and report the result.
+        #
+        # A thread that binds on its own schedule can lose the port after the
+        # preflight probe and set the shutdown flag while the ordinary AE has
+        # no server yet: the monitor then calls `ae.shutdown()` against an
+        # empty server list, and the normal listener starts afterwards - after
+        # its workers have already begun to exit. Binding in the caller makes
+        # the outcome part of the return value instead of a race.
+        try:
+            expose_server = expose_ae.start_server(
+                (args.bridge_host, args.expose_port),
+                block=False,
+                evt_handlers=expose_handlers,
+            )
+        except Exception as exc:
+            # A QA listener that cannot bind is a startup failure for THAT AE.
+            # It must not be silently degraded: the QA workstation would
+            # connect to nothing, and the operator would read a single log line.
+            if _is_addr_in_use(exc):
+                logging.error(
+                    "[FATAL] Expose AE cannot bind %s:%d: %s",
+                    args.bridge_host,
+                    args.expose_port,
+                    exc,
                 )
-            except Exception as exc:
-                logging.error("[DIMSE] Expose AE stopped: %s", exc)
-                _shutdown_requested.set()
-
-        threading.Thread(target=_serve_expose, name="dimse-expose", daemon=True).start()
+                raise RuntimeError(
+                    f"Expose AE cannot bind {args.bridge_host}:{args.expose_port}"
+                ) from exc
+            logging.error("[DIMSE] Expose AE stopped: %s", exc)
+            _shutdown_requested.set()
+            raise RuntimeError("Expose AE failed to start") from exc
+        if expose_server is None:
+            logging.error(
+                "[FATAL] Expose AE did not start on %s:%d",
+                args.bridge_host,
+                args.expose_port,
+            )
+            raise RuntimeError("Expose AE failed to start")
+        logging.info("[DIMSE] Expose AE listening (bound synchronously)")
 
     # Bridge: register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -17146,6 +22931,27 @@ def _init_dimse_ae(
         signal.signal(signal.SIGBREAK, _signal_handler)
 
     return ae, expose_ae, handlers
+
+def _start_main_listener(ae, host, port, handlers):
+    """Start the blocking DIMSE listener unless shutdown has already begun.
+
+    Returns True when the listener was started, False when it was skipped.
+
+    A signal that arrives after handler registration but before this point has
+    already fired the shutdown monitor: it called `ae.shutdown()` while no
+    server was registered, so it shut down nothing and the monitor thread is
+    gone. pynetdicom 3.0.4 only stops servers that exist when `shutdown()` runs
+    (ae.py), so starting a blocking listener now would serve connections with
+    every worker already exiting and nothing left to stop it.
+    """
+    if _shutdown_requested.is_set():
+        logging.warning(
+            "[DIMSE] Shutdown requested before the listener started - not "
+            "starting the blocking server"
+        )
+        return False
+    ae.start_server((host, port), block=True, evt_handlers=handlers)
+    return True
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -17240,8 +23046,15 @@ def main():
             args.move_poll_timeout,
         )
 
-    # Bridge: load SOP class registry
-    sop_registry = _load_sop_registry(args.sop_registry)
+    # Bridge: load SOP class registry. A registry file that exists but yields
+    # no usable entry is a configuration error, not a reason to fall back to
+    # the built-ins (which would re-enable a class the file disables), so it
+    # stops startup - with the operator-facing reason, not a traceback.
+    try:
+        sop_registry = _load_sop_registry(args.sop_registry)
+    except RegistryConfigError as exc:
+        logging.error("[STARTUP] %s", exc)
+        sys.exit(1)
 
     # - Duplicate-instance and port checks BEFORE any component starts -
     # `_init_components` calls `move_jobs.recover_in_progress_jobs()`, which
@@ -17275,6 +23088,20 @@ def main():
     _pid_path = _acquire_pid_file(args.bridge_port)
     if _pid_path:
         set_pid_path(_pid_path)
+
+    # Exclusive STARTUP ownership, taken before any component touches the
+    # database and held for the life of the process. The PID file above only
+    # records; this is what makes two concurrent starts impossible.
+    if not _acquire_startup_lock(args.bridge_port):
+        sys.exit(1)
+
+    # Ownership of the STATE DIRECTORY, which is a different question from
+    # ownership of the DIMSE port: two instances may take different ports and
+    # still share `sop_index_dir`, and `_init_components` below resets
+    # in-progress C-MOVE jobs in the shared database. Taken before that call,
+    # for the same reason the port lock is.
+    if not _acquire_state_lock(os.path.dirname(args.sop_index_dir) or "."):
+        sys.exit(1)
 
     # initialize components
     sop_index, move_jobs, printer_registry, driver_registry = _init_components(args)
@@ -17384,9 +23211,7 @@ def main():
 
     try:
         # Bridge: start_server blocks, but signal handlers will trigger shutdown
-        ae.start_server(
-            (args.bridge_host, args.bridge_port), block=True, evt_handlers=handlers
-        )
+        _start_main_listener(ae, args.bridge_host, args.bridge_port, handlers)
     except KeyboardInterrupt:
         # Bridge: Ctrl+C in terminal
         logging.info("KeyboardInterrupt received")
@@ -17401,7 +23226,12 @@ def main():
         logging.info("Waiting up to 30s for in-flight operations to complete...")
         ae.shutdown()  # Idempotent - monitor may have already called it
         if expose_ae is not None:
-            expose_ae.shutdown()
+            # The QA listener was bound synchronously in `_init_dimse_ae`; a
+            # non-blocking server is closed through its own shutdown.
+            try:
+                expose_ae.shutdown()
+            except Exception:
+                pass
         logging.info("DICOM server stopped")
 
         # Bridge: stop HTTP server - before joining threads

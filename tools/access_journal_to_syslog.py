@@ -40,6 +40,7 @@ Exit status is 0 on success (including --once runs that find nothing new),
 """
 
 import argparse
+import base64
 import errno
 import json
 import os
@@ -318,7 +319,8 @@ def render_participant_objects(event):
     series = clean_text(event.get("series"))
     sop = clean_text(event.get("sop"))
     patient = clean_text(event.get("patient"))
-    query = clean_text(event.get("q"))
+    query_raw = event.get("q")
+    query = clean_text(query_raw)
 
     if study is not None:
         out.append(_participant_uid(study, STUDY_INSTANCE_UID_CODE))
@@ -331,10 +333,13 @@ def render_participant_objects(event):
     if query is not None:
         # A search is identified by its criteria, not by a name. A.5 allows
         # exactly one of ParticipantObjectName / ParticipantObjectQuery, and
-        # for a query the criteria are the honest choice.
-        if len(query) > MAX_QUERY_CHARS:
-            query = query[:MAX_QUERY_CHARS]
-        out.append(_participant_query(query))
+        # for a query the criteria are the honest choice. The criteria travel
+        # base64-encoded in ParticipantObjectQuery (xsd:base64Binary), while
+        # ParticipantObjectID carries the escaped text.
+        raw = str(query_raw)
+        if len(raw) > MAX_QUERY_CHARS:
+            raw = raw[:MAX_QUERY_CHARS]
+        out.append(_participant_query(raw))
     return out
 
 
@@ -379,15 +384,20 @@ def _participant_query(query_text):
     """A participant object identified by search criteria.
 
     A5.1.2.4 code 10 is Search Criteria; a QIDO query carries no patient or
-    study identity of its own, which is exactly why it is recorded.
+    study identity of its own, which is exactly why it is recorded. The
+    criteria travel twice: ParticipantObjectID carries the XML-escaped text,
+    and ParticipantObjectQuery is xsd:base64Binary (PS3.15 A.5.1.1), so the
+    raw criteria are base64-encoded here.
     """
+    ident = clean_text(query_text) or ""
+    encoded = base64.b64encode(query_text.encode("utf-8")).decode("ascii")
     return (
         "<ParticipantObjectIdentification"
-        f' ParticipantObjectID="{query_text}"'
+        f' ParticipantObjectID="{ident}"'
         ' ParticipantObjectTypeCode="2"'
         ' ParticipantObjectTypeCodeRole="24">'
         '<ParticipantObjectIDTypeCode csd-code="10" codeSystemName="DCM" />'
-        f"<ParticipantObjectQuery>{query_text}</ParticipantObjectQuery>"
+        f"<ParticipantObjectQuery>{encoded}</ParticipantObjectQuery>"
         "</ParticipantObjectIdentification>"
     )
 
@@ -779,6 +789,14 @@ def write_stdout_bytes(data):
     UTF-8 BOM or Cyrillic text, so --dry-run must not go through
     sys.stdout.write. The bytes go to the underlying buffer instead, which
     gives exactly what would have been sent.
+
+    CodeQL note (py/clear-text-logging-sensitive-data): this function is the
+    --dry-run output path only; real forwarding goes through make_sender()
+    over UDP/TCP. --dry-run is operator-invoked and its whole purpose is to
+    print the PHI-bearing audit XML to the operator's own stdout, so the
+    fallback sys.stdout.write below is intentional, not a log leak. The alert
+    is a false positive and must not be "fixed" by redacting or removing the
+    write.
     """
     buffer = getattr(sys.stdout, "buffer", None)
     if buffer is None:

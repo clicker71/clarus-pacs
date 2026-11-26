@@ -322,6 +322,21 @@ pub(crate) fn audit_copy_sidecar_path(manifests_dir: &Path, study_uid: &str) -> 
     manifests_dir.join(format!("{study_uid}.audited"))
 }
 
+/// Read a reclaim sidecar, distinguishing "nothing recorded" from "cannot
+/// read".
+/// `Ok(None)` means the file is absent, which is the only state that means
+/// there is nothing to drain. Every other failure is `Err` so the caller keeps
+/// its tombstone and retries - treating EACCES, EIO or invalid UTF-8 as
+/// "absent" would report the recorded blobs as reclaimed without unlinking
+/// them, and the tombstone that triggers the retry would already be gone.
+fn read_sidecar_or_absent(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Drain the per-study audit-copy sidecar (3008): every `hex tier` line is
 /// unlinked refcount-checked - the same `referenced` guard as the orphan
 /// sidecar, so a copy whose hash equals a LIVE manifest blob of another
@@ -339,8 +354,22 @@ fn drain_audit_sidecar(
         None => return true,
     };
     let sidecar = audit_copy_sidecar_path(manifest_dir, study_uid);
-    let Ok(text) = std::fs::read_to_string(&sidecar) else {
-        return true; // no audit copies recorded - nothing to drain
+    // Only NotFound means "nothing recorded". Treating every error as absent
+    // lifted the tombstone on EACCES/EIO/invalid-UTF-8 too, so the copies the
+    // sidecar names - `.audited` alibi copies and `.orphans` blobs, both of
+    // which hold PHI - were never unlinked and no later pass could revisit
+    // them: the tombstone that triggers the drain was the thing being removed.
+    let text = match read_sidecar_or_absent(&sidecar) {
+        Ok(Some(t)) => t,
+        Ok(None) => return true, // no audit copies recorded - nothing to drain
+        Err(e) => {
+            crate::clog_warn!(
+                study_instance_uid = %study_uid,
+                error = %e,
+                "erase worker: unreadable audit sidecar; keeping the tombstone for a retry"
+            );
+            return false;
+        }
     };
     for line in text.lines() {
         let line = line.trim();
@@ -452,8 +481,21 @@ fn drain_orphan_sidecar(
         None => return true,
     };
     let sidecar = clarus_core::stow::orphan_sidecar_path(manifest_dir, study_uid);
-    let Ok(text) = std::fs::read_to_string(&sidecar) else {
-        return true; // no orphans recorded - nothing to drain
+    // Same rule as the audit sidecar: only NotFound means "nothing recorded".
+    // Any other error leaves the tombstone in place so the drain is retried;
+    // answering `true` would report the orphans as reclaimed and unlink the
+    // only record of them.
+    let text = match read_sidecar_or_absent(&sidecar) {
+        Ok(Some(t)) => t,
+        Ok(None) => return true, // no orphans recorded - nothing to drain
+        Err(e) => {
+            crate::clog_warn!(
+                study_instance_uid = %study_uid,
+                error = %e,
+                "erase worker: unreadable orphan sidecar; keeping the tombstone for a retry"
+            );
+            return false;
+        }
     };
     for line in text.lines() {
         let line = line.trim();
@@ -568,7 +610,20 @@ pub fn gc_orphans(state: &AppState, manifest_dir: &Path) -> Option<(u64, u64)> {
             continue;
         }
         let path = entry.path();
+        // The drain is a READ-MODIFY-WRITE over a file another writer appends
+        // to. `append_sidecar_line` adds a line from a STOW update-in-place or
+        // a `remove_derived_object`; without a shared exclusive section a line
+        // added between this read and the rewrite below was deleted by the
+        // rewrite - and the blob it named had already been unlinked, so
+        // nothing left on disk recorded it (replaced-version PHI stayed on
+        // disk, reported only as "unreferenced" by the CAS audit).
+        //
+        // The lease is taken INSIDE the per-sidecar loop, not around the whole
+        // pass: the pass also unlinks blobs, and holding the manifest mutex for
+        // that long would stall every STOW in the process.
+        let lease = clarus_core::stow::acquire();
         let Ok(text) = std::fs::read_to_string(&path) else {
+            drop(lease);
             continue; // unreadable: kept for the next pass
         };
         let mut fully_drained = true;
@@ -604,14 +659,20 @@ pub fn gc_orphans(state: &AppState, manifest_dir: &Path) -> Option<(u64, u64)> {
         } else {
             // Rewrite the sidecar with ONLY the not-yet-reclaimed lines so the
             // end-of-pass recount matches reality (already-unlinked lines do
-            // not linger on disk).
+            // not linger on disk). Atomic tmp+rename: a crash mid-rewrite used
+            // to be able to leave a TRUNCATED sidecar, which reads as "already
+            // drained" and loses the survivors.
             let mut rewrite = String::new();
             for l in &remaining {
                 rewrite.push_str(l);
                 rewrite.push('\n');
             }
-            let _ = std::fs::write(&path, rewrite);
+            let tmp = path.with_extension("orphans.tmp");
+            if std::fs::write(&tmp, rewrite).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
         }
+        drop(lease);
     }
     // Fresh recount of the lines still recorded (corrects any drift; 0 after
     // a clean pass).
@@ -786,5 +847,43 @@ mod tests {
             collect_referenced_counted(dir.path()).expect("an empty store scans cleanly");
         assert!(set.is_empty());
         assert_eq!(instances, 0);
+    }
+
+    /// An unreadable sidecar must KEEP the tombstone, only a missing one is
+    /// "nothing to drain".
+    ///
+    /// `let Ok(text) = read_to_string(..) else { return true }` treated
+    /// EACCES, EIO and invalid UTF-8 exactly like NotFound, so `erase_once`
+    /// lifted the tombstone while the `.audited` alibi copies (hidden PHI) it
+    /// names were never unlinked - and no later pass could revisit them,
+    /// because the tombstone that triggers the drain was what got removed.
+    #[test]
+    fn an_unreadable_sidecar_is_a_retry_not_a_drain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path();
+
+        // Missing: nothing recorded, so the drain is complete.
+        let sidecar = audit_copy_sidecar_path(manifests, "1.2.3");
+        assert_eq!(
+            read_sidecar_or_absent(&sidecar).expect("missing is absent"),
+            None,
+            "a missing sidecar is 'nothing recorded'"
+        );
+
+        // Present but NOT valid UTF-8: unreadable, so the caller must retry.
+        std::fs::write(&sidecar, b"\xFF\xFEnot utf8").expect("write sidecar");
+        assert!(
+            read_sidecar_or_absent(&sidecar).is_err(),
+            "an undecodable sidecar must not read as empty"
+        );
+
+        // Present and valid: the lines come back.
+        std::fs::write(&sidecar, b"aa 0\n").expect("write sidecar");
+        assert_eq!(
+            read_sidecar_or_absent(&sidecar)
+                .expect("readable")
+                .as_deref(),
+            Some("aa 0\n")
+        );
     }
 }

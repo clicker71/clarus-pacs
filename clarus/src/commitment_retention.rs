@@ -35,9 +35,19 @@ fn sweep_once(state: &AppState) -> usize {
         state.config.commitment.result_retention_days,
         now_secs(),
     ) {
-        Ok((removed, failed)) => {
+        Ok((removed, failed, uninspectable)) => {
             if failed > 0 {
                 crate::clog_warn!("commitment retention: {failed} result(s) could not be deleted");
+            }
+            // A corrupt record or an unreadable timestamp is LEFT IN PLACE, so
+            // without this the pass reports an empty removal list and looks
+            // like a healthy sweep with nothing to do. The files accumulate and
+            // only the filesystem notices.
+            if uninspectable > 0 {
+                crate::clog_warn!(
+                    "commitment retention: {uninspectable} result(s) could not be inspected \
+                     (corrupt record or unreadable timestamp); they were kept"
+                );
             }
             removed.len()
         }

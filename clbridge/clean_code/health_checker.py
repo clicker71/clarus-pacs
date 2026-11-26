@@ -119,7 +119,17 @@ class HealthChecker:
         return (False, 0xA700, self._last_reason or "server unhealthy")
 
     def dead_seconds(self) -> float:
-        """Return seconds since last successful health check (0 if healthy)."""
+        """Return seconds since last successful health check (0 if healthy).
+
+        Uses the same predicate as `is_healthy()`: a disabled checker is not
+        reporting an outage, so it must not report outage TIME either. In
+        `probe` mode a 503 followed by a 404 exits the poller and reopens
+        STOW admission, but the healthy Event is left as the 503 left it -
+        reading the Event alone reported an "outage" that grew for the life of
+        the process, long after the bridge had decided the server was fine.
+        """
+        if self._disabled_until_restart:
+            return 0.0
         if self._server_healthy.is_set():
             return 0.0
         return time.monotonic() - self._last_ok_time
@@ -227,7 +237,13 @@ class HealthChecker:
                 self._server_healthy.set()
                 self._consecutive_failures = 0
                 self._last_ok_time = time.monotonic()
-                return was_dead
+                # The gate is open again, so the outage it was recording is
+                # over. Returning `was_dead` left the flag set, and the NEXT
+                # 503 then took the "already down" path - no new-outage
+                # warning, so an operator saw one outage where the log
+                # recorded two (503 then 401 then 503), with the second one
+                # unannounced.
+                return False
             self._on_unhealthy(f"Server returned HTTP {resp.status_code}", was_dead)
             return True
         except requests.exceptions.Timeout:

@@ -18,6 +18,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use super::date::nonzero_errno;
+
 /// The 8-byte `YYYYMMDD` day key shared by every `.idx` writer.
 pub type DayKey = [u8; 8];
 
@@ -264,11 +266,28 @@ impl ModalityIndex {
         if self.poisoned {
             return Err(EPOISONED);
         }
+        // A no-repair handle (past-day reconcile/heal) must establish the
+        // newline boundary before writing, exactly as [`append`] does. Without
+        // it a file ending in `1.` followed by the row `2.3\n` read back as
+        // the single UID `1.2.3`: the new row fused onto the torn fragment and
+        // the caller's study UID never appeared in the index at all.
+        //
+        // The check is skipped for the rollover writer's own handle, whose
+        // file was repaired at open - that is the allocation guarantee this
+        // variant exists to keep.
+        if !self.repair
+            && let Err(e) = ensure_newline_boundary(&self.path)
+        {
+            self.poisoned = true;
+            let code = nonzero_errno(&e);
+            std::mem::forget(e);
+            return Err(code);
+        }
         match self.file.write_all(row) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.poisoned = true;
-                let code = e.raw_os_error().unwrap_or(0);
+                let code = nonzero_errno(&e);
                 std::mem::forget(e);
                 Err(code)
             }
@@ -278,6 +297,16 @@ impl ModalityIndex {
     /// Whether a failed append left this handle unusable.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Test seam: mark the handle poisoned as a failed append would.
+    ///
+    /// Production reaches this state only through an I/O failure, which a test
+    /// cannot provoke portably (a full disk is not arrangeable), so it is set
+    /// directly. Nothing mutates it in a release build.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&mut self) {
+        self.poisoned = true;
     }
 
     /// Replace a poisoned handle with a fresh one.
@@ -306,6 +335,15 @@ impl ModalityIndex {
             // append off a torn tail without truncating anything.
             ensure_newline_boundary(&path).map_err(ModalityIndexError::Io)?;
         }
+        // The DESCRIPTOR and the stored PATH must move together. Leaving
+        // `self.path` on the old root made every later `append` run its
+        // newline-boundary check against a file this handle no longer writes:
+        // if the NEW file had a torn tail the check passed against the OLD one
+        // and the row was fused onto the fragment, and if the old root had
+        // vanished the append failed for a file it was not touching. Committed
+        // here, after the checks, so a failed reopen leaves the handle exactly
+        // as it was.
+        self.path = path;
         self.poisoned = false;
         Ok(())
     }
@@ -505,6 +543,48 @@ mod tests {
         );
     }
 
+    /// The WARM path must establish the same boundary as `append`.
+    ///
+    /// `append_warm` skipped the no-repair newline check entirely, so on a file
+    /// ending in the torn fragment `1.` the row `2.3\n` was written straight
+    /// onto it: `read_study_uids` then returned `1.2.3` and the caller's real
+    /// study UID `2.3` never appeared - the index silently lost a study it had
+    /// just been told to record.
+    #[test]
+    fn a_no_repair_warm_append_establishes_a_newline_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = *b"20240115";
+        let path = file_path(dir.path(), "CT", &day);
+        {
+            let mut w = open_appender(dir.path(), "CT", &day).expect("open");
+            let mut row = [0u8; 128];
+            w.append(format_row("1.2", &mut row)).expect("seed");
+        }
+        {
+            // A torn tail: a row that never got its newline.
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            f.write_all(b"1.").expect("torn write");
+        }
+
+        let mut w = open_appender_no_repair(dir.path(), "CT", &day).expect("no repair");
+        let mut row = [0u8; 128];
+        w.append_warm(format_row("2.3", &mut row)).expect("warm");
+
+        let uids = read_study_uids(dir.path(), "CT", &day).expect("read");
+        assert!(
+            uids.contains(&"2.3".to_string()),
+            "the appended UID must be a row of its own, got {uids:?}"
+        );
+        assert!(
+            !uids.contains(&"1.2.3".to_string()),
+            "the new row must not fuse onto the torn fragment, got {uids:?}"
+        );
+    }
+
     /// A failed append must not be followed by an in-place append.
     ///
     /// Rows are newline-terminated, so a fragment left by a failed write would
@@ -627,6 +707,66 @@ mod tests {
             data, b"uid-a\nuid-torn\n",
             "reopen must keep the torn tail and add the missing newline on a \
              no-repair handle"
+        );
+    }
+
+    /// `reopen` moves the stored path WITH the descriptor.
+    ///
+    /// A handle opened in root A and reopened in root B installed B's
+    /// descriptor but left `self.path` pointing at A. Every later no-repair
+    /// `append` then ran its newline-boundary check against A's file while
+    /// writing to B's, so a torn tail in B went undetected and the new row was
+    /// fused onto the fragment - the exact corruption the check exists to
+    /// prevent.
+    #[test]
+    fn reopen_moves_the_stored_path_with_the_descriptor() {
+        let root_a = tempfile::tempdir().expect("tempdir a");
+        let root_b = tempfile::tempdir().expect("tempdir b");
+        let day = *b"20240115";
+
+        // A: a clean file. B: the same name, ending in a torn fragment.
+        {
+            let mut w = open_appender(root_a.path(), "CT", &day).expect("open a");
+            let mut row = [0u8; 128];
+            w.append(format_row("1.2", &mut row)).expect("seed a");
+        }
+        {
+            let mut w = open_appender(root_b.path(), "CT", &day).expect("open b");
+            let mut row = [0u8; 128];
+            w.append(format_row("1.2", &mut row)).expect("seed b");
+            use std::io::Write as _;
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(file_path(root_b.path(), "CT", &day))
+                .expect("open");
+            f.write_all(b"1.").expect("torn write");
+        }
+
+        let mut idx = open_appender_no_repair(root_a.path(), "CT", &day).expect("open no-repair");
+        idx.reopen(root_b.path()).expect("reopen into b");
+
+        // `reopen` itself establishes the boundary, so tear the tail AGAIN -
+        // this is the append that consults the stored path.
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(file_path(root_b.path(), "CT", &day))
+                .expect("open");
+            f.write_all(b"9.").expect("second torn write");
+        }
+
+        let mut row = [0u8; 128];
+        idx.append(format_row("2.3", &mut row)).expect("append");
+
+        let uids = read_study_uids(root_b.path(), "CT", &day).expect("read b");
+        assert!(
+            uids.contains(&"2.3".to_string()),
+            "the row must land in B as its own UID, got {uids:?}"
+        );
+        assert!(
+            !uids.contains(&"1.2.3".to_string()),
+            "the boundary check must run against B, not the old root, got {uids:?}"
         );
     }
 }

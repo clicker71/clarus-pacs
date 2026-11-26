@@ -106,9 +106,13 @@ fn refuse_if_hidden_from_store(
 ) -> Option<InstanceOutcome> {
     let trusted = state.trusted_manifest_dir();
     let reason = clarus_core::stow::hidden_reason_of(&trusted, study_uid, sop_instance_uid);
-    // 113037 patient safety / 113038 incorrect MWL: no standard un-reject, and
-    // the standard forbids re-accepting them.
-    if reason != 113_037 && reason != 113_038 {
+    // IOCM 4.66.4.2.3 / 4.66.4.3.3: no expose path exists for a
+    // patient-safety or incorrect-MWL rejection, and the receiver "shall not
+    // accept subsequent occurrence of instances that have been hidden" under
+    // them. The decision is asked of the standard-backed predicate rather than
+    // compared against a local copy of the two codes: the same rule also
+    // governs retrieval, and two spellings of it could disagree.
+    if !clarus_ports::rejection::re_store_refused(reason) {
         return None;
     }
     crate::clog_warn!(
@@ -127,6 +131,10 @@ fn refuse_if_hidden_from_store(
         reason: format!(
             "Instance is hidden by an IOCM rejection note (reason {reason}) that forbids re-acceptance"
         ),
+        // The instance is rejected by POLICY, not by the storage layer: the
+        // server understood it perfectly and refused. That is an answer about
+        // the input, so 400 remains correct when nothing else was accepted.
+        class: clarus_ports::stow_response::FailureClass::InvalidInput,
     })
 }
 
@@ -314,6 +322,30 @@ pub struct ManifestBatch {
     /// an auditor can open the KOS that justified the hide, and the batch is
     /// the last place that still knows which object the references came from.
     rejections: Vec<(String, String, u32, String)>,
+    /// SOP Instance UIDs of the rejection NOTES whose own manifest write
+    /// committed.
+    ///
+    /// A note is an ordinary SOP: it only has hiding power if the archive
+    /// actually stored it. `batch_add` records a note's references as soon as
+    /// the note is parsed, but the manifest write happens later, in a flush
+    /// that may fail. Applying a rejected note's references after a failed
+    /// write would hide a committed target on the strength of a note the
+    /// archive does not hold, and the audit row would cite an object nobody
+    /// can open. [`apply_rejections`] therefore drops any reference whose
+    /// note UID is not in this set.
+    ///
+    /// Keyed by note UID and NOT by (study, reason), because the citation is
+    /// per note: two notes naming different SOPs for the same reason in one
+    /// study stay distinguishable in the audit.
+    committed_notes: std::collections::HashSet<String>,
+    /// Note UIDs accepted into the batch whose manifest write is still
+    /// pending, mapped to the study that must commit for them to count.
+    ///
+    /// A flush moves an entry into `committed_notes` only when ITS OWN study
+    /// write succeeded. Kept as a map (not a list) so a note appearing twice
+    /// is one obligation, and so the flush can answer "which notes did I just
+    /// make durable" without rescanning the whole reference list.
+    pending_notes: std::collections::HashMap<String, String>,
     /// Study UIDs already flushed by a mid-request memory guard, with the
     /// per-study facts the follow-up work reads.
     ///
@@ -597,13 +629,18 @@ pub(crate) fn frame_records(dicom_bytes: &[u8]) -> Vec<clarus_core::manifest::Fr
     ))
 }
 
-/// Map the F5 `TooManyFrames` signal onto a STOW reject (413 Payload Too
-/// Large), naming the declared/walked counts and the configured cap.
+/// Map a frame-table failure onto the STOW reject that matches it.
 ///
-/// F5 is a REJECT, never "store without a table": storing an over-cap
-/// multi-frame instance without a frame table would hand every `/frames/{N}`
-/// request the whole-blob read path - exactly the O(instance) amplification
-/// this task removes.
+/// `TooManyFrames` is a 413 and a REJECT, never "store without a table":
+/// storing an over-cap multi-frame instance without a frame table would hand
+/// every `/frames/{N}` request the whole-blob read path - exactly the
+/// O(instance) amplification this task removes.
+///
+/// `Io` is a different fact about a different layer: the blob is stored but
+/// could not be READ back, so the instance was never inspected. Reporting it
+/// as a 413 would tell the client to send fewer frames for a file the server
+/// never opened, and reporting it as success would build a manifest row from
+/// no bytes - so it is a 500, which is what a server-side read failure is.
 fn too_many_frames_error(
     sop_class_uid: &str,
     sop_instance_uid: &str,
@@ -615,6 +652,19 @@ fn too_many_frames_error(
             walked,
             cap,
         } => (declared, walked, cap),
+        FrameTableError::Io(msg) => {
+            crate::clog_warn!(
+                sop_instance_uid = %sop_instance_uid,
+                error = %msg,
+                "STOW 500: frame table could not read the stored blob"
+            );
+            return stow_error_with_sop(
+                500,
+                format!("Failed to read the stored instance for the frame table: {msg}"),
+                Some(sop_class_uid),
+                sop_instance_uid,
+            );
+        }
     };
     crate::clog_warn!(
         sop_instance_uid = %sop_instance_uid,
@@ -650,7 +700,10 @@ fn instance_series_model(
         transfer_syntax_uid: meta
             .transfer_syntax_uid
             .clone()
-            .unwrap_or_else(|| "1.2.840.10008.1.2.1".to_string()),
+            // PS3.6 A.1: the default is Explicit VR Little Endian, sourced from
+            // the one transfer-syntax table the server already classifies
+            // against - a literal here could drift from the encoder's.
+            .unwrap_or_else(|| clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE.to_string()),
         file_size,
         referenced_series_uids: meta.referenced_series_uids.clone(),
         referenced_sop_instance_uids: meta.referenced_sop_instance_uids.clone(),
@@ -790,6 +843,13 @@ fn batch_add(
                         )
                     }),
             );
+        // The note is an ordinary SOP in this same batch, so its own write is
+        // still pending. It is promoted to `committed_notes` only by a flush
+        // that actually wrote it - a note the archive does not hold must not
+        // hide anything, and the audit must not cite it.
+        batch
+            .pending_notes
+            .insert(note_uid, meta.study_instance_uid.clone());
     }
     // The study's modality SET, accumulated per instance: the header's single
     // (0008,0060) describes one instance, not the study, and the trigger must
@@ -816,9 +876,10 @@ fn batch_add(
 ///
 /// The shadow-tier scanner is NOT told about a study that failed: its index
 /// would then advertise instances no manifest backs.
-pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) -> Vec<(String, String)> {
+pub fn commit_manifests(state: &AppState, batch: &mut ManifestBatch) -> Vec<(String, String)> {
     let manifest_dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
     let mut failed: Vec<(String, String)> = Vec::new();
+    let mut failed_studies: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (study_uid, study) in &batch.studies {
         // Rebuild fresh attrs so `write_study_manifest_full` stamps the final
         // merged counts (RAM-only) after merging all accumulated series.
@@ -835,6 +896,7 @@ pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) -> Vec<(String,
                 study_uid = %study_uid,
                 "B-tree study manifest write failed: instances of this study are reported failed"
             );
+            failed_studies.insert(study_uid.clone());
             failed.extend(
                 study
                     .series
@@ -850,6 +912,23 @@ pub fn commit_manifests(state: &AppState, batch: &ManifestBatch) -> Vec<(String,
         } else {
             state.study_scanner.on_study_committed(study_uid, &attrs);
         }
+    }
+    // Promote only the notes whose OWN study write succeeded. A note lives in
+    // the study it belongs to, so a study-level failure is exactly what makes
+    // it unciteable. Doing this here rather than in each caller means every
+    // flush - mid-request and end-of-request - keeps the same rule.
+    //
+    // A note whose study is NOT in this batch was never written by this flush
+    // either, so it stays pending: absence from `failed_studies` alone is not
+    // evidence of success.
+    let durable: Vec<String> = batch
+        .pending_notes
+        .iter()
+        .filter(|(_, study)| batch.studies.contains_key(*study) && !failed_studies.contains(*study))
+        .map(|(note, _)| note.clone())
+        .collect();
+    for note in durable {
+        batch.committed_notes.insert(note);
     }
     failed
 }
@@ -895,7 +974,15 @@ pub fn apply_rejections(state: &AppState, batch: &ManifestBatch, user: &str) {
         std::collections::HashMap::new();
     let mut skipped_scope = 0usize;
     let mut ignored_disabled = 0usize;
+    let mut uncommitted_note = 0usize;
     for (sop_class_uid, sop_instance_uid, reason, note_uid) in &batch.rejections {
+        // Guard 0: the note must be IN THE ARCHIVE. A note whose own manifest
+        // write failed is not a stored object, so it cannot justify hiding
+        // anything and the audit must not cite it.
+        if !batch.committed_notes.contains(note_uid) {
+            uncommitted_note += 1;
+            continue;
+        }
         // Guard 1: an AnyClass reason is destructive and has no standard
         // un-reject, so the deployment must opt into the feature explicitly.
         let any_class = clarus_ports::rejection::REASONS.iter().any(|r| {
@@ -937,6 +1024,16 @@ pub fn apply_rejections(state: &AppState, batch: &ManifestBatch, user: &str) {
         );
     }
 
+    if uncommitted_note > 0 {
+        // Counted and logged, not silently dropped: a request whose note never
+        // reached the archive is an operational fact (a failed manifest write
+        // already warned), and an operator chasing "my note did nothing" needs
+        // the number here rather than in a per-instance trace.
+        crate::clog_warn!(
+            references = uncommitted_note,
+            "rejection note references declined: the note itself was not stored by this request"
+        );
+    }
     let manifest_dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
     let audit_dir = std::path::PathBuf::from(&state.config.btree.audit_dir);
     let mut hidden_by_reason: std::collections::HashMap<u32, u64> =
@@ -947,24 +1044,26 @@ pub fn apply_rejections(state: &AppState, batch: &ManifestBatch, user: &str) {
         // order, so group by reason and let the FIRST hide win: `mark_rejected`
         // never overwrites an existing reason, which is what keeps a Quality
         // hide from being replaced by an IOCM one (or vice versa).
-        // A BTreeMap, not a HashMap: the note cited by the audit row is the
-        // FIRST that named this (study, reason), and "first" has to be a
-        // fixed order of the reasons rather than whatever the hasher happened
-        // to produce for this process. With a HashMap the same batch could
-        // cite a different note after a restart.
-        let mut by_reason: std::collections::BTreeMap<u32, (Vec<&str>, &str)> =
+        //
+        // The NOTE is part of the group key. Grouping by (study, reason) alone
+        // merged two notes that named different SOPs for the same reason under
+        // one citation: the row counted both targets but named only the first
+        // note, so that note did not support the second hide. An audit row has
+        // to name a note that actually references every instance it claims.
+        //
+        // A BTreeMap keyed on (reason, note) rather than a HashMap: the order
+        // the groups are applied in has to be fixed, or the same batch could
+        // cite a different note after a restart when two notes name the same
+        // instance. Reason sorts first so the same-reason groups stay adjacent.
+        let mut by_reason: std::collections::BTreeMap<(u32, &str), Vec<&str>> =
             std::collections::BTreeMap::new();
         for (sop_instance_uid, reason, note_uid) in entries {
-            let slot = by_reason.entry(reason).or_insert_with(|| (Vec::new(), ""));
-            slot.0.push(sop_instance_uid);
-            // The first note that named this (study, reason) is the one the
-            // audit row cites; a second note for the same group carries no
-            // extra evidence, and one row per group is the stated shape.
-            if slot.1.is_empty() {
-                slot.1 = note_uid;
-            }
+            by_reason
+                .entry((reason, note_uid))
+                .or_default()
+                .push(sop_instance_uid);
         }
-        for (reason, (sop_uids, note_uid)) in by_reason {
+        for ((reason, note_uid), sop_uids) in by_reason {
             // FR-014 order: the durable record of the sequester lands BEFORE
             // the manifest mutation. A crash between the two then overstates
             // the trail (a row for a hide that did not finish) rather than
@@ -1314,6 +1413,41 @@ fn ingest_tempfile(
                 &sop_instance_uid,
             )?;
         }
+        // PS3.18 10.5.3: an element the server coerced MUST be described by
+        // (0400,0561) in the stored object. Writing the generated value but
+        // not the history left the instance claiming a PatientID nobody had
+        // asked for, with the audit log as the only record - and the log is
+        // not part of the object a downstream archive receives. Appended
+        // BEFORE the hash so the CAS key describes the bytes actually served,
+        // and only when something was coerced.
+        if !coerce.generated.is_empty() {
+            let items: Vec<crate::validation::OriginalAttributeItem> = coerce
+                .generated
+                .iter()
+                .map(|&(g, e)| crate::validation::OriginalAttributeItem {
+                    group: g,
+                    element: e,
+                    old_value: String::new(),
+                    reason: "COERCE",
+                })
+                .collect();
+            let audit_bytes = crate::validation::build_original_attributes_sequence(
+                &items,
+                modifier,
+                &state.config.resolved_modifying_system(),
+            );
+            // Written at its SORTED position (PS3.5 7.1): an append would put
+            // group 0400 after PixelData for an image, and a second copy of an
+            // object that already carried a 0561 would duplicate the tag.
+            if let Err(e) = write_original_attributes_at_sorted_position(
+                temp_path,
+                &audit_bytes,
+                &sop_instance_uid,
+            ) {
+                let _ = std::fs::remove_file(temp_path);
+                return Err(e);
+            }
+        }
     }
 
     // The caller's folded digest was computed over the bytes AS RECEIVED, so
@@ -1339,7 +1473,12 @@ fn ingest_tempfile(
 
     // 2808 update-in-place: decide BEFORE any CAS materialization, exactly
     // like the bytes path (one blob per outcome, no orphan-on-idempotent).
-    let insert_result = decide_insert_result(state, &meta, &blake3);
+    let insert_result = apply_study_patient_guard(
+        state,
+        batch,
+        &meta,
+        decide_insert_result(state, &meta, &blake3),
+    );
 
     let outcome = map_insert_tempfile(
         state,
@@ -1417,6 +1556,147 @@ pub fn decide_insert_result(
     }
 }
 
+/// Apply the study-level patient guard to a decision that would otherwise
+/// store a NEW SOP.
+///
+/// The guard is separate from [`decide_insert_result`] because it is not a
+/// decision: answering it needs the study manifest, and building the manifest
+/// path allocates. `decide_insert_result` is inside the ap101 exact-budget
+/// window (the `Inserted` arm costs its five owned Strings and nothing else),
+/// so an allocation-using probe cannot live there. Callers apply this to the
+/// result, which keeps the gate honest and the check on every new SOP.
+///
+/// Only a new SOP is guarded. A SOP the archive already holds is an in-place
+/// UPDATE of that instance - PS3.18 10.5.2 lets a stored instance be corrected,
+/// and a name fix is the documented 2808 attribute-update case - so applying
+/// the study-level rule there would refuse every correction whose stored name
+/// is precisely what is being corrected.
+pub fn apply_study_patient_guard(
+    state: &AppState,
+    batch: &ManifestBatch,
+    meta: &InstanceMeta,
+    decision: InsertResult,
+) -> InsertResult {
+    if !matches!(decision, InsertResult::Inserted { .. }) {
+        return decision;
+    }
+    study_patient_conflict(state, batch, meta).unwrap_or(decision)
+}
+
+/// Refuse an incoming instance whose StudyInstanceUID already belongs to a
+/// different patient.
+///
+/// PS3.18 10.5.2 allows exactly two answers when (0020,000D) collides with a
+/// different (0010,0020) / (0010,0010): reject the instance, or coerce it onto
+/// the stored patient and record the coercion as (0400,0561) / Warn Reason
+/// B000. Clarus rejects - coercion would merge two humans into one record and
+/// hand the second patient the first patient's prior studies. Keeping both
+/// patients under one study UID without either answer is not conformant
+/// (DCST4 "conflict-demographics").
+///
+/// The comparison reads the REQUEST's `ManifestBatch` first, then the STORED
+/// study manifest - never the `sop_owner` rows (they map SOP -> study and
+/// carry no patient identity). The batch is first because a study's manifest
+/// is written only at the group commit at request end, so two instances of one
+/// study in a single STOW see no persisted manifest yet. A study absent from
+/// both the batch and the persisted manifest is not a conflict - there is no
+/// stored patient yet - and an unreadable manifest is left to
+/// `decide_known_sop`, which reports it as `UnreadableOwnerManifest` rather
+/// than guessing here.
+///
+/// Returns `Some` only on a genuine mismatch, so the accept path pays one
+/// manifest lookup it already performs for a known SOP and no extra work for
+/// a study it has never seen.
+fn study_patient_conflict(
+    state: &AppState,
+    batch: &ManifestBatch,
+    meta: &InstanceMeta,
+) -> Option<InsertResult> {
+    // The batch holds the patient identity of studies accepted EARLIER IN THIS
+    // SAME REQUEST, before the group commit writes any manifest. Two instances
+    // of one study in a single STOW arrive back-to-back and the persisted
+    // manifest does not exist yet, so the batch is the ONLY place the first
+    // instance's PatientID is visible to the second - without it both pass the
+    // guard and the request stores two patients under one study.
+    let stored_id = batch
+        .studies
+        .get(&meta.study_instance_uid)
+        .and_then(|s| s.attrs.patient_id.clone())
+        .or_else(|| {
+            let dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
+            let path = clarus_core::stow::manifest::manifest_path(&dir, &meta.study_instance_uid);
+            if !path.exists() {
+                return None;
+            }
+            let m = match state.read_server_manifest(&meta.study_instance_uid) {
+                Some(Ok(m)) => m,
+                // Unreadable: no comparison is possible, and a rejection on a
+                // guess would be worse than the known-SOP path's explicit
+                // failure. Accepting here is safe because the manifest write
+                // itself re-reads under the lease and a study it cannot decode
+                // fails that write.
+                _ => return None,
+            };
+            stored_patient_attr(&m, clarus_core::query::tag::PATIENT_ID)
+        });
+
+    // PatientID is the archive's patient key. A differing PatientID is the
+    // conflict; PatientName alone never is.
+    //
+    // PS3.18 10.5.2 states the collision as a different (0010,0020) OR a
+    // different (0010,0010), but the two are not symmetric in practice: a
+    // derived object stored under the same study legitimately carries its own
+    // name spelling for the same patient (a Key Object Selection written by a
+    // QA workstation stores `QA^NOTE` where the SEG stores `QA^SEG`, both
+    // under one PatientID). Comparing names rejected those objects wholesale.
+    // The reference implementations reconcile on PatientID and treat the name
+    // as descriptive, which is also what the archive's own patient index does
+    // (patients.rs keys on PatientID alone).
+    //
+    // An incoming instance that states NO PatientID is not a second patient
+    // either: derived objects may reference the study's instances without
+    // repeating its demographics. PS3.18 Table 10.6.1-5 makes these Type 2
+    // attributes, so an empty value is "not stated", not "differs".
+    let id_mismatch = match (stored_id.as_deref(), meta.patient_id.is_empty()) {
+        (Some(stored), false) => stored != meta.patient_id,
+        _ => false,
+    };
+    if !id_mismatch {
+        return None;
+    }
+
+    // The wire carries only the FACT that this study belongs to another
+    // patient - never WHOSE. The stored identifier stays in the operator log,
+    // where it is already masked, so a sender that reuses a StudyInstanceUID
+    // cannot read another patient's identifiers back out of the response.
+    crate::clog_warn!(
+        sop_instance_uid = %meta.sop_instance_uid,
+        study_uid = %meta.study_instance_uid,
+        "STOW refused: study already stored under a different patient"
+    );
+    Some(InsertResult::StudyPatientConflict {
+        sop_class_uid: meta.sop_class_uid.clone().unwrap_or_default(),
+        sop_instance_uid: meta.sop_instance_uid.clone(),
+        study_instance_uid: meta.study_instance_uid.clone(),
+    })
+}
+
+/// Read one text attribute from a study manifest, `None` when absent.
+///
+/// A manifest stores study-level QIDO attributes as a tag-sorted list; this is
+/// a linear scan of ~13 entries on a cold path, so a binary search would buy
+/// nothing but a second ordering invariant to keep.
+fn stored_patient_attr(m: &clarus_core::manifest::Manifest, tag: u32) -> Option<String> {
+    m.study
+        .attrs
+        .iter()
+        .find(|(t, _)| *t == tag)
+        .and_then(|(_, v)| match v {
+            clarus_core::manifest::AttrValue::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+}
+
 /// The known-SOP decision (01.09 rewrite: ONE manifest read instead of the
 /// old two - `manifest_patient` + `stored_instance`).
 ///
@@ -1476,20 +1756,34 @@ fn decide_known_sop(
 
     let dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
     let path = clarus_core::stow::manifest::manifest_path(&dir, owner_study);
+    let unreadable = || InsertResult::UnreadableOwnerManifest {
+        sop_class_uid: meta.sop_class_uid.clone().unwrap_or_default(),
+        sop_instance_uid: sop.to_string(),
+        study_instance_uid: study.to_string(),
+        series_instance_uid: meta.series_instance_uid.clone(),
+        patient_id: meta.patient_id.clone(),
+    };
+    // A study with no published manifest was deleted (01.09 erase gap: the
+    // append-only sop_owner row survives the delete), so the re-STOW rebuilds
+    // it fresh. `exists()` alone cannot tell that apart from a manifest that is
+    // present but unreadable, which is why the read below decides: the file
+    // system reports "exists" for a name whose contents nothing can parse.
     if !path.exists() {
-        // 01.09 erase gap: deleted study, stale append-only row.
         return inserted();
     }
     let m = match state.read_server_manifest(owner_study) {
         Some(Ok(m)) => m,
         _ => {
-            // Exists but unreadable: degraded study - preserve the no-op.
+            // Accepting this as an exact duplicate would count an instance the
+            // archive cannot serve: neither the SOP nor its bytes were checked
+            // against anything readable. Rewriting the manifest would be worse
+            // (it would replace a study a recovery tool may still repair).
             crate::clog_warn!(
                 sop_instance_uid = sop,
                 study_uid = study,
-                "study manifest unreadable during STOW decision - degraded to idempotent no-op"
+                "study manifest unreadable during STOW decision - instance reported as failed, manifest and blob untouched"
             );
-            return idempotent();
+            return unreadable();
         }
     };
 
@@ -1550,6 +1844,122 @@ fn decide_known_sop(
             }
         }
     }
+}
+
+/// Whether the archive's stored blob is the incoming bytes PLUS the
+/// (0400,0561) audit sequence this server wrote for them.
+///
+/// A correction retry is not byte-identical to what was stored: the archive
+/// kept the client's file and inserted a sequence describing the change, so
+/// `blake3(stored) != blake3(incoming)` even when the request asks for nothing
+/// new. Comparing digests alone therefore re-enters `Updated` on every retry,
+/// and - with no attribute left to correct - the second upload replaces the
+/// audited object with the raw file, losing the audit sequence.
+///
+/// The test is structural rather than digest-based: the installed sequence is
+/// located in the stored blob and skipped, and everything around it must equal
+/// the incoming file byte for byte. A pixel-only replacement fails that (its
+/// bytes differ outside the sequence), so it still takes the update path, and
+/// so does a genuinely different correction.
+///
+/// Cost is a bounded header read of the stored blob plus one streaming
+/// comparison against the staging file. Both are already on disk, and this runs
+/// only when no attribute differs, so it is not on the ordinary store path.
+fn is_retry_of_applied_correction(
+    meta: &InstanceMeta,
+    old_blake3: [u8; 32],
+    temp_path: &Path,
+    state: &AppState,
+) -> bool {
+    use std::io::{Read as _, Seek, SeekFrom};
+
+    // The sequence is only written for a transfer syntax that can carry it; in
+    // any other the stored blob IS the incoming bytes and the digests would
+    // have matched, so a mismatch here means something else changed.
+    if !embeddable_transfer_syntax(meta) {
+        return false;
+    }
+    let stored_path = cas_target_of(&state.cas, &clarus_adapters::hex_encode(&old_blake3));
+    let Ok(stored_len) = std::fs::metadata(&stored_path).map(|m| m.len()) else {
+        return false;
+    };
+    let Ok(incoming_len) = std::fs::metadata(temp_path).map(|m| m.len()) else {
+        return false;
+    };
+    // The stored object must be the incoming file PLUS the sequence.
+    if stored_len <= incoming_len {
+        return false;
+    }
+    let Ok(mut stored) = std::fs::File::open(&stored_path) else {
+        return false;
+    };
+    let Ok(mut incoming) = std::fs::File::open(temp_path) else {
+        return false;
+    };
+
+    // Locate the sequence from the stored blob's header. The probe read moves
+    // the cursor, so the comparison below restarts from the beginning.
+    let probe = stored_len.min(64 * 1024 * 1024) as usize;
+    let mut prefix = vec![0u8; probe];
+    if stored.read_exact(&mut prefix).is_err() {
+        return false;
+    }
+    if stored.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let Some(seam) = crate::validation::original_attributes_splice(&prefix) else {
+        return false;
+    };
+    // Only a NON-EMPTY extent counts: a zero-length seam means the tag is
+    // absent and the blob differs some other way.
+    if seam.replace_len == 0 {
+        return false;
+    }
+
+    let mut buf_stored = [0u8; 32 * 1024];
+    let mut buf_incoming = [0u8; 32 * 1024];
+
+    // 1. Everything before the sequence must match.
+    let mut before = seam.offset as u64;
+    while before > 0 {
+        let want = before.min(buf_stored.len() as u64) as usize;
+        if stored.read_exact(&mut buf_stored[..want]).is_err()
+            || incoming.read_exact(&mut buf_incoming[..want]).is_err()
+        {
+            return false;
+        }
+        if buf_stored[..want] != buf_incoming[..want] {
+            return false;
+        }
+        before -= want as u64;
+    }
+
+    // 2. Skip the sequence; the incoming file continues at the same point.
+    if stored
+        .seek(SeekFrom::Current(seam.replace_len as i64))
+        .is_err()
+    {
+        return false;
+    }
+
+    // 3. Everything after it must match.
+    let mut after = stored_len - (seam.offset + seam.replace_len) as u64;
+    while after > 0 {
+        let want = after.min(buf_stored.len() as u64) as usize;
+        if stored.read_exact(&mut buf_stored[..want]).is_err()
+            || incoming.read_exact(&mut buf_incoming[..want]).is_err()
+        {
+            return false;
+        }
+        if buf_stored[..want] != buf_incoming[..want] {
+            return false;
+        }
+        after -= want as u64;
+    }
+
+    // 4. The incoming file must be exhausted too: more bytes is a real change.
+    let mut extra = [0u8; 1];
+    incoming.read_exact(&mut extra).is_err()
 }
 
 /// The four `StudyManifestAttrs` tags that feed (0400,0561) CORRECT items
@@ -1618,11 +2028,14 @@ fn write_cas_dedup(
     bytes: &[u8],
     sop_class_uid: Option<&str>,
     sop_instance_uid: &str,
-) -> Result<(), StowError> {
+) -> Result<bool, StowError> {
     let cas_key = clarus_adapters::hex_encode(blake3);
     let cas_target = cas_target_of(&state.cas, &cas_key);
     if cas_target.exists() {
-        return Ok(());
+        // The caller did NOT create this object. Reporting that matters: a
+        // later failure must not unlink a blob an earlier, successful
+        // instance is still referenced by.
+        return Ok(false);
     }
     let bucket_dir = cas_target
         .parent()
@@ -1664,7 +2077,7 @@ fn write_cas_dedup(
     // turns it into MB/s.
     crate::metrics::CAS_WRITE_BYTES
         .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    Ok(())
+    Ok(true)
 }
 
 /// Unique temp-sibling filename for a CAS blob (`.<key>.<pid>-<seq>.tmp`),
@@ -1691,10 +2104,16 @@ fn cas_write_error(
         // that the failure is ours and transient - without it a PACS marks the
         // instance permanently failed and stops resending a study that would
         // succeed a minute later.
+        //
+        // The delay comes from the ONE shared policy constant. A local 60 here
+        // meant two answers to the same condition: the upload pre-flight tells
+        // clients 300 and this CAS path told them 60, so a client that backed
+        // off per response retried five times faster than the disk could
+        // recover.
         StowError::with_retry(
             507,
             err_json("Insufficient Storage", "CAS write error: disk full"),
-            60,
+            INSUFFICIENT_STORAGE_RETRY_AFTER,
         )
     } else {
         stow_error_with_sop(
@@ -1713,6 +2132,14 @@ fn cas_write_error(
 /// sanitized file must not grow it unboundedly). Returns `Ok(true)` when the
 /// line was actually appended; errors are the caller's WARN, never
 /// client-visible.
+///
+/// Runs under the STOW lease. The append is a read-modify-write over a file
+/// another thread may be REWRITING: `gc_orphans` drains a sidecar by reading
+/// it, unlinking its blobs and writing back only the survivors. Without a
+/// shared exclusive section a line appended in that window is either deleted
+/// by the drain's rewrite or, worse, unlinked from the CAS and then erased
+/// from the sidecar - the only record of it - so the blob is never reclaimed
+/// and replaced-version PHI stays on disk with nothing pointing at it.
 pub(crate) fn append_sidecar_line(
     manifest_dir: &Path,
     study_uid: &str,
@@ -1720,6 +2147,7 @@ pub(crate) fn append_sidecar_line(
     hex: &str,
     tier: u8,
 ) -> std::io::Result<bool> {
+    let _lease = clarus_core::stow::acquire();
     let line = format!("{hex} {tier}\n");
     let sidecar = manifest_dir.join(format!("{study_uid}{suffix}"));
     if let Ok(text) = std::fs::read_to_string(&sidecar)
@@ -1727,6 +2155,8 @@ pub(crate) fn append_sidecar_line(
     {
         return Ok(false); // already recorded - dedup, no write
     }
+    // Appended under the lease, and the OS append is a single `write_all` of
+    // one short line, so a concurrent reader never sees a half line.
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1938,13 +2368,180 @@ impl Drop for RemoveOnDrop<'_> {
     }
 }
 
+/// Append `sequence` to the file at `path`, at the sorted position.
+///
+/// Reads only the header prefix (bounded the same way as the patient splice);
+/// when the dataset is an image the pixel tail is streamed through a spill
+/// file so a multi-gigabyte instance is never resident. Falls back to a plain
+/// append when no seam can be established, which is what the previous code
+/// always did.
+fn write_original_attributes_at_sorted_position(
+    path: &Path,
+    sequence: &[u8],
+    sop_instance_uid: &str,
+) -> Result<(), StowError> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) as usize;
+    // The seam is found in the DATASET header, which the bounded reader already
+    // knows how to walk; a file small enough to be a pixel-less object is read
+    // whole.
+    let probe = len.min(64 * 1024 * 1024);
+    let mut prefix = vec![0u8; probe];
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to reopen the part for the attribute embed: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+    file.read_exact(&mut prefix).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to read the part for the attribute embed: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+
+    let Some(seam) = crate::validation::original_attributes_splice(&prefix) else {
+        // No trustworthy seam: the object is either not a dataset this writer
+        // understands or a partial read, and appending is what it did before.
+        file.seek(SeekFrom::End(0)).map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to seek the part end: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+        file.write_all(sequence).map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to write the attribute embed: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+        return Ok(());
+    };
+
+    // Everything from the seam on is rewritten: the edited prefix, then the
+    // untouched tail streamed through a spill file.
+    let tail_start = seam.offset + seam.replace_len;
+    let must_spill = tail_start < len;
+    let spill_path = path.with_extension("attrspill");
+    let mut spill = if must_spill {
+        let mut s = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&spill_path)
+            .map_err(|e| {
+                stow_error_with_sop(
+                    500,
+                    format!("Failed to open the spill file for the attribute embed: {e}"),
+                    None,
+                    sop_instance_uid,
+                )
+            })?;
+        file.seek(SeekFrom::Start(tail_start as u64)).map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to seek the attribute-embed tail: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+        std::io::copy(&mut (&mut file).take((len - tail_start) as u64), &mut s).map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to spill the attribute-embed tail: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+        s.seek(SeekFrom::Start(0)).map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to rewind the attribute-embed spill: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+        Some(s)
+    } else {
+        None
+    };
+    let _spill_guard = RemoveOnDrop(&spill_path);
+
+    // The prefix up to the seam, the sequence, then the tail.
+    file.set_len(0).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to truncate the part for the attribute embed: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to seek the part start: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    file.write_all(&prefix[..seam.offset]).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to write the attribute-embed prefix: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    file.write_all(sequence).map_err(|e| {
+        stow_error_with_sop(
+            500,
+            format!("Failed to write the attribute embed: {e}"),
+            None,
+            sop_instance_uid,
+        )
+    })?;
+    if let Some(s) = spill.as_mut() {
+        std::io::copy(s, &mut file).map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to restore the attribute-embed tail: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Read the file header up to (and including) the PixelData tag, with a
-/// growing window bounded at 64 MiB.
+/// growing window bounded at 64 MiB, plus whether the dataset ENDED there.
 ///
 /// A header larger than that is not a header; refusing is better than an
-/// unbounded read. `None` when no PixelData is found - the caller then leaves
-/// the file untouched.
-fn read_header_to_pixels(path: &Path) -> Option<Vec<u8>> {
+/// unbounded read.
+///
+/// The second element says the scan reached the END of the file without
+/// finding PixelData. That is a COMPLETE pixel-less dataset (an SR, a PR, a
+/// KOS) rather than a truncated probe, and the difference decides whether a
+/// splice at end-of-dataset is safe: a complete dataset has a well-defined end
+/// to insert at, an incomplete one does not. Returning `None` for both made a
+/// pixel-less SR silently keep an empty PatientID in its bytes while the
+/// manifest recorded the generated one, so WADO served a different identity
+/// than QIDO.
+fn read_header_to_pixels(path: &Path) -> Option<(Vec<u8>, bool)> {
     use clarus_ports::dicom::DicomParser;
     let len = std::fs::metadata(path).ok()?.len() as usize;
     let mut window = 8 * 1024 * 1024usize;
@@ -1954,9 +2551,15 @@ fn read_header_to_pixels(path: &Path) -> Option<Vec<u8>> {
         if let Ok(meta) = DicomRsParser.extract_metadata(&header)
             && meta.pixel_data_offset.is_some()
         {
-            return Some(header);
+            return Some((header, false));
         }
-        if probe == len || window >= 64 * 1024 * 1024 {
+        if probe == len {
+            // The whole file parsed with no PixelData: a complete pixel-less
+            // dataset. The header is the file, so an end-of-dataset insert is
+            // well defined.
+            return Some((header, true));
+        }
+        if window >= 64 * 1024 * 1024 {
             return None;
         }
         window *= 2;
@@ -1981,13 +2584,33 @@ fn splice_patient_elements_in_file(
         // Nothing generated: do not touch the file.
         return Ok(());
     }
-    let Some(header) = read_header_to_pixels(temp_path) else {
+    let Some((header, pixel_less)) = read_header_to_pixels(temp_path) else {
         crate::clog_warn!(
             sop_instance_uid,
-            "coerced patient elements not written: no PixelData found in the file"
+            "coerced patient elements not written: the file header could not be read"
         );
         return Ok(());
     };
+    if pixel_less {
+        // A COMPLETE dataset with no PixelData (an SR, PR or KOS): there is no
+        // pixel tail to stream, so the whole file is rewritten in memory. The
+        // patient elements must still land, or the stored bytes would carry an
+        // empty PatientID while the manifest holds the generated one.
+        let edits = patient_edits(crate::validation::patient_element_splices(&header), pn, pid);
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let rewritten = apply_edits(&header, &edits);
+        std::fs::write(temp_path, &rewritten).map_err(|e| {
+            stow_error_with_sop(
+                500,
+                format!("Failed to write the patient embed into a pixel-less part: {e}"),
+                None,
+                sop_instance_uid,
+            )
+        })?;
+        return Ok(());
+    }
     let edits = patient_edits(crate::validation::patient_element_splices(&header), pn, pid);
     if edits.is_empty() {
         return Ok(());
@@ -2192,6 +2815,64 @@ fn materialize_update_from_file(
         );
     }
 
+    // A retry of an already-applied correction.
+    //
+    // The stored digest differs from the incoming one by construction: the
+    // archive appended the (0400,0561) audit embed to what it stored, so
+    // comparing the two digests reports "different bytes" for a file that
+    // carries exactly the values the archive already holds. The digests alone
+    // therefore cannot tell an exact retry from a NEW correction, and without
+    // this check the retry enters `Updated` again - and with nothing left to
+    // correct, replaces the audited object with the raw upload, losing the
+    // audit sequence.
+    //
+    // The discriminator is the attribute comparison the audit embed itself
+    // uses: if no StudyManifestAttrs value differs and this ingest generated no
+    // new COERCE item, there is nothing to CORRECT. That is necessary but not
+    // sufficient - a PIXEL-ONLY replacement also has no attribute change, and
+    // it is a legitimate update that must still happen. So the retry answer
+    // additionally requires that the archive's stored bytes differ from the
+    // incoming ones only by the audit embed this request would have appended,
+    // which is what [`is_retry_of_applied_correction`] checks.
+    let no_corrections = correct_item(old_attrs, 0x0010, 0x0010, &meta.patient_name).is_none()
+        && correct_item(old_attrs, 0x0010, 0x0020, &meta.patient_id).is_none()
+        && correct_item(
+            old_attrs,
+            0x0010,
+            0x0030,
+            meta.patient_birth_date.as_deref().unwrap_or(""),
+        )
+        .is_none()
+        && correct_item(
+            old_attrs,
+            0x0010,
+            0x0040,
+            meta.patient_sex.as_deref().unwrap_or(""),
+        )
+        .is_none();
+    if no_corrections
+        && coerce.generated.is_empty()
+        && is_retry_of_applied_correction(meta, old_blake3, temp_path, state)
+    {
+        // Nothing new to apply: the archive already holds these values AND
+        // these bytes (plus the audit embed it wrote for them). Answering
+        // Idempotent leaves the audited blob untouched - the client's retry is
+        // acknowledged, not re-stored - and the temp file is dropped.
+        let _ = std::fs::remove_file(temp_path);
+        crate::clog_info!(
+            sop_instance_uid = %sop_instance_uid,
+            study_uid = %study_instance_uid,
+            "update request is a retry of an already-applied correction: not re-stored"
+        );
+        return Ok(InstanceOutcome::Idempotent {
+            sop_class_uid,
+            sop_instance_uid,
+            study_instance_uid,
+            series_instance_uid,
+            patient_id,
+        });
+    }
+
     // CORRECT items: one per changed StudyManifestAttrs tag (fixed order), then
     // COERCE items for fields generated during THIS ingest (old value = "").
     let mut items: Vec<crate::validation::OriginalAttributeItem> = Vec::new();
@@ -2250,25 +2931,21 @@ fn materialize_update_from_file(
         );
         // The generated patient elements were already spliced in
         // `ingest_tempfile` (before the hash and the insert/update decision);
-        // only the (0400,0561) audit embed is appended here. A second splice
-        // at the now-stale pixel-data offset would duplicate them.
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(temp_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(temp_path);
-                stow_error_with_sop(
-                    500,
-                    format!("Failed to open part for the attribute embed: {e}"),
-                    Some(sop_class_uid.as_str()),
-                    &sop_instance_uid,
-                )
-            })?;
-        if let Err(e) = std::io::Write::write_all(&mut file, &audit_bytes) {
+        // only the (0400,0561) audit embed is written here.
+        //
+        // Written at its SORTED position, not appended: the stored object may
+        // be an image whose PixelData (7FE0) is the last element, and it may
+        // already carry a 0561 from an earlier correction. An append produced
+        // both an out-of-order tag and, on the normal file path, a duplicate.
+        // The merge REPLACES the existing sequence, so the history it carried
+        // is folded into the new one.
+        if let Err(e) =
+            write_original_attributes_at_sorted_position(temp_path, &audit_bytes, &sop_instance_uid)
+        {
             let _ = std::fs::remove_file(temp_path);
             return Err(stow_error_with_sop(
-                500,
-                format!("Failed to append the attribute embed: {e}"),
+                e.status,
+                String::from_utf8_lossy(&e.body).into_owned(),
                 Some(sop_class_uid.as_str()),
                 &sop_instance_uid,
             ));
@@ -2375,6 +3052,7 @@ fn commit_updated_manifest(
                 reason: format!(
                     "Instance is hidden by an IOCM rejection note (reason {reason}) that forbids re-acceptance"
                 ),
+                class: clarus_ports::stow_response::FailureClass::InvalidInput,
             });
         }
         Err(e) => {
@@ -2390,6 +3068,10 @@ fn commit_updated_manifest(
                 reason: format!(
                     "Study manifest update failed, so the replacement was not committed: {e}"
                 ),
+                // The bytes were acceptable; the archive could not persist the
+                // change. Retrying the same payload can succeed, so this must
+                // not be reported as a bad request.
+                class: clarus_ports::stow_response::FailureClass::StoreFailure,
             });
         }
     }
@@ -2656,10 +3338,16 @@ fn map_insert_tempfile(
             ..
         } => {
             rename_temp_to_cas(state, temp_path, blake3, &sc, &si)?;
+            // The rename PUBLISHED this object, so this request created it.
+            // Only a target this request created may be unlinked later; an
+            // object that was already in CAS belongs to an earlier instance.
+            let created_original = true;
             // 3008 hidden-PHI sanitization (tempfile path): read the original
             // back from CAS, excise the union, materialize the sanitized blob
             // and record the original as the `{study}.audited` alibi.
-            let (stored_blake3, stored_size, stored_bytes) = if sanitize_hidden_phi(meta, coerce) {
+            let (stored_blake3, stored_size, stored_bytes, created_target) = if sanitize_hidden_phi(
+                meta, coerce,
+            ) {
                 let original = std::fs::read(cas_target_of(
                     &state.cas,
                     &clarus_adapters::hex_encode(blake3),
@@ -2681,7 +3369,8 @@ fn map_insert_tempfile(
                     sanitized
                 };
                 let s_blake3 = crate::shadow::blake3_of(&sanitized);
-                write_cas_dedup(state, &s_blake3, &sanitized, Some(&sc), &si)?;
+                let sanitized_created =
+                    write_cas_dedup(state, &s_blake3, &sanitized, Some(&sc), &si)?;
                 let manifest_dir = std::path::PathBuf::from(&state.config.btree.manifest_dir);
                 let hex = clarus_adapters::hex_encode(blake3);
                 match append_sidecar_line(
@@ -2707,9 +3396,56 @@ fn map_insert_tempfile(
                         );
                     }
                 }
-                (s_blake3, sanitized.len() as u64, Some(sanitized))
+                (
+                    s_blake3,
+                    sanitized.len() as u64,
+                    Some(sanitized),
+                    sanitized_created,
+                )
             } else {
-                (*blake3, size, None)
+                (*blake3, size, None, created_original)
+            };
+            // The frame table is VALIDATED BEFORE anything is published.
+            //
+            // The cap check is a decision about the instance, and an
+            // over-cap instance must leave no trace: publishing the CAS blob
+            // first and then unlinking it on failure still ran `dual_write`,
+            // whose owner rows would advertise an instance no manifest names.
+            // The table is built here from the staged bytes (or streamed off
+            // the CAS temp target); only a table that passes the cap goes on
+            // to publication.
+            //
+            // Same rule as the bytes path: the table describes the blob that
+            // is actually served, so it is built from the sanitized bytes when
+            // hidden-PHI removal ran. Otherwise the CAS blob is scanned by
+            // STREAMING its header (Read + Seek), not read back into memory:
+            // for the 13.09 GB RMS base level the old `std::fs::read` read all
+            // ~13 GB to derive an ~8.6 MiB table.
+            let frames = match stored_bytes.as_deref() {
+                Some(bytes) => frame_records_capped(bytes, state.config.max_frames_per_instance),
+                None => frame_records_from_file_capped(
+                    &cas_target_of(&state.cas, &clarus_adapters::hex_encode(&stored_blake3)),
+                    state.config.max_frames_per_instance,
+                ),
+            };
+            let frames = match frames {
+                Ok(f) => f,
+                Err(e) => {
+                    // The blob reached CAS before the scan could run, so it is
+                    // removed - but ONLY when this request is what created it.
+                    // Unlinking unconditionally deleted a blob an EARLIER
+                    // instance legitimately stored (a file accepted under a
+                    // higher cap, re-sent now), which left that instance
+                    // unreadable. The dedup write reports whether the target
+                    // pre-existed.
+                    if created_target {
+                        let _ = std::fs::remove_file(cas_target_of(
+                            &state.cas,
+                            &clarus_adapters::hex_encode(&stored_blake3),
+                        ));
+                    }
+                    return Err(too_many_frames_error(&sc, &si, e));
+                }
             };
             if let Err(e) = state.shadow.dual_write(
                 stored_blake3,
@@ -2724,39 +3460,6 @@ fn map_insert_tempfile(
                     "shadow dual-write failed (shadow tier degraded, client unaffected)"
                 );
             }
-            // Same rule as the bytes path: the table describes the blob that
-            // is actually served, so it is built from the sanitized bytes when
-            // hidden-PHI removal ran. Otherwise the CAS blob is scanned by
-            // STREAMING its header (Read + Seek), not read back into memory:
-            // for the 13.09 GB RMS base level the old `std::fs::read` read all
-            // ~13 GB to derive an ~8.6 MiB table. The file variant swallows
-            // its own errors into an empty table, so an unreadable blob keeps
-            // the whole-blob serve path without failing an instance that is
-            // already persisted.
-            // F5 (0310): the table is built with the frame cap. On an over-cap
-            // instance the blob (already renamed into CAS by
-            // `rename_temp_to_cas`) is UNLINKED and the instance is rejected -
-            // no CAS residue, no manifest entry, no whole-blob serve path.
-            let frames = match stored_bytes.as_deref() {
-                Some(bytes) => frame_records_capped(bytes, state.config.max_frames_per_instance),
-                None => frame_records_from_file_capped(
-                    &cas_target_of(&state.cas, &clarus_adapters::hex_encode(&stored_blake3)),
-                    state.config.max_frames_per_instance,
-                ),
-            };
-            let frames = match frames {
-                Ok(f) => f,
-                Err(e) => {
-                    // Unlink the just-stored blob: an over-cap instance must
-                    // not leave a CAS object behind (dedup would otherwise
-                    // resurrect it on the next STOW attempt).
-                    let _ = std::fs::remove_file(cas_target_of(
-                        &state.cas,
-                        &clarus_adapters::hex_encode(&stored_blake3),
-                    ));
-                    return Err(too_many_frames_error(&sc, &si, e));
-                }
-            };
             batch_add(state, batch, meta, stored_blake3, stored_size, frames);
             Ok(InstanceOutcome::Stored {
                 sop_class_uid: sc,
@@ -2836,6 +3539,42 @@ fn map_insert_tempfile(
                 conflicting_patient_id,
             })
         }
+        InsertResult::StudyPatientConflict {
+            sop_class_uid: sc,
+            sop_instance_uid: si,
+            study_instance_uid,
+        } => {
+            // The part never enters CAS: a blob no manifest names would sit
+            // unreachable until a reclaim pass found it.
+            let _ = std::fs::remove_file(temp_path);
+            Ok(InstanceOutcome::StudyPatientConflict {
+                sop_class_uid: sc,
+                sop_instance_uid: si,
+                study_instance_uid,
+            })
+        }
+        InsertResult::UnreadableOwnerManifest {
+            sop_class_uid: sc,
+            sop_instance_uid: si,
+            ..
+        } => {
+            // The temp part is dropped, never renamed into CAS: the archive
+            // cannot vouch for an entry it could not read, and a dump of new
+            // blobs into a study whose manifest is broken would grow the
+            // ambiguity a recovery pass has to resolve.
+            let _ = std::fs::remove_file(temp_path);
+            Ok(InstanceOutcome::Failed {
+                sop_class_uid: Some(sc),
+                sop_instance_uid: Some(si),
+                reason: "The study's existing manifest is unreadable, so this instance was not \
+                         stored and the manifest was left untouched. Retry after a recovery pass \
+                         repairs the study."
+                    .to_string(),
+                // A valid instance plus a manifest the server itself cannot
+                // read: the client's bytes are not at fault.
+                class: clarus_ports::stow_response::FailureClass::StoreFailure,
+            })
+        }
     }
 }
 
@@ -2855,12 +3594,12 @@ fn rename_temp_to_cas(
     blake3: &[u8; 32],
     sop_class_uid: &str,
     sop_instance_uid: &str,
-) -> Result<(), StowError> {
+) -> Result<bool, StowError> {
     let cas_key = clarus_adapters::hex_encode(blake3);
     let cas_target = cas_target_of(&state.cas, &cas_key);
     if cas_target.exists() {
         let _ = std::fs::remove_file(temp_path);
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = cas_target.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -2893,18 +3632,18 @@ fn rename_temp_to_cas(
     }
     if let Err(e) = std::fs::rename(temp_path, &cas_target) {
         let _ = std::fs::remove_file(temp_path);
-        return Err(stow_error_with_sop(
-            500,
-            format!("Atomic rename failed: {e}"),
-            Some(sop_class_uid),
-            sop_instance_uid,
-        ));
+        // A full disk is the same condition wherever it surfaces, so it goes
+        // through the ONE policy helper: reporting 500 here while the sibling
+        // write path answered 507 made the same failure look permanent on one
+        // route and retryable on the other.
+        return Err(cas_write_error(&e, Some(sop_class_uid), sop_instance_uid));
     }
     // The bytes are durable; make the new DIRECTORY entry durable too. Best
     // effort on Unix only - Windows cannot FlushFileBuffers a directory handle
     // (same documented OS boundary as the manifest dir).
     sync_cas_bucket_dir(&cas_target);
-    Ok(())
+    // The rename PUBLISHED this object, so this request created it.
+    Ok(true)
 }
 
 /// Best-effort directory fsync for a CAS bucket after a blob rename.
@@ -3327,6 +4066,20 @@ mod stow_uid_tests {
 
         let mut file = vec![0u8; 128];
         file.extend_from_slice(b"DICM");
+        // PS3.5 7.1: the dataset encoding comes from TransferSyntaxUID, and a
+        // Data Set with no File Meta Information is Implicit VR LE (PS3.5 A.1).
+        // The elements below are Explicit VR, so the fixture declares that.
+        file.extend_from_slice(&0x0002u16.to_le_bytes());
+        file.extend_from_slice(&0x0010u16.to_le_bytes());
+        file.extend_from_slice(b"UI");
+        let ts = b"1.2.840.10008.1.2.1";
+        file.extend_from_slice(&(ts.len() as u16).to_le_bytes());
+        file.extend_from_slice(ts);
+        // PS3.5 7.1.1: pad an odd Value Field to an even length, or the next
+        // element's tag starts one byte early.
+        if !ts.len().is_multiple_of(2) {
+            file.push(0x00);
+        }
         let mut us = |g: u16, e: u16, v: u16| {
             file.extend_from_slice(&g.to_le_bytes());
             file.extend_from_slice(&e.to_le_bytes());
@@ -3373,13 +4126,32 @@ mod crlf_strip_tests {
     use super::strip_trailing_crlf_file;
     use std::io::Write;
 
-    /// A minimal explicit-VR LE file: preamble, DICM, then `extra` appended
-    /// after one (0028,0010) US Rows element whose value is `rows_value`.
+    /// A minimal Part 10 Explicit VR LE file: 128-byte preamble, "DICM", a
+    /// File Meta group declaring the transfer syntax, then one (0028,0010) US
+    /// Rows element whose value is `rows_value`, then `tail`.
+    ///
+    /// PS3.10 7.1 makes the preamble and the prefix mandatory, and PS3.5 7.1
+    /// takes the dataset encoding from (0002,0010) - so a fixture that writes
+    /// Explicit VR elements without declaring the syntax is not a Part 10 file
+    /// at all, and a walker that follows A.1 (a bare dataset is Implicit VR LE)
+    /// reads its VR bytes as half a length. Declaring the syntax is the fix;
+    /// teaching the walker to guess is not.
     fn file_with_tail(dir: &std::path::Path, rows_value: &[u8], tail: &[u8]) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("inst.dcm");
         let mut data = vec![0u8; 128];
         data.extend_from_slice(b"DICM");
+        // (0002,0010) UI TransferSyntaxUID = Explicit VR Little Endian.
+        let ts = b"1.2.840.10008.1.2.1";
+        data.extend_from_slice(&0x0002u16.to_le_bytes());
+        data.extend_from_slice(&0x0010u16.to_le_bytes());
+        data.extend_from_slice(b"UI");
+        data.extend_from_slice(&(ts.len() as u16).to_le_bytes());
+        data.extend_from_slice(ts);
+        // PS3.5 7.1.1: pad an odd Value Field to an even length.
+        if !ts.len().is_multiple_of(2) {
+            data.push(0x00);
+        }
         data.extend_from_slice(&0x0028u16.to_le_bytes());
         data.extend_from_slice(&0x0010u16.to_le_bytes());
         data.extend_from_slice(b"US");
@@ -3638,6 +4410,76 @@ mod cas_durability_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A full disk answers the ONE retry delay, wherever it surfaces.
+    ///
+    /// Two answers to the same condition made a client that backs off per
+    /// response retry the CAS path five times faster than the upload pre-flight
+    /// told it to, hammering a disk that needed the 300 seconds.
+    #[test]
+    fn a_full_disk_answers_the_shared_retry_delay() {
+        use super::cas_write_error;
+        let enospc = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let err = cas_write_error(&enospc, None, "1.2.3.4");
+        assert_eq!(err.status, 507, "a full disk is Insufficient Storage");
+        assert_eq!(
+            err.retry_after,
+            Some(super::INSUFFICIENT_STORAGE_RETRY_AFTER),
+            "the CAS path must not invent its own delay"
+        );
+        // The pre-flight and this path must agree, or the client is told two
+        // different things about the same condition.
+        assert_eq!(super::INSUFFICIENT_STORAGE_RETRY_AFTER, 300);
+
+        // Any other I/O failure stays a plain 500: it is not a retry hint.
+        let other = std::io::Error::from(std::io::ErrorKind::Other);
+        let err = cas_write_error(&other, None, "1.2.3.4");
+        assert_eq!(err.status, 500);
+        assert_eq!(err.retry_after, None);
+    }
+
+    /// A frame-cap rejection must not unlink a blob this request did not
+    /// create: the earlier instance that stored it is still referencing it.
+    ///
+    /// The CAS writers report whether the caller created the target, and only
+    /// that answer may authorise the unlink.
+    #[test]
+    fn a_dedup_hit_reports_that_the_caller_did_not_create_the_blob() {
+        let root = unique_root("created_flag");
+        let _ = std::fs::remove_dir_all(&root);
+        let app = app_state(&root);
+        let key = [0x77u8; 32];
+
+        // First write creates it.
+        assert!(
+            write_cas_dedup(&app, &key, b"first", None, "1.2.3.4").expect("write"),
+            "the first write created the object"
+        );
+        // A second write of the same content is a dedup HIT.
+        assert!(
+            !write_cas_dedup(&app, &key, b"first", None, "1.2.3.5").expect("dedup"),
+            "a dedup hit did not create anything"
+        );
+
+        // The rename path reports the same way.
+        let target = cas_target_of(&app.cas, &clarus_adapters::hex_encode(&key));
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let temp = root.join("dedup.tmp");
+        std::fs::write(&temp, b"whatever").unwrap();
+        assert!(
+            !rename_temp_to_cas(&app, &temp, &key, "1.2.3", "1.2.3.6").expect("dedup"),
+            "an existing target was not created by this call"
+        );
+
+        let fresh_key = [0x78u8; 32];
+        let fresh_temp = root.join("fresh.tmp");
+        std::fs::write(&fresh_temp, b"fresh bytes").unwrap();
+        assert!(
+            rename_temp_to_cas(&app, &fresh_temp, &fresh_key, "1.2.3", "1.2.3.7").expect("rename"),
+            "a rename published the object"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Dedup on the TempFile path: an existing target drops the temp and does
     /// NOT overwrite the stored blob.
     #[test]
@@ -3658,6 +4500,100 @@ mod cas_durability_tests {
         assert!(!temp.exists(), "the redundant temp is dropped");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// A correction retry is recognised from the BYTES, not the digest.
+    ///
+    /// The archive stores the client's file plus an inserted (0400,0561), so
+    /// `blake3(stored) != blake3(incoming)` for a request that asks for nothing
+    /// new. The helper must match the stored blob with the sequence removed
+    /// against the incoming file, and must REJECT a pixel-only replacement.
+    #[test]
+    fn a_retry_is_recognised_from_the_bytes_with_the_sequence_removed() {
+        use super::is_retry_of_applied_correction;
+
+        let root = unique_root("retry_recognise");
+        let _ = std::fs::remove_dir_all(&root);
+        let app = app_state(&root);
+
+        // A minimal Explicit VR LE dataset: (0008,0060) CS "CT" then PixelData.
+        let mut incoming = Vec::new();
+        incoming.extend_from_slice(&[0u8; 128]);
+        incoming.extend_from_slice(b"DICM");
+        incoming.extend_from_slice(&0x0008u16.to_le_bytes());
+        incoming.extend_from_slice(&0x0060u16.to_le_bytes());
+        incoming.extend_from_slice(b"CS");
+        incoming.extend_from_slice(&2u16.to_le_bytes());
+        incoming.extend_from_slice(b"CT");
+        // (7FE0,0010) OB 4 bytes: 4 tag + 2 VR + 2 reserved + 4 length + 4 value.
+        let pixeldata_at = incoming.len();
+        incoming.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        incoming.extend_from_slice(&0x0010u16.to_le_bytes());
+        incoming.extend_from_slice(b"OB");
+        incoming.extend_from_slice(&0u16.to_le_bytes());
+        incoming.extend_from_slice(&4u32.to_le_bytes());
+        incoming.extend_from_slice(&[9, 9, 9, 9]);
+
+        // The stored blob is the incoming file with the sequence INSERTED
+        // before PixelData, which is where the writer puts it (PS3.5 7.1: group
+        // 0400 sorts before 7FE0).
+        let seq_at = pixeldata_at;
+        let mut stored = Vec::new();
+        stored.extend_from_slice(&incoming[..seq_at]);
+        stored.extend_from_slice(&0x0400u16.to_le_bytes());
+        stored.extend_from_slice(&0x0561u16.to_le_bytes());
+        stored.extend_from_slice(b"SQ");
+        stored.extend_from_slice(&0u16.to_le_bytes());
+        stored.extend_from_slice(&8u32.to_le_bytes());
+        stored.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        stored.extend_from_slice(&0xE000u16.to_le_bytes());
+        stored.extend_from_slice(&0u32.to_le_bytes());
+        stored.extend_from_slice(&incoming[seq_at..]);
+
+        let stored_key = crate::shadow::blake3_of(&stored);
+        write_cas_dedup(&app, &stored_key, &stored, None, "1.2.3.4").expect("store");
+        let temp = root.join("incoming.tmp");
+        std::fs::write(&temp, &incoming).unwrap();
+
+        // The seam itself must point at the sequence, not at PixelData.
+        let seam = crate::validation::original_attributes_splice(&stored).expect("a seam");
+        assert_eq!(
+            seam.offset, seq_at,
+            "the sequence sits at the insert point, replace_len={}",
+            seam.replace_len
+        );
+        assert_eq!(seam.replace_len, 20, "its whole extent");
+
+        let meta = clarus_ports::dicom::InstanceMeta {
+            transfer_syntax_uid: Some("1.2.840.10008.1.2.1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            is_retry_of_applied_correction(&meta, stored_key, &temp, &app),
+            "the same file minus the stored sequence IS a retry"
+        );
+
+        // A pixel-only replacement differs OUTSIDE the sequence, so it is a
+        // real change and must still take the update path.
+        let mut changed = incoming.clone();
+        let n = changed.len();
+        changed[n - 1] = 0x42;
+        std::fs::write(&temp, &changed).unwrap();
+        assert!(
+            !is_retry_of_applied_correction(&meta, stored_key, &temp, &app),
+            "different pixels are not a retry"
+        );
+
+        // An equal-length incoming file cannot be "incoming + sequence".
+        let mut same_len = stored.clone();
+        same_len.truncate(incoming.len());
+        std::fs::write(&temp, &same_len).unwrap();
+        assert!(
+            !is_retry_of_applied_correction(&meta, stored_key, &temp, &app),
+            "a blob that is not larger cannot carry the sequence"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 // -- IOCM trust gate and re-store refusal --------------------------------
@@ -3670,12 +4606,19 @@ mod iocm_anyclass_tests {
         AttrValue, InstanceRecord, Manifest, NOT_REJECTED_REASON, QUALITY_REASON_CODE,
         SeriesRecord, StudyQido, SysHeader, TIER_HOT,
     };
+    use clarus_ports::dicom::InstanceMeta;
+    use clarus_ports::stow_response::InsertResult;
     use std::path::{Path, PathBuf};
 
     const STUDY: &str = "1.2.840.10008.5.1.4.1.1.88.22.1";
     const SERIES: &str = "1.2.840.10008.5.1.4.1.1.88.22.2";
     const INSTANCE: &str = "1.2.840.10008.5.1.4.1.1.88.22.3";
+    /// A second instance of the same study, for the multi-note audit test.
+    const SECOND_INSTANCE: &str = "1.2.840.10008.5.1.4.1.1.88.22.4";
     const CT: &str = "1.2.840.10008.5.1.4.1.1.2";
+    /// An AI-result SOP Class, which is the only scope a Quality note
+    /// (113001, `AiResultClassesOnly`) may hide.
+    const AI_RESULT: &str = "1.2.840.10008.5.1.4.1.1.88.22";
     /// SOP Instance UID of the Key Object Selection note the batch cites.
     const NOTE: &str = "1.2.840.10008.5.1.4.1.1.88.22.9";
 
@@ -3755,8 +4698,55 @@ mod iocm_anyclass_tests {
         std::fs::write(&path, manifest.encode().expect("encode")).expect("rewrite");
     }
 
+    /// A batch carrying one note's reference, with the note already durable.
+    ///
+    /// The note's commit state is set explicitly because `apply_rejections`
+    /// refuses to hide on the authority of a note the archive does not hold.
+    /// A test that seeds a reference has to say the note WAS stored, or it is
+    /// testing the failure path instead of the one it names.
+    fn batch_with_committed_note(
+        sop_class: &str,
+        instance: &str,
+        reason: u32,
+        note: &str,
+    ) -> super::ManifestBatch {
+        let mut batch = super::ManifestBatch::default();
+        batch.rejections.push((
+            sop_class.to_string(),
+            instance.to_string(),
+            reason,
+            note.to_string(),
+        ));
+        batch.committed_notes.insert(note.to_string());
+        batch
+    }
+
     /// A visible CT instance in its own study manifest.
     fn seed_visible_instance(state: &AppState) {
+        seed_visible_instances(state, &[INSTANCE]);
+    }
+
+    /// A visible instance of `sop_class` in its own study manifest.
+    ///
+    /// The class matters: a Quality note is class-bounded, so whether a hide
+    /// lands depends on what the referenced instance IS. Seeding a CT for a
+    /// scope test would make the assertion vacuous.
+    fn seed_visible_instance_as(state: &AppState, sop_class: &str) {
+        seed_visible_instances_as(state, &[INSTANCE], sop_class);
+    }
+
+    /// Several visible CT instances in one study manifest.
+    fn seed_visible_instances(state: &AppState, instances: &[&str]) {
+        seed_visible_instances_as(state, instances, CT);
+    }
+
+    /// Several visible instances of `sop_class` in one study manifest.
+    ///
+    /// Every instance is also registered in the SOP->study index: the
+    /// rejection marking step resolves the owner study through it, so a
+    /// manifest-only seed would make every hide look like "no owner study"
+    /// and let a test pass that never needed the hide to land.
+    fn seed_visible_instances_as(state: &AppState, instances: &[&str], sop_class: &str) {
         let manifest = Manifest {
             sys: SysHeader {
                 version: 1,
@@ -3769,6 +4759,82 @@ mod iocm_anyclass_tests {
                     clarus_core::query::tag::STUDY_INSTANCE_UID,
                     AttrValue::Text(STUDY.to_string()),
                 )],
+                ..Default::default()
+            },
+            series: vec![SeriesRecord {
+                attrs: vec![(
+                    clarus_core::query::tag::SERIES_INSTANCE_UID,
+                    AttrValue::Text(SERIES.to_string()),
+                )],
+                instances: instances
+                    .iter()
+                    .map(|uid| InstanceRecord {
+                        blake3: [0u8; 32],
+                        attrs: vec![
+                            (
+                                clarus_core::query::tag::SOP_INSTANCE_UID,
+                                AttrValue::Text(uid.to_string()),
+                            ),
+                            (
+                                clarus_core::query::tag::SOP_CLASS_UID,
+                                AttrValue::Text(sop_class.to_string()),
+                            ),
+                        ],
+                        transfer_syntax: "1.2.840.10008.1.2.1".to_string(),
+                        storage_tier: TIER_HOT,
+                        rejection_reason: NOT_REJECTED_REASON,
+                        file_size: 64,
+                        frames: Vec::new(),
+                    })
+                    .collect(),
+            }],
+        };
+        let dir = PathBuf::from(&state.config.btree.manifest_dir);
+        let path = clarus_core::stow::manifest_path(&dir, STUDY);
+        std::fs::write(&path, manifest.encode().expect("encode")).expect("write manifest");
+        for uid in instances {
+            state
+                .shadow
+                .dual_write([0u8; 32], "CT", STUDY, SERIES, uid)
+                .expect("seed sop_owner");
+        }
+    }
+
+    /// The stored reason for the seeded instance.
+    fn stored_reason(state: &AppState) -> u32 {
+        let trusted = state.trusted_manifest_dir();
+        clarus_core::stow::hidden_reason_of(&trusted, STUDY, INSTANCE)
+    }
+
+    /// A study manifest that already belongs to `patient_id` / `patient_name`,
+    /// holding one visible instance.
+    ///
+    /// Writes the patient attributes the store-identity guard compares - the
+    /// seed used by the hide tests carries only a study UID, so a conflict
+    /// test needs its own.
+    fn seed_study_with_patient(state: &AppState, patient_id: &str, patient_name: &str) {
+        let manifest = Manifest {
+            sys: SysHeader {
+                version: 1,
+                storage_tier: TIER_HOT,
+                total_pixel_bytes: 0,
+                arrived_at: 1,
+            },
+            study: StudyQido {
+                attrs: vec![
+                    (
+                        clarus_core::query::tag::STUDY_INSTANCE_UID,
+                        AttrValue::Text(STUDY.to_string()),
+                    ),
+                    (
+                        clarus_core::query::tag::PATIENT_ID,
+                        AttrValue::Text(patient_id.to_string()),
+                    ),
+                    (
+                        clarus_core::query::tag::PATIENT_NAME,
+                        AttrValue::Text(patient_name.to_string()),
+                    ),
+                ],
                 ..Default::default()
             },
             series: vec![SeriesRecord {
@@ -3799,20 +4865,223 @@ mod iocm_anyclass_tests {
         let dir = PathBuf::from(&state.config.btree.manifest_dir);
         let path = clarus_core::stow::manifest_path(&dir, STUDY);
         std::fs::write(&path, manifest.encode().expect("encode")).expect("write manifest");
-        // The rejection marking step resolves the owner study through the
-        // SOP->study index, which a real STOW writes. Seeding only the
-        // manifest would make every hide look like "no owner study" and let a
-        // test pass that never needed the hide to land.
-        state
-            .shadow
-            .dual_write([0u8; 32], "CT", STUDY, SERIES, INSTANCE)
-            .expect("seed sop_owner");
     }
 
-    /// The stored reason for the seeded instance.
-    fn stored_reason(state: &AppState) -> u32 {
-        let trusted = state.trusted_manifest_dir();
-        clarus_core::stow::hidden_reason_of(&trusted, STUDY, INSTANCE)
+    /// The PatientID a manifest stores for its study, `""` when absent.
+    fn stored_patient_id(m: &Manifest) -> String {
+        m.study
+            .attrs
+            .iter()
+            .find(|(t, _)| *t == clarus_core::query::tag::PATIENT_ID)
+            .and_then(|(_, v)| match v {
+                AttrValue::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// PS3.18 10.5.2 / DCST4 "conflict-demographics": a second instance that
+    /// reuses the stored StudyInstanceUID for a DIFFERENT patient is refused,
+    /// and the first patient's study is left exactly as it was.
+    ///
+    /// The refusal cannot come from the per-SOP step: the incoming SOP is
+    /// unknown to `sop_owner`, so that path answers `Inserted` and the study
+    /// would silently end up holding two patients. The guard must therefore
+    /// fire on a SOP the archive has never seen - which is what this test
+    /// pins, by using an unseeded instance UID.
+    ///
+    /// Falsified by making `apply_study_patient_guard` return its input
+    /// decision unchanged: the store then answers `Inserted` and the stored
+    /// patient is untouched only because nothing was written yet.
+    #[test]
+    fn a_second_patient_under_a_stored_study_is_refused() {
+        let root = unique_root("patient_conflict");
+        let state = build_state(&root, false);
+        seed_study_with_patient(&state, "PAT-A", "ALPHA^ANNA");
+
+        let batch = super::ManifestBatch::default();
+        let mut incoming = InstanceMeta {
+            study_instance_uid: STUDY.to_string(),
+            series_instance_uid: SERIES.to_string(),
+            sop_instance_uid: "1.2.840.10008.5.1.4.1.1.88.22.77".to_string(),
+            sop_class_uid: Some(CT.to_string()),
+            patient_id: "PAT-B".to_string(),
+            patient_name: "BETA^BORIS".to_string(),
+            ..Default::default()
+        };
+        let outcome = super::apply_study_patient_guard(
+            &state,
+            &batch,
+            &incoming,
+            super::decide_insert_result(&state, &incoming, &[7u8; 32]),
+        );
+        assert!(
+            matches!(outcome, InsertResult::StudyPatientConflict { .. }),
+            "a different PatientID under a stored study must be refused, got {outcome:?}"
+        );
+
+        // The refusal must not have moved anything: the stored patient is the
+        // first one, and the study still holds exactly its one instance.
+        let m = state
+            .read_server_manifest(STUDY)
+            .expect("published manifest path")
+            .expect("read manifest");
+        assert_eq!(
+            stored_patient_id(&m),
+            "PAT-A",
+            "the first patient must survive the refused store"
+        );
+        assert_eq!(
+            m.series.iter().map(|s| s.instances.len()).sum::<usize>(),
+            1,
+            "the refused instance must not appear in the study"
+        );
+
+        // Same patient, same study: still accepted (the guard must key on the
+        // patient, not on the mere existence of the study).
+        incoming.patient_id = "PAT-A".to_string();
+        incoming.patient_name = "ALPHA^ANNA".to_string();
+        assert!(
+            matches!(
+                super::apply_study_patient_guard(
+                    &state,
+                    &batch,
+                    &incoming,
+                    super::decide_insert_result(&state, &incoming, &[7u8; 32]),
+                ),
+                InsertResult::Inserted { .. }
+            ),
+            "an instance for the study's OWN patient must still be accepted"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A differing PatientName under the SAME PatientID is not a conflict.
+    ///
+    /// PS3.18 10.5.2 names (0010,0010) alongside (0010,0020), but a derived
+    /// object stored under an existing study legitimately carries its own name
+    /// spelling for the same patient - a QA station writes `QA^NOTE` where the
+    /// SEG writes `QA^SEG`. Reconciling on the name rejected those objects and
+    /// broke the rejection-note round trip. PatientID is the patient key.
+    ///
+    /// Falsified by restoring the name comparison: this store then answers
+    /// `StudyPatientConflict` and the note can never be filed.
+    #[test]
+    fn a_differing_patient_name_under_one_id_is_accepted() {
+        let root = unique_root("name_conflict");
+        let state = build_state(&root, false);
+        seed_study_with_patient(&state, "PAT-A", "ALPHA^ANNA");
+
+        let batch = super::ManifestBatch::default();
+        let mut incoming = InstanceMeta {
+            study_instance_uid: STUDY.to_string(),
+            series_instance_uid: SERIES.to_string(),
+            sop_instance_uid: "1.2.840.10008.5.1.4.1.1.88.22.78".to_string(),
+            sop_class_uid: Some(CT.to_string()),
+            patient_id: "PAT-A".to_string(),
+            patient_name: "GAMMA^GRIGORI".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                super::apply_study_patient_guard(
+                    &state,
+                    &batch,
+                    &incoming,
+                    super::decide_insert_result(&state, &incoming, &[7u8; 32]),
+                ),
+                InsertResult::Inserted { .. }
+            ),
+            "same PatientID, different name spelling is one patient"
+        );
+
+        // No incoming name at all: still the same patient.
+        incoming.patient_name = String::new();
+        assert!(
+            matches!(
+                super::apply_study_patient_guard(
+                    &state,
+                    &batch,
+                    &incoming,
+                    super::decide_insert_result(&state, &incoming, &[7u8; 32]),
+                ),
+                InsertResult::Inserted { .. }
+            ),
+            "an instance that omits PatientName must not be refused for it"
+        );
+
+        // An empty PatientID states nothing, so it is not a second patient.
+        incoming.patient_name = "GAMMA^GRIGORI".to_string();
+        incoming.patient_id = String::new();
+        assert!(
+            matches!(
+                super::apply_study_patient_guard(
+                    &state,
+                    &batch,
+                    &incoming,
+                    super::decide_insert_result(&state, &incoming, &[7u8; 32]),
+                ),
+                InsertResult::Inserted { .. }
+            ),
+            "an absent PatientID is not a conflicting one"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A second patient for a study accepted EARLIER IN THE SAME REQUEST is
+    /// refused, even though no manifest has been committed yet.
+    ///
+    /// The group commit writes the study manifest only at request end, so the
+    /// persisted-manifest probe sees nothing during a multi-part STOW that
+    /// carries two patients under one study. The batch is the only place the
+    /// first instance's PatientID is visible to the second.
+    ///
+    /// Falsified by dropping the `batch.studies` lookup from
+    /// `study_patient_conflict`: the store then answers `Inserted` and the
+    /// request stores two patients under one study.
+    #[test]
+    fn a_second_patient_in_the_same_batch_is_refused_before_commit() {
+        let root = unique_root("batch_conflict");
+        let state = build_state(&root, false);
+
+        // No persisted manifest: the batch is the ONLY source of the study's
+        // patient identity here.
+        let mut batch = super::ManifestBatch::default();
+        batch.studies.insert(
+            STUDY.to_string(),
+            super::StudyBatch {
+                attrs: clarus_core::stow::StudyManifestAttrs {
+                    patient_id: Some("PAT-A".to_string()),
+                    ..Default::default()
+                },
+                series: Vec::new(),
+                modalities: std::collections::BTreeSet::new(),
+            },
+        );
+
+        let incoming = InstanceMeta {
+            study_instance_uid: STUDY.to_string(),
+            series_instance_uid: SERIES.to_string(),
+            sop_instance_uid: "1.2.840.10008.5.1.4.1.1.88.22.79".to_string(),
+            sop_class_uid: Some(CT.to_string()),
+            patient_id: "PAT-B".to_string(),
+            patient_name: "BETA^BORIS".to_string(),
+            ..Default::default()
+        };
+        let outcome = super::apply_study_patient_guard(
+            &state,
+            &batch,
+            &incoming,
+            super::decide_insert_result(&state, &incoming, &[7u8; 32]),
+        );
+        assert!(
+            matches!(outcome, InsertResult::StudyPatientConflict { .. }),
+            "a second patient in the SAME uncommitted request must be refused, got {outcome:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// With `anyclass_enable = false` (the default) the AnyClass hide is NOT
@@ -3825,13 +5094,7 @@ mod iocm_anyclass_tests {
         let state = build_state(&root, false);
         seed_visible_instance(&state);
 
-        let mut batch = super::ManifestBatch::default();
-        batch.rejections.push((
-            CT.to_string(),
-            INSTANCE.to_string(),
-            PATIENT_SAFETY,
-            NOTE.to_string(),
-        ));
+        let batch = batch_with_committed_note(CT, INSTANCE, PATIENT_SAFETY, NOTE);
         super::apply_rejections(&state, &batch, "tester");
 
         assert_eq!(
@@ -3913,13 +5176,7 @@ mod iocm_anyclass_tests {
         let state = build_state(&root, true);
         seed_visible_instance(&state);
 
-        let mut batch = super::ManifestBatch::default();
-        batch.rejections.push((
-            CT.to_string(),
-            INSTANCE.to_string(),
-            INCORRECT_MWL,
-            NOTE.to_string(),
-        ));
+        let batch = batch_with_committed_note(CT, INSTANCE, INCORRECT_MWL, NOTE);
         super::apply_rejections(&state, &batch, "tester");
 
         assert_eq!(
@@ -3940,13 +5197,7 @@ mod iocm_anyclass_tests {
         let state = build_state(&root, true);
         seed_visible_instance(&state);
 
-        let mut batch = super::ManifestBatch::default();
-        batch.rejections.push((
-            CT.to_string(),
-            INSTANCE.to_string(),
-            INCORRECT_MWL,
-            NOTE.to_string(),
-        ));
+        let batch = batch_with_committed_note(CT, INSTANCE, INCORRECT_MWL, NOTE);
         super::apply_rejections(&state, &batch, "op-carol");
 
         assert_eq!(stored_reason(&state), INCORRECT_MWL, "the hide landed");
@@ -3984,6 +5235,135 @@ mod iocm_anyclass_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Guard 0: a note the archive does not hold has no hiding power.
+    ///
+    /// `batch_add` records a note's references the moment the note is parsed,
+    /// but the manifest write happens in a later flush that can fail. Hiding on
+    /// a failed note would also make the audit row cite an object nobody can
+    /// open - the trail would name evidence that does not exist.
+    #[test]
+    fn a_reference_from_an_unstored_note_hides_nothing() {
+        let root = unique_root("note_not_stored");
+        let state = build_state(&root, true);
+        seed_visible_instance(&state);
+
+        // The reference is present, but the note is NOT in committed_notes -
+        // exactly the state left behind by a failed note write.
+        let mut batch = super::ManifestBatch::default();
+        batch.rejections.push((
+            CT.to_string(),
+            INSTANCE.to_string(),
+            INCORRECT_MWL,
+            NOTE.to_string(),
+        ));
+        assert!(batch.committed_notes.is_empty());
+        super::apply_rejections(&state, &batch, "tester");
+
+        assert_eq!(
+            stored_reason(&state),
+            NOT_REJECTED_REASON,
+            "the instance named by an unstored note stays visible"
+        );
+
+        // And nothing was journalled: no row may cite a note the archive
+        // cannot produce.
+        let dir = PathBuf::from(&state.config.btree.audit_dir);
+        let mut found = String::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                found.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+        assert!(
+            !found.contains(NOTE),
+            "no audit row may cite an unstored note: {found}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `commit_manifests` promotes a note ONLY when its own study write
+    /// succeeded. This is the mechanism the guard above relies on.
+    #[test]
+    fn a_note_is_committed_only_when_its_own_study_write_succeeds() {
+        let mut batch = super::ManifestBatch::default();
+        assert!(batch.committed_notes.is_empty());
+
+        // A note pending in a study that is not in `studies` cannot have been
+        // written, so the promotion loop must leave it out.
+        batch
+            .pending_notes
+            .insert(NOTE.to_string(), "9.9.9.no-such-study".to_string());
+
+        let root = unique_root("note_commit");
+        let state = build_state(&root, true);
+        super::commit_manifests(&state, &mut batch);
+        assert!(
+            !batch.committed_notes.contains(NOTE),
+            "a note whose study was never written must not be promoted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two notes naming different SOPs for the SAME reason must stay two
+    /// citations. Grouping by (study, reason) alone counted both targets under
+    /// one note, so the audit cited evidence that supported only the first
+    /// hide.
+    #[test]
+    fn each_note_cites_only_the_targets_it_names() {
+        let root = unique_root("two_notes");
+        let state = build_state(&root, true);
+        seed_visible_instances(&state, &[INSTANCE, SECOND_INSTANCE]);
+
+        const NOTE_B: &str = "1.2.840.10008.5.1.4.1.1.88.22.10";
+        let mut batch = super::ManifestBatch::default();
+        batch.rejections.push((
+            CT.to_string(),
+            INSTANCE.to_string(),
+            INCORRECT_MWL,
+            NOTE.to_string(),
+        ));
+        batch.rejections.push((
+            CT.to_string(),
+            SECOND_INSTANCE.to_string(),
+            INCORRECT_MWL,
+            NOTE_B.to_string(),
+        ));
+        batch.committed_notes.insert(NOTE.to_string());
+        batch.committed_notes.insert(NOTE_B.to_string());
+        super::apply_rejections(&state, &batch, "tester");
+
+        let dir = PathBuf::from(&state.config.btree.audit_dir);
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("audit dir").flatten() {
+            rows.push(std::fs::read_to_string(entry.path()).unwrap_or_default());
+        }
+        let citing_first: Vec<&String> = rows.iter().filter(|r| r.contains(NOTE)).collect();
+        let citing_second: Vec<&String> = rows.iter().filter(|r| r.contains(NOTE_B)).collect();
+        // `NOTE` is a prefix of `NOTE_B`, so count the exact citations.
+        assert!(
+            citing_first
+                .iter()
+                .any(|r| r.contains(&format!("\"{NOTE}\""))),
+            "the first note's own row must exist: {rows:?}"
+        );
+        assert!(
+            citing_second
+                .iter()
+                .any(|r| r.contains(&format!("\"{NOTE_B}\""))),
+            "the second note's own row must exist: {rows:?}"
+        );
+        // Each row counts exactly the ONE target its own note named.
+        for r in &rows {
+            assert!(
+                r.contains("\"count\":1"),
+                "no row may merge two notes' targets: {r}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The trail is evidence, not a precondition: a hide whose audit append
     /// fails must still hide. Refusing the sequester because the audit disk is
     /// full would leave a patient-safety image visible to satisfy a logging
@@ -4000,13 +5380,7 @@ mod iocm_anyclass_tests {
         let mut state = state;
         state.config.btree.audit_dir = blocked.to_string_lossy().to_string();
 
-        let mut batch = super::ManifestBatch::default();
-        batch.rejections.push((
-            CT.to_string(),
-            INSTANCE.to_string(),
-            PATIENT_SAFETY,
-            NOTE.to_string(),
-        ));
+        let batch = batch_with_committed_note(CT, INSTANCE, PATIENT_SAFETY, NOTE);
         super::apply_rejections(&state, &batch, "tester");
 
         assert_eq!(
@@ -4021,25 +5395,40 @@ mod iocm_anyclass_tests {
     /// The trust gate must NOT touch Quality: an AI-result rejection stays
     /// class-bounded, so it can never hide a diagnostic image whatever the
     /// deployment's trust setting.
+    ///
+    /// The CT half alone is VACUOUS as a test of the gate: Quality is
+    /// class-bounded, so a CT reference is refused by the SCOPE rule whether
+    /// or not the gate fires. The second half therefore uses an in-scope
+    /// AI-result instance, which must be hidden even with `anyclass_enable`
+    /// off - if the trust gate ever blocks every Quality note, that assertion
+    /// is what fails.
     #[test]
     fn a_quality_note_is_never_gated_and_never_hides_a_ct() {
         let root = unique_root("quality");
         let state = build_state(&root, false);
         seed_visible_instance(&state);
 
-        let mut batch = super::ManifestBatch::default();
-        batch.rejections.push((
-            CT.to_string(),
-            INSTANCE.to_string(),
-            QUALITY_REASON_CODE,
-            NOTE.to_string(),
-        ));
+        let batch = batch_with_committed_note(CT, INSTANCE, QUALITY_REASON_CODE, NOTE);
         super::apply_rejections(&state, &batch, "tester");
 
         assert_eq!(
             stored_reason(&state),
             NOT_REJECTED_REASON,
             "Quality is class-bounded: a CT reference is out of scope"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Positive half: an in-scope AI-result target IS hidden with the
+        // feature off, because Quality is not an AnyClass reason.
+        let root = unique_root("quality_in_scope");
+        let state = build_state(&root, false);
+        seed_visible_instance_as(&state, AI_RESULT);
+        let batch = batch_with_committed_note(AI_RESULT, INSTANCE, QUALITY_REASON_CODE, NOTE);
+        super::apply_rejections(&state, &batch, "tester");
+        assert_eq!(
+            stored_reason(&state),
+            QUALITY_REASON_CODE,
+            "an in-scope Quality note is honoured without anyclass_enable"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

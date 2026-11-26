@@ -1,17 +1,25 @@
 // Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
 
-//! property-based shadow-read test - 50 000 random QIDO-ish cases.
+//! Property-based shadow-INDEX test - 50 000 random QIDO-ish cases.
 //!
-//! The safety invariant is that SQLite (primary) and the B-tree (shadow)
-//! can never diverge, so a byte-for-byte QIDO comparison always agrees.
+//! SCOPE, stated precisely: this file exercises the SHADOW INDEX only. It does
+//! NOT compare the primary and shadow query paths. The property below writes
+//! straight into a `DailyIndexSet` and reads the same bytes back, so it can
+//! prove the index round-trips an arbitrary study - and nothing at all about
+//! whether the production dual-write path agrees with the primary tier. A
+//! dual-write that silently skips a study still passes here, because the
+//! skipped path is never taken.
+//!
+//! A primary/shadow QIDO parity gate would have to feed the same inputs
+//! through BOTH readers and compare their responses; that is a different test.
 //! Two properties are checked under random input:
 //!
 //! 1. **Determinism** - from the same raw DICOM search inputs, the
 //!    empty-field generators produce identical StudyInstanceUID / PatientID /
-//!    PatientName. This is exactly what lets both tiers derive the same
-//!    values and return identical JSON.
-//! 2. **Shadow idx consistency** - every study pushed through the dual-write
-//!    path lands in the date + modality `.idx` and reads back identically.
+//!    PatientName. This is what lets both tiers derive the same values from
+//!    the same manifest.
+//! 2. **Shadow idx round trip** - every study written into the date + modality
+//!    `.idx` reads back identically.
 //!
 //! `proptest` runs the configured cases (default 256; CI passes `--cases=50000`
 //! via `PROPTEST_CASES`). The plan's 50 000-case gate is set through that env
@@ -94,6 +102,31 @@ prop_compose! {
     }
 }
 
+/// The inputs the DETERMINISM property actually reads: everything that feeds
+/// `generate_study_instance_uid`. It deliberately omits the hash, day and
+/// pre-existing UID, which that function never consults - generating them made
+/// a failing case print data the assertion could not depend on.
+fn arbitrary_uid_inputs() -> impl Strategy<Value = RandomStudy> {
+    (
+        "[A-Za-z0-9]{2,10}",
+        proptest::option::of("20[0-9]{6}"),
+        proptest::option::of("[0-9]{6}"),
+        proptest::option::of("[A-Z]{0,6}"),
+        proptest::prop_oneof![Just("CT"), Just("MR")].prop_map(|s: &str| s.to_string()),
+    )
+        .prop_map(|(pid, sdate, stime, acc, modality)| RandomStudy {
+            patient_id_opt: Some(pid),
+            study_date_opt: sdate,
+            study_time_opt: stime,
+            accession_opt: acc,
+            modality,
+            // Unused by the determinism property; fixed rather than generated.
+            study_uid_opt: None,
+            blake3: [0u8; 32],
+            day: *b"20240115",
+        })
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 50_000, // The plan's 50 000-case gate. No file I/O here, so fast.
@@ -104,11 +137,8 @@ proptest! {
     /// patient ID and patient name - the property that makes SQLite == B-tree.
     #[test]
     fn empty_field_generation_is_deterministic(
-        s in arbitrary_std_study(),
-        seed in any::<u32>(),
+        s in arbitrary_uid_inputs(),
     ) {
-        // The BLAKE3 inputs are stable; the seed param only widens the space.
-        let _ = seed;
         let pid = s.patient_id_opt.as_deref().unwrap_or("");
         let a = generate_study_instance_uid(
             pid,

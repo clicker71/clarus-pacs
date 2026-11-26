@@ -214,20 +214,33 @@ pub(crate) fn repair_torn_newline_tail(path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     // Walk back to the last complete row and cut everything after it.
-    let mut all = Vec::new();
-    OpenOptions::new()
-        .read(true)
-        .open(path)?
-        .read_to_end(&mut all)?;
-    let keep = all
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    OpenOptions::new()
-        .write(true)
-        .open(path)?
-        .set_len(keep as u64)
+    //
+    // Scanned BACKWARD in bounded blocks rather than reading the whole bucket:
+    // the answer is the final newline, which is normally within the last row
+    // (129 bytes), so reading a multi-megabyte day file to find it made the
+    // torn-tail repair - a step on the first append of the day - proportional
+    // to the file instead of to the damage. The block size is the row width:
+    // one iteration finds the separator for any tail shorter than a row, which
+    // is every tail a single interrupted write can leave.
+    let mut f = OpenOptions::new().read(true).open(path)?;
+    let mut block = [0u8; ROW_LEN];
+    let mut end = len;
+    let keep = loop {
+        if end == 0 {
+            break 0;
+        }
+        let take = (end as usize).min(ROW_LEN);
+        let start = end - take as u64;
+        f.seek(SeekFrom::Start(start))?;
+        let buf = &mut block[..take];
+        f.read_exact(buf)?;
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            break start + i as u64 + 1;
+        }
+        end = start;
+    };
+    drop(f);
+    OpenOptions::new().write(true).open(path)?.set_len(keep)
 }
 
 /// Full path of a day's `sop_owner.idx` file.
@@ -294,7 +307,10 @@ impl SopOwnerIndex {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.poisoned = true;
-                let code = e.raw_os_error().unwrap_or(0);
+                // NEVER 0: `write_all` reports a zero-length write as
+                // `ErrorKind::WriteZero`, which carries no raw OS code, and
+                // this function's contract is a NONZERO errno on failure.
+                let code = super::date::nonzero_errno(&e);
                 // Do not run the Drop glue (it would call `free`).
                 std::mem::forget(e);
                 Err(code)
@@ -357,7 +373,18 @@ fn trim_pad(field: &[u8]) -> Vec<u8> {
     field[..end].to_vec()
 }
 
-/// Read an immutable day segment's rows, skipping a torn tail row.
+/// Read an immutable day segment's rows.
+///
+/// A TORN final row is skipped: a crash mid-append leaves a partial row at the
+/// tail, and refusing the whole segment for that would lose every complete row
+/// before it - the opposite of what a tail-tolerant index is for.
+///
+/// A bad newline anywhere ELSE is `InvalidData`, not a stop. The loop used to
+/// `break` and return `Ok` with everything it had read so far, so one damaged
+/// row silently truncated the snapshot: a later intact SOP row disappeared from
+/// `find`, which then reported "no owner" for a SOP the index does hold. An
+/// absent owner is a permission for a conflicting writer; an UNREADABLE owner
+/// must never be mistaken for it.
 fn read_segment(path: &Path) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut buf = Vec::new();
     File::open(path)?.read_to_end(&mut buf)?;
@@ -366,8 +393,15 @@ fn read_segment(path: &Path) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     while off + ROW_LEN <= buf.len() {
         let row = &buf[off..off + ROW_LEN];
         if row[ROW_LEN - 1] != b'\n' {
-            // Torn tail row - stop (rest is garbage).
-            break;
+            // Only the LAST full-width window may be torn; anything earlier is
+            // interior damage, and the rows after it are still on disk.
+            if off + ROW_LEN == buf.len() {
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sop_owner segment has an interior row without a newline",
+            ));
         }
         if let Some(pair) = decode_row(row) {
             rows.push(pair);
@@ -549,10 +583,56 @@ mod tests {
         // Day2 does not have the other SOPs; day1 does.
         assert!(s2.find(b"1.2.1").is_none());
         assert_eq!(s1.find(b"1.2.1").unwrap(), b"study-A");
-        assert!(s1.find(b"1.2.3").unwrap() != b"smoke"); // exists in day1 under study-X
+        // The EXACT owner, not merely "something other than one value":
+        // `!= b"smoke"` passed for study-C (day2's owner) as well, so it could
+        // not tell a correct older-segment snapshot from one that had been
+        // overwritten by the newer day. Loading day2 must not change day1.
+        assert_eq!(s1.find(b"1.2.3").unwrap(), b"study-X");
         // Fresh SOP is absent in both.
         assert!(s1.find(b"9.9.9").is_none());
         assert!(s2.find(b"9.9.9").is_none());
+    }
+
+    /// Interior damage is an ERROR, not the end of the snapshot.
+    ///
+    /// `read_segment` stopped at the first row whose last byte was not a
+    /// newline and returned what it had read so far. A single damaged row in
+    /// the middle therefore hid every row after it, and `find` answered "no
+    /// owner" for a SOP the file plainly contains - a permission for a
+    /// conflicting writer rather than a refusal. Only the FINAL row may be
+    /// torn (a crash mid-append); anything earlier is corruption.
+    #[test]
+    fn interior_damage_is_an_error_not_a_truncated_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = open_appender(dir.path(), b"20240115").unwrap();
+        idx.append(&encode("1.2.1", "study-1")).unwrap();
+        idx.append(&encode("1.2.2", "study-2")).unwrap();
+        idx.append(&encode("1.2.3", "study-3")).unwrap();
+        drop(idx);
+
+        let path = file_path(dir.path(), b"20240115");
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Corrupt the terminator of the FIRST row only; rows 2 and 3 stay
+        // intact and are what a truncated snapshot would hide.
+        bytes[ROW_LEN - 1] = b'x';
+        std::fs::write(&path, &bytes).unwrap();
+
+        let loaded = SopOwnerSnapshot::load(dir.path(), b"20240115");
+        assert!(
+            matches!(loaded, Err(SopOwnerError::Io(ref e)) if e.kind() == io::ErrorKind::InvalidData),
+            "an interior bad row must not read as a short snapshot"
+        );
+
+        // The torn FINAL row keeps the tail-tolerant behaviour: the complete
+        // rows before it still load.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[ROW_LEN - 1] = b'\n';
+        bytes.extend_from_slice(&[b'7'; ROW_LEN - 1]);
+        std::fs::write(&path, &bytes).unwrap();
+        let snap = SopOwnerSnapshot::load(dir.path(), b"20240115")
+            .expect("a torn tail is tolerated")
+            .expect("segment exists");
+        assert_eq!(snap.find(b"1.2.3").unwrap(), b"study-3");
     }
 
     #[test]

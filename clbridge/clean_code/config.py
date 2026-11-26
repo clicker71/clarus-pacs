@@ -4,6 +4,7 @@
 """Bridge: nginx-style config parser - 0 dependencies, KISS."""
 
 import logging
+import os
 from urllib.parse import urlsplit
 
 VERSION = "0.3.4-beta"
@@ -14,6 +15,10 @@ class ConfParser:
 
     def __init__(self, path):
         self.values = {}  # (section, key) -> value
+        # The file this config was read from. Path-valued settings under it
+        # (the mTLS pair) are resolved relative to its directory, which is what
+        # an operator writing `certs/client.pem` means.
+        self.path = path
         self._parse(path)
 
     def _parse(self, path):
@@ -77,6 +82,21 @@ class ConfParser:
 # ---------------------------------------------------------------------------
 # One clarus_url knob for DICOMweb (replaces host/clarus_port)
 # ---------------------------------------------------------------------------
+def _redact_url_userinfo(url):
+    """Return `url` with any `user:password@` part replaced by `***`.
+
+    Only for diagnostics. Uses string surgery rather than urlsplit because the
+    URLs reaching it are the MALFORMED ones - the cases where a structural
+    parser has already refused to give a usable answer, which is exactly when
+    the operator still needs the value quoted back to find it in their config.
+    """
+    at = url.find("@")
+    scheme_end = url.find("://")
+    if at <= 0 or scheme_end < 0 or at < scheme_end:
+        return url
+    return url[: scheme_end + 3] + "***@" + url[at + 1 :]
+
+
 def validate_clarus_url(cfg):
     """Validate the [dicomweb] clarus_url knob. Raises ValueError on failure.
 
@@ -108,15 +128,43 @@ def validate_clarus_url(cfg):
         )
 
     parts = urlsplit(clarus_url)
+    # Diagnostics must not echo the raw URL before the credential check below
+    # has run: a malformed URL can still carry `user:password@`, and an error
+    # message is the one place a secret is guaranteed to be printed.
+    _safe = _redact_url_userinfo(clarus_url)
     if parts.scheme.lower() not in ("http", "https"):
         raise ValueError(
-            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            f"Configuration error: [dicomweb] clarus_url '{_safe}' "
             "has invalid scheme (must be http or https)"
         )
     if not parts.hostname:
         raise ValueError(
-            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            f"Configuration error: [dicomweb] clarus_url '{_safe}' "
             "has no host (expected scheme://host[:port]/dicomweb)"
+        )
+
+    # A query string or fragment is not part of a DICOMweb base URL. STOW
+    # appends `/studies` to the URL as a STRING, so `...?site=a` becomes
+    # `...?site=a/studies` - the path stays bare and the query grows. A
+    # fragment has the same effect: everything after '#' is never sent.
+    if parts.query or parts.fragment:
+        raise ValueError(
+            "Configuration error: [dicomweb] clarus_url must be a plain base "
+            "URL - remove the query string ('?') and fragment ('#'); the "
+            "bridge appends its own path segments to it"
+        )
+
+    # A URL carrying `user:password@` is refused outright. This bridge has no
+    # way to use those credentials (every HTTP client here is built from the
+    # URL plus an optional mTLS pair), so accepting them only parked a
+    # plaintext secret in a config file and in every message that printed the
+    # URL - including the startup INFO line. Refusing is the honest answer and
+    # keeps the secret out of the logs by construction.
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(
+            "Configuration error: [dicomweb] clarus_url must not carry "
+            "credentials (user:password@) - the bridge cannot use them; "
+            "configure mTLS or an authenticating proxy instead"
         )
 
     # `urlsplit` accepts any text after ':' as the netloc, so `host:abc` and
@@ -130,7 +178,7 @@ def validate_clarus_url(cfg):
         port = parts.port
     except ValueError:
         raise ValueError(
-            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            f"Configuration error: [dicomweb] clarus_url '{_safe}' "
             "has an invalid port (expected a number between 1 and 65535)"
         ) from None
     # `urlsplit` returns 0 for ':0' without raising. Port 0 means "pick any
@@ -138,7 +186,7 @@ def validate_clarus_url(cfg):
     # accepting it started the bridge with a URL it can never reach.
     if port == 0:
         raise ValueError(
-            f"Configuration error: [dicomweb] clarus_url '{clarus_url}' "
+            f"Configuration error: [dicomweb] clarus_url '{_safe}' "
             "has port 0 (expected a number between 1 and 65535)"
         )
 
@@ -154,6 +202,32 @@ def validate_clarus_url(cfg):
         )
 
     return clarus_url, tls_cert, tls_key
+
+
+def resolve_config_path(value, config_path):
+    """A path from the config file, resolved against the file's directory.
+
+    A relative path in a config file means "relative to that file" - the
+    operator wrote `certs/client.pem` next to the config, not next to whatever
+    working directory the service manager happened to start the process in.
+    An absolute path is returned unchanged, and a path that is already
+    resolvable from the working directory is left alone (that is how the
+    deployment ran before this rule, and breaking it would be a silent
+    regression for anyone who relied on it).
+    """
+    if not value:
+        return value
+    if os.path.isabs(value):
+        return value
+    base = os.path.dirname(os.path.abspath(config_path)) if config_path else ""
+    if not base:
+        return value
+    candidate = os.path.join(base, value)
+    # Prefer the config-relative path when it exists; otherwise keep the value
+    # as written so a working-directory-relative deployment keeps working.
+    if os.path.exists(candidate) and not os.path.exists(value):
+        return candidate
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +295,15 @@ def parse_peers_conf(path):
 
                     if not (1 <= port <= 65535):
                         raise ValueError(f"port {port} out of range")
+
+                    # A peer must name a host. `CT :104` parses cleanly through
+                    # `rsplit(":", 1)` and would otherwise be registered with an
+                    # empty host: every later lookup compares against "" and
+                    # never matches, so the peer silently occupies a slot and
+                    # accepts nothing. Reject it through the same malformed-
+                    # address handler, which reports the line number.
+                    if not host:
+                        raise ValueError("empty host")
 
                     peers.append((ae_title, host, port))
                 except (ValueError, IndexError):

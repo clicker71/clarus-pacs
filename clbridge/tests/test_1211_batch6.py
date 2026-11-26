@@ -153,7 +153,9 @@ def test_a_serialization_failure_is_per_sop(monkeypatch):
     # The transport layer must never be reached: this batch must fail before
     # a POST could even be attempted.
     monkeypatch.setattr(
-        hh, "_http_retry", lambda fn: pytest.fail("POST attempted with no part")
+        hh,
+        "_http_retry",
+        lambda fn, **_kwargs: pytest.fail("POST attempted with no part"),
     )
 
     payloads = [
@@ -198,7 +200,7 @@ def test_a_serialization_failure_keeps_the_other_parts(monkeypatch):
         status_code = 200
         text = "{}"
 
-    def _retry(fn):
+    def _retry(fn, **_kwargs):
         sent["called"] = True
         return _Resp()
 
@@ -229,28 +231,44 @@ def test_stow_single_instance_returns_a_verdict_on_a_serialization_error(
         raise ValueError("invalid value for VR US")
 
     monkeypatch.setattr(hh, "dcmwrite", _write)
-    monkeypatch.setattr(hh, "_http_retry", lambda fn: pytest.fail("POST attempted"))
+    monkeypatch.setattr(
+        hh, "_http_retry", lambda fn, **_kwargs: pytest.fail("POST attempted")
+    )
     status, _http, msg = hh.stow_single_instance(_Bad(), "http://127.0.0.1:1")
     assert status == 0xC000
     assert "Serialize" in msg
 
 
 # ---------------------------------------------------------------------------
-# R5 - IMAGE level is refused, not relabelled as study rows
+# R5 - an IMAGE level query never comes back as relabelled study rows
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("root", ["study", "patient"])
-def test_an_image_level_query_is_refused(root):
+def test_an_image_level_query_walks_the_instance_level():
+    """R5's rule still holds: an IMAGE level answer may not be a study row
+    with a relabelled (0008,0052). Since 20.11 the level is served properly
+    (PS3.4 Table C.6-4 / standard/ps3.4/image-level-C.6-4.json), so the
+    answer is either real instance rows or a refusal of the walk - never the
+    old fall-through. The origin is unreachable, which is the walk failing."""
+    from unittest.mock import patch
+
     from clean_code.handlers import cfind
 
     from tests.conftest import make_fake_find_event
 
     event = make_fake_find_event()
     event.identifier.QueryRetrieveLevel = "IMAGE"
-    fn = cfind._handle_study_root if root == "study" else cfind._handle_patient_root
-    out = list(fn(event, "http://127.0.0.1:1/clarus/dicomweb", False, 100))
-    assert out == [
-        (0xA900, None)
-    ], "IMAGE level has no study-row equivalent; it must be refused"
+    with patch("clean_code.handlers.cfind._qido_request", return_value=[]) as mock_qido:
+        out = list(
+            cfind._handle_study_root(
+                event, "http://127.0.0.1:1/clarus/dicomweb", False, 100
+            )
+        )
+    # The walk starts at the study hop of the hierarchy (PS3.4 C.4.1.3.1.1)
+    # and hands the identifier to the instance-level search, not to a plain
+    # study render that would answer with relabelled study rows.
+    assert mock_qido.call_args[0][0].endswith("/studies")
+    assert "SOPInstanceUID" not in mock_qido.call_args[0][1]
+    # An empty study set is a complete answer: no rows, no error.
+    assert out == [(0x0000, None)]
 
 
 def test_an_unknown_level_is_refused_too():
@@ -317,7 +335,7 @@ def test_a_malformed_batch_response_maps_to_a700(monkeypatch):
         status_code = 200
         text = json.dumps({"00081198": {"Value": "oops"}})
 
-    monkeypatch.setattr(hh, "_http_retry", lambda fn: _Resp())
+    monkeypatch.setattr(hh, "_http_retry", lambda fn, **_kwargs: _Resp())
     results, _backoff = hh.stow_batch_instances(
         [("1.2.3", None, b"raw")], "http://127.0.0.1:1"
     )
@@ -443,24 +461,65 @@ def test_a_job_for_a_busy_peer_is_handed_back(tmp_path):
 
 
 def test_the_worker_loop_consults_the_peer_gate():
-    """F13 moved the busy-peer guard INTO the pick: the worker passes a
-    `skip` predicate to `pick_pending_job` that references the gate, so a job
-    for a busy peer is never claimed in the first place."""
+    """F13 moved the busy-peer guard INTO the pick; P6 made it a RESERVATION.
+
+    The pick must carry a `reserve` callback that claims the peer atomically.
+    An advisory `skip` read followed by a separate claim let two workers both
+    find the peer free and claim two jobs for it - one then parked in the gate
+    while a job for a DIFFERENT peer sat unserved. The reservation moves that
+    decision inside the pick, where it is one test-and-set.
+    """
     import inspect
 
     import clean_code.handlers.cmove as cm
 
     src = inspect.getsource(cm._cmove_worker)
-    # The pick must carry a skip predicate that consults the gate. A skip
-    # that never references `_peer_is_busy` would claim a busy peer's job
-    # again, which is the starvation this guard exists to prevent.
     assert "pick_pending_job(" in src
-    assert "skip=" in src, "the pick must carry a skip predicate"
-    assert "_peer_is_busy(" in src, "the skip predicate must consult the gate"
-    # The predicate must be wired into the SAME pick call: everything from
-    # `skip=` onward must mention the gate.
-    pick_body = src.split("skip=", 1)[1]
-    assert "_peer_is_busy(" in pick_body, "the gate must gate the pick itself"
+    # The RESERVATION is what a worker must go through. `skip=` alone is only
+    # an advisory filter and is not enough on its own.
+    assert "reserve=" in src, "the pick must carry a peer reservation"
+    assert "_try_reserve_peer(" in src, "the reservation must consult the gate"
+    # A job handed back because the reservation was lost must not burn a retry.
+    assert (
+        "release=" in src
+    ), "a candidate whose claim is lost must release its reservation"
+    pick_body = src.split("reserve=", 1)[1]
+    assert "_try_reserve_peer(" in pick_body, "the gate must gate the pick itself"
+
+
+def test_the_peer_reservation_is_a_single_test_and_set():
+    """Two workers must not both reserve the same peer. The reservation is one
+    atomic operation under the gate lock, so the second caller is refused
+    instead of joining a queue it would park in."""
+    import threading
+
+    import clean_code.handlers.cmove as cm
+
+    key = ("10.9.9.9", 11112, "RESERVE_TEST")
+    with cm._ASSOC_GATE_LOCK:
+        cm._ASSOC_BUSY.pop(key, None)
+
+    results = []
+    entered = threading.Event()
+
+    def _hold():
+        results.append(cm._try_reserve_peer(*key))
+        entered.set()
+        # Hold the reservation until the other thread has tried.
+        threading.Event().wait(0.3)
+        cm._job_gate_exit(*key)
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    assert entered.wait(2.0)
+    # The holder owns the peer: this thread must be refused, not queued.
+    assert (
+        cm._try_reserve_peer(*key) is False
+    ), "a second reservation of the same peer must fail, not block"
+    holder.join(timeout=5.0)
+    # Released: the peer is reservable again.
+    assert cm._try_reserve_peer(*key) is True
+    cm._job_gate_exit(*key)
 
 
 def test_the_handback_does_not_burn_a_retry(tmp_path):

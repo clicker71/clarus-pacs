@@ -185,25 +185,64 @@ pub fn extract_first_us(data: &[u8], tag: (u16, u16)) -> Option<u16> {
 /// `None` when the element header is not in `data` (a bounded prefix that does
 /// not reach PixelData) or the dataset is Implicit VR (no VR on the wire).
 pub fn pixel_data_vr(data: &[u8]) -> Option<[u8; 2]> {
+    pixel_data_element(data).vr
+}
+
+/// Whether an instance carries PixelData (7FE0,0010), and its wire VR when the
+/// dataset is Explicit VR.
+///
+/// The metadata renderer STOPS at PixelData, so the rendered JSON never
+/// contains the element - yet the WADO bulk-data injector has to decide whether
+/// to advertise a `BulkDataURI` for it. Two facts are needed and neither is in
+/// the JSON: whether the element EXISTS (a Structured Report, an SR, a
+/// presentation state and every other non-image SOP class has no PixelData, and
+/// inventing one publishes a reference that resolves to nothing) and which VR
+/// to label it with (an encapsulated value is `OB`, a native one `OW`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelDataElement {
+    /// The element is present in `data`.
+    pub present: bool,
+    /// The two VR bytes from the element header; `None` for Implicit VR, where
+    /// no VR is on the wire and the caller must fall back to the dictionary.
+    pub vr: Option<[u8; 2]>,
+}
+
+/// Locate PixelData in `data`, reporting presence and (for Explicit VR) its VR.
+///
+/// Returns `present: false` when the walk ends without reaching the tag, which
+/// includes the bounded-prefix case where the head does not extend to it.
+pub fn pixel_data_element(data: &[u8]) -> PixelDataElement {
     let grammar = grammar_of(data);
-    if grammar.implicit() {
-        return None;
-    }
-    let mut pos = dicom_data_start(data)?;
+    let mut pos = match dicom_data_start(data) {
+        Some(p) => p,
+        None => {
+            return PixelDataElement {
+                present: false,
+                vr: None,
+            };
+        }
+    };
     let end = data.len();
     while pos + 4 <= end {
         let g = grammar.u16(data, pos);
         let e = grammar.u16(data, pos + 2);
         pos += 4;
         if (g, e) == (0x7FE0, 0x0010) {
-            if pos + 2 > end {
-                return None;
-            }
-            return Some([data[pos], data[pos + 1]]);
+            // Explicit VR carries the two VR bytes right after the tag; an
+            // Implicit dataset has the length there instead, so no VR is read.
+            let vr = if grammar.implicit() || pos + 2 > end {
+                None
+            } else {
+                Some([data[pos], data[pos + 1]])
+            };
+            return PixelDataElement { present: true, vr };
         }
         if g == 0xFFFE {
             if pos + 4 > end {
-                return None;
+                return PixelDataElement {
+                    present: false,
+                    vr: None,
+                };
             }
             let len = grammar.u32(data, pos) as usize;
             pos += 4;
@@ -214,10 +253,16 @@ pub fn pixel_data_vr(data: &[u8]) -> Option<[u8; 2]> {
             continue;
         }
         if !skip_element(data, &mut pos, grammar) {
-            return None;
+            return PixelDataElement {
+                present: false,
+                vr: None,
+            };
         }
     }
-    None
+    PixelDataElement {
+        present: false,
+        vr: None,
+    }
 }
 
 // ===========================================================================
@@ -521,6 +566,48 @@ fn is_extended_vr(vr_bytes: [u8; 2]) -> bool {
             | b"UR"
             | b"UT"
             | b"UV"
+    )
+}
+
+/// The two VR bytes of an element header use the extended (reserved + 32-bit
+/// length) form.
+///
+/// Public because a writer that synthesizes an Explicit VR LE dataset must
+/// choose the same header shape a reader will parse; a private copy in the
+/// writer is a second protocol table that can drift from this one.
+#[must_use]
+pub fn vr_uses_extended_header(vr: [u8; 2]) -> bool {
+    is_extended_vr(vr)
+}
+
+/// Whether a VR's value is a character string, which decides its pad byte.
+///
+/// PS3.5 6.2: an odd-length value is padded to even, and "for VRs of type
+/// String the padding character shall be a SPACE (20H), otherwise a NULL
+/// (00H)". The string VRs are the ones whose Value Representation is defined
+/// as a character repertoire; the binary ones (OB/OW/OF/OD/OL/OV/UN/SQ/AT,
+/// US/SS/UL/SL/UV/SV/FL/FD) pad with NULL.
+#[must_use]
+pub fn vr_pads_with_space(vr: [u8; 2]) -> bool {
+    matches!(
+        &vr,
+        b"AE"
+            | b"AS"
+            | b"CS"
+            | b"DA"
+            | b"DS"
+            | b"DT"
+            | b"IS"
+            | b"LO"
+            | b"LT"
+            | b"PN"
+            | b"SH"
+            | b"ST"
+            | b"TM"
+            | b"UC"
+            | b"UI"
+            | b"UR"
+            | b"UT"
     )
 }
 

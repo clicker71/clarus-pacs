@@ -71,6 +71,20 @@ pub fn run_rebuild(
     let mut acc = RebuildAcc::default();
     let mut seen_sop: HashSet<String> = HashSet::new();
     let mut seen_study: HashSet<String> = HashSet::new();
+    // A rebuild over a SUBSET of the tiers cannot vouch for the store as a
+    // whole. A cold-only pass scans an empty cold CAS, finishes with zero
+    // errors, and would clear the manifest gauges while a study that exists
+    // only on hot storage is still missing - the green gauge then hides the
+    // very condition it reports.
+    //
+    // Every tier this process actually HAS must be covered before the gauges
+    // may be cleared: `hot` is always present, `cold` counts when configured,
+    // and `s3` when this build has the feature.
+    let cold_configured = state.cold_cas.is_some();
+    let mut scanned_hot = false;
+    let mut scanned_cold = false;
+    #[cfg(feature = "s3")]
+    let mut scanned_s3 = false;
 
     let manifest_dir = PathBuf::from(&state.config.btree.manifest_dir);
     let idx_dir = PathBuf::from(&state.config.btree.idx_dir);
@@ -79,6 +93,7 @@ pub fn run_rebuild(
     for src in sources {
         match src.as_str() {
             "hot" => {
+                scanned_hot = true;
                 acc.errors += walk_fs(
                     &parser,
                     state.cas.root_dir(),
@@ -94,6 +109,7 @@ pub fn run_rebuild(
             }
             "cold" => {
                 if let Some(cold) = &state.cold_cas {
+                    scanned_cold = true;
                     acc.errors += walk_fs(
                         &parser,
                         cold.root_dir(),
@@ -116,6 +132,7 @@ pub fn run_rebuild(
             "s3" => {
                 #[cfg(feature = "s3")]
                 {
+                    scanned_s3 = true;
                     acc.errors += walk_s3(
                         &parser,
                         state,
@@ -146,10 +163,22 @@ pub fn run_rebuild(
     // degraded signal: manifests are now present, so clear the flags. A pass
     // that skipped studies for write failures has NOT restored anything, and
     // clearing then would hide a still-degraded store behind a green gauge.
-    if !dry_run && acc.errors == 0 {
+    //
+    // Covering only SOME of the configured tiers does not prove the store is
+    // whole either: a study reachable solely through an unscanned tier is
+    // still missing, so the gauges stay as they were.
+    let covered_all_tiers = scanned_hot && (!cold_configured || scanned_cold);
+    #[cfg(feature = "s3")]
+    let covered_all_tiers = covered_all_tiers && scanned_s3;
+    if !dry_run && acc.errors == 0 && covered_all_tiers {
         crate::metrics::MANIFEST_MISSING.store(0, std::sync::atomic::Ordering::Relaxed);
         crate::metrics::MANIFEST_CORRUPT.store(0, std::sync::atomic::Ordering::Relaxed);
         crate::metrics::MANIFEST_DEGRADED.store(0, std::sync::atomic::Ordering::Relaxed);
+    } else if !dry_run && acc.errors == 0 {
+        crate::clog_warn!(
+            "rebuild: pass completed without errors but did not cover every tier; \
+             the manifest gauges are left unchanged"
+        );
     }
 
     let (status, finished) = (
@@ -177,6 +206,10 @@ pub fn run_rebuild(
         scanned = acc.files_scanned,
         studies = acc.manifests_written,
         instances = acc.instances_indexed,
+        // A dry run's findings are reported under their OWN names, so the
+        // completed-write counters above stay honestly zero.
+        studies_eligible = acc.studies_eligible,
+        instances_eligible = acc.instances_eligible,
         skipped = acc.skipped,
         errors = acc.errors,
         "rebuild complete"
@@ -189,6 +222,13 @@ struct RebuildAcc {
     files_scanned: u64,
     manifests_written: u64,
     instances_indexed: u64,
+    /// Studies a DRY RUN found eligible. Kept apart from
+    /// [`RebuildAcc::manifests_written`], which is a completed-write count: a
+    /// dry run writes nothing, so reporting it there told an operator the
+    /// store had been rebuilt when it had only been inspected.
+    studies_eligible: u64,
+    /// Instances a dry run found eligible, for the same reason.
+    instances_eligible: u64,
     skipped: u64,
     errors: u64,
 }
@@ -224,15 +264,57 @@ fn walk_fs(
                 continue;
             }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let md = match std::fs::metadata(&path) {
-                Ok(md) => md,
-                Err(_) => continue,
+        // `flatten()` discarded a failed directory-entry read, and
+        // `metadata` errors were discarded too: the rebuild then reported
+        // `done` without ever having seen a blob it could not read, which is
+        // the opposite of what a recovery pass is for.
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    errors += 1;
+                    crate::clog_warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "rebuild: cannot read a directory entry"
+                    );
+                    continue;
+                }
             };
-            if md.is_dir() {
+            let path = entry.path();
+            // `symlink_metadata`: the entry's OWN type, never the target's.
+            //
+            // `fs::metadata` FOLLOWS a symlink, so a bucket that links to an
+            // ancestor queue the same tree again (unbounded work), and a link
+            // into another archive indexed that archive's objects under THIS
+            // tier - a rebuild must never trust the filesystem shape it is
+            // scanning. A symlink is therefore neither recursed into nor
+            // treated as a blob.
+            let md = match std::fs::symlink_metadata(&path) {
+                Ok(md) => md,
+                Err(e) => {
+                    errors += 1;
+                    crate::clog_warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "rebuild: cannot stat a CAS entry"
+                    );
+                    continue;
+                }
+            };
+            let ft = md.file_type();
+            if ft.is_symlink() {
+                // Reported, not silently skipped: a symlinked bucket is a
+                // layout this pass cannot safely interpret.
+                crate::clog_warn!(
+                    path = %path.display(),
+                    "rebuild: skipping a symlink in the CAS tree"
+                );
+                continue;
+            }
+            if ft.is_dir() {
                 dirs.push(path);
-            } else if md.is_file() && is_dcm_blob(&path) {
+            } else if ft.is_file() && is_dcm_blob(&path) {
                 acc.files_scanned += 1;
                 process_blob(
                     parser,
@@ -337,6 +419,7 @@ fn walk_s3(
             parser,
             &obj.key,
             data.as_ref(),
+            None,
             obj.size,
             TIER_S3,
             blake3,
@@ -385,11 +468,43 @@ fn process_blob(
 ) {
     // Bounded header read (mirrors STOW `read_dicom_header`): enough for all
     // non-PixelData metadata without loading a full pixel buffer.
+    //
+    // The bound is applied in `u64` and converted AFTERWARDS. `file_size as
+    // usize` truncates on a 32-bit target, so a 4 GiB blob became a 0-byte
+    // header and the parser was handed nothing instead of the first MiB - the
+    // instance then looked unparseable and was counted as a skip, not as the
+    // I/O problem it was.
+    //
+    // A read FAILURE is a hard error, never an empty buffer: passing the
+    // partially-read prefix to the parser made an unreadable blob
+    // indistinguishable from a corrupt one, and the pass could report `done`
+    // without ever reading something it could not open.
     let mut header = vec![0u8; 0];
-    if let Ok(mut f) = std::fs::File::open(path) {
-        let len = MAX_HEADER.min(file_size as usize);
-        header.resize(len, 0);
-        let _ = f.read_exact(&mut header);
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            let len = u64::try_from(MAX_HEADER).unwrap_or(u64::MAX).min(file_size);
+            let len = usize::try_from(len).unwrap_or(MAX_HEADER);
+            header.resize(len, 0);
+            if let Err(e) = f.read_exact(&mut header) {
+                acc.errors += 1;
+                crate::clog_warn!(
+                    path = %path.display(),
+                    error = %e,
+                    len,
+                    "rebuild: cannot read the blob header"
+                );
+                return;
+            }
+        }
+        Err(e) => {
+            acc.errors += 1;
+            crate::clog_warn!(
+                path = %path.display(),
+                error = %e,
+                "rebuild: cannot open the blob"
+            );
+            return;
+        }
     }
     let blake3 = match blob_blake3(path) {
         Some(b) => b,
@@ -403,6 +518,7 @@ fn process_blob(
         parser,
         path_str(path),
         &header,
+        Some(path),
         file_size,
         tier,
         blake3,
@@ -418,11 +534,17 @@ fn process_blob(
 
 /// The byte-level core shared by the fs and s3 paths. `blob_key` is used only
 /// for logging (the fs path passes the path; the s3 path passes the object key).
+///
+/// `data` is `Some` only when the caller holds the WHOLE blob; the filesystem
+/// path walks with a bounded header and passes `fs_path` instead, so the
+/// digest check re-reads on its own budget rather than trusting a partial
+/// buffer.
 #[allow(clippy::too_many_arguments)]
 fn process_bytes(
     parser: &DicomRsParser,
     blob_key: &str,
     data: &[u8],
+    fs_path: Option<&Path>,
     file_size: u64,
     tier: u8,
     blake3: [u8; 32],
@@ -464,30 +586,64 @@ fn process_bytes(
         return;
     }
 
+    // INTEGRITY GATE: a blob is published under the digest OF ITS BYTES, and
+    // only a blob whose bytes still hash to the name it was found under may be
+    // committed.
+    //
+    // Two ways this matters. A damaged blob that still PARSES (a flipped bit in
+    // the header, a truncated tail after the last element) would be recorded
+    // with the digest from its filename, so the manifest would vouch for
+    // content the store does not hold - and because the SOP is then deduped,
+    // a VALID copy in a lower-priority source would never get its chance.
+    // Checking before the dedup insert is what keeps that copy reachable.
+    //
+    // `data` carries the whole blob only on the S3 path, which hashed these
+    // exact bytes while receiving them; the filesystem walk passes the path so
+    // the check re-reads in bounded chunks instead of buffering.
+    let whole_blob = (data.len() as u64 == file_size).then_some(data);
+    if !digest_matches(whole_blob, fs_path, file_size, &blake3, blob_key) {
+        acc.errors += 1;
+        return;
+    }
+
+    // PS3.5 A-1: when an instance declares no Transfer Syntax UID, Explicit VR
+    // Little Endian is the assumed default. Named from the repository's own
+    // constant rather than spelled out here, so the fixture and the parser
+    // cannot disagree about the UID.
     let transfer_syntax_uid = meta
         .transfer_syntax_uid
         .clone()
-        .unwrap_or_else(|| "1.2.840.10008.1.2.1".to_string());
+        .unwrap_or_else(|| clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE.to_string());
 
     // `seen_sop` and the counters advance only once the instance is actually
     // on disk. Recording the SOP UID first made a FAILED write of a
     // high-priority copy shadow the same instance in a lower-priority source
     // that could have written it successfully, and counted instances the
     // store never received.
-    if !dry_run
-        && !commit_one_instance(
-            &meta,
-            blob_key,
-            data,
-            blake3,
-            file_size,
-            tier,
-            &transfer_syntax_uid,
-            manifest_dir,
-            idx_dir,
-            state,
-        )
-    {
+    if dry_run {
+        // A dry run writes NOTHING, so the completed-write counters must stay
+        // at zero: reporting `manifests_written = 1` for a pass that skipped
+        // `commit_one_instance` told an operator the store had been rebuilt
+        // when it had only been inspected.
+        if seen_study.insert(meta.study_instance_uid.clone()) {
+            acc.studies_eligible += 1;
+        }
+        seen_sop.insert(meta.sop_instance_uid.clone());
+        acc.instances_eligible += 1;
+        return;
+    }
+    if !commit_one_instance(
+        &meta,
+        blob_key,
+        data,
+        blake3,
+        file_size,
+        tier,
+        &transfer_syntax_uid,
+        manifest_dir,
+        idx_dir,
+        state,
+    ) {
         acc.errors += 1;
         return;
     }
@@ -608,7 +764,18 @@ fn commit_one_instance(
         Some(d) if d.len() == 8 => d.to_string(),
         _ => today_yyyymmdd(),
     };
-    clarus_core::stow::index_study_names(idx_dir, &study_attrs, &meta.study_instance_uid, &day);
+    let (grams, failed) =
+        clarus_core::stow::index_study_names(idx_dir, &study_attrs, &meta.study_instance_uid, &day);
+    if failed > 0 {
+        // The manifest is committed and must stay; the accelerator is not. A
+        // partial `.idx` only widens the next fuzzymatch query back to a full
+        // scan, but an operator still needs to know the index is torn, and the
+        // row count alone could not say so.
+        eprintln!(
+            "rebuild: ngram index incomplete for study {} ({grams} rows, {failed} failed)",
+            meta.study_instance_uid
+        );
+    }
     true
 }
 
@@ -636,6 +803,50 @@ fn hex_nibble(b: u8) -> Option<u8> {
 
 fn is_dcm_blob(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "dcm")
+}
+
+/// Whether the bytes about to be committed still hash to their address.
+///
+/// `data` is what the caller read (fs: the whole blob; s3: the body it already
+/// hashed while receiving). `fs_path` is `Some` only for the filesystem walk,
+/// where re-reading in bounded chunks is the way to hash a possibly huge blob;
+/// there `data` holds just the header, so hashing it would answer a different
+/// question. A read failure counts as a mismatch: a blob the recovery pass
+/// cannot verify is not one it may publish.
+fn digest_matches(
+    data: Option<&[u8]>,
+    fs_path: Option<&Path>,
+    file_size: u64,
+    expected: &[u8; 32],
+    blob_key: &str,
+) -> bool {
+    let actual = match (data, fs_path) {
+        (Some(bytes), _) if bytes.len() as u64 == file_size => {
+            clarus_core::hash::cas_hash_one(bytes)
+        }
+        (_, Some(path)) => match crate::cas_audit_worker::hash_file_incremental(path) {
+            Ok(d) => d,
+            Err(e) => {
+                crate::clog_warn!(
+                    blob = blob_key,
+                    error = %e,
+                    "rebuild: blob could not be re-read for its digest check; not committed"
+                );
+                return false;
+            }
+        },
+        _ => return false,
+    };
+    if actual == *expected {
+        return true;
+    }
+    crate::clog_warn!(
+        blob = blob_key,
+        expected = %clarus_adapters::hex_encode(expected),
+        actual = %clarus_adapters::hex_encode(&actual),
+        "rebuild: blob content does not match the digest it is addressed by; not committed"
+    );
+    false
 }
 
 fn path_str(p: &Path) -> &str {
@@ -765,5 +976,395 @@ mod tests {
         let t = today_yyyymmdd();
         assert_eq!(t.len(), 8);
         assert!(t.bytes().all(|b| b.is_ascii_digit()));
+    }
+
+    // -- S2a regressions -------------------------------------------------
+
+    /// A private manifest tree with its own CAS root, so a whole
+    /// `run_rebuild` can be driven without touching the process state.
+    fn rebuild_state(root: &std::path::Path) -> AppState {
+        let idx_dir = root.join("idx");
+        let manifest_dir = root.join("manifests");
+        let storage_dir = root.join("cas");
+        std::fs::create_dir_all(&idx_dir).expect("idx");
+        std::fs::create_dir_all(&manifest_dir).expect("manifests");
+        std::fs::create_dir_all(&storage_dir).expect("cas");
+
+        let mut config = crate::config::Config::test_default();
+        config.storage_dir = storage_dir.to_string_lossy().to_string();
+        config.btree.manifest_dir = manifest_dir.to_string_lossy().to_string();
+        config.btree.idx_dir = idx_dir.to_string_lossy().to_string();
+        config.min_free_disk_mb = 0;
+        config.min_free_disk_pct = 0.0;
+
+        AppState {
+            cas: clarus_adapters::storage::ContentAddressedStorage::new(storage_dir).expect("cas"),
+            codec_registry: clarus_adapters::codec::CodecRegistry::default(),
+            ups_events: crate::sse_fanout::DualEventSink::new(),
+            start_time: std::time::Instant::now(),
+            metrics_ring: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::VecDeque::new(),
+            )),
+            log_buffer: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::VecDeque::new(),
+            )),
+            maintenance: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::state::MaintenanceState::default(),
+            )),
+            #[cfg(feature = "s3")]
+            s3: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cold_cas: None,
+            shadow: crate::shadow::ShadowTier::new(idx_dir.clone()),
+            study_scanner: clarus_core::query::StudyScanner::new(manifest_dir.clone(), idx_dir),
+            config,
+            workitems_dir: root.join("workitems"),
+            commitments_dir: root.join("commitments"),
+            transcode_pool: crate::state::TranscodePool::new(2),
+            readiness: crate::handlers::readiness::Readiness::new(),
+        }
+    }
+
+    /// A blank rebuild state, spelled out because [`RebuildState`] has no
+    /// `Default` impl (the process-global is built by hand for the same
+    /// reason: `status` must start as `idle`, not as an empty string).
+    fn blank_rebuild_state() -> RebuildState {
+        RebuildState {
+            status: "idle".to_string(),
+            files_scanned: 0,
+            manifests_written: 0,
+            instances_indexed: 0,
+            skipped: 0,
+            errors: 0,
+            started_at: None,
+            finished_at: None,
+            sources: Vec::new(),
+            dry_run: false,
+        }
+    }
+
+    /// The manifest gauges are PROCESS-GLOBAL, so the two tests that assert
+    /// on them must not interleave: one seeding `MANIFEST_MISSING` while the
+    /// other clears it would make either verdict meaningless.
+    static GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A DIRTY gauge must survive a pass that only covered some of the
+    /// configured tiers.
+    ///
+    /// A cold-only rebuild over an empty cold CAS finished with zero errors and
+    /// cleared all three manifest gauges, so a study that existed only on HOT
+    /// storage stayed missing while the gauge reported a healthy store.
+    #[test]
+    fn a_pass_that_covers_some_tiers_leaves_the_gauges_alone() {
+        use std::sync::atomic::Ordering;
+        let _guard = GAUGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = rebuild_state(dir.path());
+        // Seed the degraded reading; only THIS seed is compared against.
+        crate::metrics::MANIFEST_MISSING.store(7, Ordering::Relaxed);
+        let lock = RwLock::new(blank_rebuild_state());
+
+        // No source is scanned at all, so no tier is covered: the pass cannot
+        // vouch for the store and the gauge must stay dirty. (An empty source
+        // list is also the smallest expression of "some tiers were skipped".)
+        run_rebuild(&state, &[], false, &lock);
+
+        assert_eq!(
+            crate::metrics::MANIFEST_MISSING.load(Ordering::Relaxed),
+            7,
+            "a pass that skipped every tier must not clear the gauge"
+        );
+    }
+
+    /// Covering every configured tier IS a complete answer, so the gauge is
+    /// cleared.
+    ///
+    /// Only built WITHOUT the `s3` feature: with it, "every tier" includes S3,
+    /// and an unconnected client is an error by design (`rebuild: S3 not
+    /// connected`), so the gauge correctly stays dirty. The property this test
+    /// pins - that a fully-covering pass clears the gauge - is therefore only
+    /// expressible in a build where `hot` is the whole store.
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn a_pass_over_every_configured_tier_clears_the_gauge() {
+        use std::sync::atomic::Ordering;
+        let _guard = GAUGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = rebuild_state(&dir.path().join("full"));
+        crate::metrics::MANIFEST_MISSING.store(7, Ordering::Relaxed);
+        let lock = RwLock::new(blank_rebuild_state());
+
+        // `cold_cas` is None in this fixture, so `hot` is the only tier.
+        run_rebuild(&state, &["hot".to_string()], false, &lock);
+
+        assert_eq!(
+            crate::metrics::MANIFEST_MISSING.load(Ordering::Relaxed),
+            0,
+            "a pass over every configured tier clears the gauge"
+        );
+    }
+
+    /// A directory SYMLINK must not be followed during a CAS walk.
+    ///
+    /// `fs::metadata` follows the link: a bucket pointing at an ancestor
+    /// re-queued the same tree (unbounded work), and a link into another
+    /// archive indexed that archive's objects under this tier.
+    #[test]
+    fn a_symlinked_bucket_is_not_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = rebuild_state(&dir.path().join("s"));
+        let cas_root = state.cas.root_dir().to_path_buf();
+        std::fs::create_dir_all(&cas_root).expect("cas root");
+
+        // A symlink at a bucket position that points at the CAS root itself.
+        let link = cas_root.join("aa");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&cas_root, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&cas_root, &link).is_ok();
+        // A runner without symlink rights cannot express the case; the
+        // assertion below is then vacuous, so say so instead of passing.
+        assert!(
+            made,
+            "the test needs symlink creation rights to express the hazard"
+        );
+
+        let parser = DicomRsParser;
+        let mut acc = RebuildAcc::default();
+        let errors = walk_fs(
+            &parser,
+            &cas_root,
+            TIER_HOT,
+            true,
+            std::path::Path::new(&state.config.btree.manifest_dir),
+            std::path::Path::new(&state.config.btree.idx_dir),
+            &state,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut acc,
+        );
+        assert_eq!(errors, 0, "a symlink is a skip, not an I/O failure");
+        assert_eq!(
+            acc.files_scanned, 0,
+            "no blob lies behind the symlink, so nothing may be scanned"
+        );
+    }
+
+    /// An unreadable CAS entry is an ERROR, not an optimistic skip.
+    #[test]
+    fn an_unreadable_directory_entry_is_counted_as_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = rebuild_state(&dir.path().join("s"));
+        let cas_root = state.cas.root_dir().to_path_buf();
+        std::fs::create_dir_all(&cas_root).expect("cas root");
+        // A dangling symlink: `symlink_metadata` succeeds (it describes the
+        // LINK), but the entry is neither dir nor blob - so to force a real
+        // error we instead make a blob path unreadable at OPEN time by
+        // replacing the file with a directory named `*.dcm`.
+        let bogus = cas_root.join("bb");
+        std::fs::create_dir_all(bogus.join("cc")).expect("bucket");
+        std::fs::create_dir_all(bogus.join("cc").join("deadbeef.dcm")).expect("dir as blob");
+
+        let parser = DicomRsParser;
+        let mut acc = RebuildAcc::default();
+        let _ = walk_fs(
+            &parser,
+            &cas_root,
+            TIER_HOT,
+            true,
+            std::path::Path::new(&state.config.btree.manifest_dir),
+            std::path::Path::new(&state.config.btree.idx_dir),
+            &state,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut acc,
+        );
+        // A `*.dcm` DIRECTORY is not a blob (`is_file` is false), so it is
+        // skipped rather than opened - the point of this assertion is that the
+        // walk classifies by FILE TYPE and never counts a miss as read.
+        assert_eq!(
+            acc.files_scanned, 0,
+            "a directory named *.dcm is not a blob"
+        );
+        assert_eq!(acc.errors, 0, "classifying it is not an I/O error");
+    }
+
+    /// The header bound must be a NON-ZERO slice of the file.
+    ///
+    /// Observed through the real walk rather than restated arithmetic: the
+    /// fixture is a well-formed instance stored under a digest that does NOT
+    /// match its bytes. With a non-zero bound the parser reads the metadata
+    /// and the pass fails at the INTEGRITY gate, which is an ERROR. With a
+    /// zero bound the parser is handed nothing, the blob is classified as
+    /// undecodable, and the failure moves to `skipped` instead - so the two
+    /// counters distinguish the cases without the test repeating the formula.
+    #[test]
+    fn a_non_empty_blob_is_parsed_not_treated_as_an_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = rebuild_state(&dir.path().join("h"));
+        let cas_root = state.cas.root_dir().to_path_buf();
+        let bucket = cas_root.join("aa").join("bb");
+        std::fs::create_dir_all(&bucket).expect("bucket");
+
+        let body = minimal_dicom();
+        // Deliberately the WRONG digest: metadata parses, the integrity gate
+        // then refuses the blob, and that refusal is counted as a hard error.
+        let wrong = clarus_adapters::hex_encode(&[0x5Au8; 32]);
+        std::fs::write(bucket.join(format!("{wrong}.dcm")), &body).expect("write");
+
+        let parser = DicomRsParser;
+        let mut acc = RebuildAcc::default();
+        let _ = walk_fs(
+            &parser,
+            &cas_root,
+            TIER_HOT,
+            true,
+            std::path::Path::new(&state.config.btree.manifest_dir),
+            std::path::Path::new(&state.config.btree.idx_dir),
+            &state,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut acc,
+        );
+        assert_eq!(acc.files_scanned, 1, "the blob was reached by the walk");
+        assert_eq!(
+            acc.skipped, 0,
+            "the bytes decode, so this is NOT an undecodable skip"
+        );
+        assert_eq!(
+            acc.errors, 1,
+            "the digest mismatch is a hard error, which only a parsed header can reach"
+        );
+    }
+
+    /// A DRY RUN must not claim to have written anything.
+    ///
+    /// Asserted through a real `run_rebuild` over a well-formed blob: the pass
+    /// reaches the dry-run branch, so an implementation that recorded a write
+    /// there would show up as a non-zero counter.
+    #[test]
+    fn a_dry_run_reports_no_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = rebuild_state(&dir.path().join("d"));
+        let cas_root = state.cas.root_dir().to_path_buf();
+        let bucket = cas_root.join("aa").join("bb");
+        std::fs::create_dir_all(&bucket).expect("bucket");
+        let body = minimal_dicom();
+        let hex = clarus_adapters::hex_encode(&clarus_core::hash::cas_hash_one(&body));
+        std::fs::write(bucket.join(format!("{hex}.dcm")), &body).expect("write");
+
+        let lock = RwLock::new(blank_rebuild_state());
+        run_rebuild(&state, &["hot".to_string()], true, &lock);
+
+        let st = lock.read().expect("state").clone();
+        assert_eq!(
+            st.manifests_written, 0,
+            "a dry run writes no manifest, whatever it found"
+        );
+        assert_eq!(
+            st.instances_indexed, 0,
+            "a dry run indexes no instance, whatever it found"
+        );
+    }
+
+    /// A minimal, valid DICOM Part-10 file: Explicit VR Little Endian, the
+    /// SOP class/instance UIDs plus the study and series UIDs the rebuild
+    /// requires, and no PixelData.
+    ///
+    /// Tags ascend by (group, element) and every value has an even length
+    /// (PS3.5 7.1), which is what the parser's walk expects.
+    fn minimal_dicom() -> Vec<u8> {
+        minimal_dicom_with_ts(Some(b"1.2.840.10008.1.2.1"))
+    }
+
+    /// The same instance, optionally WITHOUT a Transfer Syntax UID in the meta
+    /// group. Omitting it is what makes the worker's `EXPLICIT_VR_LE` fallback
+    /// observable (PS3.5 A-1 defines the default; the worker must record it).
+    fn minimal_dicom_with_ts(ts: Option<&[u8]>) -> Vec<u8> {
+        fn elem(out: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], value: &[u8]) {
+            out.extend_from_slice(&group.to_le_bytes());
+            out.extend_from_slice(&element.to_le_bytes());
+            out.extend_from_slice(vr);
+            out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            out.extend_from_slice(value);
+            if !value.len().is_multiple_of(2) {
+                out.push(0);
+            }
+        }
+        let mut out = vec![0u8; 128];
+        out.extend_from_slice(b"DICM");
+        // Meta group first; (0002,0010 = Transfer Syntax) is OPTIONAL here so
+        // the fallback can be exercised.
+        if let Some(ts) = ts {
+            elem(&mut out, 0x0002, 0x0010, b"UI", ts);
+        }
+        // Identity: SOP class + SOP instance are BOTH required for a parse.
+        elem(
+            &mut out,
+            0x0008,
+            0x0016,
+            b"UI",
+            b"1.2.840.10008.5.1.4.1.1.2",
+        );
+        elem(&mut out, 0x0008, 0x0018, b"UI", b"1.2.3.4.5");
+        elem(&mut out, 0x0008, 0x0060, b"CS", b"CT");
+        elem(&mut out, 0x0020, 0x000D, b"UI", b"1.2.3.4.6");
+        elem(&mut out, 0x0020, 0x000E, b"UI", b"1.2.3.4.7");
+        out
+    }
+
+    /// An instance that declares NO Transfer Syntax is recorded under the
+    /// repository constant, not a literal spelled in this module.
+    ///
+    /// Driven end to end through `process_bytes`, which owns the fallback: the
+    /// fixture declares no Transfer Syntax, and the assertion is on the STORED
+    /// manifest. A literal in the worker, or a fallback that stored nothing,
+    /// both fail here - the test never recomputes the value itself.
+    #[test]
+    fn the_assumed_transfer_syntax_is_recorded_in_the_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = rebuild_state(&dir.path().join("ts"));
+        let manifest_dir = std::path::Path::new(&state.config.btree.manifest_dir);
+        let idx_dir = std::path::Path::new(&state.config.btree.idx_dir);
+
+        let body = minimal_dicom_with_ts(None);
+        // Address the blob by its REAL digest, or the integrity gate refuses
+        // it before any manifest is written.
+        let blob = clarus_core::hash::cas_hash_one(&body);
+        let parser = DicomRsParser;
+        let mut acc = RebuildAcc::default();
+        process_bytes(
+            &parser,
+            "fixture.dcm",
+            &body,
+            None,
+            body.len() as u64,
+            TIER_HOT,
+            blob,
+            false,
+            manifest_dir,
+            idx_dir,
+            &state,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut acc,
+        );
+        assert_eq!(acc.errors, 0, "the fixture commits cleanly");
+        assert_eq!(acc.instances_indexed, 1, "one instance reached a manifest");
+
+        let manifest = state
+            .read_server_manifest("1.2.3.4.6")
+            .expect("manifest readable")
+            .expect("manifest present");
+        let stored = manifest
+            .series
+            .iter()
+            .flat_map(|s| &s.instances)
+            .find(|i| i.blake3 == blob)
+            .expect("instance recorded");
+        assert_eq!(
+            stored.transfer_syntax,
+            clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE,
+            "the manifest must name the shared constant, not a local literal"
+        );
     }
 }

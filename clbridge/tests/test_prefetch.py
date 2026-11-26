@@ -9,6 +9,7 @@ fill/drain ordering, backpressure bounding, stop-on-cancel unblock, and reader
 error propagation.
 """
 
+import threading
 import time
 
 from clean_code.prefetch import DEFAULT_PREFETCH_PARTS, PartPrefetcher
@@ -166,7 +167,6 @@ def test_second_drain_unlinks_a_part_put_after_the_first_drain():
     """
     import os
     import tempfile
-    import threading
 
     from clean_code.streaming import SpilledPart
 

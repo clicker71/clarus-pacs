@@ -288,9 +288,35 @@ fn instances_json(uids: &[&str]) -> String {
 
 /// A configuration with ONE external model and one rule that always matches.
 ///
-/// Written as a file rather than built in memory because that is how a
-/// deployment configures a processor, and it is the path being tested.
+/// Written as a DIRECTORY - a base config plus `models/proc.yaml` - because
+/// that is how a deployment configures a processor, and it is the path being
+/// tested.
 fn external_conf(dir: &Path, script: &Path, interpreter: &str) -> clinfer::conf::Conf {
+    let models = dir.join("models");
+    std::fs::create_dir_all(&models).expect("models directory");
+    std::fs::write(
+        models.join("proc.yaml"),
+        format!(
+            "\
+enabled: true
+output_capabilities:
+  sop_classes:
+    - 1.2.840.10008.5.1.4.1.1.11.1
+match:
+  modality: [DX]
+runtime:
+  script: \"{}\"
+  interpreter: \"{}\"
+  timeout_secs: 60
+outputs:
+  - kind: pr
+    profile_version: 3
+",
+            script.display(),
+            interpreter,
+        ),
+    )
+    .expect("model");
     let text = format!(
         r#"server:
   base_url: "http://127.0.0.1:1/dicomweb"
@@ -298,23 +324,10 @@ fn external_conf(dir: &Path, script: &Path, interpreter: &str) -> clinfer::conf:
   listen: "127.0.0.1:18124"
 engine:
   cache_dir: "{cache}"
-models:
-  proc:
-    script: "{script}"
-    interpreter: "{interpreter}"
-    timeout_secs: 60
-rules:
-  - match:
-      modality: [DX]
-    model: "proc"
-    result:
-      kind: pr
-      profile_version: 3
+models_dir: ./models
 default_rule: cancel
 "#,
         cache = dir.join("cache").display(),
-        script = script.display(),
-        interpreter = interpreter,
     );
     let path = dir.join("clinfer.conf");
     std::fs::write(&path, text).expect("config");
@@ -323,6 +336,31 @@ default_rule: cancel
 
 /// A configuration whose single rule produces an `rtstruct`.
 fn rtstruct_conf(dir: &Path, script: &Path, interpreter: &str) -> clinfer::conf::Conf {
+    let models = dir.join("models-rtstruct");
+    std::fs::create_dir_all(&models).expect("models directory");
+    std::fs::write(
+        models.join("proc.yaml"),
+        format!(
+            "\
+enabled: true
+output_capabilities:
+  sop_classes:
+    - 1.2.840.10008.5.1.4.1.1.481.3
+match:
+  modality: [DX]
+runtime:
+  script: \"{}\"
+  interpreter: \"{}\"
+  timeout_secs: 60
+outputs:
+  - kind: rtstruct
+    profile_version: 3
+",
+            script.display(),
+            interpreter,
+        ),
+    )
+    .expect("model");
     let text = format!(
         r#"server:
   base_url: "http://127.0.0.1:1/dicomweb"
@@ -330,23 +368,10 @@ fn rtstruct_conf(dir: &Path, script: &Path, interpreter: &str) -> clinfer::conf:
   listen: "127.0.0.1:18125"
 engine:
   cache_dir: "{cache}"
-models:
-  proc:
-    script: "{script}"
-    interpreter: "{interpreter}"
-    timeout_secs: 60
-rules:
-  - match:
-      modality: [DX]
-    model: "proc"
-    result:
-      kind: rtstruct
-      profile_version: 3
+models_dir: ./models-rtstruct
 default_rule: cancel
 "#,
         cache = dir.join("cache").display(),
-        script = script.display(),
-        interpreter = interpreter,
     );
     let path = dir.join("clinfer-rtstruct.conf");
     std::fs::write(&path, text).expect("config");

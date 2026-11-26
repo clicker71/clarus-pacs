@@ -224,6 +224,19 @@ pub fn study_attrs(a: &StudyManifestAttrs) -> Vec<(u32, AttrValue)> {
     v
 }
 
+/// Whether `tag` is a DA (date) attribute whose stored `UInt` form is a
+/// fixed-width `YYYYMMDD` string (PS3.5 6.2 Table 6.2-1).
+///
+/// The restamp compares a stored `UInt` against the caller's text form, and a
+/// date whose year starts with `0` has an eight-digit string but a seven-digit
+/// integer. Rendering it unpadded made the two disagree.
+fn is_date_tag(tag: u32) -> bool {
+    matches!(
+        tag,
+        tag::STUDY_DATE | tag::SERIES_DATE | tag::PPS_START_DATE | tag::PATIENT_BIRTH_DATE
+    )
+}
+
 /// Restamp an incoming [`StudyManifestAttrs`] from the MERGED manifest's
 /// study record. Used by the STOW commit path so the RAM study index always
 /// learns the disk truth: an incoming derived object (PR/SEG) carries no
@@ -236,10 +249,22 @@ pub fn restamp_from_manifest(a: &mut StudyManifestAttrs, m: &Manifest) {
     // a real divergence (a derived object whose placeholders differ from the
     // archived truth) clones.
     let find = |t: u32| m.study.attrs.iter().find(|(x, _)| *x == t).map(|(_, v)| v);
+    // A date stored as `UInt` must be compared as the EIGHT-DIGIT string it
+    // represents (PS3.5 6.2 Table 6.2-1: DA is `YYYYMMDD`, fixed width).
+    //
+    // The render below used to drop leading zeros, so a correct incoming
+    // `09991231` was stored as `UInt(9991231)`, logged as DIFFERENT from the
+    // manifest's own `UInt(9991231)`, and then replaced with `"9991231"` - a
+    // seven-character value that no longer satisfies the DA contract. Padding
+    // to the full width keeps the comparison on the stack (the `Option<String>`
+    // slot is only rewritten on a real divergence, which is the allocation
+    // discipline this function is built around).
+    let is_date = |t: u32| is_date_tag(t);
     let same = |t: u32, want: Option<&str>| match find(t) {
         Some(AttrValue::Text(s)) => want == Some(s.as_str()),
         Some(AttrValue::UInt(n)) => {
             let mut buf = [0u8; 24];
+            let pad = if is_date(t) { 8 } else { 1 };
             let mut v = *n;
             let mut i = buf.len();
             loop {
@@ -250,7 +275,15 @@ pub fn restamp_from_manifest(a: &mut StudyManifestAttrs, m: &Manifest) {
                     break;
                 }
             }
-            want == Some(std::str::from_utf8(&buf[i..]).unwrap_or(""))
+            // Left-pad a date with zeros so `9991231` renders as `09991231`.
+            let digits = buf.len() - i;
+            let mut start = i;
+            if pad > digits && pad <= buf.len() {
+                let lead = pad - digits;
+                start = i - lead;
+                buf[start..i].fill(b'0');
+            }
+            want == Some(std::str::from_utf8(&buf[start..]).unwrap_or(""))
         }
         _ => false,
     };
@@ -258,7 +291,13 @@ pub fn restamp_from_manifest(a: &mut StudyManifestAttrs, m: &Manifest) {
         if !same(t, slot.as_deref()) {
             *slot = match find(t) {
                 Some(AttrValue::Text(s)) => Some(s.clone()),
-                Some(AttrValue::UInt(n)) => Some(n.to_string()),
+                Some(AttrValue::UInt(n)) => {
+                    if is_date(t) {
+                        Some(format!("{n:08}"))
+                    } else {
+                        Some(n.to_string())
+                    }
+                }
                 _ => None,
             };
         }
@@ -628,10 +667,27 @@ fn series_attrs(s: &SeriesModel) -> Vec<(u32, AttrValue)> {
 }
 
 /// Build a series record with its instance records.
+///
+/// A batch may carry the SAME SOPInstanceUID twice (a retried part, a client
+/// that re-sends one instance inside a larger POST). The merge path already
+/// skips such a duplicate, but the fresh-series branch did not, so the same
+/// batch counted the instance twice - and only when the series was new. The
+/// rule is applied here, at the one place a series record is built, keeping
+/// the distinct SOPs in input order so the first copy wins.
 fn series_record(s: &SeriesModel) -> SeriesRecord {
+    let mut seen: Vec<&str> = Vec::with_capacity(s.instances.len());
+    let mut instances = Vec::with_capacity(s.instances.len());
+    for inst in &s.instances {
+        let sop = inst.sop_instance_uid.as_str();
+        if seen.contains(&sop) {
+            continue;
+        }
+        seen.push(sop);
+        instances.push(instance_record(inst));
+    }
     SeriesRecord {
         attrs: series_attrs(s),
-        instances: s.instances.iter().map(instance_record).collect(),
+        instances,
     }
 }
 
@@ -931,14 +987,22 @@ fn now_epoch() -> u64 {
 /// all instance file sizes, so WADO and recovery know where fresh data lives
 /// without descending into the series array.
 pub fn build_manifest_full(a: &StudyManifestAttrs, series: &[SeriesModel]) -> Manifest {
-    let mut storage_tier = TIER_HOT;
+    let mut storage_tier = None;
     let mut total_bytes = 0u64;
     for s in series {
         for inst in &s.instances {
-            storage_tier = inst.storage_tier;
+            // FIRST instance wins, as the doc above promises. Assigning on
+            // every iteration reported the LAST instance's tier, so a batch
+            // whose first part was HOT and whose last was COLD described the
+            // study as COLD - and WADO/recovery chose its path from that.
+            // `get_or_insert` keeps the first and still sums every size.
+            storage_tier.get_or_insert(inst.storage_tier);
             total_bytes += inst.file_size;
         }
     }
+    // An empty tree stays HOT: that is the documented default and the only
+    // tier the header can honestly name with no instance to consult.
+    let storage_tier = storage_tier.unwrap_or(TIER_HOT);
     Manifest {
         sys: SysHeader {
             version: 1,
@@ -1001,6 +1065,21 @@ pub fn tombstone_path(manifests_dir: &Path, study_uid: &str) -> PathBuf {
     manifests_dir.join(format!("{study_uid}.del"))
 }
 
+/// Whether `path` exists, distinguishing "absent" from "could not tell".
+///
+/// `Path::exists()` collapses both to `false`: it returns `false` for any
+/// metadata error, so an EACCES or an I/O failure on the parent directory made
+/// the callers below take the "no manifest" branch - skipping the tombstone
+/// guard, choosing the fresh-build path over the read-merge, or reporting
+/// `Ok(0)` for a note that was never applied. Those are three different
+/// answers to a question the filesystem refused to answer.
+///
+/// `try_exists` reports the error, and every caller here propagates it instead
+/// of guessing.
+fn path_exists(path: &Path) -> Result<bool, StudyManifestError> {
+    path.try_exists().map_err(StudyManifestError::Io)
+}
+
 /// The orphan sidecar path `manifests/{study_uid}.orphans` (2808 P1).
 ///
 /// Every update-in-place appends the REPLACED blob's `hex tier` as a line
@@ -1023,59 +1102,75 @@ pub fn orphan_sidecar_path(manifests_dir: &Path, study_uid: &str) -> PathBuf {
 /// a missing n-gram only widens the next query back to a full scan).
 ///
 /// `day` is the `YYYYMMDD` bucket for the append, normally the study's date or
-/// today. Returns the number of `.idx` rows appended (0 when the study has no
-/// name to index).
+/// today. Returns `(rows appended, rows that failed)`; the caller surfaces the
+/// failure count as a diagnostic, because a non-zero value means the
+/// accelerator is incomplete and the next fuzzymatch query would need a full
+/// scan. Zero failures with zero rows is the honest "nothing to index".
 pub fn index_study_names(
     idx_dir: &Path,
     a: &StudyManifestAttrs,
     study_uid: &str,
     day: &str,
-) -> usize {
+) -> (usize, usize) {
     let mut appended = 0;
+    let mut failed = 0;
     if let Some(name) = a.patient_name.as_deref()
         && !name.is_empty()
     {
-        appended += append_ngrams(
+        let (w, f) = append_ngrams(
             idx_dir,
             crate::idx::ngram::NameKind::Patient,
             name,
             study_uid,
             day,
         );
+        appended += w;
+        failed += f;
     }
     if let Some(phys) = a.referring_physician.as_deref()
         && !phys.is_empty()
     {
-        appended += append_ngrams(
+        let (w, f) = append_ngrams(
             idx_dir,
             crate::idx::ngram::NameKind::Physician,
             phys,
             study_uid,
             day,
         );
+        appended += w;
+        failed += f;
     }
-    appended
+    (appended, failed)
 }
 
-/// Append every n-gram of one name to its kind's `.idx`, returning rows written.
+/// Append every n-gram of one name to its kind's `.idx`.
+///
+/// Returns `(rows written, rows that FAILED)`. The failure count is the point:
+/// an index write that fails after earlier grams landed leaves the accelerator
+/// incomplete, and the caller used to receive only a row count, so it could not
+/// tell a full index from a torn one. The manifest is already committed at this
+/// point and is never rolled back - a broken accelerator is a degradation to
+/// report, not a reason to lose a study.
 fn append_ngrams(
     idx_dir: &Path,
     kind: crate::idx::ngram::NameKind,
     name: &str,
     study_uid: &str,
     day: &str,
-) -> usize {
+) -> (usize, usize) {
     let mut written = 0;
+    let mut failed = 0;
     // Fuzzy path only: normalize PN separators to spaces so the n-gram keys
     // line up with the (space-separated) fuzzymatch query grams. Exact search
     // and wildcards do not read this accelerator.
     let normalized = crate::idx::ngram::fuzzy_normalize(name);
     for gram in crate::idx::ngram::name_ngrams(&normalized) {
-        if crate::idx::ngram::append(idx_dir, kind, &gram, study_uid, day).is_ok() {
-            written += 1;
+        match crate::idx::ngram::append(idx_dir, kind, &gram, study_uid, day) {
+            Ok(()) => written += 1,
+            Err(_) => failed += 1,
         }
     }
-    written
+    (written, failed)
 }
 
 /// Atomically write a study manifest with the full series/instance tree.
@@ -1102,7 +1197,7 @@ pub fn write_study_manifest_full(
     // erase-worker physically removes the files and lifts the tombstone. The
     // lease is held, so this never races a concurrent tombstone rename (the
     // admin delete takes the same mutex around its rename).
-    if tombstone_path(manifests_dir, &a.study_instance_uid).exists() {
+    if path_exists(&tombstone_path(manifests_dir, &a.study_instance_uid))? {
         return Err(StudyManifestError::StudyDeleted);
     }
 
@@ -1113,7 +1208,7 @@ pub fn write_study_manifest_full(
         crate::manifest_cache::WriteGuard::begin(manifests_dir, &a.study_instance_uid);
 
     // Read-merge: preserve instances already committed by earlier STOWs.
-    let mut manifest = if path.exists() {
+    let mut manifest = if path_exists(&path)? {
         let published = published_manifest(manifests_dir, &a.study_instance_uid)?;
         let mut m = crate::manifest::read_manifest_published(&published)
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
@@ -1149,11 +1244,7 @@ pub fn write_study_manifest_full(
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
     // B3: install the post-commit entry ONLY after the A9 guard passed.
     // encoded_len = the exact encoded bytes just committed (== file length).
-    cache_guard.commit(
-        std::sync::Arc::new(manifest),
-        bytes.len() as u64,
-        manifests_dir,
-    );
+    cache_guard.commit(std::sync::Arc::new(manifest), bytes.len() as u64);
     Ok(path)
 }
 
@@ -1179,7 +1270,7 @@ pub fn write_study_manifest_update(
 
     let _lease = super::coordinator::acquire();
 
-    if tombstone_path(manifests_dir, &a.study_instance_uid).exists() {
+    if path_exists(&tombstone_path(manifests_dir, &a.study_instance_uid))? {
         return Err(StudyManifestError::StudyDeleted);
     }
 
@@ -1187,7 +1278,7 @@ pub fn write_study_manifest_update(
     let (cache_guard, _taken) =
         crate::manifest_cache::WriteGuard::begin(manifests_dir, &a.study_instance_uid);
 
-    let mut manifest = if path.exists() {
+    let mut manifest = if path_exists(&path)? {
         let published = published_manifest(manifests_dir, &a.study_instance_uid)?;
         let mut m = crate::manifest::read_manifest_published(&published)
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
@@ -1211,11 +1302,7 @@ pub fn write_study_manifest_update(
     crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
     // B3: install the post-commit entry ONLY after the A9 guard passed.
-    cache_guard.commit(
-        std::sync::Arc::new(manifest),
-        bytes.len() as u64,
-        manifests_dir,
-    );
+    cache_guard.commit(std::sync::Arc::new(manifest), bytes.len() as u64);
     Ok(path)
 }
 
@@ -1295,17 +1382,27 @@ pub fn mark_rejected(
         return Ok(0);
     }
     let path = manifest_path(manifests_dir, study_uid);
-    if !path.exists() {
-        // No manifest: nothing to sequester. Not an error - a rejection note
-        // may arrive before the study it names, and re-arrival is the
-        // operator's problem, not a reason to fail the note's STOW.
-        return Ok(0);
-    }
 
     let _lease = super::coordinator::acquire();
 
-    if tombstone_path(manifests_dir, study_uid).exists() {
+    // The tombstone check comes FIRST and under the lease.
+    //
+    // A delete RENAMES `{uid}.manifest` to `{uid}.del`, so the state that
+    // matters here has the manifest absent and the tombstone present. Checking
+    // the manifest first returned `Ok(0)` ("nothing to sequester") for exactly
+    // that state, hiding an operation against a study the archive has already
+    // deleted. The lease is what makes the pair consistent: the admin delete
+    // takes the same mutex around its rename, so this cannot observe a
+    // half-finished one.
+    if path_exists(&tombstone_path(manifests_dir, study_uid))? {
         return Err(StudyManifestError::StudyDeleted);
+    }
+
+    if !path_exists(&path)? {
+        // No manifest and no tombstone: nothing to sequester. Not an error - a
+        // rejection note may arrive before the study it names, and re-arrival
+        // is the operator's problem, not a reason to fail the note's STOW.
+        return Ok(0);
     }
 
     // B3 cache discipline: bump + take BEFORE the disk mutation.
@@ -1345,11 +1442,7 @@ pub fn mark_rejected(
         let bytes = manifest
             .encode()
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-        cache_guard.commit(
-            std::sync::Arc::new(manifest),
-            bytes.len() as u64,
-            manifests_dir,
-        );
+        cache_guard.commit(std::sync::Arc::new(manifest), bytes.len() as u64);
         return Ok(0);
     }
 
@@ -1359,11 +1452,7 @@ pub fn mark_rejected(
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
     crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    cache_guard.commit(
-        std::sync::Arc::new(manifest),
-        bytes.len() as u64,
-        manifests_dir,
-    );
+    cache_guard.commit(std::sync::Arc::new(manifest), bytes.len() as u64);
     Ok(changed)
 }
 
@@ -1383,6 +1472,12 @@ pub fn mark_rejected(
 pub fn hidden_reason_of(manifests_dir: &TrustedManifestDir, study_uid: &str, sop_uid: &str) -> u32 {
     let dir = manifests_dir.path();
     let path = manifest_path(dir, study_uid);
+    // `exists()` on purpose, unlike the writers: this function does not return
+    // a `Result` and its answer for an unreadable manifest is already "not
+    // rejected" (see the doc comment - refusing a store because an index could
+    // not be read turns an index problem into a data-loss problem). Both a
+    // metadata error and an absent file lead to the same accepted part here, so
+    // distinguishing them would add nothing a caller could act on.
     if !path.exists() {
         return crate::manifest::NOT_REJECTED_REASON;
     }
@@ -1438,14 +1533,18 @@ pub fn mark_restored(
         return Ok(0);
     }
     let path = manifest_path(manifests_dir, study_uid);
-    if !path.exists() {
-        return Ok(0);
-    }
 
     let _lease = super::coordinator::acquire();
 
-    if tombstone_path(manifests_dir, study_uid).exists() {
+    // Tombstone first, under the lease - see `mark_rejected` for the reason:
+    // a real delete leaves exactly `manifest absent + tombstone present`, which
+    // the manifest-first order reported as "nothing to do".
+    if path_exists(&tombstone_path(manifests_dir, study_uid))? {
         return Err(StudyManifestError::StudyDeleted);
+    }
+
+    if !path_exists(&path)? {
+        return Ok(0);
     }
 
     // B3 cache discipline: bump + take BEFORE the disk mutation.
@@ -1478,11 +1577,7 @@ pub fn mark_restored(
         let bytes = manifest
             .encode()
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-        cache_guard.commit(
-            std::sync::Arc::new(manifest),
-            bytes.len() as u64,
-            manifests_dir,
-        );
+        cache_guard.commit(std::sync::Arc::new(manifest), bytes.len() as u64);
         return Ok(0);
     }
 
@@ -1492,11 +1587,7 @@ pub fn mark_restored(
     // A9 validate-before-publish: decode the exact bytes BEFORE the rename.
     crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
-    cache_guard.commit(
-        std::sync::Arc::new(manifest),
-        bytes.len() as u64,
-        manifests_dir,
-    );
+    cache_guard.commit(std::sync::Arc::new(manifest), bytes.len() as u64);
     Ok(changed)
 }
 
@@ -1527,7 +1618,7 @@ pub fn write_study_manifest_rebuild(
     let _lease = super::coordinator::acquire();
 
     // resurrection-guard, same as the full-write path.
-    if tombstone_path(manifests_dir, &a.study_instance_uid).exists() {
+    if path_exists(&tombstone_path(manifests_dir, &a.study_instance_uid))? {
         return Err(StudyManifestError::StudyDeleted);
     }
 
@@ -1535,7 +1626,7 @@ pub fn write_study_manifest_rebuild(
     let (cache_guard, _taken) =
         crate::manifest_cache::WriteGuard::begin(manifests_dir, &a.study_instance_uid);
 
-    let manifest = if path.exists() {
+    let manifest = if path_exists(&path)? {
         let published = published_manifest(manifests_dir, &a.study_instance_uid)?;
         let mut m = crate::manifest::read_manifest_published(&published)
             .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
@@ -1578,42 +1669,24 @@ pub fn write_study_manifest_rebuild(
     crate::manifest::write_bytes_atomic_validated(&path, &bytes)
         .map_err(|e| StudyManifestError::Manifest(e.to_string()))?;
     // B3: install the post-commit entry ONLY after the A9 guard passed.
-    cache_guard.commit(
-        std::sync::Arc::new(manifest),
-        bytes.len() as u64,
-        manifests_dir,
-    );
+    cache_guard.commit(std::sync::Arc::new(manifest), bytes.len() as u64);
     Ok(path)
 }
 
 /// Stamp the RAM-only derived counts (series/instance counts,
 /// ModalitiesInStudy) from a merged manifest back onto the caller's attrs.
 fn stamp_derived_counts(manifest: &Manifest, a: &mut StudyManifestAttrs) {
-    a.num_series = manifest.series.len() as u64;
-    a.num_instances = manifest
-        .series
-        .iter()
-        .map(|s| s.instances.len() as u64)
-        .fold(0u64, |acc, n| acc.saturating_add(n));
-    // ModalitiesInStudy (0008,0061): distinct series modalities in
-    // first-occurrence order, comma-joined. RAM-only; never persisted.
-    a.modalities_in_study = {
-        let mut agg = String::new();
-        for s in &manifest.series {
-            for (t, v) in &s.attrs {
-                if *t == tag::MODALITY
-                    && let AttrValue::Text(m) = v
-                    && !agg.split(',').any(|x| x == m)
-                {
-                    if !agg.is_empty() {
-                        agg.push(',');
-                    }
-                    agg.push_str(m);
-                }
-            }
-        }
-        if agg.is_empty() { None } else { Some(agg) }
-    };
+    // ONE calculation, not a second copy of the rules.
+    //
+    // This function used to walk the tree again with its own modality rules:
+    // it visited EVERY `Modality` attribute of a series, while
+    // `stamp_study_aggregates` takes the FIRST and skips an empty value. Two
+    // descriptions of the same aggregate drift the moment either changes, and
+    // the RAM copy then disagrees with the persisted one for the same study.
+    // The manifest already carries the stamped result, so copy it.
+    a.num_series = manifest.study.series_count;
+    a.num_instances = manifest.study.instance_count;
+    a.modalities_in_study = manifest.study.modalities_in_study.clone();
 }
 
 /// Atomically write a study-level-only manifest (no instance data).
@@ -1729,6 +1802,83 @@ mod tests {
         assert_eq!(
             incoming.other_patient_ids, None,
             "an id the manifest does not carry must not survive the restamp"
+        );
+    }
+
+    /// The `sys` header reports the FIRST instance's tier, as documented.
+    ///
+    /// The loop used to assign on every iteration, so the LAST instance's tier
+    /// won. A batch whose first part was HOT and whose last was COLD described
+    /// the study as COLD, which is the wrong answer for a study that starts
+    /// hot - and WADO/recovery read this header to choose a path.
+    #[test]
+    fn the_header_takes_the_first_instances_tier_and_sums_every_size() {
+        fn model(tier: u8, size: u64, uid: &str) -> SeriesModel {
+            SeriesModel {
+                series_instance_uid: "1.2.3".into(),
+                modality: "CT".into(),
+                instances: vec![
+                    InstanceModel {
+                        sop_instance_uid: format!("{uid}.1"),
+                        sop_class_uid: Some("1.2.840.10008.5.1.4.1.1.2".into()),
+                        storage_tier: tier,
+                        file_size: size,
+                        ..Default::default()
+                    },
+                    InstanceModel {
+                        sop_instance_uid: format!("{uid}.2"),
+                        sop_class_uid: Some("1.2.840.10008.5.1.4.1.1.2".into()),
+                        storage_tier: crate::manifest::TIER_COLD,
+                        file_size: 100,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }
+        }
+
+        let m = build_manifest_full(&attrs(), &[model(TIER_HOT, 50, "1")]);
+        assert_eq!(
+            m.sys.storage_tier, TIER_HOT,
+            "the header must name the first instance's tier"
+        );
+        assert_eq!(
+            m.sys.total_pixel_bytes, 150,
+            "every instance's size still counts"
+        );
+
+        // An empty tree keeps the documented HOT default.
+        let empty = build_manifest_full(&attrs(), &[]);
+        assert_eq!(empty.sys.storage_tier, TIER_HOT);
+        assert_eq!(empty.sys.total_pixel_bytes, 0);
+    }
+
+    /// A date whose year starts with `0` keeps its EIGHT-DIGIT form.
+    ///
+    /// PS3.5 6.2 Table 6.2-1: DA is `YYYYMMDD`, fixed width. `push_date` stores
+    /// it as `UInt(9991231)`, and the unpadded render made that look DIFFERENT
+    /// from the caller's correct `09991231`, so the restamp replaced a good
+    /// value with the seven-character `"9991231"` - no longer a valid DA.
+    #[test]
+    fn restamp_keeps_a_leading_zero_date_at_eight_digits() {
+        let mut on_disk = attrs();
+        on_disk.study_date = Some("09991231".into());
+        let m = build_manifest_full(&on_disk, &[]);
+        // The stored form really is the integer: this is the premise.
+        assert!(
+            m.study
+                .attrs
+                .contains(&(tag::STUDY_DATE, AttrValue::UInt(9_991_231))),
+            "the manifest stores DA as an integer"
+        );
+
+        let mut incoming = attrs();
+        incoming.study_date = Some("09991231".into());
+        restamp_from_manifest(&mut incoming, &m);
+        assert_eq!(
+            incoming.study_date.as_deref(),
+            Some("09991231"),
+            "a correct eight-digit date must survive the restamp unchanged"
         );
     }
 
@@ -2943,7 +3093,8 @@ mod tests {
             ..Default::default()
         };
 
-        let written = index_study_names(&idx, &a, "1.2.840.1.1", "20260811");
+        let (written, failed) = index_study_names(&idx, &a, "1.2.840.1.1", "20260811");
+        assert_eq!(failed, 0, "a writable idx must accept every gram");
         // "Иванов" -> 4 trigrams, "Смирнов" -> 5 trigrams.
         assert_eq!(written, 9);
 
@@ -2979,7 +3130,11 @@ mod tests {
             study_instance_uid: "1.2.3".into(),
             ..Default::default()
         };
-        assert_eq!(index_study_names(&idx, &a, "1.2.3", "20260811"), 0);
+        assert_eq!(
+            index_study_names(&idx, &a, "1.2.3", "20260811"),
+            (0, 0),
+            "nothing to index is (0 rows, 0 failures)"
+        );
     }
 
     /// StudyID flows STOW->manifest -> study attrs -> QIDO
@@ -3226,6 +3381,42 @@ mod tests {
             crate::manifest::QUALITY_REASON_CODE,
         )
         .expect_err("a tombstoned study must refuse the mutation");
+        assert!(matches!(err, StudyManifestError::StudyDeleted));
+    }
+
+    /// A REAL delete leaves the manifest ABSENT and the tombstone present.
+    ///
+    /// The existing test above drops a `.del` next to a live `.manifest`, which
+    /// is a different state from what the admin delete produces (it RENAMES the
+    /// manifest to `.del`). Checking the manifest first made exactly that state
+    /// answer `Ok(0)` - "nothing to sequester" - for a study the archive has
+    /// already deleted.
+    #[test]
+    fn a_renamed_manifest_still_refuses_both_mutations() {
+        let _g = crate::manifest_cache::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        let mut a = attrs();
+        let path =
+            write_study_manifest_full(&manifests, &mut a, &full_series()).expect("write study");
+
+        // The delete: rename, so only the tombstone remains.
+        let del = tombstone_path(&manifests, &a.study_instance_uid);
+        std::fs::rename(&path, &del).expect("delete renames the manifest");
+        assert!(!path.exists(), "the live manifest is gone after a delete");
+        assert!(del.exists(), "the tombstone is what remains");
+
+        let err = mark_rejected(
+            &manifests,
+            &a.study_instance_uid,
+            &["1.2.840.1.3"],
+            crate::manifest::QUALITY_REASON_CODE,
+        )
+        .expect_err("a deleted study must refuse a rejection");
+        assert!(matches!(err, StudyManifestError::StudyDeleted));
+
+        let err = mark_restored(&manifests, &a.study_instance_uid, &["1.2.840.1.3"])
+            .expect_err("a deleted study must refuse a restore");
         assert!(matches!(err, StudyManifestError::StudyDeleted));
     }
 

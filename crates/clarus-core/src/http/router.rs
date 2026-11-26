@@ -90,7 +90,24 @@ fn uid_ok(uid: &[u8]) -> bool {
             return false;
         }
     }
-    has_digit
+    if !has_digit {
+        return false;
+    }
+    // PS3.5 9.1: a UID is `component ("." component)*`, and a component is
+    // digits with NO leading zero unless the component IS `0`. The byte check
+    // above accepted `1..2` (an empty component), `.1`, `1.` and `01.2`,
+    // which PS3.5 does not define as UIDs. They used to reach the store as
+    // lookups that could never match, so a malformed request answered "no
+    // such study" instead of 400.
+    for component in uid.split(|&b| b == b'.') {
+        if component.is_empty() {
+            return false;
+        }
+        if component.len() > 1 && component[0] == b'0' {
+            return false;
+        }
+    }
+    true
 }
 
 /// A single `{frames}` value for `/thumbnail` and `/rendered`.
@@ -115,6 +132,12 @@ fn frame_single_ok(frame: &[u8]) -> bool {
 ///
 /// Structural checks stay in the handler: this is a cheap byte gate that maps
 /// garbage to `400` without allocating.
+///
+/// This function checks DELIMITER SYNTAX ONLY. PS3.18 10.1.1 also requires the
+/// frame numbers to be listed in ascending order; this gate does not compare
+/// them, so the handler that consumes the list is where that rule has to be
+/// enforced. Stating the split here keeps a future reader from assuming this
+/// function has already validated the ordering.
 ///
 /// Public so the ap101 gate can measure it directly: the whole point of the
 /// byte-level shape check is that it costs nothing.
@@ -277,8 +300,35 @@ pub fn match_route<'a>(method: Method, path: &'a [u8]) -> RouterOutcome<'a> {
             RouterOutcome::Options
         }
         Method::Unknown => RouterOutcome::MethodNotAllowed {
-            allow: "GET, HEAD, POST, PUT, DELETE",
+            // RFC 9110 15.5.6: `Allow` lists the methods the TARGET supports.
+            // The global list advertised POST/PUT/DELETE on `/health`, every
+            // one of which answers 404 there, so a client that followed the
+            // header was sent to a dead end. The list is derived from the same
+            // route tables the successful paths use, so the two cannot drift.
+            allow: allow_for_path(path),
         },
+    }
+}
+
+/// The `Allow` value for a path, as a `&'static str`.
+///
+/// Only the coarse distinction the router can make without re-walking the
+/// match arms: a path that resolves under GET is readable, one that resolves
+/// under PUT or DELETE is writable, and anything else supports nothing. The
+/// strings are static so the 405 path stays allocation-free.
+fn allow_for_path(path: &[u8]) -> &'static str {
+    let (segs, n) = split_segments(path);
+    let segs = &segs[..n];
+    let readable = matches!(match_get(path, segs), RouterOutcome::Match(_));
+    let writable = matches!(match_put(segs), RouterOutcome::Match(_))
+        || matches!(match_delete(segs), RouterOutcome::Match(_));
+    match (readable, writable) {
+        (true, true) => "GET, HEAD, PUT, DELETE",
+        (true, false) => "GET, HEAD",
+        (false, true) => "PUT, DELETE",
+        // Nothing serves this path under any method: an empty `Allow` is the
+        // honest answer, and the 405 body is what carries the detail.
+        (false, false) => "",
     }
 }
 
@@ -1144,12 +1194,21 @@ mod tests {
         assert!(!uid_ok(b"."));
         assert!(!uid_ok(b".."));
         assert!(!uid_ok(b"..."));
-        // A single dot inside a real UID stays legal, as does a trailing dot
-        // in a digits-bearing segment (the digits rule is what matters).
         assert!(uid_ok(b"1.2.3"));
-        assert!(uid_ok(b"1.2.3."));
-        assert!(uid_ok(b".1.2.3"));
         assert!(!uid_ok(b""));
+        // PS3.5 9.1: a component is nonempty and has no leading zero unless it
+        // IS `0`, so these shapes are not UIDs. They used to pass the
+        // `..`-only check and reach the store as lookups that never match.
+        for bad in [&b"1..2"[..], b".1", b"1.", b"01.2", b"1.02"] {
+            assert!(
+                !uid_ok(bad),
+                "{:?} is not a PS3.5 UID",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert!(uid_ok(b"0"));
+        assert!(uid_ok(b"0.1"));
+        assert!(uid_ok(b"1.0.2"));
     }
 
     #[test]
@@ -1160,6 +1219,33 @@ mod tests {
             match_route(Method::Get, b"/dicomweb/studies//series"),
             RouterOutcome::BadUid
         ));
+    }
+
+    /// RFC 9110 15.5.6: `Allow` must list the methods the TARGET supports.
+    /// A global list advertised POST/PUT/DELETE on `/health`, where all three
+    /// answer 404, so following the header led to a dead end.
+    #[test]
+    fn the_allow_header_lists_only_methods_the_target_serves() {
+        let RouterOutcome::MethodNotAllowed { allow } = match_route(Method::Unknown, b"/health")
+        else {
+            panic!("an unknown method on /health is a 405");
+        };
+        assert_eq!(allow, "GET, HEAD", "/health is read-only");
+
+        // A workitem path is writable, so PUT and DELETE belong in the list.
+        let RouterOutcome::MethodNotAllowed { allow } =
+            match_route(Method::Unknown, b"/dicomweb/workitems/1.2.3")
+        else {
+            panic!("an unknown method on a workitem is a 405");
+        };
+        assert!(
+            allow.contains("PUT") && allow.contains("DELETE"),
+            "a workitem supports PUT and DELETE: {allow}"
+        );
+        assert!(
+            !allow.contains("POST"),
+            "nothing serves POST on this path: {allow}"
+        );
     }
 
     #[test]

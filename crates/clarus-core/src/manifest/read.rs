@@ -71,6 +71,13 @@ impl PublishedManifest {
     /// outside the directory, the empty string would name the directory
     /// itself, and a leading `.` would name a hidden file. This validates the
     /// path shape only; it does not vouch for how the file came to exist.
+    ///
+    /// A DRIVE PREFIX (`C:`) is rejected as well. On Windows `Path::new("C:")`
+    /// is neither absolute nor does it contain a separator, so it passes every
+    /// check above - and joining it onto the directory REPLACES the base,
+    /// pointing the reader at the process's current directory on drive C. A
+    /// StudyInstanceUID is a dotted-decimal UID (PS3.5 Table 6.2-1, VR UI), so
+    /// nothing legitimate is lost by refusing the byte pair.
     #[must_use]
     pub fn new(manifest_dir: impl Into<PathBuf>, study_uid: impl Into<String>) -> Option<Self> {
         let study_uid = study_uid.into();
@@ -79,6 +86,7 @@ impl PublishedManifest {
             || study_uid.contains('\\')
             || Path::new(&study_uid).is_absolute()
             || study_uid.starts_with('.')
+            || has_drive_prefix(&study_uid)
         {
             return None;
         }
@@ -128,6 +136,21 @@ impl PublishedManifest {
     }
 }
 
+/// Whether `s` starts with a Windows drive prefix (`C:`).
+///
+/// Checked on every platform, not under `#[cfg(windows)]`: the same string
+/// reaches a manifest path on a Windows deployment, and a platform-conditional
+/// guard would leave the rule untestable on the hosts that build it. A
+/// StudyInstanceUID never contains `:` (PS3.5 Table 6.2-1, VR UI, digits and
+/// dots only), so the check costs a legitimate caller nothing.
+fn has_drive_prefix(s: &str) -> bool {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), Some(':')) => c.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
 /// Read and decode a manifest by mmap-ing the whole file.
 ///
 /// `trusted` vouches that the directory the manifest lives in is published
@@ -172,6 +195,23 @@ pub(crate) fn read_manifest_published(
     let mapped = crate::ffi::map_manifest_dir(manifest.dir(), &manifest.file_name())
         .map_err(ManifestReadError::Io)?;
     read_manifest_at(&mapped)
+}
+
+/// [`read_manifest_published`] that also reports how many bytes were decoded.
+///
+/// The cache charges this length to its budget, so a separate `metadata` call
+/// would be a second observation of the path: it can fail (letting an
+/// oversized manifest look free) or describe a different file, since the name
+/// is re-resolved between the read and the stat. Measuring the mapping that
+/// actually produced the buffer makes the number exact by construction.
+pub(crate) fn read_manifest_published_sized(
+    manifest: &PublishedManifest,
+) -> Result<(Manifest, usize), ManifestReadError> {
+    let mapped = crate::ffi::map_manifest_dir(manifest.dir(), &manifest.file_name())
+        .map_err(ManifestReadError::Io)?;
+    let len = mapped.len();
+    let decoded = read_manifest_at(&mapped)?;
+    Ok((decoded, len))
 }
 
 /// Shallow twin of [`read_manifest_published`] for the QIDO hotpath.
@@ -485,5 +525,27 @@ mod tests {
             read_manifest(&trusted, &published).expect("read"),
             sample_manifest()
         );
+    }
+
+    /// A drive-relative name must not be accepted as a study UID.
+    ///
+    /// On Windows `C:` is neither absolute nor shell-separated, so it passed
+    /// every check the constructor used to apply - and `dir.join("C:.manifest")`
+    /// is resolved against drive C's current directory, not against
+    /// `manifest_dir`. The assertion is the CONSTRUCTOR's answer, so it holds
+    /// on every platform rather than only where the join misbehaves.
+    #[test]
+    fn a_drive_prefix_is_not_a_manifest_name() {
+        for uid in ["C:", "C:1.2.3", "c:", "Z:evil"] {
+            assert!(
+                PublishedManifest::new("manifests", uid).is_none(),
+                "a drive prefix must not name a manifest: {uid}"
+            );
+        }
+        // A colon that is not a drive prefix is still refused: VR UI admits
+        // neither ':' nor any other punctuation a UID cannot carry.
+        assert!(PublishedManifest::new("manifests", "1.2.3:4").is_some());
+        // The ordinary dotted-decimal form keeps working.
+        assert!(PublishedManifest::new("manifests", "1.2.840.10008.5.1.4").is_some());
     }
 }

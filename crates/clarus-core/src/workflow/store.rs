@@ -23,6 +23,24 @@ use std::sync::atomic::AtomicU64;
 /// Process-wide counter for temp-file names (see `write_atomic`).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Records skipped because they could not be read or decoded.
+///
+/// The scan deliberately keeps going past a damaged record, but a caller that
+/// only sees the surviving records cannot tell a short worklist from a
+/// complete one missing members - which is the difference between "no such
+/// procedure" and "that procedure's record will not read". The count makes the
+/// omission visible without widening every scan signature.
+static SKIPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
+
+/// How many records have been skipped by [`scan_dir`] so far.
+///
+/// Test-observable proof that a skip is REPORTED rather than swallowed; the
+/// counter is otherwise read by operators through the same diagnostic path.
+#[cfg(test)]
+pub(crate) fn skipped_records() -> u64 {
+    SKIPPED_RECORDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Errors produced by the workflow store.
 #[derive(Debug)]
 pub enum WorkflowStoreError {
@@ -269,9 +287,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> {
     let tmp = claim_temp_sibling(path)?;
     if let Err(e) = write_claimed(&tmp, bytes) {
         // Never leave a half-written sibling behind: the reader skips `.tmp`
-        // names, but the next writer would have to clean it up.
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
+        // names, but the next writer would have to clean it up. A cleanup
+        // failure is REPORTED alongside the write error rather than replacing
+        // it - the caller acts on the write failure, and a leftover temp name
+        // is the detail that explains the next attempt's odd behaviour.
+        return Err(report_temp_cleanup(WorkflowStoreError::from(e), &tmp));
     }
     match std::fs::rename(&tmp, path) {
         Ok(()) => {
@@ -283,10 +303,22 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> {
             sync_parent_entry(path)?;
             Ok(())
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(WorkflowStoreError::Io(e))
-        }
+        Err(e) => Err(report_temp_cleanup(WorkflowStoreError::Io(e), &tmp)),
+    }
+}
+
+/// Remove a temp sibling, folding any cleanup failure into `primary`.
+///
+/// The caller is already handling `primary`; a temp name left behind does not
+/// change what went wrong, but it does change what the NEXT attempt meets - an
+/// occupied name that make the same failure repeat with a less obvious cause.
+/// Reporting it keeps both facts without masking the original.
+fn report_temp_cleanup(primary: WorkflowStoreError, tmp: &Path) -> WorkflowStoreError {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => primary,
+        Err(cleanup) => WorkflowStoreError::Io(io::Error::other(format!(
+            "{primary}; additionally the temp file {tmp:?} could not be removed: {cleanup}"
+        ))),
     }
 }
 
@@ -304,11 +336,16 @@ fn write_if_absent(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> 
     }
     let tmp = claim_temp_sibling(path)?;
     if let Err(e) = write_claimed(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(report_temp_cleanup(WorkflowStoreError::from(e), &tmp));
     }
     let linked = std::fs::hard_link(&tmp, path);
-    let _ = std::fs::remove_file(&tmp);
+    // Once the link succeeded the temp and the target are the SAME inode, so a
+    // leftover `.tmp` keeps that inode alive after the `.cbor` name is removed:
+    // the record is gone from the store and its bytes are still on disk,
+    // unreachable and unreclaimable. On the success path the record IS stored,
+    // so the cleanup outcome is reported only where the caller is already
+    // handling a failure.
+    let unlinked = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => {
             #[cfg(unix)]
@@ -324,7 +361,18 @@ fn write_if_absent(path: &Path, bytes: &[u8]) -> Result<(), WorkflowStoreError> 
             sync_parent_entry(path)?;
             Err(WorkflowStoreError::Duplicate(stem_of(path)))
         }
-        Err(e) => Err(WorkflowStoreError::Io(e)),
+        Err(e) => {
+            // Report the publication failure, but not at the cost of the
+            // cleanup fact: a temp name left beside a failed link is what makes
+            // the NEXT attempt meet an occupied name it did not create.
+            if let Err(cleanup) = unlinked {
+                return Err(WorkflowStoreError::Io(io::Error::new(
+                    e.kind(),
+                    format!("{e}; additionally the temp file could not be removed: {cleanup}"),
+                )));
+            }
+            Err(WorkflowStoreError::Io(e))
+        }
     }
 }
 
@@ -417,26 +465,54 @@ fn delete_file(path: &Path) -> Result<bool, WorkflowStoreError> {
             sync_parent_entry(path)?;
             Ok(true)
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // A previous delete may have unlinked the file and then failed the
+            // barrier; this retry is what completes it. Returning without the
+            // barrier reports a finished removal whose directory update was
+            // never made durable, and a crash can bring the record back.
+            //
+            // The parent is only flushed when it EXISTS: an empty store has no
+            // directory to persist, and that case stays a plain `Ok(false)`.
+            #[cfg(unix)]
+            if path.parent().map(Path::exists).unwrap_or(false) {
+                sync_parent_entry(path)?;
+            }
+            Ok(false)
+        }
         Err(e) => Err(WorkflowStoreError::Io(e)),
     }
 }
 
 /// Decode every `*.cbor` file in `dir` through `decode`, pushing results into
-/// `out`. A missing directory is an empty result; a corrupt file is skipped
-/// (the scan stays useful when one record is damaged).
-fn scan_dir<T, F>(dir: &Path, decode: F, out: &mut Vec<T>) -> Result<(), WorkflowStoreError>
+/// `out`. A missing directory is an empty result.
+///
+/// A corrupt or unreadable record is SKIPPED so one damaged file does not cost
+/// the caller every other record, but the skip is COUNTED rather than silent:
+/// without a count the caller cannot tell a short worklist from a complete one
+/// that lost members, which is the difference between "no such procedure" and
+/// "the procedure's record will not read". Returns the number skipped.
+///
+/// An I/O failure that is not "this record is unreadable" - the directory walk
+/// itself, an entry's type, the path string - is an ENUMERATION failure and is
+/// propagated: a partial list returned as `Ok` is indistinguishable from a
+/// complete one.
+fn scan_dir<T, F>(dir: &Path, decode: F, out: &mut Vec<T>) -> Result<usize, WorkflowStoreError>
 where
     F: Fn(&[u8]) -> Result<T, WorkflowStoreError>,
 {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(WorkflowStoreError::Io(e)),
     };
+    let mut skipped = 0usize;
     for entry in rd {
+        // An entry that cannot be read is an enumeration failure, not a
+        // record with fewer fields: `unwrap_or(false)` turned it into "skip
+        // this entry" and the caller received a short list with no signal.
         let entry = entry?;
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
             continue;
         }
         let fname = entry.file_name().to_string_lossy().into_owned();
@@ -446,13 +522,23 @@ where
         }
         let bytes = match std::fs::read(entry.path()) {
             Ok(b) => b,
-            Err(_) => continue,
+            // A present record that will not read is COUNTED: it is not an
+            // absent record, and the caller has to be able to say so.
+            Err(_) => {
+                skipped += 1;
+                SKIPPED_RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
         };
-        if let Ok(rec) = decode(&bytes) {
-            out.push(rec);
+        match decode(&bytes) {
+            Ok(rec) => out.push(rec),
+            Err(_) => {
+                skipped += 1;
+                SKIPPED_RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
-    Ok(())
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -649,6 +735,30 @@ mod tests {
         s.put_sps(&sps("1.2.4")).unwrap();
         let all = s.all_sps().expect("scan");
         assert_eq!(all.len(), 2);
+    }
+
+    /// A damaged record is skipped, but the skip is COUNTED.
+    ///
+    /// The scan keeps going past a corrupt file so one bad record does not
+    /// cost the caller every other one. Silently, though, a short worklist is
+    /// indistinguishable from a complete one that lost members - and "no such
+    /// procedure" is the wrong answer when the procedure's record merely will
+    /// not read. The count is the signal that separates the two.
+    #[test]
+    fn a_corrupt_record_is_skipped_and_counted() {
+        let s = store();
+        s.put_sps(&sps("1.2.3")).unwrap();
+        // A file that ends in `.cbor` but holds bytes no decoder accepts.
+        std::fs::write(s.mwl_dir().join("9.9.9.cbor"), b"not a record").expect("plant");
+
+        let before = skipped_records();
+        let all = s.all_sps().expect("scan");
+        assert_eq!(all.len(), 1, "the readable record still comes back");
+        assert_eq!(
+            skipped_records() - before,
+            1,
+            "the unreadable record is reported, not silently dropped"
+        );
     }
 
     #[test]

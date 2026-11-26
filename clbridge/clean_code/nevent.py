@@ -171,25 +171,30 @@ def send_n_event_report(
             _release_or_abort(assoc, timeout=2.0)
             continue
 
-        # The context alone does not prove the role: an SCP that accepts the
-        # abstract syntax but DECLINES the role item leaves the requestor as
-        # plain SCU (PS3.7 D.3.3.4), and the report would then never be
-        # accepted.
+        # The abstract syntax present in the accepted set is what the
+        # presentation context negotiation actually granted, and it is the only
+        # thing `send_n_event_report()` selects its context by.
         #
-        # `as_scp` is the ACCEPTOR's answer, not ours (pynetdicom
-        # PresentationContext.as_scp: "True if the association Acceptor can
-        # act as SCP for the current context"). The bridge is the N-EVENT
-        # requestor, i.e. the SCU of that service, so what it needs is a peer
-        # that will act as SCP - which is exactly `as_scp`. Testing `as_scu`
-        # here would check the wrong side of the association and reject a
-        # correct peer.
+        # `as_scp` is NOT a usable precondition here. It reports the Role
+        # Selection outcome, and Role Selection is OPTIONAL (PS3.7 D.3.3.4):
+        # an SCP that accepts the Storage Commitment context and simply omits
+        # the role item leaves `as_scp` False while the context is perfectly
+        # usable. Rejecting on that closed the association before the report
+        # was even sent, so a conformant peer never received a report the
+        # library would have delivered. The N-EVENT-REPORT RESPONSE is the
+        # authority on delivery, and it is checked after the send.
+        #
+        # `accepted_contexts` only ever holds contexts the acceptor ACCEPTED
+        # (PS3.8 9.3.3: a rejected context is reported in the A-ASSOCIATE-AC
+        # and is not in this list), so membership is the whole test.
         sc_accepted = any(
-            str(ctx.abstract_syntax) == StorageCommitmentPushModel and ctx.as_scp
+            str(ctx.abstract_syntax) == StorageCommitmentPushModel
             for ctx in assoc.accepted_contexts
         )
         if not sc_accepted:
             last_err = (
-                f"SCP {calling_ae} did not grant the SCP role for storage commitment"
+                f"SCP {calling_ae} did not accept a storage commitment "
+                "presentation context"
             )
             logging.warning("[N-EVENT] %s", last_err)
             _release_or_abort(assoc, timeout=2.0)

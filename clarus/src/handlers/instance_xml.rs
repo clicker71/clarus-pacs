@@ -72,6 +72,20 @@ enum J {
 /// RFC 3339? No - DICOM XML namespace from PS3.19 Appendix A.1.
 const DICOM_XML_NS: &str = "http://dicom.nema.org/PS3.19/models/NativeDICOM";
 
+// The three VR keywords this renderer branches on, named after the PS3.18 F.2
+// table they come from rather than spelled inline: the JSON model has its own
+// keyword set, and a literal at each use site is a second copy of the standard
+// that can drift from the one in `standard/`.
+mod vr {
+    /// PS3.18 Table F.2-1 keyword for an undetermined value, and the VR a
+    /// non-element object is reported as when the shape check has to name one.
+    pub const UN: &[u8] = b"UN";
+    /// PS3.18 Table F.2-1 keyword for a person name (F.2.2 shape).
+    pub const PN: &[u8] = b"PN";
+    /// PS3.18 Table F.2-1 keyword for a sequence of dataset objects.
+    pub const SQ: &[u8] = b"SQ";
+}
+
 // -- Parser state ---------------------------------------------------------
 
 struct Parser<'a> {
@@ -208,22 +222,38 @@ impl<'a> Parser<'a> {
                     match e {
                         b'u' => {
                             let cp = self.parse_hex4()? as u32;
-                            // Surrogate pair handling.
+                            // RFC 8259 7 admits `\uXXXX` only as a UTF-16 code
+                            // unit, and a code unit in the high-surrogate range
+                            // is only meaningful when the next escape is a LOW
+                            // surrogate. The low unit must be validated BEFORE
+                            // its base is subtracted: `(lo - 0xDC00)` on any
+                            // other value underflows, which panics under
+                            // overflow checks instead of reporting bad input.
+                            // A lone surrogate has no UTF-8 encoding at all, so
+                            // it is rejected rather than replaced.
                             let cp = if (0xd800..=0xdbff).contains(&cp) {
                                 if self.peek() == Some(b'\\')
                                     && self.src.get(self.pos + 1) == Some(&b'u')
                                 {
                                     self.pos += 2;
                                     let lo = self.parse_hex4()? as u32;
+                                    if !(0xdc00..=0xdfff).contains(&lo) {
+                                        return Err(XmlError::new(
+                                            "high surrogate without a low surrogate".to_string(),
+                                        ));
+                                    }
                                     0x10000 + (((cp - 0xd800) << 10) | (lo - 0xdc00))
                                 } else {
-                                    cp
+                                    return Err(XmlError::new("lone high surrogate".to_string()));
                                 }
+                            } else if (0xdc00..=0xdfff).contains(&cp) {
+                                return Err(XmlError::new("lone low surrogate".to_string()));
                             } else {
                                 cp
                             };
                             let mut buf = [0u8; 4];
-                            let s = std::char::from_u32(cp).unwrap_or('\u{FFFD}');
+                            let s = std::char::from_u32(cp)
+                                .ok_or_else(|| XmlError::new("invalid code point".to_string()))?;
                             out.extend_from_slice(s.encode_utf8(&mut buf).as_bytes());
                         }
                         b'"' => out.push(b'"'),
@@ -269,9 +299,22 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
+        // RFC 8259 6 requires at least one digit in the integer component, and
+        // allows a leading zero only when it is the WHOLE integer part. The
+        // check has to happen HERE: after a fraction or an exponent has been
+        // scanned the cursor has moved, so a later "did anything move" test
+        // passes on `-.5` and on `01`.
         let int_start = self.pos;
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.pos += 1;
+        }
+        if self.pos == int_start {
+            return Err(XmlError::new(
+                "invalid number: no integer digit".to_string(),
+            ));
+        }
+        if self.pos - int_start > 1 && self.src[int_start] == b'0' {
+            return Err(XmlError::new("invalid number: leading zero".to_string()));
         }
         if self.peek() == Some(b'.') {
             self.pos += 1;
@@ -295,9 +338,6 @@ impl<'a> Parser<'a> {
             if self.pos == exp_start {
                 return Err(XmlError::new("invalid number: bad exponent".to_string()));
             }
-        }
-        if self.pos == int_start {
-            return Err(XmlError::new("invalid number".to_string()));
         }
         // Preserve the raw token (byte-parity with the oracle's f64 Display).
         Ok(J::Num(self.src[start..self.pos].to_vec()))
@@ -338,19 +378,33 @@ fn obj_get_arr<'a>(obj: &'a [(Vec<u8>, J)], key: &[u8]) -> Option<&'a [J]> {
 /// such a character as `&#x1B;` is equally invalid - the only options are to
 /// drop it or to invent a visible glyph.
 ///
+/// The noncharacters #xFFFE and #xFFFF are EXCLUDED by that same production
+/// (the range stops at #xFFFD), even though RFC 8259 lets a JSON string carry
+/// them. Emitting either produces a document an XML 1.0 reader must reject.
+/// #x1FFFE and #x1FFFF are legal Char, so they are NOT filtered here.
+///
 /// PS3.5 6.1.3 allows exactly five C0 controls in a DICOM text value (LF, FF,
 /// CR, ESC, TAB); of those, FF and ESC are legal DICOM but not representable in
 /// XML, so they are dropped here too. Substituting U+FFFD would fabricate a
 /// character the source never had and make the output indistinguishable from a
 /// value that genuinely contains it.
 fn is_xml_illegal(c: char) -> bool {
-    matches!(c, '\u{0000}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}')
+    matches!(
+        c,
+        '\u{0000}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}'
+            | '\u{FFFE}' | '\u{FFFF}'
+    )
 }
 
 /// Escape text content: all 5 chars. Iterates CHARACTERS (not bytes) so
 /// non-ASCII UTF-8 (Cyrillic, CJK, ...) round-trips intact - the old byte loop
 /// did `b as char`, which corrupted any byte >= 0x80 into mojibake. ASCII
 /// behaviour is byte-identical, so goldens are unchanged.
+///
+/// CR is emitted as `&#xD;`. XML 1.0 section 2.11 requires every literal CR to
+/// be normalised to LF before the application sees it, so a value holding CRLF
+/// would arrive as LF and no longer be the stored one. A character reference is
+/// excluded from that normalisation, which is the only way to keep a CR.
 fn esc(s: &[u8]) -> String {
     let mut out = String::new();
     for c in String::from_utf8_lossy(s).chars() {
@@ -363,6 +417,7 @@ fn esc(s: &[u8]) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            '\r' => out.push_str("&#xD;"),
             _ => out.push(c),
         }
     }
@@ -373,6 +428,10 @@ fn esc(s: &[u8]) -> String {
 /// iteration as [`esc`] (attribute values can also carry non-ASCII text),
 /// and the same C0 removal - XML attribute values are governed by the same
 /// character production as text nodes.
+///
+/// CR is referenced here for the same reason as in [`esc`]: attribute-value
+/// normalisation (XML 1.0 section 3.3.3) turns a literal CR into a space before
+/// it reaches the application.
 fn esc_attr(s: &[u8]) -> String {
     let mut out = String::new();
     for c in String::from_utf8_lossy(s).chars() {
@@ -383,6 +442,7 @@ fn esc_attr(s: &[u8]) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '"' => out.push_str("&quot;"),
+            '\r' => out.push_str("&#xD;"),
             _ => out.push(c),
         }
     }
@@ -488,13 +548,13 @@ fn write_scalar(xml: &mut String, v: &J, index: usize) {
 fn write_dicom_attribute(xml: &mut String, tag: &[u8], keyword: &str, info: &J) {
     let (vr, bulk, inline, value) = match info {
         J::Obj(members) => {
-            let vr = obj_get_str(members, b"vr").unwrap_or(b"UN");
+            let vr = obj_get_str(members, b"vr").unwrap_or(vr::UN);
             let bulk = obj_get_str(members, b"BulkDataURI");
             let inline = obj_get_str(members, b"InlineBinary");
             let value = obj_get_arr(members, b"Value");
             (vr, bulk, inline, value)
         }
-        _ => (b"UN".as_slice(), None, None, None),
+        _ => (vr::UN, None, None, None),
     };
 
     let _ = write!(
@@ -525,7 +585,7 @@ fn write_dicom_attribute(xml: &mut String, tag: &[u8], keyword: &str, info: &J) 
     // DICOM JSON object, and every person-name value is numbered. Reading only
     // `Alphabetic` dropped Ideographic and Phonetic (the common case for CJK
     // names) and a value that has ONLY Ideographic wrote no PersonName at all.
-    if vr == b"PN" {
+    if vr == vr::PN {
         if let Some(values) = value {
             for (i, item) in values.iter().enumerate() {
                 match item {
@@ -549,7 +609,7 @@ fn write_dicom_attribute(xml: &mut String, tag: &[u8], keyword: &str, info: &J) 
     // child attributes straight into the parent DicomAttribute merged every
     // item of a multi-item sequence into one flat list, which a reader cannot
     // split back into items.
-    if vr == b"SQ" {
+    if vr == vr::SQ {
         if let Some(values) = value {
             for (i, item) in values.iter().enumerate() {
                 if let J::Obj(members) = item {
@@ -601,10 +661,26 @@ pub fn json_metadata_to_xml(json_bytes: &[u8]) -> Result<Vec<u8>, XmlError> {
         pos: 0,
     };
     let v = parser.parse_document()?;
+    // PS3.18 Table 10.4-1 types the /metadata response as a JSON ARRAY of
+    // datasets, each a JSON object. Accepting any other top-level shape made a
+    // producer error (`[]`, `null`, a string) render as an EMPTY
+    // NativeDicomModel - indistinguishable from a genuinely empty dataset, and
+    // silently lossy. `{}` stays valid: an empty object is an empty dataset.
+    if !matches!(v, J::Obj(_)) {
+        return Err(XmlError::new(
+            "metadata document must be a JSON object".to_string(),
+        ));
+    }
 
     let mut xml = String::with_capacity(json_bytes.len() + 512);
     let _ = writeln!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
-    let _ = writeln!(xml, r#"<NativeDicomModel xmlns="{DICOM_XML_NS}">"#);
+    // PS3.19 Table A.1.5-1 requires `xml:space="preserve"` on the
+    // NativeDicomModel root, which tells a consumer not to strip or collapse
+    // the whitespace inside a DICOM text value.
+    let _ = writeln!(
+        xml,
+        r#"<NativeDicomModel xml:space="preserve" xmlns="{DICOM_XML_NS}">"#
+    );
     write_dicom_attributes(&mut xml, &v);
     let _ = writeln!(xml, "</NativeDicomModel>");
     Ok(xml.into_bytes())
@@ -641,6 +717,15 @@ pub fn json_info_to_xml_element(
         pos: 0,
     };
     let info = parser.parse_document()?;
+    // Same shape rule as the document path: the info object IS the
+    // `{"vr","Value"}` element, so anything but an object would render an
+    // attribute with no `vr` and no value - an element the schema does not
+    // allow, produced silently.
+    if !matches!(info, J::Obj(_)) {
+        return Err(XmlError::new(
+            "info object must be a JSON object".to_string(),
+        ));
+    }
 
     let mut xml = String::with_capacity(json_bytes.len() + 64);
     write_dicom_attribute(&mut xml, tag.as_bytes(), keyword, &info);
@@ -664,6 +749,112 @@ mod tests {
         assert!(xml.contains("<NativeDicomModel"));
         assert!(xml.contains("</NativeDicomModel>"));
         assert!(!xml.contains("<DicomAttribute"));
+    }
+
+    // -- Document shape ----------------------------------------------
+
+    /// PS3.19 Table A.1.5-1 requires `xml:space="preserve"` on the root.
+    /// Remove the attribute and this test reds.
+    #[test]
+    fn root_declares_whitespace_preservation() {
+        let xml = to_xml("{}");
+        assert!(
+            xml.contains(r#"<NativeDicomModel xml:space="preserve" "#.trim_end_matches(' ')),
+            "the model root must declare xml:space: {xml}"
+        );
+    }
+
+    /// A top-level ARRAY is not a metadata document (PS3.18 Table 10.4-1 makes
+    /// the response an array of datasets, but each element of THAT array is
+    /// what this function renders - one dataset object). Accepting `[]` and
+    /// emitting an empty model made a producer error look like empty metadata.
+    #[test]
+    fn a_non_object_document_is_rejected() {
+        for bad in ["[]", "null", "\"x\"", "3"] {
+            assert!(
+                json_metadata_to_xml(bad.as_bytes()).is_err(),
+                "{bad} is not a metadata document and must be refused"
+            );
+        }
+    }
+
+    // -- Number grammar ----------------------------------------------
+
+    /// RFC 8259 6 requires a digit in the integer component.
+    #[test]
+    fn a_number_needs_an_integer_digit() {
+        for bad in ["-.5", ".5", "-"] {
+            // Wrap in an attribute-shaped element so the failure is in the
+            // number, not in the surrounding grammar.
+            let doc = format!(r#"{{"7FE00010":{{"vr":"DS","Value":[{bad}]}}}}"#);
+            assert!(
+                json_metadata_to_xml(doc.as_bytes()).is_err(),
+                "{bad} has no integer digit and must be refused"
+            );
+        }
+    }
+
+    /// RFC 8259 6 allows a leading zero only when it is the whole integer part.
+    #[test]
+    fn a_leading_zero_is_rejected() {
+        for bad in ["01", "-01", "00"] {
+            let doc = format!(r#"{{"7FE00010":{{"vr":"DS","Value":[{bad}]}}}}"#);
+            assert!(
+                json_metadata_to_xml(doc.as_bytes()).is_err(),
+                "{bad} has a leading zero and must be refused"
+            );
+        }
+        // The conformant neighbours stay accepted.
+        for good in ["0", "-0.5", "1e-3", "0.5"] {
+            let doc = format!(r#"{{"7FE00010":{{"vr":"DS","Value":[{good}]}}}}"#);
+            assert!(
+                json_metadata_to_xml(doc.as_bytes()).is_ok(),
+                "{good} is a conformant number and must be accepted"
+            );
+        }
+    }
+
+    // -- Surrogate escapes -------------------------------------------
+
+    /// A low surrogate is validated before its base is subtracted. Without the
+    /// check `(lo - 0xDC00)` underflows and panics under overflow checks; a
+    /// lone surrogate has no UTF-8 form at all.
+    #[test]
+    fn malformed_surrogate_escapes_are_refused_not_panicked() {
+        for bad in [
+            r#""\uD800\u0041""#,
+            r#""\uD800""#,
+            r#""\uDC00""#,
+            r#"{"7FE00010":"#,
+        ] {
+            let doc = format!(r#"{{"00081030":{{"vr":"LO","Value":[{bad}]}}}}"#);
+            let got = json_metadata_to_xml(doc.as_bytes());
+            assert!(got.is_err(), "{bad} must be refused, not panicked");
+        }
+        // A valid pair still decodes.
+        let xml = to_xml(r#"{"00081030":{"vr":"LO","Value":["\uD83D\uDE00"]}}"#);
+        assert!(xml.contains('\u{1F600}'), "{xml}");
+    }
+
+    // -- Escaping: XML 1.0 char production ---------------------------
+
+    /// XML 1.0 Char stops at #xFFFD, so #xFFFE and #xFFFF are not
+    /// representable - not even as a character reference.
+    #[test]
+    fn noncharacters_are_dropped() {
+        let xml = to_xml(r#"{"00081030":{"vr":"LO","Value":["a\uFFFEb\uFFFFc"]}}"#);
+        assert!(xml.contains("<Value number=\"1\">abc</Value>"), "{xml}");
+    }
+
+    /// XML 1.0 2.11 normalises a literal CR to LF, so a CR must be a
+    /// character reference to survive.
+    #[test]
+    fn carriage_return_is_a_character_reference() {
+        let xml = to_xml(r#"{"00081030":{"vr":"LO","Value":["a\r\nb"]}}"#);
+        assert!(
+            xml.contains("<Value number=\"1\">a&#xD;\nb</Value>"),
+            "CR must be referenced and LF kept literal: {xml}"
+        );
     }
 
     // -- PN decomposition --------------------------------------------
@@ -779,13 +970,17 @@ mod tests {
             r#"{{"00080010":{{"vr":"PN","Value":["{}"]}}}}"#,
             name
         ));
+        // Assert the ELEMENTS, not the bare substrings. `"Иванов"` contains
+        // `"Иван"`, so a bare contains() on the given name passes even when
+        // the writer emits only the family name - the assertion could not fail
+        // for the defect it is meant to catch.
         assert!(
-            xml2.contains("Иванов"),
-            "PN FamilyName must round-trip: {xml2}"
+            xml2.contains("<FamilyName>Иванов</FamilyName>"),
+            "PN FamilyName must round-trip into its own element: {xml2}"
         );
         assert!(
-            xml2.contains("Иван"),
-            "PN GivenName must round-trip: {xml2}"
+            xml2.contains("<GivenName>Иван</GivenName>"),
+            "PN GivenName must round-trip into its own element: {xml2}"
         );
         // And neither part is the byte-as-char mojibake.
         let fam: String = "Иванов".as_bytes().iter().map(|&b| b as char).collect();

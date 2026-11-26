@@ -17,7 +17,7 @@
 pub mod error;
 pub mod helpers;
 pub mod types;
-mod validation;
+pub(crate) mod validation;
 
 pub use error::WadoError;
 pub use types::{WadoQueryParams, WadoUriQuery};

@@ -3,17 +3,33 @@
 //! On-disk study indexes (`idx/`) - the shadow B-tree tier.
 //!
 //! Each index is a set of append-only files, one per content-addressed
-//! bucket key and day. Every row is a fixed-size record that is lexicographically
-//! sorted when the bucket key is a BLAKE3 hash (chronological order), enabling
-//! binary search on read. Writes use `O_APPEND` (a single `write()` syscall,
+//! bucket key and day. Writes use `O_APPEND` (a single `write()` syscall,
 //! never overwrites, safe under a crash because a torn row is only ever at
 //! the tail and is skipped on read).
+//!
+//! # Row formats, and what may be binary-searched
+//!
+//! The three files do NOT share one shape, and the difference decides how a
+//! reader may search them:
+//!
+//! - `dates/YYYYMMDD.idx`: fixed [`date::ROW_LEN`] bytes, 64 lowercase hex
+//!   chars + `\n`. Rows are appended in ARRIVAL order, so the file is NOT
+//!   sorted by hash - a reader that wants binary search must sort it first
+//!   (or search the sorted in-memory copy). The fixed width is what makes a
+//!   torn tail detectable as a non-multiple length.
+//! - `modality/{CS}/YYYYMMDD.idx`: VARIABLE length, `study_uid\n` per row, in
+//!   arrival order. There is no fixed stride to align on, so a reader must
+//!   split on `\n`; a missing final newline is a torn append and the fragment
+//!   is not a row.
+//! - `sop_owner/YYYYMMDD.idx`: fixed 129 bytes, `SOP(64)|Study(64)|\n`, and
+//!   the rows are IMMUTABLE once the day is sealed.
 //!
 //! # Immutability model
 //!
 //! - Today's files are `O_APPEND` (mutable, written by STOW).
-//! - A midnight rollover ([`rollover`]) closes today's files and renames them
-//!   to the immutable set that read-only mmap consumers may map forever.
+//! - A midnight rollover ([`rollover`]) CLOSES today's handles and stops
+//!   writing to them; it does not rename or move the files. The day's files
+//!   then become the immutable set that read-only mmap consumers may map.
 //!
 //! # Zero-allocation hotpath
 //!

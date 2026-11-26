@@ -45,6 +45,16 @@ jobs:
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/clarus dist/clarus
           cp target/x86_64-unknown-linux-musl/release/clinfer dist/clinfer
+          # clinfer's runtime directory: config, the model YAMLs, the ABI
+          # scripts the enabled model runs, and the local mirror of the
+          # extension StructureDefinitions. models_dir and fhir.extension_base
+          # in clinfer.conf are relative to the config file, so the layout here
+          # mirrors clinfer/.
+          cp clinfer/clinfer.conf dist/clinfer.conf
+          cp -r clinfer/models dist/models
+          cp -r clinfer/abi dist/abi
+          rm -rf dist/abi/__pycache__
+          cp -r clinfer/fhir dist/fhir
           cp clbridge/clbridge.py clbridge/clbridge.conf \
              clbridge/sop_classes.yaml clbridge/printers.yaml clbridge/peers.conf \
              clarus.conf RELEASE_README.txt dist/
@@ -88,6 +98,16 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/clarus.exe dist/clarus.exe
           Copy-Item target/release/clinfer.exe dist/clinfer.exe
+          # clinfer's runtime directory: config, the model YAMLs, the ABI
+          # scripts the enabled model runs, and the local mirror of the
+          # extension StructureDefinitions. models_dir and fhir.extension_base
+          # in clinfer.conf are relative to the config file, so the layout here
+          # mirrors clinfer/.
+          Copy-Item clinfer/clinfer.conf dist/clinfer.conf
+          Copy-Item clinfer/models dist/models -Recurse
+          Copy-Item clinfer/abi dist/abi -Recurse
+          Remove-Item dist/abi/__pycache__ -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item clinfer/fhir dist/fhir -Recurse
           Copy-Item clbridge/dist/clbridge.exe dist/clbridge.exe
           Copy-Item clbridge/clbridge.py, clbridge/clbridge.conf, `
             clbridge/sop_classes.yaml, clbridge/printers.yaml, clbridge/peers.conf, `

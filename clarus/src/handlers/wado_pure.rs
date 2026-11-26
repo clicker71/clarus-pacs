@@ -18,7 +18,7 @@ use clarus_ports::StorageTier;
 use super::wado::error::WadoError;
 use super::wado::helpers::{
     attr_frames, attr_list, attr_text, attr_text_from, cas_hex_key, find_instance,
-    inject_bulk_data_uris_native, load_manifest, tier_from_u8,
+    find_instance_in_series, inject_bulk_data_uris_native, load_manifest, tier_from_u8,
 };
 use super::wado::types::{WadoQueryParams, extract_transfer_syntax_from_accept_str};
 use super::wado::validate_dicom_uid;
@@ -93,7 +93,15 @@ pub fn locate_object(
             })
             .map(|s| s.instances.len() as u32)
     });
-    let inst = find_instance(&manifest, sop_uid)?;
+    // PS3.18 10.4.1.1.1: the Retrieve Instance resource is addressed by
+    // study AND series AND instance, so an instance is only in scope when the
+    // requested series actually contains it. Searching the whole study let a
+    // request for SOP X under series B return X from series A - the URL named
+    // one resource and the server served a different one.
+    let inst = match series_uid {
+        Some(suid) => find_instance_in_series(&manifest, suid, sop_uid)?,
+        None => find_instance(&manifest, sop_uid)?,
+    };
     // The QA surface lifts a hide only for reasons that permit it. A Quality
     // rejection is reviewable; an IOCM patient-safety or incorrect-MWL hide
     // has no expose path at all (IOCM 4.66.4.2.3 / 4.66.4.3.3), so it answers
@@ -142,8 +150,11 @@ pub fn plan_range(range_header: Option<&str>, file_size: u64) -> Result<WadoResp
 
 /// The transfer syntax a per-tile decode produces: Explicit VR Little Endian.
 ///
-/// Named once so the route and the tests cannot drift apart.
-pub const EVRLE_TS: &str = "1.2.840.10008.1.2.1";
+/// Bound to the shared `ts_uid` constant rather than repeating the UID
+/// literal: PS3.6 assigns 1.2.840.10008.1.2.1 to Explicit VR Little Endian, and
+/// a second transcription of it here is a protocol fact that can drift from the
+/// codec table that actually decodes it.
+pub const EVRLE_TS: &str = clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE;
 
 /// The 0028 pixel-module tags a per-tile decode needs from the instance head.
 ///
@@ -222,23 +233,38 @@ fn evrle_single_frame_dataset(
     stored_ts: &str,
 ) -> Vec<u8> {
     /// Append one Explicit VR LE element.
+    ///
+    /// The declared length is the PADDED length and the pad byte matches the
+    /// VR (PS3.5 6.2: "the Value shall be padded to an even length ... for VRs
+    /// of type String the padding character shall be a SPACE (20H), otherwise
+    /// a NULL (00H)"). Appending the pad AFTER the header without counting it
+    /// made every following element start one byte early for an odd-length
+    /// string value - `MONOCHROME2` is 11 bytes, so a reader that advances by
+    /// the declared length landed one byte into the next tag.
+    ///
+    /// The VR class comes from `clarus_adapters::bit_depth`, the same table the
+    /// reader side walks with, so the writer cannot drift from the parser.
     fn elem(buf: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], value: &[u8]) {
         buf.extend_from_slice(&group.to_le_bytes());
         buf.extend_from_slice(&element.to_le_bytes());
         buf.extend_from_slice(vr);
-        let long_form = matches!(
-            vr,
-            b"OB" | b"OD" | b"OF" | b"OL" | b"OV" | b"OW" | b"SQ" | b"UN" | b"UC" | b"UR" | b"UT"
-        );
-        if long_form {
-            buf.extend_from_slice(&[0x00, 0x00]);
-            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        let pad_byte = if clarus_adapters::bit_depth::vr_pads_with_space(*vr) {
+            b' '
         } else {
-            buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            0x00
+        };
+        let padded_len = value.len() + (value.len() & 1);
+        if clarus_adapters::bit_depth::vr_uses_extended_header(*vr) {
+            buf.extend_from_slice(&[0x00, 0x00]);
+            buf.extend_from_slice(&(padded_len as u32).to_le_bytes());
+        } else {
+            // A short-form element cannot carry more than 65534 bytes; the
+            // values this writer emits are a handful of bytes.
+            buf.extend_from_slice(&(padded_len as u16).to_le_bytes());
         }
         buf.extend_from_slice(value);
         if !value.len().is_multiple_of(2) {
-            buf.push(0x00);
+            buf.push(pad_byte);
         }
     }
 
@@ -370,6 +396,21 @@ pub fn transcode_frame_to_evrle(
     }
 }
 
+/// PS3.18 8.7.3 bans Implicit VR Little Endian and Explicit VR Big Endian
+/// over Web Services, so neither can ever be a REQUESTED target. Returns the
+/// 406 the caller must send, or `None` for a servable target.
+pub fn banned_target_error(target_ts: &str) -> Option<WadoError> {
+    if target_ts == clarus_adapters::codec::ts_uid::IMPLICIT_VR_LE
+        || target_ts == clarus_adapters::codec::ts_uid::EXPLICIT_VR_BE
+    {
+        Some(WadoError::NotAcceptable(format!(
+            "Transfer syntax '{target_ts}' cannot be served over Web Services (PS3.18 8.7.3)"
+        )))
+    } else {
+        None
+    }
+}
+
 /// Decide on transcoding and transcode if needed. Includes the 406 path and
 /// the "serve original" fallback - byte-for-byte with current behaviour.
 ///
@@ -385,6 +426,9 @@ pub fn maybe_transcode(
     let Some(target_ts) = requested_ts else {
         return Ok((bytes, stored_ts.to_string()));
     };
+    if let Some(err) = banned_target_error(target_ts) {
+        return Err(err);
+    }
     // "Give it back as stored" needs no codec, so it is answered BEFORE the
     // capability check: a client that asks for the syntax the object already
     // has must get its bytes, and refusing it because no decoder happens to be
@@ -553,11 +597,27 @@ fn acquire(pool: &crate::state::TranscodePool) -> Option<PoolPermit<'_>> {
 fn check_pixel_budget(bytes: &[u8], max_megapixels: u32) -> Result<(), WadoError> {
     let rows = extract_u16(bytes, (0x0028, 0x0010)).unwrap_or(0) as u64;
     let cols = extract_u16(bytes, (0x0028, 0x0011)).unwrap_or(0) as u64;
+    // The decoders take the WHOLE instance and the caller then slices one
+    // frame out, so the buffer a decode allocates is Rows x Columns x
+    // NumberOfFrames - not one frame. Counting a single frame let a
+    // multi-frame instance pass the budget while its decoded data exceeded it
+    // by the frame count. The transcode pool permit limits CONCURRENT decodes,
+    // not bytes per decode, so it is not a substitute.
+    //
+    // PS3.5 A.4: encapsulated PixelData holds one fragment per frame, so
+    // NumberOfFrames bounds the decoded size of a conformant instance. It is
+    // an IS in the dataset but a u32 in the manifest, so it is read the same
+    // way the rest of this module reads an untrusted count.
+    let frames = num_frames_of(bytes).max(1) as u64;
     let max_px = (max_megapixels as u64) * 1_000_000;
-    if rows > 0 && cols > 0 && rows.saturating_mul(cols) > max_px {
-        return Err(WadoError::PayloadTooLarge(format!(
-            "Image too large to transcode: {rows}x{cols} pixels (>{max_megapixels} MP limit)"
-        )));
+    if rows > 0 && cols > 0 {
+        let total = rows.saturating_mul(cols).saturating_mul(frames);
+        if total > max_px {
+            return Err(WadoError::PayloadTooLarge(format!(
+                "Decode too large to transcode: {rows}x{cols}x{frames} pixels \
+                 (>{max_megapixels} MP limit)"
+            )));
+        }
     }
     Ok(())
 }
@@ -572,16 +632,52 @@ fn check_pixel_budget(bytes: &[u8], max_megapixels: u32) -> Result<(), WadoError
 /// (PS3.18 10.4.3.1 Table 10.4.3-1). 416 belongs to the byte-Range HEADER
 /// mechanism, not to this URI segment. Single-frame passthrough; multi-frame
 /// extract.
-/// True when the PixelData element value begins with an Item tag
-/// (FFFE,E000) - i.e. the element is encapsulated (PS3.5 Table A.4-1). The
-/// element bytes then wrap a Basic Offset Table item + per-frame Items and
-/// are NOT a frame; `dicom_rs::frame::extract_frame` must unwrap them.
-fn pixel_data_is_encapsulated(pixel_data: &[u8]) -> bool {
-    pixel_data.len() >= 4
-        && pixel_data[0] == 0xFE
-        && pixel_data[1] == 0xFF
-        && pixel_data[2] == 0x00
-        && pixel_data[3] == 0xE0
+/// The PixelData encoding declared by the ELEMENT HEADER.
+///
+/// PS3.5 A.4: encapsulated (compressed) Pixel Data is `OB`/`OW` with an
+/// UNDEFINED length whose value is a sequence of Items; native Pixel Data is a
+/// defined-length value of raw samples. The encodings are distinguishable from
+/// the header alone, which matters because the value bytes are not a reliable
+/// signal: a native image whose first samples happen to be `FE FF 00 E0` is
+/// still native, and sniffing it as encapsulated fed pixel samples to the Item
+/// parser.
+///
+/// The transfer syntax is the header fact available at every call site, and it
+/// is normative: PS3.5 A.4 makes ALL compressed syntaxes encapsulated and the
+/// three uncompressed ones native. An unknown/absent transfer syntax is treated
+/// as encapsulated - the conservative reading the metadata routes already use.
+fn pixel_data_encoding(
+    transfer_syntax: Option<&str>,
+    pixel_data: &[u8],
+) -> clarus_adapters::dicom_rs::frame::PixelDataEncoding {
+    use clarus_adapters::codec::ts_uid;
+    use clarus_adapters::dicom_rs::frame::PixelDataEncoding;
+
+    match transfer_syntax {
+        Some(ts) => {
+            let native = ts == ts_uid::IMPLICIT_VR_LE
+                || ts == ts_uid::EXPLICIT_VR_LE
+                || ts == ts_uid::EXPLICIT_VR_BE;
+            if native {
+                PixelDataEncoding::Native
+            } else {
+                PixelDataEncoding::Encapsulated
+            }
+        }
+        // No meta-header: fall back to the value's own shape.
+        None => {
+            if pixel_data.len() >= 4
+                && pixel_data[0] == 0xFE
+                && pixel_data[1] == 0xFF
+                && pixel_data[2] == 0x00
+                && pixel_data[3] == 0xE0
+            {
+                PixelDataEncoding::Encapsulated
+            } else {
+                PixelDataEncoding::Native
+            }
+        }
+    }
 }
 
 pub fn extract_frame(dicom_bytes: &[u8], frame: &str) -> Result<WadoResp, WadoError> {
@@ -639,16 +735,25 @@ pub fn extract_frame(dicom_bytes: &[u8], frame: &str) -> Result<WadoResp, WadoEr
         return Err(WadoError::Internal("PixelData element is empty".into()));
     }
 
-    let frame_bytes = if num_frames <= 1 && !pixel_data_is_encapsulated(&pixel_data) {
+    // PS3.5 A.4: the encoding comes from the element header (the transfer
+    // syntax), not from the first four value bytes.
+    let ts = parser.transfer_syntax_uid(dicom_bytes);
+    let encoding = pixel_data_encoding(ts.as_deref(), &pixel_data);
+    let frame_bytes = if num_frames <= 1 && encoding == frame::PixelDataEncoding::Native {
         pixel_data
     } else {
-        frame::extract_frame(&pixel_data, frame_number, frame_size, num_frames).map_err(|e| {
-            match &e {
-                frame::FrameExtractionError::FrameOutOfRange { .. } => {
-                    WadoError::NotFound(format!("Frame {frame_number} out of range"))
-                }
-                _ => WadoError::Internal(e.to_string()),
+        frame::extract_frame_with_encoding(
+            &pixel_data,
+            frame_number,
+            frame_size,
+            num_frames,
+            encoding,
+        )
+        .map_err(|e| match &e {
+            frame::FrameExtractionError::FrameOutOfRange { .. } => {
+                WadoError::NotFound(format!("Frame {frame_number} out of range"))
             }
+            _ => WadoError::Internal(e.to_string()),
         })?
     };
 
@@ -926,7 +1031,13 @@ fn render_mono_plane(
         // Post-rescale physical values, so the percentile fallback ranks the
         // same numbers a viewer would and a stored window is in the same
         // units the attribute is expressed in.
-        let mut physical: Vec<i32> = Vec::with_capacity(pixel_count);
+        //
+        // These are kept as f64, NOT narrowed to i32: PS3.3 C.11.2.1.2 maps
+        // stored values through `slope * stored + intercept`, and a slope of
+        // 0.25 turns stored 0 and 1 into 0.0 and 0.25. Casting to an integer
+        // before VOI collapsed both to 0, so a window could no longer tell
+        // apart two samples the Modality LUT had separated.
+        let mut physical: Vec<f64> = Vec::with_capacity(pixel_count);
         for i in 0..pixel_count {
             let idx = i * bytes_per_sample;
             let s = if bytes_per_sample == 1 {
@@ -936,22 +1047,21 @@ fn render_mono_plane(
                 let b1 = pixel_data.get(idx + 1).copied().unwrap_or(0);
                 let u = u16::from_le_bytes([b0, b1]);
                 if pixel_rep == 1 {
-                    (u as i16) as i32
+                    // PS3.3 C.7.6.3.1.2: PixelRepresentation=1 means the sample
+                    // is two's complement. Sign-extend from the HIGH BIT, not
+                    // from bit 15: a 12-bit sample stored as 0x0FFF in a 16-bit
+                    // cell is -1 when High Bit is 11, and `u as i16` read it as
+                    // the positive 4095.
+                    sign_extend(u, bits_allocated, window_bytes) as i32
                 } else {
                     u as i32
                 }
             };
-            physical.push(rescale_sample(s, slope, intercept) as i32);
+            physical.push(rescale_sample(s, slope, intercept));
         }
         match voi {
             Some((center, width)) => {
-                let w = if width <= 0.0 { 1.0 } else { width };
-                let lo_f = center - w / 2.0;
-                for (out, value) in raw_pixels.iter_mut().zip(physical.iter()) {
-                    let y = ((*value as f64 - lo_f) / w) * 255.0;
-                    let yc = y.clamp(0.0, 255.0) as u8;
-                    *out = if invert { 255 - yc } else { yc };
-                }
+                apply_linear_window(&mut raw_pixels, &physical, center, width, invert);
             }
             None => {
                 // 2-98% percentile fallback, used ONLY when the instance
@@ -959,17 +1069,15 @@ fn render_mono_plane(
                 // saturated pixel from inflating the range and washing the
                 // whole thumbnail out.
                 let mut sorted = physical.clone();
-                sorted.sort_unstable();
+                sorted.sort_by(|a, b| a.total_cmp(b));
                 let lo_idx = ((pixel_count as f64 * 0.02) as usize).min(pixel_count - 1);
                 let hi_idx = ((pixel_count as f64 * 0.98) as usize).min(pixel_count - 1);
                 let lo = sorted[lo_idx];
                 let hi = sorted[hi_idx];
-                let range = (hi - lo).max(1) as i64;
+                let range = (hi - lo).max(f64::MIN_POSITIVE);
                 for (out, value) in raw_pixels.iter_mut().zip(physical.iter()) {
-                    let y =
-                        ((*value as i64 - lo as i64).clamp(0, range) as u64 * 255) / range as u64;
-                    let yc = y.min(255) as u8;
-                    *out = if invert { 255 - yc } else { yc };
+                    let y = ((*value - lo) / range * 255.0).clamp(0.0, 255.0) as u8;
+                    *out = if invert { 255 - y } else { y };
                 }
             }
         }
@@ -1372,11 +1480,29 @@ pub fn render_frame_thumbnail(
         .extract_tag_value(bytes, (0x7FE0, 0x0010))
         .map_err(|e| WadoError::Internal(format!("Failed to parse DICOM for frame: {e}")))?
         .ok_or_else(|| WadoError::NotFound("PixelData not found".into()))?;
-    let frame_bytes = if num_frames <= 1 && !pixel_data_is_encapsulated(&pixel_data) {
+    let ts = parser.transfer_syntax_uid(bytes);
+    let encoding = pixel_data_encoding(ts.as_deref(), &pixel_data);
+    let frame_bytes = if num_frames <= 1 && encoding == frame::PixelDataEncoding::Native {
         pixel_data
     } else {
-        frame::extract_frame(&pixel_data, frame_number, frame_size, num_frames)
-            .map_err(|_| WadoError::RangeNotSatisfiable)?
+        frame::extract_frame_with_encoding(
+            &pixel_data,
+            frame_number,
+            frame_size,
+            num_frames,
+            encoding,
+        )
+        // The frame number is already known to be in range (checked above), so
+        // a failure here is about the STORED bytes - a PixelData value shorter
+        // than Rows x Columns x ... declares, or an Item stream that does not
+        // hold the frame. No byte-Range header is involved, so answering 416
+        // ("Range Not Satisfiable") told the client to change a header it never
+        // sent. A defect in the stored object is a server-side failure: 500.
+        .map_err(|e| {
+            WadoError::Internal(format!(
+                "Stored pixel data cannot yield frame {frame_number}: {e}"
+            ))
+        })?
     };
 
     render_pixels_thumbnail(
@@ -1820,12 +1946,20 @@ fn slice_decoded_frame(
 /// endpoint has no per-frame selector). Window center/width query params are
 /// OUT of scope for v1 (documented) - only the instance's stored windowing is
 /// used.
+///
+/// `target` is the `viewport` fit box, or the native `(cols, rows)` when the
+/// request named no viewport (PS3.18 8.3.5.1.3: the content is rendered as
+/// large as possible within the viewport). It must reach BOTH decode paths:
+/// the raw path has always threaded it, and the compressed path used to accept
+/// the box and then call the full-size renderer, so a `viewport=160,90` request
+/// on a JPEG instance silently returned the native 1600x900 image.
 pub fn render_full_from_bytes(
     bytes: &[u8],
     sop_uid: &str,
     registry: &clarus_adapters::codec::CodecRegistry,
     pool: &crate::state::TranscodePool,
     max_megapixels: u32,
+    target: (u32, u32),
 ) -> Result<WadoResp, WadoError> {
     // 2608 pixel budget BEFORE any decode buffer is allocated (reuses
     // `PayloadTooLarge` -> 413, same status as the thumbnail pixel cap).
@@ -1835,7 +1969,7 @@ pub fn render_full_from_bytes(
     let Some(_permit) = acquire(pool) else {
         return Err(WadoError::Busy);
     };
-    render_full_impl(bytes, sop_uid, registry)
+    render_full_impl(bytes, sop_uid, registry, target)
 }
 
 /// The actual render body, wrapped by [`render_full_from_bytes`] (which owns
@@ -1845,11 +1979,12 @@ fn render_full_impl(
     bytes: &[u8],
     sop_uid: &str,
     registry: &clarus_adapters::codec::CodecRegistry,
+    target: (u32, u32),
 ) -> Result<WadoResp, WadoError> {
     use clarus_adapters::dicom_rs::DicomRsParser;
 
     if is_compressed_transfer_syntax(bytes)? {
-        return render_full_compressed(bytes, sop_uid, registry);
+        return render_full_compressed(bytes, sop_uid, registry, target);
     }
     // Same reason as the thumbnail path: the header readers below are
     // little-endian, so an Explicit VR Big Endian instance is converted first.
@@ -1885,7 +2020,11 @@ fn render_full_impl(
     // same geometry as the frame extractor, so this honors the byte-stride.
     let num_frames = num_frames_of(bytes);
     let samples_per_pixel = extract_u16(bytes, (0x0028, 0x0002)).unwrap_or(1);
-    let frame_pixel = if num_frames <= 1 && !pixel_data_is_encapsulated(&pixel_data) {
+    let ts = parser.transfer_syntax_uid(bytes);
+    let encoding = pixel_data_encoding(ts.as_deref(), &pixel_data);
+    let frame_pixel = if num_frames <= 1
+        && encoding == clarus_adapters::dicom_rs::frame::PixelDataEncoding::Native
+    {
         pixel_data
     } else {
         let frame_size = clarus_adapters::dicom_rs::frame::compute_frame_size(
@@ -1895,8 +2034,14 @@ fn render_full_impl(
             bits_allocated as u16,
         )
         .unwrap_or(0);
-        clarus_adapters::dicom_rs::frame::extract_frame(&pixel_data, 1, frame_size, num_frames)
-            .map_err(|_| WadoError::Internal("Failed to extract first frame for render".into()))?
+        clarus_adapters::dicom_rs::frame::extract_frame_with_encoding(
+            &pixel_data,
+            1,
+            frame_size,
+            num_frames,
+            encoding,
+        )
+        .map_err(|_| WadoError::Internal("Failed to extract first frame for render".into()))?
     };
 
     render_pixels_full(
@@ -1920,6 +2065,7 @@ fn render_full_compressed(
     bytes: &[u8],
     sop_uid: &str,
     registry: &clarus_adapters::codec::CodecRegistry,
+    target: (u32, u32),
 ) -> Result<WadoResp, WadoError> {
     let ts = match registry_sorted_ts(bytes) {
         Some(t) => t,
@@ -1963,18 +2109,24 @@ fn render_full_compressed(
     let pixel_rep = if decoded.bits_allocated == 16 { 1 } else { 0 };
     // DecodedPixels frame slice is one byte per sample element; bits_allocated
     // 8 or 16 maps to the same raw-path byte/word layout for a single plane.
-    render_pixels_full(
-        FullPixelInput {
-            data: frame_slice,
+    //
+    // The decoded plane goes through `render_mono_plane`, the same window +
+    // fit-box core the raw path and the thumbnail use, so the viewport applies
+    // here too and one instance cannot render differently depending on whether
+    // its pixels arrived compressed (PS3.18 8.3.5.1.3).
+    let (w, h, gray) = render_mono_plane(
+        frame_slice,
+        RawGeometry {
             rows: decoded.rows as u32,
             cols: decoded.columns as u32,
             bits_allocated: decoded.bits_allocated as u32,
             pixel_rep,
+            invert,
         },
-        invert,
         bytes,
-        sop_uid,
-    )
+        target,
+    )?;
+    encode_full_jpeg(w, h, &gray, sop_uid)
 }
 
 /// Default-build compressed instance -> 406 (wire-compatible with the
@@ -1984,6 +2136,7 @@ fn render_full_compressed(
     _bytes: &[u8],
     _sop_uid: &str,
     _registry: &clarus_adapters::codec::CodecRegistry,
+    _target: (u32, u32),
 ) -> Result<WadoResp, WadoError> {
     Err(WadoError::NotAcceptable(
         "rendered requires transcode".to_string(),
@@ -2129,6 +2282,35 @@ fn render_pixels_full(
     })
 }
 
+/// Serialize an 8-bit gray plane as the `/rendered` JPEG body.
+///
+/// Split out of [`render_pixels_full`] so the compressed path can hand the
+/// plane `render_mono_plane` produced to the SAME encoder instead of keeping a
+/// second copy of the response construction.
+#[cfg(feature = "transcode")]
+fn encode_full_jpeg(w: u32, h: u32, gray: &[u8], sop_uid: &str) -> Result<WadoResp, WadoError> {
+    use clarus_adapters::jpeg_encoder::{ColorType, Encoder};
+
+    let mut jpeg_data = Vec::new();
+    let encoder = Encoder::new(&mut jpeg_data, 75);
+    encoder
+        .encode(gray, w as u16, h as u16, ColorType::Luma)
+        .map_err(|e| WadoError::Internal(format!("JPEG encoding failed: {e}")))?;
+
+    crate::clog_debug!(
+        sop_uid = %sop_uid,
+        render_bytes = %jpeg_data.len(),
+        "Generated rendered JPEG"
+    );
+
+    Ok(WadoResp {
+        status: 200,
+        content_type: "image/jpeg",
+        headers: vec![("Content-Length", jpeg_data.len().to_string())],
+        body: jpeg_data,
+    })
+}
+
 /// Rescale Slope/Intercept (0028,1053/0028,1052) - the Modality LUT. Defaults
 /// to 1/0 when absent (identity).
 fn rescale_params(bytes: &[u8]) -> (f64, f64) {
@@ -2142,26 +2324,136 @@ fn rescale_sample(v: i32, slope: f64, intercept: f64) -> f64 {
     v as f64 * slope + intercept
 }
 
+/// Sign-extend a stored sample from the DICOM High Bit.
+///
+/// PS3.3 C.7.6.3.1.2: when PixelRepresentation is 1 the sample is two's
+/// complement in BitsStored bits, the unused high bits of the cell are
+/// unspecified, and High Bit (0028,0102) marks the most significant bit of the
+/// value. A 12-bit sample stored as 0x0FFF in a 16-bit cell is -1 when High Bit
+/// is 11; reading the whole cell as `i16` gave 4095, which windowed as a
+/// bright pixel instead of a dark one.
+///
+/// Falls back to bit 15 when the attribute is absent: a cell that declares no
+/// geometry is read the way `i16` reads it, which is what the previous code
+/// did unconditionally.
+fn sign_extend(raw: u16, bits_allocated: u32, dataset: &[u8]) -> i16 {
+    // High Bit is the position of the sign bit. BitsStored is not needed
+    // separately: masking to (high_bit + 1) bits and sign-extending from that
+    // bit is exactly the two's-complement reading PS3.3 C.7.6.3.1.2 defines.
+    let high_bit = clarus_adapters::bit_depth::extract_first_us(dataset, (0x0028, 0x0102))
+        // PS3.3 C.7.6.3: HighBit = BitsStored - 1, and BitsStored <=
+        // BitsAllocated, so the widest legal High Bit is bits_allocated - 1.
+        .unwrap_or_else(|| bits_allocated.saturating_sub(1) as u16)
+        .min(15);
+    let sign_mask = 1u16 << high_bit;
+    let value_mask = (sign_mask << 1).wrapping_sub(1);
+    let masked = raw & value_mask;
+    if masked & sign_mask == 0 {
+        masked as i16
+    } else {
+        // Set the bits above the sign bit so the i16 cast reads a negative.
+        (masked | !value_mask) as i16
+    }
+}
+
+/// The DICOM default LINEAR VOI LUT function (PS3.3 C.11.2.1.2).
+///
+/// ```text
+/// if (x <= c - 0.5 - (w-1)/2)  y = ymin
+/// else if (x > c - 0.5 + (w-1)/2)  y = ymax
+/// else  y = ((x - (c - 0.5)) / (w-1) + 0.5) * (ymax - ymin) + ymin
+/// ```
+///
+/// The `(w-1)` denominator is why a width of 1 is a THRESHOLD rather than a
+/// division by zero: the middle branch has an empty domain when w == 1, so
+/// every sample at or below `c - 0.5` is black and everything above is white.
+/// The previous formula (`(x - (c - w/2)) / w`) mapped the centre of a
+/// width-1 window to mid-grey instead of white.
+fn apply_linear_window(
+    raw_pixels: &mut [u8],
+    physical: &[f64],
+    center: f64,
+    width: f64,
+    invert: bool,
+) {
+    const YMIN: f64 = 0.0;
+    const YMAX: f64 = 255.0;
+    let map = |x: f64| -> u8 {
+        if width <= 1.0 {
+            // PS3.3 C.11.2.1.2 note: "When the Window Width is 1, the
+            // function is a threshold at c - 0.5."
+            return if x <= center - 0.5 {
+                YMIN as u8
+            } else {
+                YMAX as u8
+            };
+        }
+        let half = width / 2.0;
+        let lower = center - 0.5 - (half - 0.5);
+        let upper = center - 0.5 + (half - 0.5);
+        let y = if x <= lower {
+            YMIN
+        } else if x > upper {
+            YMAX
+        } else {
+            ((x - (center - 0.5)) / (width - 1.0) + 0.5) * (YMAX - YMIN) + YMIN
+        };
+        y.clamp(YMIN, YMAX) as u8
+    };
+    for (out, value) in raw_pixels.iter_mut().zip(physical.iter()) {
+        let yc = map(*value);
+        *out = if invert { 255 - yc } else { yc };
+    }
+}
+
 /// Resolve the VOI window per PS3.3 C.11.2.1.2 order. Returns the window from
 /// the VOI LUT Sequence's first item when present, else the top-level Window
 /// Center/Width, else `None` (the caller then uses the percentile fallback).
 fn resolve_voi_window(bytes: &[u8]) -> Result<Option<(f64, f64)>, WadoError> {
     // 1. VOI LUT Sequence first item.
+    //
+    // PS3.3 C.11.2.1.1 / Table C.11.2-1 (`standard/ps3.3/voi-lut-stored-C.11.2.1.json`):
+    // an Item of the VOI LUT Sequence describes one VOI LUT through LUT
+    // Descriptor (0028,3002) and LUT Data (0028,3006). It is NOT a place to
+    // look for Window Center/Width, so an item that carries a stored LUT has
+    // no window pair to find - and the previous code then fell through to
+    // "no VOI information at all" and applied the percentile fallback,
+    // discarding the presentation the instance actually declared.
+    //
+    // The stored LUT is applied as the window-equivalent pair implied by its
+    // descriptor: the LUT maps stored inputs starting at `first_mapped` over
+    // `entries` steps, so the linear window that reproduces it is centred on
+    // the middle of that input range with a unit-wide full-scale span.
     let parser = clarus_adapters::dicom_rs::DicomRsParser;
-    if let Some((c, w)) = parser
+    if let Some(seq) = parser
         .extract_tag_value(bytes, (0x0028, 0x3010))
         .unwrap_or(None)
-        .and_then(|seq| extract_first_item_window(&seq))
     {
-        return Ok(Some((c, w)));
+        if let Some((c, w)) = extract_first_item_window(&seq) {
+            return Ok(Some((c, w)));
+        }
+        if let Some((c, w)) = extract_first_item_stored_lut(&seq) {
+            return Ok(Some((c, w)));
+        }
     }
     // 2. Top-level Window Center / Window Width.
-    let center = parse_ds_tag(bytes, (0x0028, 0x1050));
-    let width = parse_ds_tag(bytes, (0x0028, 0x1051));
-    match (center, width) {
-        (Some(c), Some(w)) => Ok(Some((c, w))),
-        _ => Ok(None),
+    //
+    // Both are multi-valued (VM 1-n) and PS3.3 C.11.2.1.2 pairs them BY
+    // INDEX: the i-th Window Center belongs with the i-th Window Width. Taking
+    // the first of each independently is only correct when the two lists line
+    // up, which the standard does not require. Selection is the FIRST pair: a
+    // viewer that offers the operator a choice picks from the same list, and
+    // the default view is the first entry.
+    let centers = parse_ds_tag_multivalue(bytes, (0x0028, 0x1050));
+    let widths = parse_ds_tag_multivalue(bytes, (0x0028, 0x1051));
+    for (c, w) in centers.iter().zip(widths.iter()) {
+        // A width <= 0 names no displayable window (PS3.3 C.11.2.1.2 requires
+        // Window Width > 0), so it is skipped rather than clamped.
+        if *w > 0.0 {
+            return Ok(Some((*c, *w)));
+        }
     }
+    Ok(None)
 }
 
 /// Walk a VOI LUT Sequence body (explicit VR LE, first item, defined or
@@ -2226,19 +2518,134 @@ fn extract_first_item_window(seq: &[u8]) -> Option<(f64, f64)> {
     None
 }
 
-/// Parse a DICOM DS (decimal string) element value to f64. Tolerates trailing
-/// padding bytes (space or NUL).
+/// Derive the equivalent linear window from a stored VOI LUT in the first
+/// Sequence item.
+///
+/// PS3.3 C.11.2.1.1 / Table C.11.2-1 (`standard/ps3.3/voi-lut-stored-C.11.2.1.json`):
+/// a VOI LUT Sequence item carries LUT Descriptor (0028,3002, US or SS, VM 3)
+/// and LUT Data (0028,3006). The Descriptor's three values are, in order, the
+/// number of entries, the first stored input value mapped, and the bits per
+/// entry.
+///
+/// The renderer only knows how to apply a linear window, so the LUT is
+/// expressed as the window that covers exactly the stored inputs it maps: the
+/// input domain is `[first_mapped, first_mapped + entries - 1]`, giving centre
+/// `first_mapped + (entries - 1) / 2` and width `entries`. That reproduces the
+/// LUT's shape for a monotonic (identity-ish) ramp, which is what a VOI LUT
+/// that can be drawn as a window means; a non-monotonic LUT would need the
+/// table itself, and rendering it as a window is still better than the
+/// percentile fallback that ignored it entirely.
+fn extract_first_item_stored_lut(seq: &[u8]) -> Option<(f64, f64)> {
+    let mut pos = 0usize;
+    while pos + 8 <= seq.len() {
+        let g = u16::from_le_bytes([seq[pos], seq[pos + 1]]);
+        let e = u16::from_le_bytes([seq[pos + 2], seq[pos + 3]]);
+        if g == 0xFFFE && e == 0xE000 {
+            break;
+        }
+        pos += 8;
+    }
+    if pos + 8 > seq.len() {
+        return None;
+    }
+    let mut scan = pos + 8;
+    let mut entries: Option<u32> = None;
+    let mut first_mapped: Option<i32> = None;
+    while scan + 8 <= seq.len() {
+        let g = u16::from_le_bytes([seq[scan], seq[scan + 1]]);
+        let e = u16::from_le_bytes([seq[scan + 2], seq[scan + 3]]);
+        if g == 0xFFFE {
+            break;
+        }
+        let vr = [seq[scan + 4], seq[scan + 5]];
+        let is_extended = clarus_adapters::bit_depth::vr_uses_extended_header(vr);
+        let len = if is_extended {
+            if scan + 12 > seq.len() {
+                break;
+            }
+            u32::from_le_bytes([seq[scan + 8], seq[scan + 9], seq[scan + 10], seq[scan + 11]])
+                as usize
+        } else {
+            u16::from_le_bytes([seq[scan + 6], seq[scan + 7]]) as usize
+        };
+        let value_off = scan + if is_extended { 12 } else { 8 };
+        let value_end = (value_off + len).min(seq.len());
+        if g == 0x0028 && e == 0x3002 {
+            // Table C.11.2-1: the Descriptor is SS when the first mapped input
+            // is negative and US otherwise, so the signedness is a property of
+            // the VALUE. Read the words signed first, and fall back to the
+            // unsigned reading when the signed one cannot be a descriptor
+            // (a US descriptor above 32767 entries).
+            let raw = &seq[value_off..value_end];
+            if raw.len() >= 6 {
+                let w0 = u16::from_le_bytes([raw[0], raw[1]]);
+                let w1 = u16::from_le_bytes([raw[2], raw[3]]);
+                let signed_first = i32::from(w1 as i16);
+                entries = Some(u32::from(w0));
+                // A bit width of 8/10/12/16 is the conformant set; anything
+                // else means the SS reading is wrong for this value.
+                let w2 = u16::from_le_bytes([raw[4], raw[5]]);
+                first_mapped = if matches!(w2, 8 | 10 | 12 | 16) {
+                    Some(signed_first)
+                } else {
+                    Some(i32::from(w1))
+                };
+            }
+        }
+        scan = value_end;
+    }
+    let entries = entries?;
+    let first_mapped = first_mapped?;
+    if entries == 0 {
+        return None;
+    }
+    let span = f64::from(entries - 1);
+    Some((
+        f64::from(first_mapped) + span / 2.0,
+        // A single-entry LUT is a constant: width 1 makes the LINEAR function
+        // a threshold (see `apply_linear_window`).
+        entries as f64,
+    ))
+}
+
+/// Parse a DICOM DS (decimal string) element value to f64.
+///
+/// PS3.5 6.2: a DS value may be padded with leading AND trailing SPACE (20H),
+/// and "Leading and trailing spaces ... are not significant". The previous
+/// scan stopped at the FIRST space, so a legal `" 128"` produced an empty
+/// string and the stored window was silently discarded. Only the PAD is
+/// stripped here; a backslash-separated multi-value needs
+/// [`parse_ds_multivalue`].
 fn parse_ds(v: &[u8]) -> Option<f64> {
-    let s = v
-        .iter()
-        .copied()
-        .take_while(|b| *b != 0 && *b != b' ')
-        .collect::<Vec<u8>>();
-    let s = std::str::from_utf8(&s).ok()?.trim();
+    let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+    let s = std::str::from_utf8(&v[..end]).ok()?.trim();
     if s.is_empty() {
         return None;
     }
     s.parse::<f64>().ok()
+}
+
+/// Parse a multi-valued DS element into its components, in order.
+///
+/// PS3.5 6.2: a DS value with VM > 1 separates its values with a BACKSLASH
+/// (5CH). Window Center/Width are commonly multi-valued (`128\256`), and a
+/// scalar parse of the whole string failed, which discarded the entire stored
+/// window.
+fn parse_ds_multivalue(v: &[u8]) -> Vec<f64> {
+    let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+    let Ok(s) = std::str::from_utf8(&v[..end]) else {
+        return Vec::new();
+    };
+    s.split('\\')
+        .filter_map(|part| {
+            let t = part.trim();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<f64>().ok()
+            }
+        })
+        .collect()
 }
 
 /// Parse a top-level DS tag from the instance to f64.
@@ -2246,6 +2653,15 @@ fn parse_ds_tag(bytes: &[u8], tag: (u16, u16)) -> Option<f64> {
     let parser = clarus_adapters::dicom_rs::DicomRsParser;
     let val = parser.extract_tag_value(bytes, tag).ok()??;
     parse_ds(&val)
+}
+
+/// Parse a top-level multi-valued DS tag, preserving the component order.
+fn parse_ds_tag_multivalue(bytes: &[u8], tag: (u16, u16)) -> Vec<f64> {
+    let parser = clarus_adapters::dicom_rs::DicomRsParser;
+    match parser.extract_tag_value(bytes, tag).ok().flatten() {
+        Some(val) => parse_ds_multivalue(&val),
+        None => Vec::new(),
+    }
 }
 
 /// Uncompressed transfer syntax UIDs the raw thumbnail path can serve
@@ -2292,7 +2708,10 @@ pub fn metadata_from_dcm(
     let json = clarus_adapters::dicom_rs::DicomRsParser
         .extract_full_metadata_bytes(dcm)
         .map_err(|e| WadoError::Internal(format!("Metadata render failed: {e}")))?;
-    let body = inject_bulk_data_uris_native(&json, study_uid, series_uid, sop_uid);
+    // The renderer stops AT PixelData, so the JSON cannot say whether the
+    // instance has the element or what its VR is; the bytes can.
+    let pixel = clarus_adapters::bit_depth::pixel_data_element(dcm);
+    let body = inject_bulk_data_uris_native(&json, study_uid, series_uid, sop_uid, pixel);
     Ok(WadoResp {
         status: 200,
         content_type: crate::handlers::DICOM_JSON_CONTENT_TYPE,
@@ -2318,7 +2737,11 @@ pub fn metadata_from_dcm_bounded(
     let json = clarus_adapters::dicom_rs::DicomRsParser
         .extract_full_metadata_bytes_bounded(head)
         .map_err(|e| WadoError::Internal(format!("Metadata render failed: {e}")))?;
-    let body = inject_bulk_data_uris_native(&json, study_uid, series_uid, sop_uid);
+    // Same reasoning as `metadata_from_dcm`: presence and VR come from the
+    // bytes. `pixel_data_element` walks element HEADERS only, so it stays
+    // within the bounded read.
+    let pixel = clarus_adapters::bit_depth::pixel_data_element(head);
+    let body = inject_bulk_data_uris_native(&json, study_uid, series_uid, sop_uid, pixel);
     Ok(WadoResp {
         status: 200,
         content_type: crate::handlers::DICOM_JSON_CONTENT_TYPE,
@@ -2884,8 +3307,13 @@ mod tests {
         b.extend_from_slice(&0x0002_u16.to_le_bytes());
         b.extend_from_slice(&0x0010_u16.to_le_bytes());
         b.extend_from_slice(b"UI");
-        b.extend_from_slice(&[0u8, 0u8]); // reserved
-        b.extend_from_slice(&(ts_uid.len() as u32).to_le_bytes());
+        // PS3.5 Table 6.2-1 VR width classes: UI is a SHORT-form VR (2-byte
+        // length, no reserved field). Writing the long form here put a
+        // reserved word and a 32-bit length where a conformant reader looks
+        // for a 16-bit one, so the fixture failed to parse before the budget
+        // check it exists to exercise.
+        let ui_len = (ts_uid.len() + (ts_uid.len() & 1)) as u16;
+        b.extend_from_slice(&ui_len.to_le_bytes());
         b.extend_from_slice(ts_uid);
         b.push(0x00); // odd-length UI pad
         push_implicit(&mut b, 0x0028, 0x0010, &rows.to_le_bytes()); // Rows
@@ -3703,6 +4131,7 @@ mod full_render_tests {
             &be,
             "1.2.3.4.5.6.7.8.9.11",
             &clarus_adapters::codec::CodecRegistry::default(),
+            (cols as u32, rows as u32),
         );
         assert!(
             full.is_ok(),
@@ -3840,13 +4269,170 @@ mod full_render_tests {
     }
 
     fn render_ok(d: &[u8]) -> WadoResp {
+        let (cols, rows) = native_size(d);
         unwrap_resp(render_full_from_bytes(
             d,
             "1.2.3",
             &clarus_adapters::codec::CodecRegistry::default(),
             &crate::state::TranscodePool::new(32),
             64,
+            (cols, rows),
         ))
+    }
+
+    /// Native `(cols, rows)` of a fixture, i.e. the box a viewport-free request
+    /// resolves to (see `rendered_viewport`).
+    fn native_size(d: &[u8]) -> (u32, u32) {
+        (
+            extract_u16(d, (0x0028, 0x0011)).expect("Columns") as u32,
+            extract_u16(d, (0x0028, 0x0010)).expect("Rows") as u32,
+        )
+    }
+
+    /// PS3.3 C.11.2.1.2 LINEAR is a THRESHOLD when the width is 1.
+    ///
+    /// The middle branch divides by `(w-1)`, so with w == 1 it has an empty
+    /// domain and the function maps everything at or below `c - 0.5` to the
+    /// minimum and everything above to the maximum. The previous formula
+    /// `(x - (c - w/2)) / w` mapped the CENTRE of such a window to mid-grey.
+    #[test]
+    fn a_width_one_window_is_a_threshold_not_mid_grey() {
+        // The branch is `x <= c - 0.5 -> ymin`, so with c = 128 everything up
+        // to 127.5 is black and 128 itself is already WHITE.
+        let mut out = [0u8; 3];
+        apply_linear_window(&mut out, &[127.0, 128.0, 129.0], 128.0, 1.0, false);
+        assert_eq!(
+            out,
+            [0, 255, 255],
+            "a width-1 window at c=128 thresholds at 127.5"
+        );
+        // Inverted (MONOCHROME1) flips the two ends.
+        let mut inv = [0u8; 2];
+        apply_linear_window(&mut inv, &[127.0, 128.0], 128.0, 1.0, true);
+        assert_eq!(inv, [255, 0]);
+    }
+
+    /// The LINEAR ramp spans `(c - 0.5) +- (w-1)/2`, so its ends saturate.
+    ///
+    /// A width of 100 centred on 0 covers -50.0..49.0. A sample exactly at the
+    /// low end is the minimum; one just past the high end saturates to the
+    /// maximum; the centre lands mid-grey.
+    #[test]
+    fn the_linear_ramp_is_centred_on_the_window_and_saturates() {
+        let mut out = [0u8; 3];
+        apply_linear_window(&mut out, &[-50.0, 49.5, 0.0], 0.0, 100.0, false);
+        assert_eq!(out[0], 0, "the low end of the window is black");
+        assert_eq!(out[1], 255, "past the high end saturates to white");
+        // The physical centre of the window maps to the middle of the range.
+        assert!(
+            (126..=130).contains(&out[2]),
+            "the window centre must be mid-grey, got {}",
+            out[2]
+        );
+    }
+
+    /// Sign extension starts at the DICOM High Bit, not at bit 15.
+    ///
+    /// PS3.3 C.7.6.3.1.2: a signed 12-bit sample stored as 0x0FFF in a 16-bit
+    /// cell is -1 when High Bit is 11. `u as i16` read it as the positive 4095,
+    /// which windows as a bright pixel instead of a dark one.
+    #[test]
+    fn a_signed_sample_is_extended_from_the_high_bit() {
+        /// A dataset carrying only High Bit (0028,0102), which is all
+        /// `sign_extend` reads. The meta-header is required: the element walk
+        /// starts after it and rejects a dataset it cannot frame (PS3.10 7.1
+        /// makes the File Meta group the entry point of the syntax grammar).
+        fn with_high_bit(hb: u16) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0u8; 128]);
+            b.extend_from_slice(b"DICM");
+            let ts_uid = b"1.2.840.10008.1.2";
+            b.extend_from_slice(&0x0002_u16.to_le_bytes());
+            b.extend_from_slice(&0x0010_u16.to_le_bytes());
+            b.extend_from_slice(b"UI");
+            // PS3.5 Table 6.2-1: UI is a short-form VR.
+            b.extend_from_slice(&((ts_uid.len() + (ts_uid.len() & 1)) as u16).to_le_bytes());
+            b.extend_from_slice(ts_uid);
+            b.push(0x00);
+            let push = |out: &mut Vec<u8>, g: u16, e: u16, v: &[u8]| {
+                out.extend_from_slice(&g.to_le_bytes());
+                out.extend_from_slice(&e.to_le_bytes());
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(v);
+            };
+            push(&mut b, 0x0028, 0x0102, &hb.to_le_bytes());
+            b
+        }
+        let twelve_bit = with_high_bit(11);
+        // 0x0FFF with High Bit 11 is -1, not 4095.
+        assert_eq!(sign_extend(0x0FFF, 16, &twelve_bit), -1);
+        assert_eq!(sign_extend(0x0800, 16, &twelve_bit), -2048);
+        // A value whose sign bit is clear stays positive.
+        assert_eq!(sign_extend(0x07FF, 16, &twelve_bit), 2047);
+        // A full-width sample keeps working when High Bit is 15.
+        let full = with_high_bit(15);
+        assert_eq!(sign_extend(0xFFFF, 16, &full), -1);
+        assert_eq!(sign_extend(0x8000, 16, &full), i16::MIN);
+        // Without the attribute the cell is read as i16 read it, which is the
+        // behaviour the caller had before the High Bit was carried in.
+        assert_eq!(sign_extend(0xFFFF, 16, &[]), -1);
+    }
+
+    /// A fractional rescale survives into the VOI step.
+    ///
+    /// PS3.3 C.11.2.1.2: stored 0 and 1 with slope 0.25 become the modality
+    /// values 0.0 and 0.25. Narrowing to an integer before windowing collapsed
+    /// both to 0, so a window could no longer tell them apart. This drives
+    /// `render_mono_plane` - the real path - rather than calling the window
+    /// helper with hand-made floats, which would not test the cast at all.
+    #[test]
+    fn a_fractional_rescale_is_not_truncated_before_windowing() {
+        /// A 2x1 MONOCHROME2 8-bit instance whose two samples are `a` and `b`,
+        /// with the given rescale and one width-5 window.
+        fn two_samples(slope: f64, a: u8, b: u8) -> Vec<u8> {
+            let mut d = Vec::new();
+            d.extend_from_slice(&[0u8; 128]);
+            d.extend_from_slice(b"DICM");
+            push_explicit(&mut d, 0x0002, 0x0010, b"UI", b"1.2.840.10008.1.2.1");
+            push_explicit(&mut d, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+            push_explicit(&mut d, 0x0028, 0x0004, b"CS", b"MONOCHROME2");
+            push_explicit(&mut d, 0x0028, 0x0010, b"US", &1u16.to_le_bytes());
+            push_explicit(&mut d, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+            push_explicit(&mut d, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+            push_explicit(&mut d, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+            push_explicit(&mut d, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+            push_explicit(&mut d, 0x0028, 0x1053, b"DS", &ds_f(slope));
+            push_explicit(&mut d, 0x0028, 0x1052, b"DS", b"0");
+            // Window wide enough to cover both rescaled values.
+            push_explicit(&mut d, 0x0028, 0x1050, b"DS", b"0.125");
+            push_explicit(&mut d, 0x0028, 0x1051, b"DS", b"5");
+            push_explicit(&mut d, 0x7FE0, 0x0010, b"OW", &[a, b]);
+            d
+        }
+
+        let geom = |rows: u32, cols: u32| RawGeometry {
+            rows,
+            cols,
+            bits_allocated: 8,
+            pixel_rep: 0,
+            invert: false,
+        };
+
+        // slope 0.25: samples 0 and 1 -> modality 0.0 and 0.25.
+        let fractional = two_samples(0.25, 0, 1);
+        let (_, _, frac) = render_mono_plane(&[0u8, 1], geom(1, 2), &fractional, (2, 1))
+            .expect("the fractional instance must render");
+        assert!(
+            frac[0] < frac[1],
+            "the two rescaled samples must differ: {frac:?}"
+        );
+
+        // The same instance with an IDENTITY slope still differs (it is the
+        // stored values 0 and 1), so the case above is not passing by accident.
+        let identity = two_samples(1.0, 0, 1);
+        let (_, _, ident) = render_mono_plane(&[0u8, 1], geom(1, 2), &identity, (2, 1))
+            .expect("the identity instance must render");
+        assert!(ident[0] < ident[1], "{ident:?}");
     }
 
     #[test]
@@ -3908,6 +4494,7 @@ mod full_render_tests {
             &clarus_adapters::codec::CodecRegistry::default(),
             &crate::state::TranscodePool::new(32),
             64,
+            (64, 64),
         ) {
             Ok(_) => panic!("compressed instance must be rejected in default build"),
             Err(e) => e,
@@ -4000,6 +4587,114 @@ mod full_render_tests {
         pool.release();
         assert!(pool.try_acquire(), "permit freed after release");
         pool.release();
+    }
+
+    /// A request that REACHES `acquire` must report `Busy` while the pool is
+    /// saturated, and get past the guard once a permit frees up.
+    ///
+    /// The test above stops before `acquire` on both paths it exercises (one
+    /// is the stored==target no-op, the other is refused by the capability
+    /// check), so it would still pass if `maybe_transcode` stopped enforcing
+    /// the pool entirely. This one drives a stored->target pair the default
+    /// registry really supports.
+    #[test]
+    fn a_real_transcode_reports_busy_while_the_pool_is_full() {
+        /// A minimal RLE Lossless instance whose PixelData is one segment.
+        ///
+        /// PS3.5 A.4: an encapsulated PixelData value is an item stream, so the
+        /// RLE codec's `decode` takes the synthesized dataset path. The exact
+        /// bytes do not matter here - the test only needs the request to reach
+        /// `acquire`, which happens before `decode`.
+        ///
+        /// Gated with its only caller: RLE is registered in a transcode build,
+        /// so a default build has no test that can use this fixture.
+        #[cfg(feature = "transcode")]
+        fn an_rle_instance() -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0u8; 128]);
+            b.extend_from_slice(b"DICM");
+            let ts_uid = b"1.2.840.10008.1.2.5";
+            b.extend_from_slice(&0x0002_u16.to_le_bytes());
+            b.extend_from_slice(&0x0010_u16.to_le_bytes());
+            b.extend_from_slice(b"UI");
+            // PS3.5 Table 6.2-1: UI is a short-form VR.
+            b.extend_from_slice(&((ts_uid.len() + (ts_uid.len() & 1)) as u16).to_le_bytes());
+            b.extend_from_slice(ts_uid);
+            b.push(0x00);
+            let push = |out: &mut Vec<u8>, g: u16, e: u16, vr: &[u8; 2], v: &[u8]| {
+                out.extend_from_slice(&g.to_le_bytes());
+                out.extend_from_slice(&e.to_le_bytes());
+                out.extend_from_slice(vr);
+                let padded = v.len() + (v.len() & 1);
+                out.extend_from_slice(&(padded as u16).to_le_bytes());
+                out.extend_from_slice(v);
+                if !v.len().is_multiple_of(2) {
+                    out.push(b' ');
+                }
+            };
+            push(&mut b, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+            push(&mut b, 0x0028, 0x0004, b"CS", b"MONOCHROME2");
+            push(&mut b, 0x0028, 0x0010, b"US", &1u16.to_le_bytes());
+            push(&mut b, 0x0028, 0x0011, b"US", &1u16.to_le_bytes());
+            push(&mut b, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+            push(&mut b, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+            push(&mut b, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+            b
+        }
+
+        let registry = clarus_adapters::codec::CodecRegistry::default();
+        // Explicit VR Big Endian is a supported SOURCE in every build (the
+        // base codecs are unconditional); the target is Explicit VR LE, which
+        // needs no codec. The Big Endian re-encode path is taken before the
+        // permit, so it is NOT the path this test needs.
+        //
+        // Implicit VR LE -> Explicit VR LE is NOT this test's path: PS3.18
+        // 8.7.3 re-encoding of an uncompressed source is a dataset-level
+        // rewrite that returns BEFORE the pool, by design.
+        //
+        // A compressed source with a compressed target is the path that
+        // decodes through a codec, so it is the one that must respect the
+        // pool. RLE Lossless is registered in every transcode build.
+        #[cfg(feature = "transcode")]
+        {
+            let src = an_rle_instance();
+            let pool = crate::state::TranscodePool::new(1);
+            assert!(pool.try_acquire(), "hold the single permit");
+
+            let err = maybe_transcode(
+                src.clone(),
+                clarus_adapters::codec::ts_uid::RLE_LOSSLESS,
+                Some(clarus_adapters::codec::ts_uid::JPEG_BASELINE),
+                &registry,
+                &pool,
+                64,
+            )
+            .expect_err("a saturated pool must refuse, not block");
+            assert!(
+                matches!(err, WadoError::Busy),
+                "a request that reaches acquire must report Busy, got {err:?}"
+            );
+
+            // Freeing the permit moves the SAME request past the pool guard:
+            // whatever the transcode then does, it is no longer Busy.
+            pool.release();
+            if let Err(after) = maybe_transcode(
+                src,
+                clarus_adapters::codec::ts_uid::RLE_LOSSLESS,
+                Some(clarus_adapters::codec::ts_uid::JPEG_BASELINE),
+                &registry,
+                &pool,
+                64,
+            ) {
+                assert!(
+                    !matches!(after, WadoError::Busy),
+                    "with a free permit the request must not report Busy: {after:?}"
+                );
+            }
+            pool.release();
+        }
+        // Keep the binding used in a non-transcode build.
+        let _ = &registry;
     }
 
     /// A plan list of `count` single-frame instances, all ordinary except the

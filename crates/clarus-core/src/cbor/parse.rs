@@ -238,20 +238,43 @@ impl<'a> CborReader<'a> {
 mod tests {
     use super::*;
 
-    /// A deeply nested stream must fail, not overflow the stack.
+    /// A deeply nested stream must fail on the DEPTH guard, not on truncation.
     ///
     /// `0x81` is "array of one", legal CBOR at ANY depth. Walking it without a
     /// bound recursed until the stack ran out and the process aborted - one
     /// small uploaded manifest was enough.
+    ///
+    /// The fixture ends in a real SCALAR leaf and every array header is
+    /// closed by it, so the stream is COMPLETE: without this the parser ran out
+    /// of bytes first and returned `Truncated`, and a bare `is_err()` accepted
+    /// that as proof of the depth guard. The assertion is now the guard's own
+    /// variant.
     #[test]
     fn skip_value_refuses_excessive_nesting() {
-        // One array wrapper per level, then a single uint leaf.
-        let deep = vec![0x81u8; MAX_NESTING_DEPTH + 8];
+        // One array wrapper per level, then a single uint leaf: a well-formed
+        // document that is merely too deep.
+        let mut deep = vec![0x81u8; MAX_NESTING_DEPTH + 8];
+        deep.push(0x01);
         let mut r = CborReader::new(&deep);
-        assert!(
-            r.skip_value().is_err(),
-            "a stream deeper than MAX_NESTING_DEPTH must be refused"
+        assert_eq!(
+            r.skip_value(),
+            Err(CborError::Unsupported(7)),
+            "a stream deeper than MAX_NESTING_DEPTH must be refused by the \
+             depth guard, not by running out of input"
         );
+    }
+
+    /// The same shape, one level shallower than the limit, parses to the end.
+    ///
+    /// This is the control for the test above: it proves the fixture is a
+    /// valid document and that the failure there is depth, not malformedness.
+    #[test]
+    fn skip_value_accepts_nesting_at_the_limit() {
+        let mut max = vec![0x81u8; MAX_NESTING_DEPTH];
+        max.push(0x01);
+        let mut r = CborReader::new(&max);
+        r.skip_value().expect("nesting at the limit must skip");
+        assert!(r.is_empty(), "the whole document must be consumed");
     }
 
     /// Legitimate nesting (a few levels) still skips cleanly.

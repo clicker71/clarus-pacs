@@ -10,21 +10,30 @@
 //! - a result kind whose encoder is not linked into this build is a
 //!   startup error, never a silently skipped result.
 //!
+//! This file is the BASE layer: the origin, the engine and the models
+//! DIRECTORY. What a model is lives in one file per model under that
+//! directory (see [`crate::models`]), which is what makes adding a model a
+//! matter of dropping a file rather than editing a shared one.
+//!
 //! Every model is an EXTERNAL PROCESSOR (see `abi/README.md`): clinfer
 //! carries no inference engine of its own - the site's script decides
-//! what a study produces, and the rule's `result` carries the metadata
-//! of the object clinfer writes.
+//! what a study produces, and the model's `outputs` carry the metadata of
+//! the object clinfer writes.
 
 /// The error type of every configuration operation.
 pub use crate::value::{ConfError, Result};
 
-use crate::value::{Section, str_items};
+use crate::value::Section;
 use crate::yaml::{Yaml, parse_file};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Name of the configuration file looked for in the working directory.
 pub const DEFAULT_CONFIG_FILE: &str = "clinfer.conf";
+
+/// The models directory a configuration that names none gets, relative to
+/// the configuration file.
+pub const DEFAULT_MODELS_DIR: &str = "models";
 
 /// Default address of the sidecar's own UPS-RS receiver.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8124";
@@ -78,7 +87,12 @@ pub enum ResultKind {
 }
 
 impl ResultKind {
-    const ALL: [ResultKind; 7] = [
+    /// Every kind, in the order the enum declares them.
+    ///
+    /// Public because a model file names a kind and the model layer must
+    /// answer "is this a kind this build writes" without a second copy of
+    /// the list.
+    pub const ALL: [ResultKind; 7] = [
         Self::Pr,
         Self::Seg,
         Self::Stl,
@@ -88,7 +102,9 @@ impl ResultKind {
         Self::Rtstruct,
     ];
 
-    fn parse(text: &str) -> Option<Self> {
+    /// The kind a name denotes, or `None`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.as_str() == text)
     }
 
@@ -146,7 +162,8 @@ pub enum DefaultRule {
 }
 
 impl DefaultRule {
-    fn parse(text: &str) -> Option<Self> {
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
         match text {
             "cancel" => Some(Self::Cancel),
             "off" => Some(Self::Off),
@@ -163,37 +180,9 @@ impl DefaultRule {
     }
 }
 
-/// How a source frame is fitted to a processor's input is the processor's
-/// own business: a script declares its geometry in its own code. This
-/// section therefore holds no resize or tensor declaration at all.
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Model {
-    /// The key the model was declared under; also its subscription unit.
-    pub id: String,
-    /// The processor program: the whole declaration of what the model is.
-    ///
-    /// clinfer runs it once per study as
-    /// `interpreter script <workdir>` and encodes the objects its
-    /// `result.json` declares. There is no in-process model kind: the
-    /// sidecar is the transport, the site's script is the model.
-    pub script: Option<PathBuf>,
-    /// The interpreter that runs [`Self::script`], e.g. a venv's python.
-    /// Defaults to `python3` when the script is declared without one.
-    pub interpreter: Option<PathBuf>,
-    /// Budget of one run, end to end.
-    pub timeout_secs: u32,
-    /// Ceiling on the `result.json` this model may write, in bytes.
-    ///
-    /// Per model rather than one global constant, because the document's
-    /// size is a property of WHAT the model produces: a box list or a report
-    /// is kilobytes, while a structure set grows with the traced polygon
-    /// count, and the studies in one deployment differ by an order of
-    /// magnitude. See [`DEFAULT_MAX_RESULT_BYTES`] for the reasoning and the
-    /// measurements; a site with volumetric studies raises it on the model
-    /// that produces them and leaves the rest where they are.
-    pub max_result_bytes: u64,
-}
+// How a source frame is fitted to a processor's input is the processor's
+// own business: a script declares its geometry in its own code. This
+// section therefore holds no resize or tensor declaration at all.
 
 /// A binding from one DICOM tag to value patterns.
 #[derive(Debug, Clone, PartialEq)]
@@ -204,21 +193,27 @@ pub struct TagBinding {
     pub patterns: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Every signal a study is matched on. An empty field constrains nothing, so
+/// the default is "every study", which is what a model that only states its
+/// anatomy means.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Match {
-    /// Required, and the only mandatory key of a rule.
+    /// (0008,0061) values the model accepts, upper-cased.
+    ///
+    /// A model that names none accepts every modality - the reading an
+    /// example file wants when it is about the OUTPUT rather than the input.
     pub modality: Vec<String>,
     /// (0040,4018) Scheduled Workitem Code Sequence Code Values, upper-cased.
     ///
-    /// The PRIMARY key of a rule, and the reason it is first: the workitem
-    /// carries its own intent (the server writes it from the study's modality
-    /// or the requester sets it), so a rule can match WITHOUT fetching the
-    /// study at all. The code is what the task was ASKED to do; the modality
-    /// is a property of the input.
+    /// The PRIMARY key of a match, and the reason it is first: the workitem
+    /// carries its own intent, so a match can be decided WITHOUT fetching
+    /// the study at all.
     ///
-    /// An EMPTY list is unconstrained, which is exactly what every rule meant
-    /// before this key existed - so an existing configuration keeps working
-    /// with no migration.
+    /// A model file does not set this key directly: it declares the procedure
+    /// it performs at the top level (`procedure_code`), and the derived rule
+    /// copies that Code Value here, so the workitem's code selects the model.
+    /// A model that declares no procedure code leaves the list empty, which
+    /// constrains nothing - the pre-key behaviour.
     pub code: Vec<String>,
     pub study_description_contains: Vec<String>,
     pub code_meaning_contains: Vec<String>,
@@ -239,7 +234,8 @@ pub enum LabelAnchor {
 impl LabelAnchor {
     const ALL: [LabelAnchor; 2] = [Self::TopLeft, Self::Center];
 
-    fn parse(text: &str) -> Option<Self> {
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|anchor| anchor.as_str() == text)
     }
 
@@ -315,7 +311,8 @@ pub enum SrTemplate {
 impl SrTemplate {
     const ALL: [SrTemplate; 2] = [Self::Tid2000, Self::Tid1500];
 
-    fn parse(text: &str) -> Option<Self> {
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|template| template.as_str() == text)
@@ -353,34 +350,6 @@ impl fmt::Display for SrTemplate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RuleResult {
-    pub kind: ResultKind,
-    pub color: Option<String>,
-    pub profile_version: u32,
-    pub series_description: Option<String>,
-    /// The label geometry for a pr result.
-    pub label: LabelProfile,
-    /// The sr result block, for an sr result.
-    pub sr: Option<SrResult>,
-    /// The measurements result block, for a measurements result.
-    ///
-    /// The same shape as `sr` - a series title and a template id - because
-    /// it answers the same two questions about a different document. It is a
-    /// separate field rather than a reuse of `sr` so that a result of one
-    /// kind can never be handed the other kind's template.
-    pub measurements: Option<SrResult>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Rule {
-    pub r#match: Match,
-    pub model: String,
-    pub result: RuleResult,
-    /// Position in the file, used in messages.
-    pub index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -431,19 +400,80 @@ pub struct EngineConf {
     pub workers: Option<usize>,
 }
 
+/// The base URL under which the extension StructureDefinitions are published.
+///
+/// The public repository is the default. A site that hosts the definitions
+/// itself - its own site, a national mirror, or an intranet server - points
+/// this at that base; every extension URL is `{base}/{file}.json`. The admin
+/// never has to touch code to move the schemas.
+pub const DEFAULT_EXTENSION_BASE: &str =
+    "https://github.com/clicker71/clarus-pacs/blob/main/clinfer/fhir/StructureDefinition";
+
+/// The FHIR-facing settings: where the capability document's extension
+/// definitions are published. Everything else the document serves is derived
+/// from the models.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FhirConf {
+    /// Base URL of the extension StructureDefinitions; see
+    /// [`DEFAULT_EXTENSION_BASE`].
+    pub extension_base: String,
+}
+
+/// The base configuration: everything that is not a model.
+///
+/// `models` is the registry the `models_dir` produced, already filtered to
+/// the enabled files, and `rules` is derived from it: a model IS its rules,
+/// so the two can never disagree about which model a study runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conf {
     pub server: ServerConf,
     pub engine: EngineConf,
-    pub models: Vec<Model>,
+    pub fhir: FhirConf,
+    /// Where the model files live, as the configuration spells it.
+    pub models_dir: PathBuf,
+    pub models: Vec<crate::models::Model>,
+    /// One entry per (model, output), in model-file order.
     pub rules: Vec<Rule>,
     pub default_rule: DefaultRule,
 }
 
+/// One model's declaration of one object it produces.
+///
+/// Derived rather than configured: the model file states the outputs, and
+/// this is the worker's view of one of them. The index is its position in
+/// the derived list, which is what a report or a log names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rule {
+    /// Position in [`Conf::rules`], used in messages.
+    pub index: usize,
+    /// The id of the model that produces it.
+    pub model: String,
+    pub result: RuleResult,
+    /// The study filter, taken from the model.
+    pub r#match: Match,
+}
+
+/// The metadata of one produced object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleResult {
+    pub kind: ResultKind,
+    pub series_description: Option<String>,
+    pub profile_version: u32,
+    /// The label geometry of a `pr` result.
+    ///
+    /// It is the encoder's default rather than a model field: a label
+    /// offset is a rendering decision of THIS writer, not a property of the
+    /// model, and a site that needs another offset says so in the writer.
+    pub label: LabelProfile,
+}
+
 impl Conf {
+    /// The enabled model with this id.
     #[must_use]
-    pub fn model(&self, id: &str) -> Option<&Model> {
-        self.models.iter().find(|model| model.id == id)
+    pub fn model(&self, id: &str) -> Option<&crate::models::Model> {
+        self.models
+            .iter()
+            .find(|model| model.enabled && model.id == id)
     }
 
     /// How many model processes may run at the same time.
@@ -451,27 +481,26 @@ impl Conf {
     /// The ONE place the ceiling is computed, so startup, reload and the
     /// startup report cannot disagree about it:
     ///
-    /// - absent -> every model with a script, which is exactly the behaviour
-    ///   of a sidecar with one model and the natural reading of a site that
-    ///   declared several;
+    /// - absent -> every enabled model, which is exactly the behaviour of a
+    ///   sidecar with one model and the natural reading of a site that
+    ///   dropped in several;
     /// - configured larger -> capped to the number of models rather than
     ///   refused, because a ceiling above the number of threads that exist
     ///   is not an error, it is a redundant setting;
     /// - `0` never reaches here: the parser refuses it by name.
     #[must_use]
     pub fn workers(&self) -> usize {
-        let models = self
-            .models
-            .iter()
-            .filter(|model| model.script.is_some())
-            .count();
+        let models = self.models.iter().filter(|model| model.enabled).count();
         self.engine
             .workers
             .map_or(models, |workers| workers.min(models))
     }
 }
 
-/// Load and validate a configuration file.
+/// Load and validate a configuration file and its models directory.
+///
+/// The models directory is resolved against the CONFIGURATION FILE's
+/// directory, so a deployment is a directory that can be moved whole.
 pub fn load(path: &Path) -> Result<Conf> {
     let document = parse_file(path).map_err(|err| {
         // The YAML layer knows the line; the caller knows the file.
@@ -484,9 +513,71 @@ pub fn load(path: &Path) -> Result<Conf> {
     // directory component, and anchoring at the empty parent would
     // leave relative paths unresolved.
     let absolute = absolutize(path);
-    let conf = build(&document, absolute.parent()).map_err(|err| err.in_file(path))?;
+    let base = absolute.parent().map(Path::to_path_buf);
+    let mut conf = build(&document, base.as_deref()).map_err(|err| err.in_file(path))?;
+    load_models(&mut conf)?;
     validate(&conf)?;
     Ok(conf)
+}
+
+/// Read the models directory into `conf`.
+///
+/// Every file is checked (a disabled example included); an enabled model is
+/// additionally checked for a script that exists, and an ENABLED model is
+/// the only thing registered - so one broken example cannot stop a site
+/// serving the models it did install, while a broken enabled model stops the
+/// start rather than being silently absent.
+fn load_models(conf: &mut Conf) -> Result<()> {
+    let dir = &conf.models_dir;
+    let loaded = crate::models::load_dir(dir)?;
+    let diagnostics = crate::models::validate::check(dir, &loaded);
+    if !diagnostics.is_empty() {
+        return Err(ConfError::new(
+            dir.display().to_string(),
+            format!("\n{}", diagnostics.report()),
+        ));
+    }
+    let enabled: Vec<crate::models::Model> = loaded.enabled().cloned().collect();
+    conf.rules = derive_rules(&enabled);
+    conf.models = enabled;
+    Ok(())
+}
+
+/// One rule per (model, output).
+///
+/// The chain semantics are unchanged: every rule that matches runs, in
+/// model-file order, and each delivers its own object. A model declaring
+/// several outputs therefore delivers several objects from ONE run, which is
+/// what a detector producing a presentation state AND a report needs.
+fn derive_rules(models: &[crate::models::Model]) -> Vec<Rule> {
+    let mut rules = Vec::new();
+    for model in models {
+        for output in &model.outputs {
+            let Some(kind) = ResultKind::parse(&output.kind) else {
+                continue;
+            };
+            // The procedure code IS the workitem-code key: the value the
+            // requester put in (0040,4018) is what selects the model, so the
+            // derived rule carries it in its match. A model that declares no
+            // procedure code matches every code, which is the pre-key reading.
+            let mut r#match = model.r#match.clone();
+            if let Some(code) = &model.procedure_code {
+                r#match.code = vec![code.value.trim().to_ascii_uppercase()];
+            }
+            rules.push(Rule {
+                index: rules.len(),
+                model: model.id.clone(),
+                r#match,
+                result: RuleResult {
+                    kind,
+                    series_description: output.series_description.clone(),
+                    profile_version: output.profile_version,
+                    label: LabelProfile::default(),
+                },
+            });
+        }
+    }
+    rules
 }
 
 /// The same path, guaranteed absolute.
@@ -517,8 +608,23 @@ fn build(document: &Yaml, base: Option<&Path>) -> Result<Conf> {
 
     let server = parse_server(&mut root)?;
     let engine = parse_engine(&mut root)?;
-    let models = parse_models(&mut root, base)?;
-    let rules = parse_rules(&mut root)?;
+    let fhir = parse_fhir(&mut root)?;
+    let models_dir = match root.opt_str("models_dir")? {
+        Some(text) => {
+            let path = PathBuf::from(text);
+            match (base, path.is_relative()) {
+                (Some(dir), true) => dir.join(path),
+                _ => path,
+            }
+        }
+        // The shipped default: a deployment is a directory holding
+        // `clinfer.conf` and `models/`, and a config that says nothing gets
+        // that directory beside the file it lives in.
+        None => match base {
+            Some(dir) => dir.join(DEFAULT_MODELS_DIR),
+            None => PathBuf::from(DEFAULT_MODELS_DIR),
+        },
+    };
     let default_rule = match root.opt_str("default_rule")? {
         Some(text) => DefaultRule::parse(text).ok_or_else(|| {
             ConfError::new(
@@ -533,8 +639,10 @@ fn build(document: &Yaml, base: Option<&Path>) -> Result<Conf> {
     Ok(Conf {
         server,
         engine,
-        models,
-        rules,
+        fhir,
+        models_dir,
+        models: Vec::new(),
+        rules: Vec::new(),
         default_rule,
     })
 }
@@ -551,7 +659,11 @@ fn parse_server(root: &mut Section<'_>) -> Result<ServerConf> {
             .opt_str("listen")?
             .unwrap_or(DEFAULT_LISTEN)
             .to_string(),
-        trusted_proxies: owned(section.opt_str_list("trusted_proxies")?),
+        trusted_proxies: section
+            .opt_str_list("trusted_proxies")?
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         require_proxy_identity: section.opt_bool("require_proxy_identity")?.unwrap_or(false),
         station_aet: section
             .opt_str("station_aet")?
@@ -634,443 +746,26 @@ fn parse_engine(root: &mut Section<'_>) -> Result<EngineConf> {
     Ok(conf)
 }
 
-fn parse_models(root: &mut Section<'_>, base: Option<&Path>) -> Result<Vec<Model>> {
-    let Some(models) = root.opt_mapping("models")? else {
-        return Err(ConfError::new("models", "missing required section"));
-    };
-    let entries = models.entries();
-    if entries.is_empty() {
-        return Err(ConfError::new("models", "the mapping is empty"));
-    }
-    let mut out = Vec::with_capacity(entries.len());
-    for (id, value) in entries {
-        let mut model = Section::wrap(value, format!("models.{id}"))?;
-        // Every model is an EXTERNAL PROCESSOR: a configured program that
-        // reads the workdir and writes result.json. `script` is the whole
-        // declaration of what the model is - clinfer carries no engine.
-        let parsed = parse_external_model(&mut model, id, base)?;
-        model.finish("a model")?;
-        out.push(parsed);
-    }
-    Ok(out)
-}
-
-/// An external processor: a program clinfer runs once per study.
-///
-/// The workdir contract (see `abi/README.md`) is: clinfer writes the frames
-/// and a manifest, runs `interpreter script <workdir>`, and reads the
-/// script's `result.json`. The script never sees DICOM; keeping the object
-/// writing inside clinfer is what makes the result conformant regardless of
-/// what the site's script does.
-///
-/// `interpreter` defaults to `python3`. A site using a virtualenv points it
-/// at the venv's own python binary - activation is an interactive-shell
-/// convenience and has no place in a spawn path.
-fn parse_external_model(model: &mut Section<'_>, id: &str, base: Option<&Path>) -> Result<Model> {
-    let mut script = PathBuf::from(model.require_str("script")?);
-    // A relative `script` is anchored at the configuration FILE, not at
-    // the process cwd and not at the ABI workdir: the workdir is minted
-    // per run, so nothing the site configures can live inside it, and
-    // anchoring at the file is what makes a shipped demo configuration
-    // work when the sidecar is started from anywhere.
-    if script.is_relative()
-        && let Some(dir) = base
-    {
-        script = dir.join(&script);
-    }
-    let mut interpreter = model
-        .opt_str("interpreter")?
-        .map_or_else(|| PathBuf::from(DEFAULT_INTERPRETER), PathBuf::from);
-    // A relative interpreter THAT NAMES A PATH (has a separator) is
-    // anchored at the configuration file exactly like `script`: the
-    // child's cwd is the workdir, so a `./py` or `venv/bin/python`
-    // resolved there would miss. A bare name stays bare - it is a PATH
-    // lookup, and anchoring it would stop the platform python from ever
-    // being found.
-    if interpreter.is_relative()
-        && interpreter.components().count() > 1
-        && let Some(dir) = base
-    {
-        interpreter = dir.join(&interpreter);
-    }
-    // Optional with a default: a processor that does not say how long it
-    // may take gets a generous budget rather than an unbounded wait.
-    let timeout_secs = match model.opt_bounded_int("timeout_secs", 5, 1800)? {
-        Some(value) => value as u32,
-        None => DEFAULT_TIMEOUT_SECS,
-    };
-    let max_result_bytes = match model.opt_size("max_result_bytes")? {
-        Some(value) => {
-            if value == 0 {
-                return Err(ConfError::new(
-                    format!("{}.max_result_bytes", model.at()),
-                    "0 is not a budget: omit the key to take the default",
-                ));
-            }
-            if value > MAX_RESULT_BYTES_CEILING {
-                return Err(ConfError::new(
-                    format!("{}.max_result_bytes", model.at()),
-                    format!(
-                        "{value} is over the {MAX_RESULT_BYTES_CEILING}-byte ceiling; a \
-                         result this large is a runaway script, not a study"
-                    ),
-                ));
-            }
-            value
+fn parse_fhir(root: &mut Section<'_>) -> Result<FhirConf> {
+    let mut section = match root.take("fhir")? {
+        Some(value) => Section::wrap(value, "fhir")?,
+        None => {
+            return Ok(FhirConf {
+                extension_base: DEFAULT_EXTENSION_BASE.to_string(),
+            });
         }
-        None => DEFAULT_MAX_RESULT_BYTES,
     };
-    Ok(Model {
-        id: id.to_string(),
-        script: Some(script),
-        interpreter: Some(interpreter),
-        timeout_secs,
-        max_result_bytes,
-    })
-}
-
-/// Default budget of one processor's `result.json`, in bytes (64 MiB).
-///
-/// A STRUCTURE SET grows with the traced polygon count: every contour
-/// carries three coordinates per point, so the document is proportional to
-/// the pixels a model outlines. Measured on live CT with the producer still
-/// emitting every traced pixel:
-///
-/// ```text
-///   36 frames / 528 contours   16628332 bytes   15.9 MiB
-///   53 frames / 521 contours   28106522 bytes   26.8 MiB
-/// ```
-///
-/// That is roughly 0.5 MiB per frame, so 64 MiB covers a study well over a
-/// hundred frames larger than the ones measured, while still stopping a
-/// script that loops. The limit is not a security boundary - the script is
-/// operator-configured and shares the configuration's trust domain - it is
-/// the difference between a bounded failure and a disk filled before the
-/// timeout notices.
-///
-/// It is a DEFAULT, not a ceiling: a volumetric study needs more, and
-/// `max_result_bytes` on the model is where that is said.
-pub const DEFAULT_MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
-
-/// The largest per-model budget this parser accepts, in bytes (1 GiB).
-///
-/// The bound exists so a mistyped `max_result_bytes = 64g` is refused at
-/// startup rather than after a run reads a gigabyte into memory. A gigabyte
-/// is already far past any structure set a study can carry - the encoded
-/// object has its own `ContourData` ceiling that no result size can lift -
-/// so the number that gets a site working is well inside it, and the values
-/// beyond it are typos rather than deployments.
-pub const MAX_RESULT_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
-
-/// Default budget of one processor run, in seconds.
-pub const DEFAULT_TIMEOUT_SECS: u32 = 300;
-
-/// The interpreter an external processor runs under when none is given.
-///
-/// A bare name, not a path: it is resolved through `PATH` by the process
-/// spawner, which is what lets a site rely on the platform's own python.
-pub const DEFAULT_INTERPRETER: &str = "python3";
-
-fn parse_rules(root: &mut Section<'_>) -> Result<Vec<Rule>> {
-    let items = root.opt_section_list("rules")?;
-    if items.is_empty() {
-        return Err(ConfError::new("rules", "the list is empty"));
-    }
-    let mut rules = Vec::with_capacity(items.len());
-    for (index, mut item) in items.into_iter().enumerate() {
-        let at = item.at().to_string();
-
-        let mut m = match item.take("match")? {
-            Some(value) => Section::wrap(value, format!("{at}.match"))?,
-            None => {
-                return Err(ConfError::new(
-                    format!("{at}.match"),
-                    "missing required key",
-                ));
-            }
-        };
-        let match_at = m.at().to_string();
-        let modality: Vec<String> = m
-            .require_str_list("modality")?
-            .into_iter()
-            .map(|value| value.to_ascii_uppercase())
-            .collect();
-        // The code is the OTHER optional key, and unlike the modality it is
-        // not required: a rule written before codes existed constrains no
-        // code, which is what keeps an existing configuration working.
-        let code: Vec<String> = m
-            .opt_str_list("code")?
-            .into_iter()
-            .map(|value| value.trim().to_ascii_uppercase())
-            .collect();
-        if code.iter().any(|value| value.is_empty()) {
-            return Err(ConfError::new(
-                m.child_at("code"),
-                "a code value is empty; omit the key to constrain no code",
-            ));
-        }
-        let study_description_contains = owned(m.opt_str_list("study_description_contains")?);
-        let code_meaning_contains = owned(m.opt_str_list("code_meaning_contains")?);
-        let body_part_contains = owned(m.opt_str_list("body_part_contains")?);
-        let tags = match m.peek("tag") {
-            Some(value) => {
-                let parsed = parse_tag_bindings(value, &match_at)?;
-                m.claim("tag");
-                parsed
-            }
-            None => Vec::new(),
-        };
-        m.finish("a match block")?;
-        let r#match = Match {
-            modality,
-            code,
-            study_description_contains,
-            code_meaning_contains,
-            body_part_contains,
-            tags,
-        };
-
-        let model = item.require_str("model")?.to_string();
-
-        let mut result = match item.take("result")? {
-            Some(value) => Section::wrap(value, format!("{at}.result"))?,
-            None => {
-                return Err(ConfError::new(
-                    format!("{at}.result"),
-                    "missing required key",
-                ));
-            }
-        };
-        let kind = parse_enum(
-            &mut result,
-            "kind",
-            ResultKind::parse,
-            ResultKind::ALL.iter().map(|k| k.as_str()).collect(),
-        )?;
-        let color = result.opt_str("color")?.map(str::to_string);
-        match result.peek("colors") {
-            // Per-class layer colors. The map is a presentation-state
-            // feature; a rule producing anything else would carry a key
-            // nothing reads.
-            Some(_) if kind != ResultKind::Pr => {
-                return Err(ConfError::new(
-                    result.child_at("colors"),
-                    format!("'{kind}' results have no per-class colors; pr only"),
-                ));
-            }
-            Some(value) if color.is_none() => {
-                let _ = value;
-                return Err(ConfError::new(
-                    result.child_at("color"),
-                    "required when colors is present",
-                ));
-            }
-            // Claimed but never read: no code in the crate consumes a per-class
-            // colour map, so accepting it let an operator write a presentation
-            // setting that silently did nothing. A key nothing reads is a
-            // configuration error, and the start-up is where it should be told.
-            Some(_) => {
-                return Err(ConfError::new(
-                    result.child_at("colors"),
-                    "'colors' is not supported; no per-class colour map is read",
-                ));
-            }
-            None => {}
-        }
-        let profile_version = match result.opt_bounded_int("profile_version", 1, 1_000_000)? {
-            Some(value) => value as u32,
-            None => 1,
-        };
-        let series_description = result.opt_str("series_description")?.map(str::to_string);
-        let label = match result.opt_mapping("label")? {
-            Some(mut block) => {
-                let anchor = match block.opt_str("anchor")? {
-                    Some(text) => LabelAnchor::parse(text).ok_or_else(|| {
-                        ConfError::new(block.child_at("anchor"), "expected 'tl' or 'center'")
-                    })?,
-                    None => LabelAnchor::default(),
-                };
-                let offset_y_px = match block.opt_bounded_int("offset_y_px", -100_000, 100_000)? {
-                    Some(value) => value as i32,
-                    None => -110,
-                };
-                let offset_x_left_px =
-                    match block.opt_bounded_int("offset_x_left_px", -100_000, 100_000)? {
-                        Some(value) => value as i32,
-                        None => -200,
-                    };
-                let offset_x_right_px =
-                    match block.opt_bounded_int("offset_x_right_px", -100_000, 100_000)? {
-                        Some(value) => value as i32,
-                        None => 80,
-                    };
-                if offset_x_left_px >= offset_x_right_px {
-                    return Err(ConfError::new(
-                        block.child_at("offset_x_right_px"),
-                        "must be greater than offset_x_left_px",
-                    ));
-                }
-                block.finish("a label block")?;
-                LabelProfile {
-                    anchor,
-                    offset_y_px,
-                    offset_x_left_px,
-                    offset_x_right_px,
-                }
-            }
-            None => LabelProfile::default(),
-        };
-        let sr = match result.peek("sr") {
-            Some(_) if kind != ResultKind::Sr => {
-                return Err(ConfError::new(
-                    result.child_at("sr"),
-                    format!("'{kind}' results carry no sr block; sr only"),
-                ));
-            }
-            Some(value) => {
-                let parsed = parse_sr_block(value, &result.child_at("sr"), SrTemplate::default())?;
-                result.claim("sr");
-                Some(parsed)
-            }
-            // An sr result without a block is legal: the template and the
-            // title both have defaults, and a report with no series
-            // description is still a report. The block exists to say
-            // something, not to be said.
-            None if kind == ResultKind::Sr => Some(SrResult::default()),
-            None => None,
-        };
-        // The measurements block: the same shape as sr, but its template
-        // defaults to TID 1500, because that is the template an Enhanced SR
-        // follows and the only one a numeric finding may declare.
-        let measurements = match result.peek("measurements") {
-            Some(_) if kind != ResultKind::Measurements => {
-                return Err(ConfError::new(
-                    result.child_at("measurements"),
-                    format!("'{kind}' results carry no measurements block; measurements only"),
-                ));
-            }
-            Some(value) => {
-                let parsed =
-                    parse_sr_block(value, &result.child_at("measurements"), SrTemplate::Tid1500)?;
-                result.claim("measurements");
-                Some(parsed)
-            }
-            None if kind == ResultKind::Measurements => Some(SrResult {
-                title: None,
-                template_id: SrTemplate::Tid1500,
-            }),
-            None => None,
-        };
-        result.finish("a result block")?;
-        item.finish("a rule")?;
-
-        rules.push(Rule {
-            r#match,
-            model,
-            result: RuleResult {
-                kind,
-                color,
-                profile_version,
-                series_description,
-                label,
-                sr,
-                measurements,
-            },
-            index,
-        });
-    }
-    Ok(rules)
-}
-
-/// The `sr:` (or `measurements:`) block of a report result.
-///
-/// Both keys are optional, and the block itself is optional: a report result
-/// with no block is a document with the defaults. A block on a result of any
-/// other kind is refused by the caller, because a key nothing reads is a
-/// declaration that will not happen.
-///
-/// `default_template` is the template the block's kind follows when the
-/// administrator names none: TID 2000 for `sr`, TID 1500 for `measurements`.
-/// The two blocks share this parser because they answer the same two
-/// questions; they differ only in which template is the right default.
-fn parse_sr_block(value: &Yaml, at: &str, default_template: SrTemplate) -> Result<SrResult> {
-    let mut section = Section::wrap(value, at)?;
-    let title = section.opt_str("title")?.map(str::to_string);
-    let template_id = match section.opt_str("template_id")? {
-        Some(text) => unknown_value(
-            SrTemplate::parse,
-            text,
-            &section.child_at("template_id"),
-            SrTemplate::ALL.iter().map(|t| t.as_str()).collect(),
-        )?,
-        None => default_template,
+    let conf = FhirConf {
+        extension_base: section
+            .opt_str("extension_base")?
+            .unwrap_or(DEFAULT_EXTENSION_BASE)
+            .to_string(),
     };
-    section.finish("a report block")?;
-    Ok(SrResult { title, template_id })
+    section.finish("fhir")?;
+    Ok(conf)
 }
 
-fn parse_tag_bindings(value: &Yaml, at: &str) -> Result<Vec<TagBinding>> {
-    let section_at = format!("{at}.tag");
-    let mut section = Section::wrap(value, &section_at)?;
-    let entries = section.entries();
-    if entries.is_empty() {
-        return Err(ConfError::new(&section_at, "the mapping is empty"));
-    }
-    let mut out = Vec::with_capacity(entries.len());
-    for (key, patterns) in entries {
-        let tag = normalize_tag(key).ok_or_else(|| {
-            ConfError::new(format!("{section_at}.{key}"), "expected 8 hex digits")
-        })?;
-        let item_at = format!("{section_at}.{key}");
-        let patterns = owned(str_items(patterns, &item_at)?);
-        if patterns.is_empty() {
-            return Err(ConfError::new(&item_at, "the list is empty"));
-        }
-        section.claim(key);
-        out.push(TagBinding { tag, patterns });
-    }
-    section.finish("a tag block")?;
-    Ok(out)
-}
-
-fn parse_enum<T: Copy>(
-    section: &mut Section<'_>,
-    key: &str,
-    parse: impl Fn(&str) -> Option<T>,
-    allowed: Vec<&str>,
-) -> Result<T> {
-    let at = section.child_at(key);
-    let text = section
-        .opt_str(key)?
-        .ok_or_else(|| ConfError::new(&at, "missing required key"))?;
-    unknown_value(parse, text, &at, allowed)
-}
-
-/// Read an enum key whose absence is legal.
-///
-/// The legal set is still enforced: a key that is present but names
-/// nothing is a typo in a declaration, and treating a typo as "absent"
-/// would silently apply the default.
-fn unknown_value<T>(
-    parse: impl Fn(&str) -> Option<T>,
-    text: &str,
-    at: &str,
-    allowed: Vec<&str>,
-) -> Result<T> {
-    parse(text).ok_or_else(|| {
-        ConfError::new(
-            at,
-            format!("unknown value '{text}'; expected {}", allowed.join(", ")),
-        )
-    })
-}
-
-fn owned(values: Vec<&str>) -> Vec<String> {
-    values.into_iter().map(str::to_string).collect()
-}
-
-/// `00211109`, `0021,1109` and `0021, 1109` all name the same tag; the
-/// canonical form is eight upper-case hex digits.
+/// `00211109`, `0021,1109` and `0021, 1109` all name the same tag; the/// canonical form is eight upper-case hex digits.
 #[must_use]
 pub fn normalize_tag(text: &str) -> Option<String> {
     let cleaned: String = text
@@ -1105,7 +800,53 @@ pub fn parse_listen(text: &str) -> Option<(String, u16)> {
 
 // -- Cross-section validation ------------------------------------------
 
+/// Default budget of one processor's `result.json`, in bytes (64 MiB).
+///
+/// A STRUCTURE SET grows with the traced polygon count: every contour
+/// carries three coordinates per point, so the document is proportional to
+/// the pixels a model outlines. Measured on live CT with the producer still
+/// emitting every traced pixel:
+///
+/// ```text
+///   36 frames / 528 contours   16628332 bytes   15.9 MiB
+///   53 frames / 521 contours   28106522 bytes   26.8 MiB
+/// ```
+///
+/// That is roughly 0.5 MiB per frame, so 64 MiB covers a study well over a
+/// hundred frames larger than the ones measured, while still stopping a
+/// script that loops. The limit is not a security boundary - the script is
+/// operator-configured and shares the configuration's trust domain - it is
+/// the difference between a bounded failure and a disk filled before the
+/// timeout notices.
+///
+/// It is a DEFAULT, not a ceiling: a volumetric study needs more, and
+/// `runtime.max_result_bytes` on the model is where that is said.
+pub const DEFAULT_MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The largest per-model budget this parser accepts, in bytes (1 GiB).
+///
+/// The bound exists so a mistyped `max_result_bytes = 64g` is refused at
+/// startup rather than after a run reads a gigabyte into memory. A gigabyte
+/// is already far past any structure set a study can carry - the encoded
+/// object has its own `ContourData` ceiling that no result size can lift -
+/// so the number that gets a site working is well inside it, and the values
+/// beyond it are typos rather than deployments.
+pub const MAX_RESULT_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
+
+/// Default budget of one processor run, in seconds.
+pub const DEFAULT_TIMEOUT_SECS: u32 = 300;
+
+/// The interpreter an external processor runs under when none is given.
+///
+/// A bare name, not a path: it is resolved through `PATH` by the process
+/// spawner, which is what lets a site rely on the platform's own python.
+pub const DEFAULT_INTERPRETER: &str = "python3";
+
 fn validate(conf: &Conf) -> Result<()> {
+    // A rule is derived from a model, so the only way one can name a model
+    // that does not exist or a kind without an encoder is a bug in the
+    // derivation - and a bug there would store an object the build cannot
+    // write, which is the one outcome worth refusing at startup.
     for rule in &conf.rules {
         let at = format!("rules[{}]", rule.index);
         if conf.model(&rule.model).is_none() {
@@ -1195,55 +936,12 @@ pub fn station_matches(code_value: &str, station_aet: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::yaml::parse_document;
-
-    /// The document is leaked so a section can borrow it for the length of
-    /// the test body; tests are short-lived processes.
-    fn document(source: &str) -> &'static Yaml {
-        Box::leak(Box::new(
-            parse_document(source, Path::new("t")).expect("parses"),
-        ))
-    }
 
     #[test]
     fn every_result_kind_round_trips_through_its_name() {
         for kind in ResultKind::ALL {
             assert_eq!(ResultKind::parse(kind.as_str()), Some(kind));
         }
-    }
-
-    #[test]
-    fn every_kind_has_a_built_encoder() {
-        // The set is spelled out rather than derived, so dropping an
-        // encoder without saying so here fails this test. Every kind is
-        // listed because every kind is written by this crate: a `false`
-        // here would refuse a configuration the build can actually serve,
-        // which is how `seg` and `derived` were unreachable before.
-        for kind in [
-            ResultKind::Pr,
-            ResultKind::Sr,
-            ResultKind::Measurements,
-            ResultKind::Seg,
-            ResultKind::Stl,
-            ResultKind::Derived,
-            ResultKind::Rtstruct,
-        ] {
-            assert!(kind.encoder_built(), "{kind} has an encoder");
-        }
-        assert_eq!(ResultKind::ALL.len(), 7, "every kind is covered above");
-    }
-
-    #[test]
-    fn tag_normalization_accepts_separators() {
-        assert_eq!(normalize_tag("00211109").as_deref(), Some("00211109"));
-        assert_eq!(normalize_tag("0021,1109").as_deref(), Some("00211109"));
-        assert_eq!(normalize_tag("0021,ab09").as_deref(), Some("0021AB09"));
-        assert_eq!(normalize_tag("0021, 1109").as_deref(), Some("00211109"));
-        assert_eq!(normalize_tag("0021110"), None);
-        // Whitespace is a separator, so this is not eight digits.
-        assert_eq!(normalize_tag("0021 1109"), Some("00211109".to_string()));
-        assert_eq!(normalize_tag("0021110g"), None);
-        assert_eq!(normalize_tag(""), None);
     }
 
     #[test]
@@ -1265,129 +963,30 @@ mod tests {
         assert_eq!(profile.offset_x_right_px, 80);
     }
 
-    /// A rule's result block, parsed with the same reader `load` uses.
-    fn rule_result_of(result_yaml: &str) -> RuleResult {
-        let source = format!(
-            "rules:\n  - match:\n      modality: [DX]\n    model: m\n    result:\n{result_yaml}"
-        );
-        let doc = document(&source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let rules = parse_rules(&mut root).expect("rules parse");
-        assert_eq!(rules.len(), 1, "one rule");
-        rules[0].result.clone()
+    #[test]
+    fn the_sr_template_names_round_trip() {
+        for template in SrTemplate::ALL {
+            assert_eq!(SrTemplate::parse(template.as_str()), Some(template));
+        }
+        assert_eq!(SrTemplate::parse("tid2000"), None, "the casing is fixed");
+        assert_eq!(SrTemplate::parse("1419"), None);
+        assert_eq!(SrTemplate::default(), SrTemplate::Tid2000);
+        assert_eq!(SrTemplate::Tid2000.designator(), "DCMR");
+        assert_eq!(SrTemplate::Tid2000.template_number(), "2000");
+        assert_eq!(SrTemplate::Tid1500.as_str(), "TID1500");
+        assert_eq!(SrTemplate::Tid1500.designator(), "DCMR");
+        assert_eq!(SrTemplate::Tid1500.template_number(), "1500");
+        assert_eq!(SrTemplate::parse("tid1500"), None, "the casing is fixed");
     }
 
     #[test]
-    fn the_label_block_parses_into_the_rule_result() {
-        let result = rule_result_of(
-            "      kind: pr\n      label:\n        anchor: center\n        offset_y_px: -50\n        offset_x_left_px: -150\n        offset_x_right_px: 90\n",
-        );
-        assert_eq!(result.label.anchor, LabelAnchor::Center);
-        assert_eq!(result.label.offset_y_px, -50);
-        assert_eq!(result.label.offset_x_left_px, -150);
-        assert_eq!(result.label.offset_x_right_px, 90);
-    }
-
-    #[test]
-    fn an_absent_label_block_defaults_to_the_corner() {
-        let result = rule_result_of("      kind: pr\n");
-        assert_eq!(result.label, LabelProfile::default());
-    }
-
-    // -- The measurements result block -------------------------------------
-
-    #[test]
-    fn a_measurements_result_defaults_its_template_to_tid_1500() {
-        // The block is optional, and its default template is the one an
-        // Enhanced SR follows - NOT the TID 2000 a text report would take.
-        let result = rule_result_of("      kind: measurements\n");
-        assert_eq!(result.kind, ResultKind::Measurements);
-        let block = result.measurements.as_ref().expect("the block defaults");
-        assert_eq!(block.template_id, SrTemplate::Tid1500);
-        assert!(block.title.is_none());
-        assert!(result.sr.is_none(), "measurements is not an sr block");
-    }
-
-    #[test]
-    fn a_measurements_block_carries_its_title_and_template() {
-        let result = rule_result_of(
-            "      kind: measurements\n      measurements:\n        title: Chest classifier\n        template_id: TID1500\n",
-        );
-        let block = result.measurements.as_ref().expect("the block");
-        assert_eq!(block.title.as_deref(), Some("Chest classifier"));
-        assert_eq!(block.template_id, SrTemplate::Tid1500);
-    }
-
-    #[test]
-    fn a_measurements_block_may_declare_either_template() {
-        // The block's DEFAULT is TID 1500, but the template is the
-        // administrator's to name and both ids are implemented by this
-        // build. Pinned so the default is not mistaken for a constraint.
-        let result = rule_result_of(
-            "      kind: measurements\n      measurements:\n        template_id: TID2000\n",
-        );
-        let block = result.measurements.as_ref().expect("the block");
-        assert_eq!(block.template_id, SrTemplate::Tid2000);
-    }
-
-    #[test]
-    fn a_measurements_block_refuses_an_unknown_template() {
-        // A value that is not a template this build implements. Both
-        // Tid2000 and Tid1500 are legal in the block (the administrator may
-        // declare either); an unlisted id is what the parser must refuse.
-        let source = "rules:\n  - match:\n      modality: [DX]\n    model: m\n    result:\n      kind: measurements\n      measurements:\n        template_id: TID1419\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let err = parse_rules(&mut root).expect_err("an unknown template is refused");
-        assert!(err.to_string().contains("template_id"), "{err}");
-    }
-
-    #[test]
-    fn a_measurements_block_on_a_text_report_is_refused() {
-        // A key nothing reads is a declaration that will not happen: the
-        // template would be parsed and then silently ignored.
-        let source = "rules:\n  - match:\n      modality: [DX]\n    model: m\n    result:\n      kind: sr\n      measurements:\n        title: nope\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let err = parse_rules(&mut root).expect_err("sr carries no measurements block");
-        assert!(err.to_string().contains("measurements"), "{err}");
-    }
-
-    #[test]
-    fn an_sr_block_on_a_measurements_result_is_refused() {
-        let source = "rules:\n  - match:\n      modality: [DX]\n    model: m\n    result:\n      kind: measurements\n      sr:\n        title: nope\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let err = parse_rules(&mut root).expect_err("measurements carries no sr block");
-        assert!(err.to_string().contains("sr"), "{err}");
-    }
-
-    #[test]
-    fn an_unknown_key_in_a_measurements_block_is_refused() {
-        let source = "rules:\n  - match:\n      modality: [DX]\n    model: m\n    result:\n      kind: measurements\n      measurements:\n        titel: typo\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let err = parse_rules(&mut root).expect_err("a misspelling is an error");
-        assert!(err.to_string().contains("titel"), "{err}");
-    }
-
-    #[test]
-    fn a_degenerate_label_box_is_rejected() {
-        let source = "rules:\n  - match:\n      modality: [DX]\n    model: m\n    result:\n      kind: pr\n      label:\n        offset_x_left_px: 10\n        offset_x_right_px: -10\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let err = parse_rules(&mut root).expect_err("degenerate box must fail");
-        assert!(err.to_string().contains("offset_x_right_px"), "{err}");
-    }
-
-    #[test]
-    fn an_unknown_anchor_value_is_rejected() {
-        let source = "rules:\n  - match:\n      modality: [DX]\n    model: m\n    result:\n      kind: pr\n      label:\n        anchor: corner\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let err = parse_rules(&mut root).expect_err("bad anchor must fail");
-        assert!(err.to_string().contains("anchor"), "{err}");
-        assert!(err.to_string().contains("'tl' or 'center'"), "{err}");
+    fn tag_normalization_accepts_separators() {
+        assert_eq!(normalize_tag("00211109").as_deref(), Some("00211109"));
+        assert_eq!(normalize_tag("0021,1109").as_deref(), Some("00211109"));
+        assert_eq!(normalize_tag("0021,ab09").as_deref(), Some("0021AB09"));
+        assert_eq!(normalize_tag("0021110"), None);
+        assert_eq!(normalize_tag("0021110g"), None);
+        assert_eq!(normalize_tag(""), None);
     }
 
     #[test]
@@ -1403,222 +1002,43 @@ mod tests {
         assert_eq!(parse_listen(":8124"), None);
     }
 
-    // -- The result kinds --------------------------------------------------
-
     #[test]
-    fn the_sr_template_names_round_trip() {
-        for template in SrTemplate::ALL {
-            assert_eq!(SrTemplate::parse(template.as_str()), Some(template));
-        }
-        assert_eq!(SrTemplate::parse("tid2000"), None, "the casing is fixed");
-        assert_eq!(SrTemplate::parse("1419"), None);
-        assert_eq!(SrTemplate::default(), SrTemplate::Tid2000);
-        // The three spellings the object carries must agree on the one
-        // template, or the report would name a template it does not follow.
-        assert_eq!(SrTemplate::Tid2000.designator(), "DCMR");
-        assert_eq!(SrTemplate::Tid2000.template_number(), "2000");
-        // TID 1500 carries the same designator and its own number.
-        assert_eq!(SrTemplate::Tid1500.as_str(), "TID1500");
-        assert_eq!(SrTemplate::Tid1500.designator(), "DCMR");
-        assert_eq!(SrTemplate::Tid1500.template_number(), "1500");
-        assert_eq!(SrTemplate::parse("tid1500"), None, "the casing is fixed");
-    }
-
-    // -- The per-model result budget ---------------------------------------
-
-    /// Parse one `models:` entry through the real reader.
-    fn model_of(body: &str) -> Result<Model> {
-        let source = format!("models:\n  m:\n{body}");
-        let doc = document(&source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        parse_models(&mut root, None).map(|models| models.into_iter().next().expect("one model"))
-    }
-
-    /// A relative `script` resolves against the configuration file's
-    /// directory, so a packaged config works from any process cwd.
-    #[test]
-    fn a_relative_script_is_anchored_at_the_configuration_file() {
-        let source = "models:\n  m:\n    script: ./totalseg.py\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let base = Path::new("/opt/demo/pack");
-        let models = parse_models(&mut root, Some(base)).expect("parses");
-        let model = &models[0];
-        assert_eq!(
-            model.script,
-            Some(PathBuf::from("/opt/demo/pack/totalseg.py")),
-            "a relative script joins the config directory"
-        );
-
-        // An absolute script is left alone: the site pointed at a fixed
-        // location and the parser must not second-guess it.
-        let source = "models:\n  m:\n    script: /opt/clinfer/scripts/clahe.py\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let models = parse_models(&mut root, Some(base)).expect("parses");
-        assert_eq!(
-            models[0].script,
-            Some(PathBuf::from("/opt/clinfer/scripts/clahe.py"))
-        );
-    }
-
-    /// `load` anchors at the file's directory even when the config path
-    /// is a BARE file name: `Path::parent` of `pack.conf` is the empty
-    /// path, so the resolver absolutizes the file first.
-    #[test]
-    fn absolutize_turns_a_bare_path_absolute() {
-        let bare = Path::new("pack.conf");
-        let absolute = super::absolutize(bare);
-        assert!(absolute.is_absolute(), "{absolute:?} is not absolute");
-        assert!(absolute.ends_with(bare), "{absolute:?} lost the file name");
-        // Absolute on every platform by construction: a Unix-style
-        // `/opt/x/...` is NOT absolute on Windows (no drive prefix).
-        let fixed = std::env::current_dir()
-            .expect("cwd")
-            .join("opt/x/pack.conf");
-        assert_eq!(
-            super::absolutize(&fixed),
-            fixed,
-            "an absolute path is returned untouched"
-        );
-    }
-
-    /// A relative interpreter that NAMES A PATH anchors at the config
-    /// file like `script`; a bare name stays a PATH lookup.
-    #[test]
-    fn a_relative_interpreter_follows_the_script_anchor() {
-        let base = Path::new("/opt/demo/pack");
-        let parse = |body: &str| {
-            let source = format!("models:\n  m:\n{body}");
-            let doc = document(&source);
-            let mut root = Section::wrap(doc, "").expect("mapping");
-            parse_models(&mut root, Some(base)).expect("parses")
+    fn a_models_procedure_code_becomes_the_rules_workitem_code_key() {
+        let clahe = crate::models::Model {
+            id: "clahe".to_string(),
+            enabled: true,
+            title: None,
+            description: None,
+            provider: None,
+            procedure_code: Some(crate::models::Code {
+                value: "IMG-CLAHE".to_string(),
+                scheme: "99CLARUS".to_string(),
+                meaning: Some("Adaptive Histogram Equalization (CLAHE)".to_string()),
+            }),
+            input_requirements: crate::models::InputRequirements::default(),
+            output_capabilities: crate::models::OutputCapabilities::default(),
+            parameters: Vec::new(),
+            r#match: Match::default(),
+            runtime: None,
+            outputs: vec![crate::models::Output {
+                kind: "derived".to_string(),
+                series_description: Some("CLAHE".to_string()),
+                profile_version: 1,
+            }],
         };
+        let rules = derive_rules(&[clahe.clone()]);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].r#match.code, vec!["IMG-CLAHE".to_string()]);
 
-        let anchored = parse("    script: /s/proc.py\n    interpreter: ./venv/bin/python\n");
-        assert_eq!(
-            anchored[0].interpreter,
-            Some(PathBuf::from("/opt/demo/pack/venv/bin/python")),
-            "a relative path-interpreter joins the config directory"
-        );
-
-        let bare = parse("    script: /s/proc.py\n    interpreter: python3\n");
-        assert_eq!(
-            bare[0].interpreter,
-            Some(PathBuf::from("python3")),
-            "a bare name stays a PATH lookup"
-        );
-    }
-
-    /// An absent key takes the default, so an existing configuration is
-    /// unchanged by the knob's arrival.
-    #[test]
-    fn a_model_without_a_result_budget_takes_the_default() {
-        let model = model_of("    script: proc.py\n").expect("parses");
-        assert_eq!(model.max_result_bytes, DEFAULT_MAX_RESULT_BYTES);
-    }
-
-    /// Both spellings of the same budget mean the same number: the suffixed
-    /// form is the documented one and the bare count is what it decodes to.
-    #[test]
-    fn a_budget_is_read_from_a_suffix_or_a_bare_count() {
-        let suffixed = model_of("    script: proc.py\n    max_result_bytes: 128m\n")
-            .expect("a suffixed budget parses");
-        assert_eq!(suffixed.max_result_bytes, 128 * 1024 * 1024);
-
-        let bare = model_of("    script: proc.py\n    max_result_bytes: 134217728\n")
-            .expect("a bare budget parses");
-        assert_eq!(bare.max_result_bytes, 128 * 1024 * 1024);
-
-        let kilobytes = model_of("    script: proc.py\n    max_result_bytes: 64k\n")
-            .expect("a k suffix parses");
-        assert_eq!(kilobytes.max_result_bytes, 64 * 1024);
-    }
-
-    /// Every unusable value is refused AT STARTUP with a message naming the
-    /// key, rather than after a run has already read a gigabyte.
-    #[test]
-    fn an_unusable_budget_is_refused_with_its_key_named() {
-        let cases: &[(&str, &str)] = &[
-            // Zero is not a budget: it would refuse every result, and the
-            // honest way to say "no result" is to remove the model.
-            (
-                "    script: proc.py\n    max_result_bytes: 0\n",
-                "0 is not a budget",
-            ),
-            // Fractions are refused rather than rounded: rounding is a
-            // silent wrong answer to a question nobody asked.
-            (
-                "    script: proc.py\n    max_result_bytes: 1.5m\n",
-                "expected a byte count",
-            ),
-            // A unit the convention does not define.
-            (
-                "    script: proc.py\n    max_result_bytes: 64mb\n",
-                "expected a byte count",
-            ),
-            // Negative, which is not a byte count in any reading.
-            (
-                "    script: proc.py\n    max_result_bytes: -1\n",
-                "not a byte count",
-            ),
-            // Over the ceiling: a typo, not a deployment.
-            (
-                "    script: proc.py\n    max_result_bytes: 64g\n",
-                "expected a byte count",
-            ),
-            (
-                "    script: proc.py\n    max_result_bytes: 2g\n",
-                "expected a byte count",
-            ),
-        ];
-        for (body, expected) in cases {
-            let err = model_of(body).expect_err(body);
-            let text = err.to_string();
-            assert!(
-                text.contains("max_result_bytes"),
-                "{body}: the message must name the key: {text}"
-            );
-            assert!(
-                text.contains(expected),
-                "{body}: expected {expected:?}, got {text}"
-            );
-        }
-    }
-
-    /// The ceiling itself is a plain integer count, so it is worth stating
-    /// that the bound is inclusive at the top and exclusive of anything over.
-    #[test]
-    fn the_budget_ceiling_is_inclusive() {
-        let at_ceiling = model_of(&format!(
-            "    script: proc.py\n    max_result_bytes: {MAX_RESULT_BYTES_CEILING}\n"
-        ))
-        .expect("the ceiling itself is accepted");
-        assert_eq!(at_ceiling.max_result_bytes, MAX_RESULT_BYTES_CEILING);
-
-        let over = model_of(&format!(
-            "    script: proc.py\n    max_result_bytes: {}\n",
-            MAX_RESULT_BYTES_CEILING + 1
-        ))
-        .expect_err("one byte over is refused");
-        assert!(over.to_string().contains("ceiling"), "{over}");
-    }
-
-    /// The budget belongs to the MODEL, so two models in one file may differ.
-    #[test]
-    fn two_models_may_carry_different_budgets() {
-        let source = "models:\n  detect:\n    script: d.py\n    max_result_bytes: 1m\n  outline:\n    script: o.py\n    max_result_bytes: 512m\n";
-        let doc = document(source);
-        let mut root = Section::wrap(doc, "").expect("mapping");
-        let models = parse_models(&mut root, None).expect("both models parse");
-
-        let detect = models.iter().find(|m| m.id == "detect").expect("detect");
-        let outline = models.iter().find(|m| m.id == "outline").expect("outline");
-        assert_eq!(detect.max_result_bytes, 1024 * 1024);
-        assert_eq!(outline.max_result_bytes, 512 * 1024 * 1024);
-        assert_ne!(
-            detect.max_result_bytes, outline.max_result_bytes,
-            "one budget per model, not one per file"
-        );
+        // A model that declares no procedure code matches every code: the
+        // pre-key behaviour, not a rule that can never match.
+        let bare = crate::models::Model {
+            id: "bare".to_string(),
+            procedure_code: None,
+            ..clahe
+        };
+        let rules = derive_rules(&[bare]);
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].r#match.code.is_empty());
     }
 }

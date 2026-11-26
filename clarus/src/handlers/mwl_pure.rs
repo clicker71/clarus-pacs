@@ -73,6 +73,26 @@ pub struct MwlQuery {
     /// Physician's Name (0040,0006), Referring Physician's Name (0008,0090) -
     /// per PS3.18 8.3.4.2. Default `false`: exact single-value matching.
     pub fuzzymatching: bool,
+    /// (control) `emptyvaluematching` as the client sent it, retained so the
+    /// search can report the option as unsupported (PS3.18 8.4).
+    pub empty_value_matching: Option<bool>,
+    /// (control) `multiplevaluematching` as the client sent it, same purpose.
+    pub multiple_value_matching: Option<bool>,
+}
+
+/// Parse a `*valuematching` control-parameter value.
+///
+/// PS3.18 Table 8.3.4-1 types both as boolean, so only `true`/`false` are
+/// values; a present but unparsable one is a malformed query parameter, and
+/// answering it as `false` would turn a typo into a silently different search.
+fn parse_matching_flag(key: &str, val: &str) -> Result<bool, String> {
+    if val.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if val.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(format!("{key} must be 'true' or 'false' (got \"{val}\")"))
+    }
 }
 
 /// Parse the MWL search query string.
@@ -124,12 +144,16 @@ fn parse_query(query_str: &str) -> Result<MwlQuery, String> {
             | "Modality"
             | "00400100.00080060"
             | "ScheduledProcedureStepSequence.Modality" => q.modality = Some(val),
-            // (0040,0006) Scheduled Performing Physician's Name.
+            // (0040,0006) Scheduled Performing Physician's Name. PS3.4 K.6.6
+            // (`standard/ps3.4/mwl-k.6-1-matching-keys.json`) names the key
+            // `ScheduledPerformingPhysiciansName` - the PLURAL, matching the
+            // DICOM keyword - so the qualified form must be accepted too.
             "00400006"
             | "ScheduledPerformingPhysicianName"
             | "ScheduledPerformingPhysiciansName"
             | "00400100.00400006"
-            | "ScheduledProcedureStepSequence.ScheduledPerformingPhysicianName" => {
+            | "ScheduledProcedureStepSequence.ScheduledPerformingPhysicianName"
+            | "ScheduledProcedureStepSequence.ScheduledPerformingPhysiciansName" => {
                 q.performing_physician = Some(val)
             }
             "00100010" | "PatientName" => q.patient_name = Some(val),
@@ -164,15 +188,40 @@ fn parse_query(query_str: &str) -> Result<MwlQuery, String> {
                     format!("offset must be a non-negative integer (got \"{val}\")")
                 })?)
             }
-            // PS3.18 Table 8.3.4-1 control parameters. `fuzzymatching` is
-            // honoured (8.3.4.2: fuzzy matching of Person Name attributes);
-            // the rest are accepted and ignored only where ignoring them
-            // cannot change the answer: `includefield` is satisfied because
-            // the render returns every attribute the record holds, and the
-            // two `*valuematching` parameters are the default literal-match
-            // behaviour.
-            "fuzzymatching" => q.fuzzymatching = val.eq_ignore_ascii_case("true"),
-            "includefield" | "emptyvaluematching" | "multiplevaluematching" => {}
+            // PS3.18 Table 8.3.4-1 control parameters.
+            //
+            // `fuzzymatching` is a BOOLEAN, so only `true`/`false` are values;
+            // anything else is a malformed query parameter (PS3.18 8.5), not a
+            // silent `false`. Reading `fuzzymatching=treu` as false answered a
+            // successful EXACT search for a request that asked for fuzzy - the
+            // client cannot tell its typo from "no fuzzy matches".
+            "fuzzymatching" => {
+                q.fuzzymatching = if val.eq_ignore_ascii_case("true") {
+                    true
+                } else if val.eq_ignore_ascii_case("false") {
+                    false
+                } else {
+                    return Err(format!(
+                        "fuzzymatching must be 'true' or 'false' (got \"{val}\")"
+                    ));
+                }
+            }
+            // The two `*valuematching` options are not implemented, and PS3.18
+            // 8.4 makes an unsupported option a WARNING, not a silent fallback:
+            // a client that asked for empty-value matching and silently got the
+            // default has no way to know its answer is narrower than it asked
+            // for. The flag is retained so `search` can emit the header.
+            "emptyvaluematching" => q.empty_value_matching = Some(parse_matching_flag(&key, &val)?),
+            "multiplevaluematching" => {
+                q.multiple_value_matching = Some(parse_matching_flag(&key, &val)?)
+            }
+            // `includefield` names attributes to return, not filters to apply,
+            // so it can never widen or narrow the match set. This server renders
+            // a fixed attribute set (PS3.4 K.6.1.2 makes the returned set an
+            // implementation choice) and therefore ignores the parameter -
+            // ignoring it is not a silent filter loss, because it is not a
+            // filter. Accepted here so a conformant client is not refused.
+            "includefield" => {}
             other => {
                 return Err(format!(
                     "Unknown or misspelled query parameter '{other}': matching keys are \
@@ -197,6 +246,43 @@ fn fuzzy_pn(pattern: &str, name: &str) -> bool {
     )
 }
 
+/// Whether a stored DA matches the search key: exact, or an inclusive range.
+///
+/// PS3.4 K.6.6 types Scheduled Procedure Step Start Date as "Single Value or
+/// Range" (`standard/ps3.4/mwl-k.6-1-matching-keys.json`), and PS3.4 C.2.2.2.5
+/// gives the range form `<lower>-<upper>` with either side open and both ends
+/// inclusive. Comparing the pattern to the stored value as text made
+/// `20261010-20261012` match nothing, so a modality asking for a three-day
+/// window received an empty worklist even when steps fell inside it.
+///
+/// The comparison is delegated to the shared core helper
+/// (`clarus_core::query::range::da_range_matches`) so MWL and QIDO cannot
+/// disagree about what a range means.
+fn date_key_matches(pattern: &str, stored: &str) -> bool {
+    use clarus_core::manifest::AttrValue;
+    // A stored DA that is not 8 digits cannot satisfy a range, but an EXACT
+    // pattern is still a plain string comparison, so the exact form keeps
+    // working for any stored spelling.
+    if !pattern.contains('-') {
+        return stored == pattern;
+    }
+    clarus_core::query::range::da_range_matches(&AttrValue::Text(stored.to_string()), pattern)
+}
+
+/// Whether a stored TM matches the search key: exact, or an inclusive range.
+///
+/// Same rule as [`date_key_matches`] for (0040,0003) Scheduled Procedure Step
+/// Start Time ("Single Value or Range"), delegated to the shared TM helper
+/// (PS3.4 C.2.2.2.5.2: a shortened stored value matches when its period
+/// intersects the range).
+fn time_key_matches(pattern: &str, stored: &str) -> bool {
+    use clarus_core::manifest::AttrValue;
+    if !pattern.contains('-') {
+        return stored == pattern;
+    }
+    clarus_core::query::range::tm_range_matches(&AttrValue::Text(stored.to_string()), pattern)
+}
+
 /// Whether a record satisfies every filter (AND semantics).
 fn matches(rec: &SpsRecord, q: &MwlQuery) -> bool {
     macro_rules! eq_opt {
@@ -219,12 +305,12 @@ fn matches(rec: &SpsRecord, q: &MwlQuery) -> bool {
         return false;
     }
     if let Some(v) = q.sps_start_date.as_deref()
-        && rec.sps_start_date != v
+        && !date_key_matches(v, &rec.sps_start_date)
     {
         return false;
     }
     if let Some(v) = q.sps_start_time.as_deref()
-        && rec.sps_start_time != v
+        && !time_key_matches(v, &rec.sps_start_time)
     {
         return false;
     }
@@ -392,6 +478,24 @@ pub fn search(
             ),
         ));
     }
+    // PS3.18 8.4: a matching option the origin server does not support is
+    // reported as a Warning, not silently downgraded. Both options are typed
+    // boolean here, so only a client that asked for `true` is told anything -
+    // `false` and an absent parameter already name the behaviour the server
+    // implements. Each is its OWN Warning header (RFC 9110 5.5 makes the field
+    // repeatable) so the truncation Warning above is never displaced.
+    if query.empty_value_matching == Some(true) {
+        headers.push((
+            "Warning",
+            format!("299 {service}: Empty-value matching is not supported; the default matching was applied"),
+        ));
+    }
+    if query.multiple_value_matching == Some(true) {
+        headers.push((
+            "Warning",
+            format!("299 {service}: Multiple-value matching is not supported; the default matching was applied"),
+        ));
+    }
 
     // One line per search, emitted HERE - at the single place the answer is
     // known - so a line describes every search exactly once whatever the
@@ -476,21 +580,41 @@ fn write_sps_json(out: &mut Vec<u8>, rec: &SpsRecord) {
                 wrote = true;
                 out.push(b'"');
                 out.extend_from_slice($tag.as_bytes());
-                out.extend_from_slice(b"\":{\"Value\":[");
-                push_json_str(out, v);
-                out.extend_from_slice(b"],\"vr\":\"");
-                out.extend_from_slice($vr.as_bytes());
-                out.extend_from_slice(b"\"}");
+                out.extend_from_slice(b"\":{\"Value\":");
+                // A PN's Value is an OBJECT (PS3.18 F.2.3), never a string.
+                if $vr == "PN" {
+                    push_pn_object(out, v);
+                    out.extend_from_slice(b",\"vr\":\"PN\"}");
+                } else {
+                    out.push(b'[');
+                    push_json_str(out, v);
+                    out.extend_from_slice(b"],\"vr\":\"");
+                    out.extend_from_slice($vr.as_bytes());
+                    out.extend_from_slice(b"\"}");
+                }
             }
         };
     }
     // Alphabetical tag order, the DICOMweb JSON convention this tree follows.
+    //
+    // PS3.4 Table K.6-1 (`standard/ps3.4/mwl-k.6-1-matching-keys.json`) puts the
+    // Scheduled Procedure Step attributes INSIDE (0040,0100) Scheduled Procedure
+    // Step Sequence - "the Scheduled Procedure Step Sequence shall contain only
+    // a single Item" - and the modality reads them from there. Emitting them at
+    // the dataset root, which this used to do, left a conformant SCU with an
+    // item that has no procedure step at all.
     emit!("00080050", "SH", rec.accession_number.as_deref());
     emit!("00080060", "CS", Some(rec.modality.as_str()));
     emit!("00080090", "PN", rec.referring_physician.as_deref());
     emit!("00100010", "PN", Some(rec.patient_name.as_str()));
     emit!("00100020", "LO", Some(rec.patient_id.as_str()));
-    emit!("00100030", "DA", rec.birth_date.as_deref());
+    // Patient's Birth Date is Type 2 on return: it must be PRESENT and may be
+    // empty, which is a different statement from "the attribute is absent".
+    emit!(
+        "00100030",
+        "DA",
+        Some(rec.birth_date.as_deref().unwrap_or(""))
+    );
     emit!("00100040", "CS", rec.sex.as_deref());
     emit!("0020000D", "UI", rec.study_uid.as_deref());
     emit!("00321032", "PN", rec.requesting_physician.as_deref());
@@ -499,20 +623,70 @@ fn write_sps_json(out: &mut Vec<u8>, rec: &SpsRecord) {
         "LO",
         rec.requested_procedure_description.as_deref()
     );
-    emit!("00400001", "AE", Some(rec.station_aet.as_str()));
-    emit!("00400002", "DA", Some(rec.sps_start_date.as_str()));
-    emit!("00400003", "TM", Some(rec.sps_start_time.as_str()));
-    emit!(
-        "00400006",
-        "PN",
-        Some(rec.scheduled_performing_physician.as_str())
-    );
-    emit!("00400009", "SH", rec.sps_id.as_deref());
     emit!("00401001", "SH", rec.requested_procedure_id.as_deref());
-    // The last emit sets `wrote` without a reader; naming the read keeps the
+    if wrote {
+        out.push(b',');
+    }
+    out.extend_from_slice(b"\"00400100\":{\"Value\":[{");
+    let mut item_wrote = false;
+    // The SPS item, alphabetical by tag. These are the SAME attributes that
+    // used to sit at the root; only their container changed.
+    for (tag, vr, value) in [
+        ("00400001", "AE", Some(rec.station_aet.as_str())),
+        ("00400002", "DA", Some(rec.sps_start_date.as_str())),
+        ("00400003", "TM", Some(rec.sps_start_time.as_str())),
+        ("00400009", "SH", rec.sps_id.as_deref()),
+    ] {
+        let Some(v) = value else { continue };
+        if item_wrote {
+            out.push(b',');
+        }
+        item_wrote = true;
+        out.push(b'"');
+        out.extend_from_slice(tag.as_bytes());
+        out.extend_from_slice(b"\":{\"Value\":[");
+        push_json_str(out, v);
+        out.extend_from_slice(b"],\"vr\":\"");
+        out.extend_from_slice(vr.as_bytes());
+        out.extend_from_slice(b"\"}");
+    }
+    // (0040,0006) is a Person Name, so its Value is an object, not a string
+    // (PS3.18 F.2.3: "the Value of a PN attribute is a JSON object").
+    if item_wrote {
+        out.push(b',');
+    }
+    out.extend_from_slice(b"\"00400006\":{\"Value\":");
+    push_pn_object(out, &rec.scheduled_performing_physician);
+    out.extend_from_slice(b",\"vr\":\"PN\"}}],\"vr\":\"SQ\"}");
+    // The last write sets `wrote` without a reader; naming the read keeps the
     // shared macro (and every emit above it) free of a special case.
     let _ = wrote;
     out.push(b'}');
+}
+
+/// Append a Person Name value as the DICOM JSON object PS3.18 F.2.3 requires.
+///
+/// A PN is not a string: its Value is an object with the `Alphabetic`,
+/// `Ideographic` and `Phonetic` component groups, split at the `=` delimiter
+/// (PS3.5 6.2, `standard/ps3.5/pn-delimiters.json`). Emitting
+/// `Value:["IVANOV^IVAN"]` handed a conformant JSON reader a value of the wrong
+/// type, and a reader that also parses the groups found none.
+fn push_pn_object(out: &mut Vec<u8>, raw: &str) {
+    let mut groups = raw.split('=');
+    let alphabetic = groups.next().unwrap_or("");
+    let ideographic = groups.next().filter(|s| !s.is_empty());
+    let phonetic = groups.next().filter(|s| !s.is_empty());
+    out.extend_from_slice(b"[{\"Alphabetic\":");
+    push_json_str(out, alphabetic);
+    if let Some(i) = ideographic {
+        out.extend_from_slice(b",\"Ideographic\":");
+        push_json_str(out, i);
+    }
+    if let Some(p) = phonetic {
+        out.extend_from_slice(b",\"Phonetic\":");
+        push_json_str(out, p);
+    }
+    out.extend_from_slice(b"}]");
 }
 
 /// Render ONE SPS record as a DICOM XML `NativeDicomModel` document.
@@ -549,7 +723,14 @@ fn sps_to_xml(records: &[SpsRecord]) -> String {
         );
         xml_attr(&mut out, "00100010", "PN", Some(rec.patient_name.as_str()));
         xml_attr(&mut out, "00100020", "LO", Some(rec.patient_id.as_str()));
-        xml_attr(&mut out, "00100030", "DA", rec.birth_date.as_deref());
+        // Type 2: present, possibly empty. `xml_attr` with `Some("")` writes the
+        // element with no `<Value>` child, which is exactly the empty form.
+        xml_attr(
+            &mut out,
+            "00100030",
+            "DA",
+            Some(rec.birth_date.as_deref().unwrap_or("")),
+        );
         xml_attr(&mut out, "00100040", "CS", rec.sex.as_deref());
         xml_attr(&mut out, "0020000D", "UI", rec.study_uid.as_deref());
         xml_attr(
@@ -564,6 +745,21 @@ fn sps_to_xml(records: &[SpsRecord]) -> String {
             "LO",
             rec.requested_procedure_description.as_deref(),
         );
+        xml_attr(
+            &mut out,
+            "00401001",
+            "SH",
+            rec.requested_procedure_id.as_deref(),
+        );
+        // The Scheduled Procedure Step attributes live INSIDE (0040,0100), one
+        // item per record (PS3.4 Table K.6-1, `standard/ps3.4/
+        // mwl-k.6-1-matching-keys.json`). The JSON renderer wraps them the same
+        // way, so the two models stay item-for-item identical.
+        out.push_str(
+            "<DicomAttribute tag=\"00400100\" vr=\"SQ\" \
+             keyword=\"ScheduledProcedureStepSequence\">",
+        );
+        out.push_str("<Item number=\"1\">");
         xml_attr(&mut out, "00400001", "AE", Some(rec.station_aet.as_str()));
         xml_attr(
             &mut out,
@@ -584,12 +780,7 @@ fn sps_to_xml(records: &[SpsRecord]) -> String {
             Some(rec.scheduled_performing_physician.as_str()),
         );
         xml_attr(&mut out, "00400009", "SH", rec.sps_id.as_deref());
-        xml_attr(
-            &mut out,
-            "00401001",
-            "SH",
-            rec.requested_procedure_id.as_deref(),
-        );
+        out.push_str("</Item></DicomAttribute>");
     }
     out.push_str("</NativeDicomModel>");
     out
@@ -613,8 +804,20 @@ fn multipart_content_type(boundary: &str) -> String {
 /// parses as "no records" instead of failing on the media type the client
 /// asked for.
 fn multipart_body(records: &[SpsRecord], boundary: &str) -> String {
+    // An empty result is still ONE part, carrying the empty `NativeDicomModel`
+    // PS3.18 prescribes. A bare closing delimiter - what this used to emit - is
+    // not a multipart body at all: RFC 2046 5.1.1 requires at least one body
+    // part between the delimiter lines, and a reader that parses the framing
+    // finds no document to read.
     if records.is_empty() {
-        return format!("--{boundary}--\r\n");
+        let xml = empty_model_xml();
+        let mut body = String::new();
+        body.push_str(&format!("--{boundary}\r\n"));
+        body.push_str("Content-Type: application/dicom+xml\r\n");
+        body.push_str(&format!("Content-Length: {}\r\n\r\n", xml.len()));
+        body.push_str(&xml);
+        body.push_str(&format!("\r\n--{boundary}--\r\n"));
+        return body;
     }
     let mut body = String::new();
     for rec in records {
@@ -630,6 +833,19 @@ fn multipart_body(records: &[SpsRecord], boundary: &str) -> String {
     }
     body.push_str(&format!("\r\n--{boundary}--\r\n"));
     body
+}
+
+/// The zero-match DICOM XML document (PS3.19 A.1 `NativeDicomModel`).
+///
+/// PS3.18 14.1.3 leaves an empty search with no records to report, and the
+/// model that reports "no attributes" is the root element with nothing inside
+/// it. It stays in the model namespace so an XML reader recognizes it as DICOM.
+fn empty_model_xml() -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><NativeDicomModel xmlns=\"{}\">\
+         </NativeDicomModel>",
+        NATIVE_DICOM_MODEL_NS
+    )
 }
 
 /// Append one `DicomAttribute` with a single `PersonName` or `Value` child.
@@ -655,8 +871,7 @@ fn xml_attr(out: &mut String, tag: &str, vr: &str, value: Option<&str>) {
 /// renderer has one place to name it.
 const NATIVE_DICOM_MODEL_NS: &str = "http://dicom.nema.org/PS3.19/models/NativeDICOM";
 
-/// Write a `PN` value as its PS3.19 A.1.2 component groups.
-///
+/// Write a `PN` value as its PS3.19 A.1.2 component groups.///
 /// A PN is `family^given^middle^prefix^suffix` per group (PS3.5 6.2), and the
 /// groups are separated by `=`. Rendering the whole raw string inside
 /// `<Alphabetic>` loses the boundary: a consumer reading `FamilyName` gets

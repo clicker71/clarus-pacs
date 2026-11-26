@@ -220,11 +220,13 @@ pub struct MeasurementsProfile {
 impl MeasurementsProfile {
     #[must_use]
     pub fn of(result: &crate::conf::RuleResult) -> Self {
-        let block = result.measurements.clone().unwrap_or_default();
         Self {
             series_description: result.series_description.clone(),
-            title: block.title,
-            template_id: block.template_id,
+            title: None,
+            // TID 1500 is the only template a numeric finding has a legal
+            // home in (PS3.3 A.35.1.3.1.1), so it is the writer's default
+            // rather than a model field.
+            template_id: crate::conf::SrTemplate::Tid1500,
         }
     }
 }

@@ -46,6 +46,12 @@ pub struct Reason {
     pub code_value: &'static str,
     /// Coding Scheme Designator (0008,0102) of the Document Title.
     pub scheme: &'static str,
+    /// Code Meaning (0008,0104) of the Document Title, as CID 7010 words it.
+    ///
+    /// Carried on the row rather than looked up at each call site: the admin
+    /// surface reports it to an operator, and a second copy of the wording
+    /// could drift from the code it describes.
+    pub meaning: &'static str,
     /// How far this reason's note may hide instances.
     pub scope: Scope,
 }
@@ -70,6 +76,7 @@ pub const REASONS: &[Reason] = &[
         // Quality Reasons" for AI result assessment.
         code_value: "113001",
         scheme: "DCM",
+        meaning: "Rejected for Quality Reasons",
         scope: Scope::AiResultClassesOnly,
     },
     // IOCM 4.66.4.2: wrong patient / patient-safety rejections name the
@@ -78,6 +85,7 @@ pub const REASONS: &[Reason] = &[
         name: "patient-safety",
         code_value: "113037",
         scheme: "DCM",
+        meaning: "Rejected for Patient Safety Reasons",
         scope: Scope::AnyClass,
     },
     // IOCM 4.66.4.3: acquired against the wrong Modality Worklist entry.
@@ -85,6 +93,7 @@ pub const REASONS: &[Reason] = &[
         name: "incorrect-mwl",
         code_value: "113038",
         scheme: "DCM",
+        meaning: "Incorrect Modality Worklist Entry",
         scope: Scope::AnyClass,
     },
     // IOCM 4.66.4.4: retention period has lapsed. A lifecycle marker: the
@@ -94,6 +103,7 @@ pub const REASONS: &[Reason] = &[
         name: "retention-expired",
         code_value: "113039",
         scheme: "DCM",
+        meaning: "Data Retention Policy Expired",
         scope: Scope::AnyClass,
     },
 ];
@@ -112,6 +122,29 @@ pub const REASONS: &[Reason] = &[
 /// drift from what was actually recorded at STOW time.
 pub fn never_expose(reason_code: u32) -> bool {
     reason_code != QUALITY_REASON_CODE
+}
+
+/// Whether a re-store of an instance hidden under `reason_code` must be
+/// REFUSED rather than accepted.
+///
+/// IOCM 4.66.4.2.3 (patient safety) and 4.66.4.3.3 (incorrect MWL) are the two
+/// reasons under which the receiver "shall not accept subsequent occurrence of
+/// instances that have been hidden": the hidden image is diagnostically wrong,
+/// so taking a fresh copy of it back into the archive would undo the
+/// sequester. Quality (113001) and retention (113039) are different: Quality
+/// has a review surface and a corrected AI result is expected back, and the
+/// retention reason is a lifecycle marker rather than a statement about the
+/// pixels.
+///
+/// Asked of the TABLE, not of the code numbers: `never_expose` answers the
+/// neighbouring question ("can any surface show it again") and is true for
+/// retention as well, so reusing it here refused a re-store the standard
+/// allows.
+pub fn re_store_refused(reason_code: u32) -> bool {
+    REASONS
+        .iter()
+        .find(|r| reason_code_to_u32(r.code_value) == Some(reason_code))
+        .is_some_and(|r| r.name == "patient-safety" || r.name == "incorrect-mwl")
 }
 
 /// The Quality reason code as an integer, for the persisted reason field.
@@ -214,6 +247,22 @@ mod tests {
         assert!(reason_for("113001", "SCT").is_none());
     }
 
+    /// IOCM 4.66.4.2.3 / 4.66.4.3.3 forbid re-acceptance under EXACTLY two
+    /// reasons. Quality is re-storable (a corrected AI result comes back) and
+    /// retention is a lifecycle marker, so neither may be refused - which is
+    /// why this cannot reuse `never_expose` (true for retention too).
+    #[test]
+    fn only_the_two_iocm_hide_reasons_refuse_a_re_store() {
+        assert!(re_store_refused(113_037), "patient safety");
+        assert!(re_store_refused(113_038), "incorrect MWL");
+        assert!(!re_store_refused(113_001), "Quality is re-storable");
+        assert!(!re_store_refused(113_039), "retention is not a pixel claim");
+        assert!(!re_store_refused(NOT_REJECTED), "a visible instance");
+        // An unknown code must not be treated as one of the two: the table is
+        // the authority, so a code it does not hold refuses nothing.
+        assert!(!re_store_refused(999_999));
+    }
+
     #[test]
     fn the_three_any_class_reasons_are_recognised() {
         for (code, name) in [
@@ -293,6 +342,7 @@ mod tests {
             name: "test",
             code_value: "0",
             scheme: "X",
+            meaning: "test",
             scope: Scope::AnyClass,
         };
         assert!(may_hide(&wide, "1.2.840.10008.5.1.4.1.1.2"));

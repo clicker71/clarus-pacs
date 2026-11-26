@@ -36,6 +36,10 @@ sop_classes:
     name: Digital Mammography X-Ray Image Storage – For Processing
     modality: MG
     accept: true
+  "1.2.840.10008.5.1.4.1.1.13.1.3":
+    name: Breast Tomosynthesis Image Storage
+    modality: MG
+    accept: true
   "1.2.840.10008.5.1.4.1.1.1.3":
     name: Digital Intra-Oral X-Ray Image Storage – For Presentation
     modality: IO

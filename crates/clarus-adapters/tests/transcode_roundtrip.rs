@@ -66,7 +66,157 @@ fn build_explicit_vr_le_mono(rows: u16, cols: u16, bits: u8) -> Vec<u8> {
     };
     assert_eq!(raw_pixels.len(), pixel_count * bytes_per_sample);
 
-    build_dicom_explicit_vr_le(rows, cols, 1, bits, "MONOCHROME2", &raw_pixels, 0)
+    let mut d = build_dicom_explicit_vr_le(rows, cols, 1, bits, "MONOCHROME2", &raw_pixels, 0);
+    // PS3.3 C.11.2.1.2: a display window is part of the image, and a 16-bit
+    // source carries a 16-bit one. Writing it here is what makes the
+    // bit-depth-reduction test able to tell "the tag was dropped or replaced"
+    // apart from "the tag was never there".
+    let (centre, width) = if bits == 16 {
+        ("32768", "65536")
+    } else {
+        ("128", "256")
+    };
+    insert_element_before_pixeldata(&mut d, 0x0028, 0x1050, b"DS", centre.as_bytes());
+    insert_element_before_pixeldata(&mut d, 0x0028, 0x1051, b"DS", width.as_bytes());
+    d
+}
+
+/// Insert an Explicit VR LE element immediately before PixelData.
+fn insert_element_before_pixeldata(
+    d: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    vr: &[u8; 2],
+    value: &[u8],
+) {
+    // A byte search for the tag finds the SAMPLES: a 16-bit ramp contains
+    // E0 7F 10 00 often enough that splicing there cuts PixelData in half.
+    // Walk the elements instead and stop at the first real PixelData header.
+    let at = first_element_at(d, (0x7FE0, 0x0010)).expect("the fixture has a PixelData element");
+    let mut element_bytes = Vec::new();
+    append_element(&mut element_bytes, group, element, vr, value);
+    d.splice(at..at, element_bytes);
+}
+
+/// The TransferSyntaxUID declared in the File Meta Information.
+fn transfer_syntax_of(d: &[u8]) -> Option<String> {
+    let mut pos = 132usize;
+    while pos + 8 <= d.len() {
+        let group = u16::from_le_bytes([d[pos], d[pos + 1]]);
+        if group != 0x0002 {
+            return None;
+        }
+        let element = u16::from_le_bytes([d[pos + 2], d[pos + 3]]);
+        // PS3.5 6.2 Table 6.2-1: the VR decides the header shape, and the meta
+        // group also opens with (0002,0000) UL - whose 4-byte length would be
+        // read as two bytes if every element were assumed short-form.
+        let vr = d.get(pos + 4..pos + 6)?;
+        let long = matches!(
+            vr,
+            b"OB"
+                | b"OD"
+                | b"OF"
+                | b"OL"
+                | b"OV"
+                | b"OW"
+                | b"SQ"
+                | b"SV"
+                | b"UC"
+                | b"UN"
+                | b"UR"
+                | b"UT"
+                | b"UV"
+        );
+        let (len, start) = if long {
+            (
+                u32::from_le_bytes(d.get(pos + 8..pos + 12)?.try_into().ok()?) as usize,
+                pos + 12,
+            )
+        } else {
+            (
+                u16::from_le_bytes(d.get(pos + 6..pos + 8)?.try_into().ok()?) as usize,
+                pos + 8,
+            )
+        };
+        let value = d.get(start..start + len)?;
+        if (group, element) == (0x0002, 0x0010) {
+            return Some(
+                String::from_utf8_lossy(value)
+                    .trim_end_matches([' ', '\0'])
+                    .to_string(),
+            );
+        }
+        // The declared length already covers the pad byte (PS3.5 6.2).
+        pos = start + len;
+    }
+    None
+}
+
+/// The offset of the first top-level Explicit VR LE element with `tag`.
+fn first_element_at(d: &[u8], tag: (u16, u16)) -> Option<usize> {
+    let mut pos = 132usize;
+    while pos + 8 <= d.len() {
+        let group = u16::from_le_bytes([d[pos], d[pos + 1]]);
+        let element = u16::from_le_bytes([d[pos + 2], d[pos + 3]]);
+        if (group, element) == tag {
+            return Some(pos);
+        }
+        let vr = d.get(pos + 4..pos + 6)?;
+        let long = matches!(
+            vr,
+            b"OB"
+                | b"OD"
+                | b"OF"
+                | b"OL"
+                | b"OV"
+                | b"OW"
+                | b"SQ"
+                | b"SV"
+                | b"UC"
+                | b"UN"
+                | b"UR"
+                | b"UT"
+                | b"UV"
+        );
+        let (len, header) = if long {
+            (
+                u32::from_le_bytes(d.get(pos + 8..pos + 12)?.try_into().ok()?) as usize,
+                12,
+            )
+        } else {
+            (
+                u16::from_le_bytes(d.get(pos + 6..pos + 8)?.try_into().ok()?) as usize,
+                8,
+            )
+        };
+        pos += header + len;
+    }
+    None
+}
+
+/// Read a top-level Explicit VR LE numeric value as text, if present.
+#[cfg(feature = "transcode")]
+fn window_value(d: &[u8], group: u16, element: u16) -> Option<String> {
+    let at = d
+        .windows(4)
+        .position(|w| w[0..2] == group.to_le_bytes() && w[2..4] == element.to_le_bytes())?;
+    let vr = std::str::from_utf8(d.get(at + 4..at + 6)?).ok()?;
+    let long = matches!(
+        vr,
+        "OB" | "OD" | "OF" | "OL" | "OV" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT" | "UV"
+    );
+    let len = if long {
+        u32::from_le_bytes(d.get(at + 8..at + 12)?.try_into().ok()?) as usize
+    } else {
+        u16::from_le_bytes(d.get(at + 6..at + 8)?.try_into().ok()?) as usize
+    };
+    let start = at + if long { 12 } else { 8 };
+    let raw = d.get(start..start + len)?;
+    Some(
+        String::from_utf8_lossy(raw)
+            .trim_end_matches([' ', '\0'])
+            .to_string(),
+    )
 }
 
 /// Build a minimal Explicit VR **Big Endian** DICOM with uncompressed
@@ -145,8 +295,12 @@ fn build_explicit_vr_be_mono(rows: u16, cols: u16, bits: u8) -> Vec<u8> {
     );
     append_element_be(&mut d, 0x0028, 0x0106, b"US", &0u16.to_be_bytes());
 
-    // (7FE0,0010) OB - PixelData (always OB for Explicit VR, even for OW-like content)
-    append_element_be(&mut d, 0x7FE0, 0x0010, b"OB", &raw_pixels);
+    // (7FE0,0010) - PS3.5 6.2: Pixel Data is OW when the samples are wider
+    // than 8 bits and OB otherwise, and an encapsulated (compressed) value is
+    // OB. Writing OB for a 16-bit native value made the fixture non-conformant
+    // and turned the round-trip suite into a test of the reader's tolerance.
+    let pixel_vr: &[u8; 2] = if bits <= 8 { b"OB" } else { b"OW" };
+    append_element_be(&mut d, 0x7FE0, 0x0010, pixel_vr, &raw_pixels);
 
     d
 }
@@ -283,52 +437,40 @@ fn append_element(buf: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], val
             | b"UV"
     );
 
-    // DICOM PS3.5 Section 6.2: UI values with odd length SHALL include the
-    // NULL pad character (00H) in the Value Length. All other VRs
-    // pad OUTSIDE the length per Section 7.1.
-    if vr == b"UI" && !len.is_multiple_of(2) {
-        // UI: pad INSIDE length
-        let padded_len = len + 1;
-        if is_extended {
-            buf.extend_from_slice(&[0x00, 0x00]);
-            buf.extend_from_slice(&(padded_len as u32).to_le_bytes());
-        } else {
-            buf.extend_from_slice(&(padded_len as u16).to_le_bytes());
-        }
-        buf.extend_from_slice(value);
-        buf.push(0x00); // NULL pad
+    // PS3.5 6.2: the Value Field is padded to an EVEN length and that padded
+    // size is what the Value Length declares - for every VR, not only UI. The
+    // pad CHARACTER differs: a text VR pads with a space, a binary VR with
+    // 00H. Padding outside the declared length put the reader on the pad byte
+    // instead of the next tag, so these fixtures exercised a malformed file.
+    let padded_len = len + (len % 2);
+    if is_extended {
+        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&(padded_len as u32).to_le_bytes());
     } else {
-        if is_extended {
-            buf.extend_from_slice(&[0x00, 0x00]);
-            buf.extend_from_slice(&(len as u32).to_le_bytes());
-        } else {
-            buf.extend_from_slice(&(len as u16).to_le_bytes());
-        }
-        buf.extend_from_slice(value);
-        if !len.is_multiple_of(2) {
-            let pad = if vr == b"CS"
-                || vr == b"LO"
-                || vr == b"SH"
-                || vr == b"PN"
-                || vr == b"AE"
-                || vr == b"AS"
-                || vr == b"DA"
-                || vr == b"DS"
-                || vr == b"DT"
-                || vr == b"IS"
-                || vr == b"LT"
-                || vr == b"ST"
-                || vr == b"TM"
-                || vr == b"UC"
-                || vr == b"UR"
-                || vr == b"UT"
-            {
-                0x20
-            } else {
-                0x00
-            };
-            buf.push(pad);
-        }
+        buf.extend_from_slice(&(padded_len as u16).to_le_bytes());
+    }
+    buf.extend_from_slice(value);
+    if !len.is_multiple_of(2) {
+        let text_vr = matches!(
+            vr,
+            b"AE"
+                | b"AS"
+                | b"CS"
+                | b"DA"
+                | b"DS"
+                | b"DT"
+                | b"IS"
+                | b"LO"
+                | b"LT"
+                | b"PN"
+                | b"SH"
+                | b"ST"
+                | b"TM"
+                | b"UC"
+                | b"UR"
+                | b"UT"
+        );
+        buf.push(if text_vr { 0x20 } else { 0x00 });
     }
 }
 
@@ -370,49 +512,38 @@ fn append_element_be(buf: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], 
             | b"UV"
     );
 
-    if vr == b"UI" && !len.is_multiple_of(2) {
-        // UI: pad INSIDE length (PS3.5 Section 6.2)
-        let padded_len = len + 1;
-        if is_extended {
-            buf.extend_from_slice(&[0x00, 0x00]);
-            buf.extend_from_slice(&(padded_len as u32).to_be_bytes());
-        } else {
-            buf.extend_from_slice(&(padded_len as u16).to_be_bytes());
-        }
-        buf.extend_from_slice(value);
-        buf.push(0x00);
+    // PS3.5 6.2: the Value Field is padded to an EVEN length and that padded
+    // size is what the Value Length declares, for every VR. The pad character
+    // is a space for a text VR and 00H for a binary one.
+    let padded_len = len + (len % 2);
+    if is_extended {
+        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&(padded_len as u32).to_be_bytes());
     } else {
-        if is_extended {
-            buf.extend_from_slice(&[0x00, 0x00]);
-            buf.extend_from_slice(&(len as u32).to_be_bytes());
-        } else {
-            buf.extend_from_slice(&(len as u16).to_be_bytes());
-        }
-        buf.extend_from_slice(value);
-        if !len.is_multiple_of(2) {
-            let pad = if vr == b"CS"
-                || vr == b"LO"
-                || vr == b"SH"
-                || vr == b"PN"
-                || vr == b"AE"
-                || vr == b"AS"
-                || vr == b"DA"
-                || vr == b"DS"
-                || vr == b"DT"
-                || vr == b"IS"
-                || vr == b"LT"
-                || vr == b"ST"
-                || vr == b"TM"
-                || vr == b"UC"
-                || vr == b"UR"
-                || vr == b"UT"
-            {
-                0x20
-            } else {
-                0x00
-            };
-            buf.push(pad);
-        }
+        buf.extend_from_slice(&(padded_len as u16).to_be_bytes());
+    }
+    buf.extend_from_slice(value);
+    if !len.is_multiple_of(2) {
+        let text_vr = matches!(
+            vr,
+            b"AE"
+                | b"AS"
+                | b"CS"
+                | b"DA"
+                | b"DS"
+                | b"DT"
+                | b"IS"
+                | b"LO"
+                | b"LT"
+                | b"PN"
+                | b"SH"
+                | b"ST"
+                | b"TM"
+                | b"UC"
+                | b"UR"
+                | b"UT"
+        );
+        buf.push(if text_vr { 0x20 } else { 0x00 });
     }
 }
 
@@ -1019,20 +1150,46 @@ fn e2e_16bit_to_jpeg_baseline_to_explicit_vr_le_metadata() {
     assert_eq!(ba, 8, "E2E: BitsAllocated should be 8");
     assert_eq!(bs, 8, "E2E: BitsStored should be 8");
     assert_eq!(hb, 7, "E2E: HighBit should be 7");
+    // PS3.5 6.2: a CS value is padded to even length with a space, and the pad
+    // belongs to the Value Field - so the raw value of MONOCHROME2 is the
+    // 11-character text plus one space.
     assert_eq!(
-        pi, "MONOCHROME2",
+        pi.trim_end(),
+        "MONOCHROME2",
         "E2E: PhotometricInterpretation should be MONOCHROME2"
     );
 
-    // 6. Verify no WindowCenter (0028,1050) / WindowWidth (0028,1051)
+    // 6. The SOURCE carries its own window (it is written by
+    // `build_explicit_vr_le_mono` below), so these two assertions are only
+    // meaningful if the window really was present on the way in - otherwise
+    // they pass whether or not the bit-depth reduction touches the tags.
     assert!(
-        !has_tag(&output, 0x0028, 0x1050),
-        "E2E: WindowCenter should be absent"
+        has_tag(&src_16bit, 0x0028, 0x1050) && has_tag(&src_16bit, 0x0028, 0x1051),
+        "E2E fixture bug: the source must carry WindowCenter/WindowWidth"
     );
-    assert!(
-        !has_tag(&output, 0x0028, 0x1051),
-        "E2E: WindowWidth should be absent"
+    // PS3.3 C.11.2.1.2: a window written for a 16-bit range is meaningless
+    // once the samples are reduced to 8 bits, so either it is gone or it was
+    // replaced - it must not survive unchanged.
+    let src_windows = (
+        window_value(&src_16bit, 0x0028, 0x1050),
+        window_value(&src_16bit, 0x0028, 0x1051),
     );
+    let out_windows = (
+        window_value(&output, 0x0028, 0x1050),
+        window_value(&output, 0x0028, 0x1051),
+    );
+    assert_ne!(
+        src_windows, out_windows,
+        "E2E: the 16-bit window must be dropped or replaced after 8-bit reduction"
+    );
+    if has_tag(&output, 0x0028, 0x1050) || has_tag(&output, 0x0028, 0x1051) {
+        // A replacement must be consistent: both tags present, and centred on
+        // the new 8-bit range rather than the old 16-bit one.
+        assert!(
+            has_tag(&output, 0x0028, 0x1050) && has_tag(&output, 0x0028, 0x1051),
+            "E2E: a replacement window needs BOTH centre and width"
+        );
+    }
 
     // 7. Verify pixel data size = Rows x Columns x 1 byte (8-bit)
     let pixel_size = extract_pixel_data_len(&output);
@@ -1241,10 +1398,11 @@ fn validate_explicit_vr(data: &[u8]) -> (usize, Option<usize>) {
         let g = u16::from_le_bytes([data[pos], data[pos + 1]]);
         let e = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
 
-        // Stop at PixelData
+        // Stop at PixelData: the elements before it are what this walk
+        // verifies, and the encapsulated value that follows is not a stream of
+        // Explicit VR elements.
         if g == 0x7FE0 && e == 0x0010 {
-            count += 1;
-            break;
+            return (count + 1, None);
         }
 
         let vr_bytes = &data[pos + 4..pos + 6];
@@ -1270,8 +1428,12 @@ fn validate_explicit_vr(data: &[u8]) -> (usize, Option<usize>) {
         );
 
         let val_len: usize = if is_ext {
+            // PS3.5 7.1.2: the long form is tag(4) + VR(2) + reserved(2) +
+            // ValueLength(4). A header that does not fit is a TRUNCATED
+            // element, not the end of the dataset - breaking out here reported
+            // success and let the earlier elements satisfy the count check.
             if pos + 12 > data.len() {
-                break;
+                return (count, Some(pos));
             }
             u32::from_le_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]])
                 as usize
@@ -1279,16 +1441,26 @@ fn validate_explicit_vr(data: &[u8]) -> (usize, Option<usize>) {
             u16::from_le_bytes([data[pos + 6], data[pos + 7]]) as usize
         };
 
-        let elem_size = if is_ext {
-            12 + val_len
-        } else {
-            8 + val_len + (val_len % 2)
-        };
-        pos += elem_size;
+        // PS3.5 6.2: the Value Length IS the even-sized Value Field, so the
+        // element is exactly header + declared length. Adding a pad byte again
+        // for an odd length walked one byte past every such element, which is
+        // how a well-formed file was reported as truncated.
+        let elem_size = if is_ext { 12 + val_len } else { 8 + val_len };
+        // PS3.5 6.2: the Value Field is even-sized, so the Value Length is the
+        // padded size for every VR. A value that runs past the buffer is a
+        // truncated element; advancing the cursor beyond the slice and then
+        // returning success is how a truncation became a pass.
+        let value_end = pos.checked_add(elem_size);
+        match value_end {
+            Some(end) if end <= data.len() => pos = end,
+            _ => return (count, Some(pos)),
+        }
         count += 1;
     }
 
-    (count, None)
+    // Falling out of the loop means a partial header was left over - an
+    // element tail that does not reach its declared end.
+    (count, Some(pos))
 }
 
 /// Transcode to EVRLE and verify all elements have valid Explicit VR.
@@ -1308,9 +1480,19 @@ fn transcode_direct_structural_validity() {
     );
     assert!(src_count > 5, "Source has only {src_count} elements");
 
-    // Transcode 16-bit EVRLE -> 16-bit EVRLE (passthrough may trigger direct path)
-    let output = transcode_dicom(&source, ts_uid::EXPLICIT_VR_LE, &registry)
-        .expect("EVRLE structural validity: transcode to EVRLE failed");
+    // A same-syntax transcode returns its input before `transcode_direct` is
+    // ever reached, so this case could not exercise the writer it names.
+    // Explicit VR Big Endian -> Explicit VR Little Endian is a different
+    // source syntax with the same sample depth and no compressed codec, which
+    // is what sends it down the direct path.
+    let be = build_explicit_vr_be_mono(64, 64, 16);
+    let output = transcode_dicom(&be, ts_uid::EXPLICIT_VR_LE, &registry)
+        .expect("EVRLE structural validity: transcode BE -> EVRLE failed");
+    assert_eq!(
+        transfer_syntax_of(&output).as_deref(),
+        Some(ts_uid::EXPLICIT_VR_LE),
+        "the output must declare the target syntax, i.e. the writer really ran"
+    );
     assert!(
         output.len() > 200,
         "Output too small: {} bytes",

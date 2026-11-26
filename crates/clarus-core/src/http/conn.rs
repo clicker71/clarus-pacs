@@ -138,6 +138,27 @@ pub struct Conn {
     /// inside every slice would keep a worker indefinitely. The loop compares
     /// against this instant instead.
     head_deadline: Option<std::time::Instant>,
+    /// The status of the response head that was actually SENT for the current
+    /// request, once it has been committed.
+    ///
+    /// `header` is a reusable scratch buffer and a streaming handler clears it
+    /// straight after writing (the buffered instance path sends a 206 and then
+    /// drops the head to stream the body). A caller that re-parsed `header`
+    /// afterwards saw an EMPTY buffer and recorded 200 for a 206 - the journal
+    /// and the metrics then disagreed with what the client received. The status
+    /// is recorded HERE, at the moment the head is written, and survives the
+    /// clear.
+    committed_status: Option<u16>,
+}
+
+/// Whether a status code forbids a message body (and its framing headers).
+///
+/// RFC 9110 8.6 and 15.3.5: a 1xx or a 204 response carries no content, and a
+/// server MUST NOT send `Content-Length` with one. `send_body` and `send_error`
+/// accept any code, so the check belongs where the head is built rather than in
+/// every caller.
+fn status_forbids_content(code: u16) -> bool {
+    (100..200).contains(&code) || code == 204
 }
 
 impl Conn {
@@ -154,6 +175,7 @@ impl Conn {
             body_drained: 0,
             announced_body: None,
             head_deadline: None,
+            committed_status: None,
         }
     }
 
@@ -288,6 +310,9 @@ impl Conn {
     /// serve loop uses it so a slice that expires mid-head can resume from the
     /// bytes already buffered instead of asking the socket for them again.
     pub fn begin_head(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<HeadRead> {
+        // A new request starts with no committed response: the previous
+        // request's status must not be attributed to this one.
+        self.committed_status = None;
         set_timeouts(&self.stream, timeout, self.send_timeout)?;
         // The header deadline is ABSOLUTE, not per-read. A socket timeout is
         // re-armed on every `read`, so a peer that delivers one byte just
@@ -378,6 +403,18 @@ impl Conn {
             if used >= buf.len() {
                 return Err(io::Error::other("head too large"));
             }
+            // The absolute deadline is checked AFTER each read, not before.
+            //
+            // Capping the blocking wait by the remaining budget looks like the
+            // obvious fix, and it was tried: it breaks a head that arrives in
+            // segments the server must keep waiting for. `read_head` is called
+            // with a budget the CALLER sizes (see the shutdown tests, which
+            // deliver a head in two writes 500 ms apart under a 2 s budget),
+            // and shortening every individual socket wait to whatever is left
+            // turns a slow-but-legitimate head into an error. The socket
+            // timeout set by `begin_head`/`read_head` already bounds each wait,
+            // and the post-read check below bounds the TOTAL, which is the
+            // property that matters against a drip-feeding peer.
             match self.stream.read(&mut buf[used..]) {
                 Ok(0) => return Ok(HeadRead::Eof(used)),
                 Ok(n) => {
@@ -428,8 +465,16 @@ impl Conn {
     /// A3: no `setsockopt` here - the send timeout was applied once by
     /// [`Conn::read_head`] for this phase.
     pub fn write_head(&mut self) -> io::Result<()> {
+        // Counted AFTER the write, by the bytes the socket accepted.
+        //
+        // Crediting the requested length up front let the access log report a
+        // complete response for a transfer that stopped partway: a `write_all`
+        // that fails on the third byte still had the whole head counted, and a
+        // partial write left the count equal to the full body. The real
+        // transfer is the only thing worth logging.
+        self.stream.write_all(&self.header)?;
         self.response_bytes += self.header.len() as u64;
-        self.stream.write_all(&self.header)
+        Ok(())
     }
 
     /// Write raw response bytes.
@@ -440,8 +485,9 @@ impl Conn {
         if self.suppress_body {
             return Ok(());
         }
+        self.stream.write_all(data)?;
         self.response_bytes += data.len() as u64;
-        self.stream.write_all(data)
+        Ok(())
     }
 
     /// The configured send timeout (SO_SNDTIMEO) applied per write.
@@ -460,8 +506,39 @@ impl Conn {
     /// A3: the configured send timeout is applied once per phase by
     /// [`Conn::read_head`]; the write path performs no `setsockopt`.
     pub fn write_head_configured(&mut self) -> io::Result<()> {
+        self.stream.write_all(&self.header)?;
         self.response_bytes += self.header.len() as u64;
-        self.stream.write_all(&self.header)
+        // Record what went on the wire BEFORE any caller clears `header`. The
+        // buffered-instance route sends its 206 head with this call and then
+        // clears the scratch buffer to stream the body, so a later re-parse
+        // would read an empty buffer and report 200.
+        self.committed_status = self
+            .committed_status
+            .or_else(|| Self::status_from_head(&self.header));
+        Ok(())
+    }
+
+    /// The status of the response head that was committed for this request.
+    ///
+    /// `None` when no head was written - a request that failed before any
+    /// response, which the access journal must not record as a 200.
+    #[must_use]
+    pub fn committed_status(&self) -> Option<u16> {
+        self.committed_status
+    }
+
+    /// Last-resort parse of a status line, used when the head is written.
+    fn status_from_head(header: &[u8]) -> Option<u16> {
+        // "HTTP/1.1 206 Partial Content\r\n..." -> 206.
+        let rest = header.strip_prefix(b"HTTP/1.")?;
+        let sp = rest.iter().position(|&b| b == b' ')?;
+        let code = rest.get(sp + 1..sp + 4)?;
+        if !code.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let n =
+            (code[0] - b'0') as u16 * 100 + (code[1] - b'0') as u16 * 10 + (code[2] - b'0') as u16;
+        Some(n)
     }
 
     /// Write raw response bytes using the configured send timeout.
@@ -471,8 +548,9 @@ impl Conn {
         if self.suppress_body {
             return Ok(());
         }
+        self.stream.write_all(data)?;
         self.response_bytes += data.len() as u64;
-        self.stream.write_all(data)
+        Ok(())
     }
 
     // -- High-level response API (used by handlers) ------------------
@@ -486,6 +564,24 @@ impl Conn {
         body: &[u8],
         keep_alive: bool,
     ) -> io::Result<()> {
+        // RFC 9110 8.6: a server MUST NOT send `Content-Length` in a 1xx or a
+        // 204 response, and no content follows either. Both helpers accept any
+        // status, so a caller passing 204 put a prohibited header on the wire -
+        // and a nonempty body after it was read by the client as the start of
+        // the NEXT response on a keep-alive connection.
+        if status_forbids_content(code) {
+            crate::http::response::build_head(
+                &mut self.header,
+                code,
+                reason,
+                None,
+                None,
+                keep_alive,
+                &[],
+            );
+            self.write_head()?;
+            return Ok(());
+        }
         crate::http::response::build_head(
             &mut self.header,
             code,
@@ -503,7 +599,6 @@ impl Conn {
     pub fn send_error(&mut self, code: u16, reason: &str, keep_alive: bool) -> io::Result<()> {
         self.send_body(code, reason, b"text/plain; charset=utf-8", b"", keep_alive)
     }
-
     /// Send a file via `sendfile` following a small head (WADO instance).
     pub fn send_file(
         &mut self,
@@ -818,6 +913,48 @@ mod tests {
         // header + body; header includes the HTTP status line + headers.
         let head_len = conn.header.len() as u64;
         assert_eq!(conn.response_bytes(), head_len + 11, "head + body bytes");
+    }
+
+    /// RFC 9110 8.6: a 204 (and any 1xx) response MUST NOT carry
+    /// `Content-Length`, and no content follows it. Writing a body after such a
+    /// head made a keep-alive client read those bytes as the next response.
+    #[test]
+    fn a_bodyless_status_omits_content_length_and_the_body() {
+        assert!(status_forbids_content(204));
+        assert!(status_forbids_content(100));
+        assert!(status_forbids_content(199));
+        assert!(!status_forbids_content(200));
+        assert!(!status_forbids_content(304));
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .expect("write");
+        let mut conn = Conn::new(server, b"127.0.0.1".to_vec());
+        let mut head_buf = [0u8; HEADER_BUF_SIZE];
+        conn.read_head(&mut head_buf, Duration::from_secs(5))
+            .expect("read head");
+
+        conn.send_body(204, "No Content", b"text/plain", b"stray bytes", true)
+            .expect("send 204");
+        assert_eq!(
+            conn.response_bytes(),
+            conn.header.len() as u64,
+            "only the head reaches the wire for a 204"
+        );
+        let head = String::from_utf8_lossy(&conn.header).to_ascii_lowercase();
+        assert!(
+            !head.contains("content-length"),
+            "a 204 must not carry Content-Length: {head}"
+        );
+        assert!(
+            !head.contains("content-type"),
+            "a 204 must not announce a content type: {head}"
+        );
     }
 
     /// A fresh `read_head` must reset the counter (keep-alive per-request

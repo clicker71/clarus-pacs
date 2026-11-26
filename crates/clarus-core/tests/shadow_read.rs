@@ -70,12 +70,49 @@ fn shadow_tier_matches_sqlite_accepted_set() {
     let stored_dates: BTreeSet<[u8; 32]> = date_rows.into_iter().collect();
     assert_eq!(stored_dates, reference_dates, "dates idx != accepted set");
 
+    // Compare EACH bucket with its own expected set. The previous union of
+    // CT+MR hid cross-contamination entirely: a CT study also written into MR
+    // still appeared once in the union, so the set comparison passed while the
+    // MR accelerator answered lookups with a study that is not MR.
     let ct_uids = modality::read_study_uids(dir.path(), "CT", &day).expect("ct");
     let mr_uids = modality::read_study_uids(dir.path(), "MR", &day).expect("mr");
-    let stored_modality: BTreeSet<String> = ct_uids.into_iter().chain(mr_uids).collect();
+    let expected_ct: BTreeSet<String> = reference_modality
+        .iter()
+        .filter(|u| {
+            studies
+                .iter()
+                .any(|s| s.modality == "CT" && &s.study_uid == *u)
+        })
+        .cloned()
+        .collect();
+    let expected_mr: BTreeSet<String> = reference_modality
+        .iter()
+        .filter(|u| {
+            studies
+                .iter()
+                .any(|s| s.modality == "MR" && &s.study_uid == *u)
+        })
+        .cloned()
+        .collect();
+    // Sorted vectors, not sets: a DUPLICATE row inside one bucket must stay
+    // visible instead of collapsing.
+    let mut ct_sorted = ct_uids.clone();
+    ct_sorted.sort();
+    let mut mr_sorted = mr_uids.clone();
+    mr_sorted.sort();
     assert_eq!(
-        stored_modality, reference_modality,
-        "modality idx != accepted"
+        ct_sorted,
+        expected_ct.iter().cloned().collect::<Vec<_>>(),
+        "the CT bucket must hold exactly the CT studies, once each"
+    );
+    assert_eq!(
+        mr_sorted,
+        expected_mr.iter().cloned().collect::<Vec<_>>(),
+        "the MR bucket must hold exactly the MR studies, once each"
+    );
+    assert!(
+        expected_ct.is_disjoint(&expected_mr),
+        "the fixture itself must not put a UID in both buckets"
     );
 
     // 3) Every study appears exactly in the right bucket (no cross-contamination).

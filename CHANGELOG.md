@@ -2,7 +2,33 @@
 
 All notable changes to Clarus PACS are documented here.
 
-## [0.3.4-beta] — 2026-11-18
+## [0.3.4-beta] — 2026-11-26
+
+### Added
+
+- **clinfer serves a FHIR R4 capability document at
+  `/processors/Questionnaire`.** A `searchset` Bundle holds one Questionnaire
+  per enabled model. The output is R4-conformant: extension URLs are absolute
+  canonical URLs, the provider is a complex extension (name/vendor/version),
+  `Coding.system` is a URI (`urn:clarus:scheme:<designator>`) rather than a
+  bare private scheme designator, and `Bundle.link.url` / `entry.fullUrl` are
+  absolute URLs built from the request's Host header.
+- **`fhir.extension_base` is configurable** (default: the public repository).
+  The extension StructureDefinitions ship under `clinfer/fhir/StructureDefinition/`
+  and the listener mirrors them at `/fhir/StructureDefinition/*.json` (the
+  bytes are compiled in), so offline validators can dereference the canonical
+  URLs without reaching the public copy.
+- **The model procedure code selects the model.** The derived rule carries the
+  `procedure_code` Code Value as its workitem-code key; `clahe.yaml` uses the
+  local `99CLARUS` code `IMG-CLAHE` instead of a SNOMED procedure.
+- **clinfer runs out of the box with a license-free CLAHE task.** The default
+  configuration enables a built-in CLAHE filter (`99CLARUS` `IMG-CLAHE`) that
+  needs no model weights, carries no license encumbrance, and runs on modest
+  hardware, so a fresh install exercises the full UPS-RS AI loop immediately.
+  The result is stored as a DERIVED series - a second, contrast-enhanced copy
+  beside the source, which is never modified. To clinfer, CLAHE and a
+  heavyweight inference model are the same contract: swap the model file to
+  plug in a detector or segmentation model.
 
 ### Fixed
 
@@ -13,6 +39,9 @@ All notable changes to Clarus PACS are documented here.
   whose study rode in (0040,A370) were cancelled with "no rule matched". The
   input study is now read from (0040,A370) first, with (0040,4021) as a
   fallback.
+- **clinfer reads LongCodeValue (0008,0119) as a CodeValue fallback.** A code
+  sequence item that carries the long form instead of (0008,0100) now resolves
+  its code correctly.
 
 ### Conformance
 
@@ -24,11 +53,32 @@ All notable changes to Clarus PACS are documented here.
   always-on serving attribute rather than consuming an includefield slot.
   Clients that read it unguarded (dwv) no longer crash on a conformant server.
 
-### Demo
+### Server robustness
 
-- **cxr10 chest X-ray detector demo** (`docker-compose.cxr10-demo.yml`):
-  containerised clinfer with the OpenVINO ChestX-Det10 model writes GSPS
-  presentation-state boxes over the demo chest radiographs.
+- **Worklist, UPS-RS and Storage Commitment conformance** hardened across
+  request handling, readiness state and the XML/JSON renderers.
+- **STOW conformance**: malformed or conflicting instances are rejected before
+  the batch is committed, and the commitment remainder paths are closed.
+- **Data-movement workers publish only after verify-before-publish**: a
+  partially written object is never exposed as stored.
+- **PHI masking, the I/O fault seam, lock scoping and the FFI boundary**
+  tightened.
+- **Log durability, shutdown ordering and validation conformance** aligned
+  with the standard.
+
+### DIMSE bridge
+
+- **C-MOVE retrieves PDF and Segmentation instances again.** The C-MOVE
+  pre-flight misread the query result and failed, so the association proposal
+  overflowed its presentation-context limit and dropped these SOP classes;
+  the pre-flight now consumes the query page as produced, and all negotiated
+  classes are proposed.
+- **C-STORE conflict handling**: the bridge answers a store association only
+  after the origin has decided the STOW, and the server rejects a second
+  patient stored under the same study within a single request, not only
+  across requests.
+- **The conformance statement now documents the bridge SCP transfer-syntax
+  list, duplicate-stored semantics, and the server media types.**
 
 ## [0.3.3-beta] — 2026-11-18
 

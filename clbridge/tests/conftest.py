@@ -32,6 +32,7 @@ _SHUTDOWN_TARGETS = [
     "clean_code.handlers.cmove._shutdown_requested",
     "clean_code.handlers.cfind._shutdown_requested",
     "clean_code.handlers.naction._shutdown_requested",
+    "clean_code.handlers.mpps._shutdown_requested",
 ]
 
 
@@ -47,6 +48,24 @@ def _patch_shutdown(is_set_value):
     finally:
         for p in patchers:
             p.stop()
+
+
+@pytest.fixture(autouse=True)
+def _clear_study_patient_map():
+    """Isolate the module-level study->PatientID guard cache across tests.
+
+    `handle_c_store` records a study's PatientID in a module dict (the guard
+    is process-scoped in production); a test that stores study X under P1
+    must not leak P1 into the next test that stores X under P2 or an empty
+    PatientID.
+    """
+    from clean_code.handlers import cstore
+
+    cstore._study_patient_map.clear()
+    try:
+        yield
+    finally:
+        cstore._study_patient_map.clear()
 
 
 @pytest.fixture

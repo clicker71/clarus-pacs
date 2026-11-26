@@ -195,6 +195,69 @@ fn series_instance_qido_is_allocation_free() {
     assert!(zero_alloc, "filtered write_instance_json must not allocate");
     assert!(n > 0);
 
+    // -- RetrieveURL construction: 0 alloc --
+    //
+    // EVERY measured call above passes `retrieve_base = None`, so the URL
+    // builder - the only branch that assembles a compound value on a stack
+    // buffer - was never measured. An allocation added there would have left
+    // this whole gate green.
+    const BASE: &str = "http://qido.test.example:8042";
+    let (zero_alloc, n) = allocate_env(|| {
+        let mut buf = [0u8; 2048];
+        let n = write_series_json(
+            &mut buf,
+            &manifest.series[0],
+            None,
+            Some(BASE),
+            Some("1.2.840.1.1"),
+        )
+        .expect("fits");
+        std::hint::black_box(&buf);
+        n
+    });
+    assert!(
+        zero_alloc,
+        "write_series_json with a retrieve base must not allocate"
+    );
+    assert!(n > 0);
+
+    let (zero_alloc, n) = allocate_env(|| {
+        let mut buf = [0u8; 2048];
+        let n = write_instance_json(
+            &mut buf,
+            &manifest.series[0].instances[0],
+            "1.2.840.1.1",
+            "1.2.840.1.2",
+            None,
+            Some(BASE),
+        )
+        .expect("fits");
+        std::hint::black_box(&buf);
+        n
+    });
+    assert!(
+        zero_alloc,
+        "write_instance_json with a retrieve base must not allocate"
+    );
+    assert!(n > 0);
+
+    // The URL itself is checked OUTSIDE the measured window.
+    let mut check = [0u8; 2048];
+    let checked = write_instance_json(
+        &mut check,
+        &manifest.series[0].instances[0],
+        "1.2.840.1.1",
+        "1.2.840.1.2",
+        None,
+        Some(BASE),
+    )
+    .expect("fits");
+    let text = String::from_utf8_lossy(&check[..checked]);
+    assert!(
+        text.contains(&format!("{BASE}/dicomweb/studies/1.2.840.1.1")),
+        "the RetrieveURL must be built from the base and the context UIDs: {text}"
+    );
+
     // -- Borrow-form series search: warm `out` once, then measure steady state --
     let mut out: Vec<&SeriesRecord> = Vec::new();
     // Warm-up outside the window (may grow `out`).

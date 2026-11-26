@@ -236,6 +236,21 @@ pub fn encode(
     let row = w.checked_mul(ch).ok_or(EncodingError {
         reason: "png: row size overflows u32",
     })?;
+    // PNG spec 5.3: a chunk's Length field is a 4-byte unsigned integer and
+    // MUST NOT exceed 2^31 - 1 bytes. This encoder emits the whole zlib stream
+    // as ONE IDAT, so a geometry whose stream passes that ceiling has no valid
+    // encoding here. Checked on the GEOMETRY and before the sample buffer, so
+    // an unrepresentable size is refused without the caller having to allocate
+    // 2 GiB merely to be told no, and before `encoded_len`, which would
+    // otherwise request a buffer the format cannot declare.
+    const MAX_CHUNK_LEN: usize = i32::MAX as usize;
+    let filtered_est = (h as usize).saturating_mul(row as usize + 1);
+    let zlib_len = zlib_stream_len(filtered_est);
+    if zlib_len > MAX_CHUNK_LEN {
+        return Err(EncodingError {
+            reason: "png: the zlib stream exceeds the 2^31-1 byte chunk limit (spec 5.3)",
+        });
+    }
     // The caller's buffer must match the geometry exactly. A short buffer
     // panicked mid-encode on a slice index in the /rendered route, and a long
     // one silently shifted every row, so the preview showed the wrong pixels.
@@ -249,7 +264,7 @@ pub fn encode(
             reason: "png: sample count does not match the image extent",
         });
     }
-    let filtered = (h as usize) * (row as usize + 1);
+    let filtered = filtered_est;
 
     let total = encoded_len(filtered);
     let mut out = Vec::with_capacity(total);
@@ -273,7 +288,6 @@ pub fn encode(
     // one chunk keeps the sizing formula exact). It is written straight into
     // `out` - buffering it separately would cost a second allocation, and the
     // ap101 gate pins the encoder at exactly one.
-    let zlib_len = zlib_stream_len(filtered);
     push_be_u32(&mut out, zlib_len as u32);
     let idat_start = out.len();
     out.extend_from_slice(b"IDAT");
@@ -568,6 +582,38 @@ mod tests {
     fn zero_extent_is_rejected() {
         assert!(encode(&[], 0, 4, ColorType::Grayscale, BitDepth::Eight).is_err());
         assert!(encode(&[], 4, 0, ColorType::Grayscale, BitDepth::Eight).is_err());
+    }
+
+    /// A geometry whose single IDAT would exceed 2^31-1 bytes is REFUSED, not
+    /// written with a wrapped length field (PNG spec 5.3).
+    ///
+    /// The sample buffer cannot be allocated for the real boundary image, so
+    /// the guard is placed before the size check the caller would trip first:
+    /// the geometry below is rejected for the CHUNK LIMIT, and the assertion
+    /// matches that reason rather than merely `is_err()` - a refusal for any
+    /// other cause would not prove the ceiling is enforced.
+    #[test]
+    fn a_geometry_whose_idat_exceeds_the_png_limit_is_refused() {
+        // 65535 x 32766 grayscale: filtered = 32766 * 65536, whose zlib
+        // stream is 2147549183 bytes, one scanline past 2^31-1.
+        const MAX_CHUNK_LEN: usize = i32::MAX as usize;
+        let row = 65535usize + 1;
+        assert!(32766usize * row < MAX_CHUNK_LEN, "raw size alone fits");
+        assert!(
+            zlib_stream_len(32766usize * row) > MAX_CHUNK_LEN,
+            "the wrapped stream is what breaks the limit"
+        );
+
+        // `encode` must refuse before allocating. `samples` is empty, so a
+        // guard that ran after the extent check would report a length
+        // mismatch instead - the message is what distinguishes them.
+        let err = encode(&[], 65535, 32766, ColorType::Grayscale, BitDepth::Eight)
+            .expect_err("a 2 GiB IDAT is not representable");
+        assert!(
+            err.reason.contains("chunk limit"),
+            "the refusal must name the chunk limit, got: {}",
+            err.reason
+        );
     }
 
     #[test]

@@ -89,11 +89,17 @@ fn manifest_write_is_blocked(path: &Path) -> bool {
 /// The encoding is done first so the serialization can never be interleaved
 /// with disk writes. The payload is then flushed to `{path}.tmp` and renamed
 /// over `path` in one atomic step.
+///
+/// Routed through [`write_bytes_atomic_validated`], not `write_bytes_atomic`:
+/// encoding SUCCEEDING is not the same as this codec being able to read the
+/// result back. An attribute nested past the decoder's depth limit encodes
+/// without complaint, so an unvalidated rename would replace a good manifest
+/// with one the next reader rejects.
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), WriteManifestError> {
     let bytes = manifest
         .encode()
         .map_err(|e| WriteManifestError::Encode(e.to_string()))?;
-    write_bytes_atomic(path, &bytes)
+    write_bytes_atomic_validated(path, &bytes)
 }
 
 /// Write raw bytes atomically to `path`, decoding them FIRST.
@@ -109,6 +115,75 @@ pub fn write_bytes_atomic_validated(path: &Path, bytes: &[u8]) -> Result<(), Wri
     crate::manifest::read::read_manifest_at(bytes)
         .map_err(|e| WriteManifestError::Encode(e.to_string()))?;
     write_bytes_atomic(path, bytes)
+}
+
+/// Publish `bytes` at `path` AND retire the study, in one atomic step.
+///
+/// A delete that empties a study has to leave the study's final shape visible
+/// under the tombstone name. Writing the new content first and renaming after
+/// leaves a window in which the LIVE name carries the retired shape - readers
+/// still see the study, and a crash there publishes an empty manifest as if it
+/// were a live study. Renaming the LIVE name onto the tombstone closes that
+/// window: the live name disappears in the same step that the tombstone
+/// appears.
+///
+/// `bytes` is validated by decoding it before anything moves, for the same
+/// reason [`write_bytes_atomic_validated`] does: a codec regression must fail
+/// the delete, not publish a name nothing can read.
+///
+/// When the retired shape DIFFERS from the bytes the live manifest holds, the
+/// differing payload is written to the tombstone AFTER the rename. Two things
+/// keep that safe:
+/// - the tombstone existed only because of this rename, so a failed rewrite
+///   leaves the PREVIOUS content (never a half-written file - the rewrite goes
+///   through the same `tmp`+rename), and
+/// - a retry is still possible: the live name is gone, so the caller must treat
+///   this study as already retired. That is why the failure is reported rather
+///   than swallowed.
+pub fn publish_tombstone_bytes(
+    path: &Path,
+    tombstone: &Path,
+    bytes: &[u8],
+) -> Result<(), WriteManifestError> {
+    crate::manifest::read::read_manifest_at(bytes)
+        .map_err(|e| WriteManifestError::Encode(e.to_string()))?;
+
+    // Read the ON-DISK payload BEFORE the rename, so the "does it differ"
+    // question is answered against the live manifest and not against a
+    // tombstone this function has already moved into place.
+    //
+    // A read failure is NOT a mismatch. `unwrap_or(true)` would treat an
+    // unreadable live manifest as "differs", rewrite the tombstone, and return
+    // Ok - retiring a study while silently discarding the fact that nobody
+    // could read it. A live manifest that cannot be read is exactly the case a
+    // recovery pass needs to know about, so it fails the retirement instead.
+    let on_disk = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Nothing to retire: the caller's delete is already done.
+            return Err(WriteManifestError::Io(e));
+        }
+        Err(e) => return Err(WriteManifestError::Io(e)),
+    };
+
+    std::fs::rename(path, tombstone).map_err(WriteManifestError::Io)?;
+    // The NAME of the tombstone is a new directory entry: flush the directory
+    // that holds it so a crash cannot lose the retirement that the caller is
+    // about to report. Unix-only by necessity, same policy as the writers.
+    #[cfg(unix)]
+    if let Some(parent) = crate::durable::parent_entry_dir(tombstone)
+        && let Err(e) = crate::durable::sync_dir_entry(parent)
+    {
+        return Err(WriteManifestError::Io(e));
+    }
+    // A same-directory rename keeps the original inode, so the tombstone now
+    // holds the bytes the live manifest held. Only a DIFFERENT retired shape
+    // needs the payload rewritten, and that rewrite must be durable before the
+    // caller reports the retirement.
+    if on_disk != bytes {
+        write_bytes_atomic(tombstone, bytes)?;
+    }
+    Ok(())
 }
 
 /// Write raw bytes atomically to `path` via a `*.tmp` sibling + rename.
@@ -149,7 +224,7 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), WriteManifest
         crate::durable::sync_barrier(&f)
     })();
     if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp_path);
+        report_stale_temp(&tmp_path, &e);
         return Err(WriteManifestError::Io(e));
     }
 
@@ -169,10 +244,41 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), WriteManifest
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
+            report_stale_temp(&tmp_path, &e);
             Err(WriteManifestError::Io(e))
         }
     }
+}
+
+/// Note a temp file that survived the failure that made it garbage.
+///
+/// The primary error is what the caller must see, so this never replaces it.
+/// What it must NOT do is stay silent: a leftover `*.tmp` sits in `manifests/`
+/// forever (nothing sweeps that directory), and the only moment the reason is
+/// known is here. A crate that reports through a counter rather than a logger
+/// keeps the observation where an operator can already read it.
+fn report_stale_temp(tmp_path: &Path, primary: &io::Error) {
+    match std::fs::remove_file(tmp_path) {
+        Ok(()) => {}
+        Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => {}
+        Err(cleanup) => {
+            let _ = (tmp_path, primary, cleanup);
+            STALE_TEMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Manifest temp files a failed write could not remove.
+///
+/// Each one is an unusable `*.tmp` left in the manifest directory for good.
+/// Non-zero means the deployment leaks a temp file per failed write; reading it
+/// is the only way to notice, because the caller is told about the primary
+/// failure and nothing else.
+static STALE_TEMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many manifest temp files have been left behind by a failed cleanup.
+pub fn stale_temp_files() -> u64 {
+    STALE_TEMPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Build a unique `{path}.{pid}.{seq}.tmp` sibling, creating it exclusively.
@@ -218,6 +324,84 @@ mod tests {
     use super::*;
     use crate::durable::syncs_observed;
     use crate::manifest::record::tests::sample_manifest;
+
+    /// Retiring a study must never publish an empty manifest under the LIVE
+    /// name, and must leave the retired shape under the tombstone name.
+    ///
+    /// The old order (write the emptied manifest to the live path, then rename)
+    /// left a window where readers of the live name saw a study with nothing in
+    /// it - and a crash inside that window left exactly that on disk.
+    #[test]
+    fn retiring_a_study_moves_the_live_name_in_one_step() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("study.manifest");
+        let tomb = dir.path().join("study.manifest.del");
+        let manifest = sample_manifest();
+        let original = manifest.encode().expect("encode");
+        write_bytes_atomic_validated(&live, &original).expect("seed live");
+
+        // The retired shape: same study, no instances (what a delete produces).
+        let mut retired = manifest.clone();
+        retired.series.clear();
+        let retired_bytes = retired.encode().expect("encode retired");
+        assert_ne!(retired_bytes, original, "the shapes differ");
+
+        publish_tombstone_bytes(&live, &tomb, &retired_bytes).expect("retire");
+
+        assert!(!live.exists(), "the live name is gone, not emptied");
+        assert_eq!(
+            std::fs::read(&tomb).expect("tombstone"),
+            retired_bytes,
+            "the tombstone carries the retired shape for the erase accounting"
+        );
+        assert!(
+            crate::manifest::read::read_manifest_at(&std::fs::read(&tomb).expect("read")).is_ok(),
+            "the published tombstone must decode"
+        );
+    }
+
+    /// A payload the codec cannot decode must fail the retirement BEFORE the
+    /// name moves: a delete that leaves the study where it was is recoverable,
+    /// one that publishes an unreadable tombstone is not.
+    #[test]
+    fn an_undecodable_retired_shape_does_not_move_the_live_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("study.manifest");
+        let tomb = dir.path().join("study.manifest.del");
+        let original = sample_manifest().encode().expect("encode");
+        write_bytes_atomic_validated(&live, &original).expect("seed live");
+
+        let err = publish_tombstone_bytes(&live, &tomb, b"\xFF\xFF\xFF\xFF");
+
+        assert!(err.is_err(), "an undecodable payload must be refused");
+        assert_eq!(
+            std::fs::read(&live).expect("live manifest"),
+            original,
+            "the study is exactly where it was"
+        );
+        assert!(!tomb.exists(), "no tombstone was published");
+    }
+
+    /// A retirement that cannot complete must not publish the tombstone.
+    ///
+    /// Publishing it would make the study invisible on the tombstone name while
+    /// the caller was told the delete failed - a refused delete that silently
+    /// happened. (Atomically replacing the live name is a property of `rename`,
+    /// which the test above exercises; this pins the failure contract.)
+    #[test]
+    fn a_refused_retirement_publishes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("study.manifest");
+        let tomb = dir.path().join("study.manifest.del");
+        std::fs::write(&live, b"live").expect("seed");
+        assert!(publish_tombstone_bytes(&live, &tomb, b"garbage").is_err());
+        assert!(!tomb.exists(), "a refused retirement publishes nothing");
+        assert_eq!(
+            std::fs::read(&live).expect("live"),
+            b"live",
+            "the live manifest is untouched"
+        );
+    }
 
     #[test]
     fn validated_write_round_trips() {

@@ -396,6 +396,40 @@ impl UpsEventBus {
             });
         }
     }
+
+    /// Send a notification that (0040,4041) Input Readiness State changed.
+    ///
+    /// PS3.4 CC.2.4.1 makes the readiness report the way a subscriber learns
+    /// that a workitem became performable, so the change needs an event of its
+    /// own: the workflow state does not move when inputs arrive, and a state
+    /// change event carrying the same state on both sides is muted by
+    /// `notify_state_change`. The readiness in the event is the value just
+    /// written, so the report never lags the record.
+    pub fn notify_readiness_change(
+        &self,
+        workitem_uid: &str,
+        previous_readiness: &str,
+        new_readiness: &str,
+        filter: FilterRouting,
+    ) {
+        if previous_readiness == new_readiness {
+            return;
+        }
+        let mut filter = filter;
+        filter.input_readiness = Some(new_readiness.to_string());
+        let event = UpsEvent {
+            workitem_uid: workitem_uid.to_string(),
+            previous_state: String::new(),
+            new_state: String::new(),
+            timestamp: timestamp_now(),
+            event_id: 0, // filled by send()
+            step_label: filter.step_label.clone(),
+            scheduled_code: filter.scheduled_code.clone(),
+            input_readiness: new_readiness.to_string(),
+            filter: Box::new(filter),
+        };
+        self.send(event);
+    }
 }
 
 impl Default for UpsEventBus {

@@ -239,12 +239,18 @@ fn build_palette_rle_dicom(stream: &[u8], rows: u16, cols: u16) -> Vec<u8> {
     out.extend_from_slice(&[0u8; 128]);
     out.extend_from_slice(b"DICM");
     let ts = b"1.2.840.10008.1.2.5";
+    // PS3.5 6.2: the declared Value Length is the even, padded length. This UID
+    // is 19 characters, so the element declares 20 and the NUL is the
+    // twentieth byte.
+    let ts_len = ts.len() + usize::from(!ts.len().is_multiple_of(2));
     out.extend_from_slice(&0x0002u16.to_le_bytes());
     out.extend_from_slice(&0x0010u16.to_le_bytes());
     out.extend_from_slice(b"UI");
-    out.extend_from_slice(&(ts.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(ts_len as u16).to_le_bytes());
     out.extend_from_slice(ts);
-    out.push(0x00);
+    if ts_len != ts.len() {
+        out.push(0x00);
+    }
 
     let us_tag = |d: &mut Vec<u8>, tag: (u16, u16), v: u16| {
         d.extend_from_slice(&tag.0.to_le_bytes());
@@ -258,14 +264,23 @@ fn build_palette_rle_dicom(stream: &[u8], rows: u16, cols: u16) -> Vec<u8> {
     us_tag(&mut out, (0x0028, 0x0002), 1);
     us_tag(&mut out, (0x0028, 0x0100), 8);
 
-    // PI = PALETTE COLOR (13 chars, odd -> pad)
+    // PI = PALETTE COLOR. PS3.5 6.2: the Value Field is padded to an even
+    // length and the declared Value Length is the PADDED length, so 13
+    // characters declare 14 and the space is the fourteenth byte. Declaring 13
+    // and appending the pad outside it writes an element that occupies one byte
+    // more than it declares, which desynchronises every reader that trusts the
+    // length - this fixture did exactly that and only passed because the walker
+    // used to re-add the pad.
     let pi = b"PALETTE COLOR";
+    let pi_len = pi.len() + usize::from(!pi.len().is_multiple_of(2));
     out.extend_from_slice(&0x0028u16.to_le_bytes());
     out.extend_from_slice(&0x0004u16.to_le_bytes());
     out.extend_from_slice(b"CS");
-    out.extend_from_slice(&(pi.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(pi_len as u16).to_le_bytes());
     out.extend_from_slice(pi);
-    out.push(b' ');
+    if pi_len != pi.len() {
+        out.push(b' ');
+    }
 
     // Descriptor (0028,1101): [4 entries, first mapped 0]
     out.extend_from_slice(&0x0028u16.to_le_bytes());
@@ -357,13 +372,18 @@ fn palette_same_target_must_convert_not_passthrough() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0u8; 128]);
     bytes.extend_from_slice(b"DICM");
-    let ts = b"1.2.840.10008.1.2.1"; // 19 chars, odd -> pad
+    let ts = b"1.2.840.10008.1.2.1";
+    // PS3.5 6.2: the declared Value Length is the even, padded length, so this
+    // 19-character UID declares 20 and the NUL is its twentieth byte.
+    let ts_len = ts.len() + usize::from(!ts.len().is_multiple_of(2));
     bytes.extend_from_slice(&0x0002u16.to_le_bytes());
     bytes.extend_from_slice(&0x0010u16.to_le_bytes());
     bytes.extend_from_slice(b"UI");
-    bytes.extend_from_slice(&(ts.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&(ts_len as u16).to_le_bytes());
     bytes.extend_from_slice(ts);
-    bytes.push(0x00);
+    if ts_len != ts.len() {
+        bytes.push(0x00);
+    }
     let us_tag = |d: &mut Vec<u8>, tag: (u16, u16), v: u16| {
         d.extend_from_slice(&tag.0.to_le_bytes());
         d.extend_from_slice(&tag.1.to_le_bytes());
@@ -376,12 +396,16 @@ fn palette_same_target_must_convert_not_passthrough() {
     us_tag(&mut bytes, (0x0028, 0x0002), 1);
     us_tag(&mut bytes, (0x0028, 0x0100), 8);
     let pi = b"PALETTE COLOR";
+    // The same even-length rule for the 13-character photometric value.
+    let pi_len = pi.len() + usize::from(!pi.len().is_multiple_of(2));
     bytes.extend_from_slice(&0x0028u16.to_le_bytes());
     bytes.extend_from_slice(&0x0004u16.to_le_bytes());
     bytes.extend_from_slice(b"CS");
-    bytes.extend_from_slice(&(pi.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&(pi_len as u16).to_le_bytes());
     bytes.extend_from_slice(pi);
-    bytes.push(b' ');
+    if pi_len != pi.len() {
+        bytes.push(b' ');
+    }
     bytes.extend_from_slice(&0x0028u16.to_le_bytes());
     bytes.extend_from_slice(&0x1101u16.to_le_bytes());
     bytes.extend_from_slice(b"US");

@@ -236,3 +236,52 @@ class TestScpTargetRegistry:
         mgr.register_peer("PEER_AE", "10.0.0.2", 11112)
         target = mgr.lookup_scp("PEER_AE")
         assert target == ("10.0.0.2", 11112)
+
+
+class TestReloadDelegatesToRegisterPeer:
+    """The file reload and manual registration share ONE upsert path (D1).
+
+    Reverting the reload to its own INSERT OR REPLACE makes
+    `test_reload_calls_register_peer_for_each_entry` go red, because the
+    monkeypatched `register_peer` is then never reached.
+    """
+
+    def test_reload_calls_register_peer_for_each_entry(self, tmp_path, monkeypatch):
+        peers = tmp_path / "peers.conf"
+        peers.write_text("A 10.0.0.1:104\nB 10.0.0.2:105\n", encoding="utf-8")
+        db = _TestDb(str(tmp_path / "move_jobs.db"))
+        store = MoveJobManager(shared_db=db, max_workers=1)
+        calls = []
+        monkeypatch.setattr(
+            store, "register_peer", lambda ae, h, p: calls.append((ae, h, p))
+        )
+        try:
+            store.reload_peers_from_file(str(peers))
+        finally:
+            store.close()
+            db.close()
+        assert ("A", "10.0.0.1", 104) in calls
+        assert ("B", "10.0.0.2", 105) in calls
+
+    def test_reload_still_upserts_and_removes_through_register_peer(self, tmp_path):
+        """Behavioural contract of the dedup: a changed port is updated and a
+        peer dropped from the file is removed - through the single upsert
+        path."""
+        peers = tmp_path / "peers.conf"
+        peers.write_text("A 10.0.0.1:104\nB 10.0.0.2:104\n", encoding="utf-8")
+        db = _TestDb(str(tmp_path / "move_jobs.db"))
+        store = MoveJobManager(shared_db=db, max_workers=1)
+        try:
+            store.reload_peers_from_file(str(peers))
+            assert store.lookup_scp("A", "10.0.0.1") == ("10.0.0.1", 104)
+            assert store.lookup_scp("B", "10.0.0.2") == ("10.0.0.2", 104)
+
+            peers.write_text("A 10.0.0.1:11112\n", encoding="utf-8")
+            store.lazyload_peers_interval = 0
+            store.reload_peers_from_file(str(peers))
+
+            assert store.lookup_scp("A", "10.0.0.1") == ("10.0.0.1", 11112)
+            assert store.lookup_scp("B", "10.0.0.2") is None
+        finally:
+            store.close()
+            db.close()

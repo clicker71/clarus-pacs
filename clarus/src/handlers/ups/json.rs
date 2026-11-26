@@ -14,6 +14,11 @@ use crate::handlers::json_common::{JsonVal, push_json_str};
 
 /// The UPS Push SOP Class UID (PS3.4 Table CC.2.5-3, SOP Class UID row: the
 /// workitem's own SOP Class, returned by N-GET and by retrieve).
+///
+/// Verified against the repository reference
+/// `standard/ps3.6/sop-class-uids.json` (`by_uid`:
+/// `"Unified Procedure Step - Push SOP Class"`); the test below fails if the
+/// two ever disagree, which is what keeps this literal from drifting.
 pub const UPS_PUSH_SOP_CLASS_UID: &str = "1.2.840.10008.5.1.4.34.6.1";
 
 /// Coding Scheme Designator of the codes this server mints itself.
@@ -188,7 +193,17 @@ pub fn write_workitem_json(out: &mut Vec<u8>, wi: &WorkItem) {
     // nested study inside the Referenced Request Sequence: they are different
     // facts (where the results go vs which study was read), so the root copy is
     // not a duplicate. Absent when the record names none.
-    emit_str!("0020000D", "UI", wi.output_study_uid.as_deref());
+    //
+    // Type 2 means the attribute is ALWAYS present in a conformant instance and
+    // may hold zero length, so an absent output study is stated as
+    // `{"vr":"UI"}` rather than by omitting the row: a consumer cannot tell a
+    // workitem that has not been assigned an output study from one whose
+    // renderer forgot the attribute.
+    emit_str!(
+        "0020000D",
+        "UI",
+        Some(wi.output_study_uid.as_deref().unwrap_or(""))
+    );
     emit_str!("00400002", "DA", wi.procedure_step_start_date.as_deref());
     emit_str!("00400003", "TM", wi.procedure_step_start_time.as_deref());
     emit_str!("00400010", "SH", wi.station_name.as_deref());
@@ -664,10 +679,22 @@ fn emit_referenced_request(
     *wrote = true;
     out.extend_from_slice(b"\"0040A370\":{\"Value\":[{");
     let mut item_wrote = false;
-    if let Some(accession) = accession.filter(|a| !a.is_empty()) {
-        out.extend_from_slice(b"\"00080050\":{\"Value\":[");
-        push_json_str(out, accession);
-        out.extend_from_slice(b"],\"vr\":\"SH\"}");
+    if let Some(accession) = accession {
+        if item_wrote {
+            out.push(b',');
+        }
+        // An EXPLICITLY empty accession is a different fact from an absent one:
+        // `None` means the requester stated nothing, `Some("")` means it stated
+        // there is no accession number. PS3.18 F.2.5 carries the second by
+        // OMITTING `Value`, which is what the XML renderer already does.
+        out.extend_from_slice(b"\"00080050\":");
+        if accession.is_empty() {
+            out.extend_from_slice(b"{\"vr\":\"SH\"}");
+        } else {
+            out.extend_from_slice(b"{\"Value\":[");
+            push_json_str(out, accession);
+            out.extend_from_slice(b"],\"vr\":\"SH\"}");
+        }
         item_wrote = true;
     }
     {
@@ -919,6 +946,29 @@ mod tests {
         );
     }
 
+    /// The UPS Push SOP Class UID must be the one the repository reference
+    /// names, not a literal nobody re-checked.
+    #[test]
+    fn the_ups_push_sop_class_uid_matches_the_standard_reference() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("standard")
+            .join("ps3.6")
+            .join("sop-class-uids.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("standard reference {}: {e}", path.display()));
+        let needle = format!("\"{UPS_PUSH_SOP_CLASS_UID}\"");
+        assert!(
+            text.contains(&needle),
+            "{UPS_PUSH_SOP_CLASS_UID} is not in {}",
+            path.display()
+        );
+        assert!(
+            text.contains("Unified Procedure Step - Push SOP Class"),
+            "and it is the PUSH class, not the Watch/Pull/Event sibling"
+        );
+    }
+
     /// K2: the zero-length rule holds for every emitter, not only the issuer.
     ///
     /// PS3.18 F.2.5: an attribute present with zero length carries no `Value`.
@@ -949,6 +999,31 @@ mod tests {
         assert!(
             text.contains("\"00404033\":{\"vr\":\"SQ\"}"),
             "an empty output list states the sequence with no Value: {text}"
+        );
+
+        // An explicitly empty accession is a statement the client made, distinct
+        // from the absent one: it must be PRESENT, with no Value.
+        let mut wi = sample_workitem();
+        wi.input_study_uid = Some("1.2.3.4.5".into());
+        wi.accession_number = Some(String::new());
+        let mut out = Vec::new();
+        write_workitem_json(&mut out, &wi);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(
+            text.contains("\"00080050\":{\"vr\":\"SH\"}"),
+            "an explicitly empty accession is present with no Value: {text}"
+        );
+
+        // The absent accession stays absent - a different fact.
+        let mut wi = sample_workitem();
+        wi.input_study_uid = Some("1.2.3.4.5".into());
+        wi.accession_number = None;
+        let mut out = Vec::new();
+        write_workitem_json(&mut out, &wi);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(
+            !text.contains("\"00080050\""),
+            "an absent accession states nothing at all: {text}"
         );
         assert!(
             !text.contains("\"00404033\":{\"Value\":[]"),
@@ -1102,10 +1177,14 @@ mod tests {
                     };
                     let key = &text[start..start + off];
                     let after = start + off + 1;
+                    // An 8HEXDIG tag, not only the decimal-looking subset:
+                    // `0040A370` and `0020000D` are dataset-level attributes
+                    // too, and the digit-only check let either of them sit out
+                    // of order without the test noticing.
                     if depth == 1
                         && bytes.get(after) == Some(&b':')
                         && key.len() == 8
-                        && key.bytes().all(|b| b.is_ascii_digit())
+                        && key.bytes().all(|b| b.is_ascii_hexdigit())
                     {
                         tags.push(key.to_string());
                     }
@@ -1120,12 +1199,22 @@ mod tests {
             tags.len() >= 10,
             "the walk found the dataset level: {tags:?}"
         );
+        // Lexicographic order on uppercase 8HEXDIG strings is the numeric tag
+        // order, because every tag is zero-padded to four digits per group.
         let mut sorted = tags.clone();
         sorted.sort_unstable();
         assert_eq!(
             tags, sorted,
             "top-level tags must ascend (PS3.18 F.2): {text}"
         );
+        // The two hex-bearing tags must actually be in the walk, or the order
+        // check above says nothing about them.
+        for required in ["0020000D", "0040A370"] {
+            assert!(
+                tags.iter().any(|t| t == required),
+                "the walk must cover ({required}): {tags:?}"
+            );
+        }
     }
 
     /// The identity shape of PS3.4 CC.2.5-3: the workitem UID is the SOP
@@ -1149,6 +1238,7 @@ mod tests {
              \"00100010\":{\"Value\":[{\"Alphabetic\":\"SMIRNOV^IVAN\"}],\"vr\":\"PN\"},\
              \"00100020\":{\"Value\":[\"PT-1\"],\"vr\":\"LO\"},\
              \"00100021\":{\"vr\":\"LO\"},\
+             \"0020000D\":{\"vr\":\"UI\"},\
              \"00400002\":{\"Value\":[\"20260802\"],\"vr\":\"DA\"},\
              \"00400003\":{\"Value\":[\"103000\"],\"vr\":\"TM\"},\
              \"00400010\":{\"Value\":[\"Scanner A\"],\"vr\":\"SH\"},\
@@ -1167,9 +1257,12 @@ mod tests {
                 || text.contains("\"0040A370\":{\"Value\":[{\"00080050\""),
             "(0008,0050) must appear only inside the sequence: {text}"
         );
+        // The dataset-root (0020,000D) is Type 2 (PS3.4 Table CC.2.5-1), so it is
+        // ALWAYS present and may be zero length. This record names no output
+        // study, so it must be the empty form - not an omitted attribute.
         assert!(
-            !text.contains("\"0020000D\":{"),
-            "no bare (0020,000D) at the top level: {text}"
+            text.contains("\"0020000D\":{\"vr\":\"UI\"}"),
+            "the Type 2 root study is present and empty: {text}"
         );
     }
 
@@ -1224,9 +1317,10 @@ mod tests {
     ///
     /// PS3.4 Table CC.2.5-1 lists two rows: 'Study Instance UID (Referenced
     /// Request Sequence)' Type 1 and 'Study Instance UID (top level)' Type 2.
-    /// The root one is the study assigned to the OUTPUT instances, so a record
-    /// holding only an input study emits no root element at all - the two are
-    /// not interchangeable copies of one value.
+    /// The root one is the study assigned to the OUTPUT instances. It is Type 2,
+    /// so a record holding only an input study emits it EMPTY rather than
+    /// filled with the input study - the two are not interchangeable copies of
+    /// one value.
     ///
     /// The Input Information Sequence (0040,4021) is a Referenced Instances and
     /// Access Macro item (PS3.3 Table 10-3b): it names instances through
@@ -1239,12 +1333,18 @@ mod tests {
         let mut out = Vec::new();
         write_workitem_json(&mut out, &wi);
         let text = std::str::from_utf8(&out).unwrap();
-        // No root study: `output_study_uid` is None here, and the input study
-        // is a DIFFERENT attribute that lives only inside the sequence.
+        // The root study is Type 2, so it is present and EMPTY when the record
+        // names no output study; the input study is a DIFFERENT attribute and
+        // must not fill that slot.
         let head = text.split("\"00400002\"").next().unwrap();
         assert!(
-            !head.contains("\"0020000D\""),
-            "no root (0020,000D) when no output study is named: {text}"
+            head.contains("\"0020000D\":{\"vr\":\"UI\"}"),
+            "the root (0020,000D) is present and empty, not filled by the input \
+             study: {text}"
+        );
+        assert!(
+            !head.contains("\"0020000D\":{\"Value\":["),
+            "the root study carries no value: {text}"
         );
         // The input study appears exactly once - inside the Referenced Request.
         assert_eq!(

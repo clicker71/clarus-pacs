@@ -94,7 +94,24 @@ pub fn run_cas_audit(
                 return;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            // `flatten()` would treat an unreadable directory entry as absent,
+            // so a blob whose metadata cannot be read vanished from the audit:
+            // `checked` came out lower and `unreadable` stayed zero, i.e. the
+            // report claimed a clean tree over a subtree it never saw.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    errors += 1;
+                    unreadable += 1;
+                    crate::clog_warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "CAS audit: unreadable directory entry"
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
             // The CAS staging directory holds files being written right now.
             // Counting them made every in-flight upload look like an orphan,
@@ -103,9 +120,28 @@ pub fn run_cas_audit(
             if path == temp_dir {
                 continue;
             }
-            if path.is_dir() {
+            // `file_type()` from the entry is the type WITHOUT following a
+            // symlink, unlike `is_dir()`/`is_file()` which stat the target. A
+            // link inside the CAS root is not a stored blob: following one
+            // walks out of the tree (or loops forever), and a link to a real
+            // blob would be verified under the LINK's name, reporting a hash
+            // mismatch against content that is fine.
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(e) => {
+                    errors += 1;
+                    unreadable += 1;
+                    crate::clog_warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "CAS audit: unreadable file type"
+                    );
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
                 dirs.push(path);
-            } else if path.is_file() {
+            } else if file_type.is_file() {
                 // Only stored instances are candidates. A sidecar, a part
                 // file or a lock in the tree is not an instance, and counting
                 // it as unreferenced reported a phantom orphan.
@@ -286,7 +322,12 @@ mod hash_seam {
 
 /// Stream `path` through a BLAKE3 hasher in bounded chunks, returning the
 /// 32-byte digest that addresses CAS. Never buffers the whole file.
-fn hash_file_incremental(path: &Path) -> std::io::Result<[u8; 32]> {
+///
+/// Shared with the recovery pass, which compares the digest of a blob it is
+/// about to publish against the name the blob is addressed by: a byte-exact
+/// comparison must derive both sides the same way, so there is ONE hasher for
+/// the store's bytes.
+pub(crate) fn hash_file_incremental(path: &Path) -> std::io::Result<[u8; 32]> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = clarus_core::hash::cas_hasher();
     let mut buf = [0u8; AUDIT_HASH_CHUNK];
@@ -382,6 +423,93 @@ mod tests {
             "the failure must be reported as an error status: {}",
             st.status
         );
+    }
+
+    /// A symlink inside the CAS tree must not be followed.
+    ///
+    /// `is_file()` stats the TARGET, so a link named after one hash but pointing
+    /// at another blob was verified as if it held the name's content: the audit
+    /// reported a corruption that does not exist. A link to a DIRECTORY was
+    /// worse - the walk descended through it, so the same real files were
+    /// counted again under a path the store never wrote.
+    #[test]
+    fn a_symlink_inside_the_cas_tree_is_not_followed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cas = tmp.path().join("cas");
+        let bucket = cas.join("ab");
+        std::fs::create_dir_all(&bucket).expect("bucket");
+
+        // A real, VALID blob.
+        let real = write_valid_cas(&bucket, b"real-content");
+
+        // A link whose name claims a different hash while pointing at `real`.
+        let liar_name = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.dcm";
+        let liar = bucket.join(liar_name);
+        if !make_symlink(&real, &liar) {
+            // Creating symlinks needs a privilege on Windows; skip rather than
+            // assert something the platform cannot set up.
+            return;
+        }
+
+        // A link to a directory outside the tree, which must not be walked.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        write_valid_cas(&outside, b"outside-content");
+        let _ = make_symlink(&outside, &cas.join("escape"));
+
+        let state = RwLock::new(CasAuditState {
+            status: "running".to_string(),
+            files_checked: 0,
+            files_total: 0,
+            errors: 0,
+            unreferenced: 0,
+            corrupted: 0,
+            unreadable: 0,
+            corrupted_hashes: Vec::new(),
+            started_at: None,
+            eta_seconds: None,
+        });
+        run_cas_audit(
+            cas,
+            tmp.path().join("manifests"),
+            tmp.path().join("_tmp"),
+            &state,
+        );
+
+        let st = state.read().expect("lock");
+        assert_eq!(st.status, "done");
+        assert_eq!(
+            st.corrupted, 0,
+            "a symlink is not a stored blob; following it fakes a corruption: {:?}",
+            st.corrupted_hashes
+        );
+        assert_eq!(
+            st.files_checked, 1,
+            "only the real blob counts; a followed directory link double-counts"
+        );
+    }
+
+    /// Create a symlink, returning false when the platform refuses.
+    fn make_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            let dir_target = target.is_dir();
+            let r = if dir_target {
+                std::os::windows::fs::symlink_dir(target, link)
+            } else {
+                std::os::windows::fs::symlink_file(target, link)
+            };
+            r.is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
     }
 
     #[test]

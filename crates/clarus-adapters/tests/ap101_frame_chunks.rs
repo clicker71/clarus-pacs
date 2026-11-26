@@ -61,15 +61,34 @@ fn append_element(buf: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], val
         };
         padded.push(pad);
     }
-    let is_text = !matches!(vr, b"OB" | b"OD" | b"OF" | b"OL" | b"OV" | b"OW" | b"UN");
+    let is_text = !matches!(
+        vr,
+        b"OB" | b"OD" | b"OF" | b"OL" | b"OV" | b"OW" | b"UN" | b"UV"
+    );
     let declared = if is_text { padded.len() } else { value.len() };
 
     buf.extend_from_slice(&group.to_le_bytes());
     buf.extend_from_slice(&element.to_le_bytes());
     buf.extend_from_slice(vr);
+    // PS3.5 6.2 Table 6.2-1: the VR decides the header shape, and the pad
+    // character decides whether the pad is inside the declared length. Both
+    // tables live here once - a second copy is how a fixture writer starts
+    // disagreeing with the reader it is meant to exercise.
     let extended = matches!(
         vr,
-        b"OB" | b"OD" | b"OF" | b"OL" | b"OV" | b"OW" | b"SQ" | b"UC" | b"UN" | b"UR" | b"UT"
+        b"OB"
+            | b"OD"
+            | b"OF"
+            | b"OL"
+            | b"OV"
+            | b"OW"
+            | b"SQ"
+            | b"SV"
+            | b"UC"
+            | b"UN"
+            | b"UR"
+            | b"UT"
+            | b"UV"
     );
     if extended {
         buf.extend_from_slice(&[0, 0]);
@@ -134,7 +153,18 @@ struct TempFile {
 }
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // A missing file is the expected outcome when a test already removed
+        // it; anything else leaves a fixture behind and must be reported. A
+        // panic here would abort during unwinding of the real failure, so the
+        // report goes to stderr instead.
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "ap101_frame_chunks: could not remove fixture {}: {e}",
+                self.path.display()
+            ),
+        }
     }
 }
 fn write_temp(bytes: &[u8]) -> (TempFile, std::path::PathBuf) {
@@ -205,14 +235,20 @@ fn walked_count_over_cap_is_rejected_not_a_giant_vec() {
     // NumberOfFrames is declared WITHIN the cap on purpose: declaring 40 would
     // trip the declared-frame check before the walk ever starts, so the test
     // would pass without exercising the walked-count limit at all.
-    let empty: Vec<&[u8]> = vec![&[]; 40];
+    // 20 000 zero-length items (8-byte headers each): a full table would be
+    // 20 000 rows x 56 B ~= 1.1 MiB, far over the 16 KiB budget below, while a
+    // walk that stops at the cap allocates a few hundred bytes. 40 items was
+    // too few to tell the two apart - a build-then-reject implementation
+    // allocated under the budget and passed the very test meant to reject it.
+    const ITEMS: usize = 20_000;
+    let empty: Vec<&[u8]> = vec![&[]; ITEMS];
     let file = instance_with_declared("8", &empty);
 
     let ((count, bytes), r) = window(|| compute_frame_chunks_capped(&file, 8));
 
     assert!(
         matches!(r, Err(FrameTableError::TooManyFrames { cap: 8, .. })),
-        "40 items over a cap of 8 must reject"
+        "{ITEMS} items over a cap of 8 must reject"
     );
     // At most `cap` rows were pushed before the trip (8 * 56 B ~= 448 B).
     assert!(
@@ -336,6 +372,9 @@ fn undefined_length_pixeldata_table_is_file_size_independent() {
     let mut d = Vec::new();
     d.extend_from_slice(&[0u8; 128]);
     d.extend_from_slice(b"DICM");
+    // PS3.5 7.1: the dataset encoding is stated in TransferSyntaxUID and the
+    // streaming walk reads it there rather than inferring it per element.
+    append_element(&mut d, 0x0002, 0x0010, b"UI", b"1.2.840.10008.1.2.4.50");
     append_element(&mut d, 0x0008, 0x0060, b"CS", b"SM");
     append_element(&mut d, 0x0028, 0x0010, b"US", &us(2));
     append_element(&mut d, 0x0028, 0x0011, b"US", &us(2));

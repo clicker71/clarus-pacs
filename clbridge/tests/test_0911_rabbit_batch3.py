@@ -44,7 +44,15 @@ def _write_blob(path, uid, name="Aged^Item"):
 # P0 - the N-EVENT-REPORT SCP role must be proposed as a role-selection item
 # ---------------------------------------------------------------------------
 class TestP0ScpRoleNegotiation:
-    def _run(self, monkeypatch, *, as_scp=True, established=True, status=0x0000):
+    def _run(
+        self,
+        monkeypatch,
+        *,
+        as_scp=True,
+        established=True,
+        status=0x0000,
+        no_context=False,
+    ):
         """Drive send_n_event_report with AE.associate stubbed; return spy."""
         from pynetdicom.sop_class import StorageCommitmentPushModel
 
@@ -62,7 +70,7 @@ class TestP0ScpRoleNegotiation:
 
         class _Assoc:
             is_established = established
-            accepted_contexts = [ctx]
+            accepted_contexts = [] if no_context else [ctx]
 
             def send_n_event_report(self, *a, **kw):
                 return _Status(), None
@@ -118,16 +126,36 @@ class TestP0ScpRoleNegotiation:
         assert role[0].scp_role is True, "the requestor must hold the SCP role"
         assert role[0].scu_role is True, "the requestor also sends the request"
 
-    def test_a_peer_that_declines_the_role_is_not_reported_delivered(
+    def test_a_peer_that_declines_the_role_still_gets_the_report(
         self, monkeypatch, caplog
     ):
-        """Accepting the abstract syntax but declining the role leaves the
-        requestor a plain SCU, and the report cannot be pushed - so it must
-        not count as delivered."""
+        """A declined role item does not make the context unusable.
+
+        Role Selection is OPTIONAL (PS3.7 D.3.3.4): an SCP that accepts the
+        Storage Commitment context and omits the role item leaves `as_scp`
+        False while the presentation context is perfectly usable, and
+        `send_n_event_report()` selects its context by abstract syntax alone.
+        Treating `as_scp` as a precondition closed the association before the
+        report was sent, so a conformant peer never received a report the
+        library would have delivered. Delivery is decided by the response.
+        """
         with caplog.at_level(logging.WARNING):
             ok, _spy = self._run(monkeypatch, as_scp=False)
+        assert ok is True
+        assert "SCP role" not in "\n".join(r.message for r in caplog.records)
+
+    def test_a_peer_with_no_storage_commitment_context_is_not_delivered(
+        self, monkeypatch, caplog
+    ):
+        """Control for the test above: the CONTEXT is still required.
+
+        Without an accepted Storage Commitment presentation context there is
+        nothing to send the report on, and that is what the guard checks.
+        """
+        with caplog.at_level(logging.WARNING):
+            ok, _spy = self._run(monkeypatch, no_context=True)
         assert ok is False
-        assert "SCP role" in "\n".join(r.message for r in caplog.records)
+        assert "presentation context" in "\n".join(r.message for r in caplog.records)
 
     def test_the_dead_helper_is_gone(self):
         """`_request_scp_role` set an attribute that does not exist."""

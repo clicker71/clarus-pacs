@@ -60,7 +60,10 @@ struct Bucket {
     /// Sum of handler microseconds (only when the source supplies them).
     us: u64,
     /// Whether any source supplied size/timing fields (else omit both).
-    has_size: bool,
+    /// Whether any slice supplied bytes (explicit zero counts).
+    has_bytes: bool,
+    /// Whether any slice supplied a duration (explicit zero counts).
+    has_us: bool,
     /// Time of the last recorded slice.
     last: Instant,
 }
@@ -204,15 +207,20 @@ fn record_slices(
         conflicts: 0,
         bytes: 0,
         us: 0,
-        has_size: false,
+        has_bytes: false,
+        has_us: false,
         last: now,
     };
     record_into(
         &mut b, stored, idempotent, failed, conflicts, bytes, us, now,
     );
-    // A brand-new session surfaces a `started` marker FIRST.
+    // A brand-new session surfaces a `started` marker, APPENDED rather than
+    // inserted at index 0: the lazy sweep above may already have emitted a
+    // `completed` for the OLD session of this same key, and a consumer pairing
+    // lines by (study, user, ip) would otherwise read the new start followed by
+    // the previous session's totals and close the new session with them.
     let started = format_started(&b);
-    out.insert(0, started);
+    out.push(started);
     buckets.push(b);
     out
 }
@@ -273,14 +281,19 @@ fn record_into(
     b.conflicts += conflicts;
     if let Some(x) = bytes {
         b.bytes += x;
+        b.has_bytes = true;
     }
     if let Some(x) = us {
         b.us += x;
+        b.has_us = true;
     }
-    if bytes.is_some() || us.is_some() {
-        b.has_size = true;
+    // `now` is sampled before the table lock is taken, so a caller that
+    // acquires the lock later can still carry an EARLIER instant. Assigning it
+    // moved `last` backwards and the TTL sweep then completed an active session
+    // early, ending a transfer mid-flight. Keep the later observation.
+    if now > b.last {
+        b.last = now;
     }
-    b.last = now;
 }
 
 /// Line marking the first slice of a brand-new STOW session for a study.
@@ -364,11 +377,20 @@ fn field(raw: &[u8]) -> String {
 
 /// Render ` bytes=.. us=..` when the source supplied size/timing, else empty.
 fn format_size(b: &Bucket) -> String {
-    if b.has_size {
-        format!(" bytes={} us={}", b.bytes, b.us)
-    } else {
-        String::new()
+    // Per-FIELD presence, not one bucket-wide flag. `bytes=Some(1000)` with
+    // `us=None` used to render `bytes=1000 us=0`, inventing a zero-duration
+    // measurement the caller never supplied - and an aggregate that reports a
+    // fabricated zero is read as "instant", which is the best possible result.
+    // A field is printed only when a slice actually supplied it; an explicit
+    // zero still prints, because that IS a supplied measurement.
+    let mut out = String::new();
+    if b.has_bytes {
+        out.push_str(&format!(" bytes={}", b.bytes));
     }
+    if b.has_us {
+        out.push_str(&format!(" us={}", b.us));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -392,7 +414,8 @@ mod tests {
             conflicts: 0,
             bytes: 0,
             us: 0,
-            has_size: false,
+            has_bytes: false,
+            has_us: false,
             last: Instant::now(),
         }
     }
@@ -591,6 +614,133 @@ mod tests {
                     && l.contains("bytes=1000 us=50")
             }),
             "completed must carry the supplied size fields: {out:?}"
+        );
+    }
+
+    /// A slice that supplies only one of the two optional measurements must not
+    /// have the other invented as zero. An absent duration rendered as `us=0`
+    /// reads as an instantaneous transfer, i.e. the best possible result, so a
+    /// caller that simply omitted the field would silently improve the numbers.
+    #[test]
+    fn an_absent_measurement_is_omitted_rather_than_reported_as_zero() {
+        let mut h = Harness::new();
+        let t0 = Instant::now();
+        // bytes supplied, duration NOT supplied.
+        let _ = record_slices(
+            &mut h.buckets,
+            b"1.2.3",
+            b"u",
+            b"ip",
+            1,
+            0,
+            0,
+            0,
+            Some(1000),
+            None,
+            t0,
+        );
+        let t1 = t0 + TTL + Duration::from_secs(1);
+        let out = h.sweep(t1);
+        let line = out
+            .iter()
+            .find(|l| l.starts_with("completed study=1.2.3"))
+            .unwrap_or_else(|| panic!("no completed line: {out:?}"));
+        assert!(line.contains("bytes=1000"), "{line}");
+        assert!(
+            !line.contains("us="),
+            "an unsupplied duration must not appear at all: {line}"
+        );
+
+        // The mirror case: a SUPPLIED zero still prints, because zero seconds is
+        // a real measurement and dropping it would be just as misleading.
+        let mut h = Harness::new();
+        let _ = record_slices(
+            &mut h.buckets,
+            b"4.5.6",
+            b"u",
+            b"ip",
+            1,
+            0,
+            0,
+            0,
+            None,
+            Some(0),
+            t0,
+        );
+        let out = h.sweep(t1);
+        let line = out
+            .iter()
+            .find(|l| l.starts_with("completed study=4.5.6"))
+            .unwrap_or_else(|| panic!("no completed line: {out:?}"));
+        assert!(line.contains("us=0"), "an explicit zero must stay: {line}");
+        assert!(
+            !line.contains("bytes="),
+            "an unsupplied byte count must not appear: {line}"
+        );
+    }
+
+    /// `now` is sampled before the table lock is taken, so a slice can arrive
+    /// carrying an instant EARLIER than the bucket's last observation. Letting
+    /// `last` move backwards lets the TTL sweep declare an in-flight transfer
+    /// finished and emit `completed` for it mid-upload.
+    #[test]
+    fn an_older_timestamp_does_not_expire_an_active_session() {
+        let mut h = Harness::new();
+        let t0 = Instant::now();
+        let _ = h.slice("1.2.3", "u", "ip", 1, 0, 0, 0, t0);
+        // A concurrent slice that sampled the clock well before the first one
+        // and only reached the table afterwards. Its own lazy sweep runs BEFORE
+        // the update, so the rewind only becomes visible on the NEXT sweep.
+        let early = t0 - Duration::from_secs(5);
+        let _ = h.slice("1.2.3", "u", "ip", 1, 0, 0, 0, early);
+        assert_eq!(
+            h.buckets[0].last, t0,
+            "a delayed observation must not rewind the idle anchor"
+        );
+        // Probe inside the window where the two outcomes disagree: less than TTL
+        // after `t0` (a kept `last` reads live) but more than TTL after `early`
+        // (a rewound `last` reads idle).
+        let probe = t0 + TTL - Duration::from_secs(2);
+        let out = h.sweep(probe);
+        assert!(
+            !out.iter().any(|l| l.contains("completed study=1.2.3")),
+            "an older sample must not rewind last: {out:?}"
+        );
+        // ... and it does complete once the later observation really ages out.
+        let out = h.sweep(t0 + TTL + Duration::from_secs(1));
+        assert!(
+            out.iter().any(|l| l.contains("completed study=1.2.3")),
+            "the live session must still complete at its own TTL: {out:?}"
+        );
+    }
+
+    /// A restart of the same key (previous session already swept) must emit the
+    /// old `completed` BEFORE the new `started`. A consumer that pairs lines by
+    /// (study, user, ip) would otherwise attach the previous session's totals to
+    /// the new one.
+    #[test]
+    fn a_restart_with_the_same_key_closes_the_old_session_first() {
+        let mut h = Harness::new();
+        let t0 = Instant::now();
+        let _ = h.slice("1.2.3", "u", "ip", 5, 0, 0, 0, t0);
+        let t1 = t0 + TTL + Duration::from_secs(1);
+        // The restarting slice both sweeps the stale session and opens a new one.
+        let out = h.slice("1.2.3", "u", "ip", 1, 0, 0, 0, t1);
+        let completed = out
+            .iter()
+            .position(|l| l.starts_with("completed study=1.2.3"))
+            .unwrap_or_else(|| panic!("old session not completed: {out:?}"));
+        let started = out
+            .iter()
+            .position(|l| l.starts_with("started study=1.2.3"))
+            .unwrap_or_else(|| panic!("new session not started: {out:?}"));
+        assert!(
+            completed < started,
+            "the old session must close first: {out:?}"
+        );
+        assert!(
+            out[completed].contains("stored=5"),
+            "the totals must belong to the old session: {out:?}"
         );
     }
 

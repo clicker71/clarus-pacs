@@ -191,11 +191,10 @@ pub struct SrProfile {
 impl SrProfile {
     #[must_use]
     pub fn of(result: &RuleResult) -> Self {
-        let sr = result.sr.clone().unwrap_or_default();
         Self {
             series_description: result.series_description.clone(),
-            title: sr.title,
-            template_id: sr.template_id,
+            title: None,
+            template_id: SrTemplate::default(),
         }
     }
 }
@@ -2059,28 +2058,30 @@ mod tests {
     }
 
     #[test]
-    fn the_profile_reads_the_sr_block_from_the_rule_result() {
+    fn the_profile_reads_the_series_description_from_the_rule_result() {
+        // The template is the writer's own default: a text report is a TID
+        // 2000 document and nothing in a model file can make it another
+        // template, so the profile carries the description and the default
+        // template together - never a per-model template that the encoder
+        // does not implement.
         let result = RuleResult {
             kind: crate::conf::ResultKind::Sr,
-            color: None,
             profile_version: 1,
             series_description: Some("LLM Findings".to_string()),
             label: crate::conf::LabelProfile::default(),
-            sr: Some(crate::conf::SrResult {
-                title: Some("LLM Findings".to_string()),
-                template_id: SrTemplate::Tid2000,
-            }),
-            measurements: None,
         };
         let profile = SrProfile::of(&result);
         assert_eq!(profile.series_description.as_deref(), Some("LLM Findings"));
-        assert_eq!(profile.title.as_deref(), Some("LLM Findings"));
+        assert!(profile.title.is_none(), "no per-model title exists");
         assert_eq!(profile.template_id, SrTemplate::Tid2000);
 
-        // A result with no sr block still yields a usable profile.
-        let bare = RuleResult { sr: None, ..result };
+        // A result naming no series still yields a usable profile.
+        let bare = RuleResult {
+            series_description: None,
+            ..result
+        };
         let profile = SrProfile::of(&bare);
-        assert!(profile.title.is_none());
+        assert!(profile.series_description.is_none());
         assert_eq!(profile.template_id, SrTemplate::Tid2000);
     }
 }

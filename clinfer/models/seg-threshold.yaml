@@ -1,0 +1,43 @@
+# Segmentation: pixel masks as a DICOM SEG.
+#
+# DISABLED by default. To enable: install numpy and opencv-python
+# (`pip install numpy opencv-python`) - no weights, this is a threshold.
+
+enabled: false
+
+title: "Threshold masker"
+description: "Pixels above a threshold become one binary mask per frame."
+
+provider:
+  name: "SEG-threshold"
+  vendor: "Clarus"
+  version: "1.0"
+
+input_requirements:
+  modalities: [DX, CR, CT]
+  photometric_interpretation: [MONOCHROME1, MONOCHROME2]
+
+output_capabilities:
+  sop_classes: ["1.2.840.10008.5.1.4.1.1.66.4"]
+
+parameters:
+  - code: THRESHOLD
+    type: integer
+    text: "Stored pixel value threshold"
+    default: 128
+    min: 0
+    max: 65535
+
+match:
+  modality: [DX, CR]
+  study_description_contains: ["*chest*"]
+
+runtime:
+  script: "../abi/SEG-threshold.py"
+  interpreter: "python3"
+  timeout_secs: 600
+
+outputs:
+  - kind: seg
+    series_description: "AI Segmentation"
+    profile_version: 1

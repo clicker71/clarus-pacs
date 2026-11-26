@@ -123,7 +123,13 @@ fn scheduled_start_secs(date: &str, time: &str) -> Option<u64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    // `TM` is optional in a worklist query; an absent time means midnight,
+    // `1..=31` is not a calendar: February 31 and April 31 pass it, and
+    // `days_from_civil` then normalises them into the following month. A DA
+    // that names no day (PS3.5 Table 6.2) cannot be interpreted, so the pair
+    // is refused and the caller falls back to the record stamp.
+    if !valid_date(year, month, day) {
+        return None;
+    }
     // which can only make the row look OLDER - never newer than it is.
     let hhmmss = time.split('.').next().unwrap_or("");
     let (hour, minute, second) = match hhmmss.len() {
@@ -146,7 +152,11 @@ fn scheduled_start_secs(date: &str, time: &str) -> Option<u64> {
         return None;
     }
     let days = days_from_civil(year, month, day);
-    Some((days as u64) * SECS_PER_DAY + hour * 3600 + minute * 60 + second)
+    // Same pre-epoch hazard as `parse_stamp_secs`: a negative day count cast
+    // to `u64` becomes a date far in the future, which would make an old row
+    // permanently un-expirable. A pre-1970 schedule is expired by definition.
+    let days = days.max(0) as u64;
+    Some(days * SECS_PER_DAY + hour * 3600 + minute * 60 + second)
 }
 
 /// Sweep the FINAL MPPS rows that are past the window.
@@ -164,7 +174,17 @@ fn sweep_mpps(store: &WorkflowStore, cutoff: u64) -> usize {
         if !MppsRecord::is_final_status(&rec.status) {
             continue;
         }
-        let Some(updated) = rec.updated_at.as_deref().or(rec.created_at.as_deref()) else {
+        // Only `updated_at` dates the FINAL transition. Falling back to
+        // `created_at` measured the step from when it was STARTED, which for a
+        // procedure that ran for a week is arbitrarily older than the moment
+        // the record became final - so a still-recent final report could be
+        // deleted the instant it was written. A final record with no
+        // `updated_at` is left alone: the age of the transition is unknown,
+        // and guessing it is the one thing retention must not do.
+        //
+        // (MWL keeps its creation-time fallback below: a worklist item's age
+        // does not depend on a later transition.)
+        let Some(updated) = rec.updated_at.as_deref() else {
             continue;
         };
         let Some(updated_secs) = parse_stamp_secs(updated) else {
@@ -227,21 +247,66 @@ fn now_secs() -> u64 {
 ///
 /// The inverse of the stamp writer in `handlers::ups_pure::now_stamp`; a
 /// malformed stamp is `None` (the record is then left alone, never guessed at).
+///
+/// The shape is checked EXACTLY, not merely tokenised. `str::parse` accepts
+/// a leading `+`, leading zeros and any magnitude, and a range check of
+/// `1..=12`/`1..=31` accepts a day that the month cannot have - so
+/// `2026-10-11 25:00:00` used to normalise into the NEXT DAY and
+/// `2026-02-31 00:00:00` into March, both of which then compared as a real
+/// instant and could expire a record whose timestamp the policy says must be
+/// treated as malformed. Ten `char`s per field sum to the only digits allowed.
 fn parse_stamp_secs(stamp: &str) -> Option<u64> {
     let (date, time) = stamp.split_once(' ')?;
     let mut d = date.split('-');
-    let year: i64 = d.next()?.parse().ok()?;
-    let month: u32 = d.next()?.parse().ok()?;
-    let day: u32 = d.next()?.parse().ok()?;
+    let year: i64 = exact_num(d.next()?, 4)?.parse().ok()?;
+    let month: u32 = exact_num(d.next()?, 2)?.parse().ok()?;
+    let day: u32 = exact_num(d.next()?, 2)?.parse().ok()?;
+    // A fourth component (`2026-10-11-x`) is not this format.
+    if d.next().is_some() {
+        return None;
+    }
     let mut t = time.split(':');
-    let hour: u64 = t.next()?.parse().ok()?;
-    let minute: u64 = t.next()?.parse().ok()?;
-    let second: u64 = t.next()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    let hour: u64 = exact_num(t.next()?, 2)?.parse().ok()?;
+    let minute: u64 = exact_num(t.next()?, 2)?.parse().ok()?;
+    let second: u64 = exact_num(t.next()?, 2)?.parse().ok()?;
+    if t.next().is_some() {
+        return None;
+    }
+    if !valid_date(year, month, day) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let days = days_from_civil(year, month, day);
-    Some((days as u64) * SECS_PER_DAY + hour * 3600 + minute * 60 + second)
+    // A pre-epoch day count is NEGATIVE (`1969-12-31` is -1), and `as u64`
+    // would turn it into a date ~584 billion years in the future - so every
+    // pre-1970 record read as "not yet expired" and was never deleted.
+    // Retention only ever compares against a cutoff AFTER the epoch, so a
+    // pre-epoch stamp is genuinely expired: clamp to 0 rather than wrap.
+    let days = days.max(0) as u64;
+    Some(days * SECS_PER_DAY + hour * 3600 + minute * 60 + second)
+}
+
+/// `value` if it is exactly `len` ASCII digits, else `None`.
+fn exact_num(value: &str, len: usize) -> Option<&str> {
+    (value.len() == len && value.bytes().all(|b| b.is_ascii_digit())).then_some(value)
+}
+
+/// Whether `(year, month, day)` names a day that exists on the calendar.
+///
+/// PS3.5 Table 6.2 types DA as `YYYYMMDD` with a real day-of-month; a
+/// February 31 is not a date, so a stamp carrying one cannot be interpreted.
+fn valid_date(year: i64, month: u32, day: u32) -> bool {
+    if !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let last = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    day <= last
 }
 
 /// Days since 1970-01-01 for a proleptic-Gregorian date.
@@ -274,6 +339,57 @@ mod tests {
         assert_eq!(parse_stamp_secs("2026-10-11"), None);
     }
 
+    /// An out-of-range clock component must be REFUSED, not normalised into
+    /// the next day. `2026-10-11 25:00:00` parsed to `2026-10-12 01:00:00`,
+    /// which then compared as a real instant and could expire a record whose
+    /// timestamp the policy says must be treated as malformed.
+    #[test]
+    fn an_impossible_clock_or_calendar_date_is_refused() {
+        for bad in [
+            "2026-10-11 25:00:00",
+            "2026-10-11 23:60:00",
+            "2026-10-11 23:00:60",
+            // Days that no month has.
+            "2026-02-31 00:00:00",
+            "2026-04-31 00:00:00",
+            "2026-06-31 00:00:00",
+            // 2026 is not a leap year, so there is no 29 February.
+            "2026-02-29 00:00:00",
+            // A day of zero.
+            "2026-10-00 00:00:00",
+            // Non-numeric or wrongly padded fields.
+            "2026-1-11 00:00:00",
+            "2026-10-11T00:00:00",
+            "2026-10-11 00:00:00junk",
+        ] {
+            assert_eq!(parse_stamp_secs(bad), None, "{bad} must be refused");
+        }
+        // A real leap day in a leap year is still a date.
+        assert!(parse_stamp_secs("2024-02-29 12:00:00").is_some());
+    }
+
+    /// A PRE-EPOCH stamp must not wrap into the far future.
+    ///
+    /// `days_from_civil` returns a negative count for any date before
+    /// 1970-01-01, and `as u64` turned that into a date roughly 584 billion
+    /// years ahead. Every such record compared as "not yet expired" and was
+    /// never deleted - the exact opposite of what an old timestamp means.
+    #[test]
+    fn a_pre_epoch_stamp_is_treated_as_expired_not_as_the_future() {
+        // The DAY count clamps to the epoch; the time of day is kept, so the
+        // value stays in the first day rather than wrapping to the far future.
+        assert_eq!(parse_stamp_secs("1969-12-31 00:00:00"), Some(0));
+        assert_eq!(parse_stamp_secs("1969-12-31 23:59:59"), Some(86_399));
+        assert_eq!(parse_stamp_secs("1960-01-01 00:00:00"), Some(0));
+        // One second AFTER the epoch is still a real, small value.
+        assert_eq!(parse_stamp_secs("1970-01-01 00:00:01"), Some(1));
+        // The property that matters: no pre-epoch stamp can land past the
+        // epoch, which is what the old `as u64` cast produced.
+        for stamp in ["1969-12-31 00:00:00", "1950-06-15 12:00:00"] {
+            assert!(parse_stamp_secs(stamp).expect("parsed") < SECS_PER_DAY);
+        }
+    }
+
     #[test]
     fn scheduled_start_secs_reads_the_dicom_forms() {
         // Midnight on a known day, and the same day with a time.
@@ -301,6 +417,68 @@ mod tests {
         assert_eq!(scheduled_start_secs("19701301", "000000"), None);
         assert_eq!(scheduled_start_secs("19700101", "250000"), None);
         assert_eq!(scheduled_start_secs("19700101", "xx"), None);
+        // A DA that names no day on the calendar: `1..=31` accepted it and
+        // `days_from_civil` then normalised it into the next month.
+        assert_eq!(scheduled_start_secs("20260231", "000000"), None);
+        assert_eq!(scheduled_start_secs("20260431", "000000"), None);
+        // 2026 is not a leap year.
+        assert_eq!(scheduled_start_secs("20260229", "000000"), None);
+        // A real leap day is a date.
+        assert!(scheduled_start_secs("20240229", "000000").is_some());
+    }
+
+    /// A pre-epoch DA must not wrap into the far future on the MWL path
+    /// either - the same `as u64` cast lived in both converters.
+    #[test]
+    fn a_pre_epoch_schedule_is_expired_not_far_future() {
+        assert_eq!(scheduled_start_secs("19691231", "000000"), Some(0));
+        assert_eq!(scheduled_start_secs("19700101", "000000"), Some(0));
+        assert_eq!(scheduled_start_secs("19700102", "000000"), Some(86_400));
+    }
+
+    /// A final MPPS record with no `updated_at` must NOT be expired from
+    /// `created_at`.
+    ///
+    /// `created_at` dates when the step STARTED, not when it became final. A
+    /// long procedure (or one whose N-SET left the write stamp empty) could
+    /// therefore be deleted the instant its final report was written, because
+    /// the age measured from the start already exceeded the window. The age of
+    /// the FINAL transition is unknown in that case, and retention must not
+    /// guess - so the record is kept.
+    #[test]
+    fn a_final_mpps_without_an_update_stamp_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = WorkflowStore::new(dir.path().to_path_buf());
+        let now = now_secs();
+        let ancient = format_stamp(now.saturating_sub(365 * SECS_PER_DAY));
+
+        let rec = clarus_core::workflow::MppsRecord {
+            mpps_uid: "1.2.840.9.6.1".to_string(),
+            status: "COMPLETED".to_string(),
+            created_at: Some(ancient),
+            updated_at: None,
+            ..Default::default()
+        };
+        store.put_mpps(&rec).expect("seed final record");
+
+        // A cutoff far newer than `created_at`: the old rule would delete it.
+        let cutoff = now.saturating_sub(7 * SECS_PER_DAY);
+        assert_eq!(
+            sweep_mpps(&store, cutoff),
+            0,
+            "an unknown final-transition age must not be guessed from created_at"
+        );
+        assert!(
+            store.find_mpps("1.2.840.9.6.1").expect("read").is_some(),
+            "the record survives"
+        );
+
+        // With a real `updated_at` inside the window it IS swept, so the
+        // guard above is about the missing stamp, not a blanket exemption.
+        let mut aged = rec.clone();
+        aged.updated_at = Some(format_stamp(now.saturating_sub(30 * SECS_PER_DAY)));
+        store.put_mpps(&aged).expect("update stamp");
+        assert_eq!(sweep_mpps(&store, cutoff), 1, "a known age is swept");
     }
 
     /// A worklist row scheduled in the FUTURE must outlive its filing age.

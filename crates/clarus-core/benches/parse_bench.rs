@@ -37,7 +37,14 @@ fn bench_head_parse(c: &mut Criterion) {
     c.bench_function("http_head_parse/200b", |b| {
         b.iter(|| {
             let (mut head, line_end) = parse_request_line(black_box(&req)).expect("request line");
-            black_box(parse_headers(&mut head, black_box(&req[line_end + 2..])).expect("headers"));
+            // `head` is populated by `parse_headers`, but only its byte count
+            // was ever handed to `black_box`. With cross-crate inlining the
+            // compiler is then free to treat the field stores as dead and
+            // delete the very work this benchmark exists to measure, so the
+            // head itself is observed too.
+            let consumed =
+                parse_headers(&mut head, black_box(&req[line_end + 2..])).expect("headers");
+            black_box((&head, consumed));
         });
     });
 }

@@ -1,21 +1,31 @@
 // Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
 
-//! gate: byte-for-byte SQLite <-> B-tree QIDO agreement under random input.
+//! gate: manifest round trip and scan agreement under random input.
 //!
-//! Answering QIDO from the B-tree tier (CBOR
-//! manifests + query engine) is byte-identical to answering it from SQLite.
-//! The library is DB-free, so this test models the two tiers explicitly:
+//! SCOPE, stated precisely: this is NOT an SQLite-parity gate, and it cannot
+//! be one. The "reference" below is an in-memory vector filtered by the SAME
+//! `QueryFilter` predicate the engine runs, and rendered by the SAME JSON
+//! writer. A filter that wrongly excludes a study on both sides, or a writer
+//! that omits a field on both sides, agrees with itself and passes. What the
+//! property genuinely proves is narrower and still valuable:
 //!
-//! - **SQLite reference** - an in-memory vector of study attribute sets (the
-//!   `Study` rows SQLite would return), filtered by the same `QueryFilter`
-//!   predicate logic the engine uses.
+//! - the CBOR codec round-trips a randomly built study without losing or
+//!   altering an attribute, and
+//! - the B-tree scan selects and renders exactly what the in-memory model of
+//!   those same records selects and renders.
+//!
+//! Comparing against real SQLite output (or any independent reference) would
+//! be the way to make a parity claim; that is out of scope here.
+//!
+//! - **Reference model** - an in-memory vector of study attribute sets,
+//!   filtered by the same `QueryFilter` predicate logic the engine uses.
 //! - **B-tree tier** - each study written as a CBOR manifest via the STOW
 //!   producer, then read back through `StudyScanner`.
 //!
 //! For a random population and a random query, the property asserts that the
 //! **set of matching study UIDs is identical** and that the **streamed JSON
-//! bytes for each study are identical** between the two tiers. Filters that
-//! produce nothing on either side must agree too.
+//! bytes for each study are identical** between the model and the scan.
+//! Filters that produce nothing on either side must agree too.
 //!
 //! Deterministic empty-field generation (B-007) guarantees both tiers name the
 //! same `StudyInstanceUID`, so the study sets are directly comparable.
@@ -409,9 +419,10 @@ fn model_to_instance_record(m: &InstanceModel) -> clarus_core::manifest::Instanc
 proptest! {
     #![proptest_config(ProptestConfig::default())]
 
-    /// SQLite and B-tree must answer QIDO identically (set + byte-for-byte JSON).
+    /// The B-tree scan and the in-memory model must answer a study query
+    /// identically (set + byte-for-byte JSON).
     #[test]
-    fn sqlite_and_btree_agree(
+    fn manifest_scan_matches_the_model(
         pop in proptest::collection::vec(arb_study(), 0..6),
         filter in arb_filter(),
     ) {
@@ -436,7 +447,7 @@ proptest! {
         let scanner = StudyScanner::new(manifests, idx);
         let (btree, _) = scanner.search(&filter).unwrap();
 
-        // -- SQLite reference: filter the in-memory population --
+        // -- Reference model: filter the in-memory population --
         // The B-tree tier (scan.rs::search) sorts /studies by
         // (study_date ASC, study_uid ASC): numeric 8-digit YYYYMMDD, missing
         // date last (u64::MAX), UID tiebreak. The reference here must sort
@@ -466,7 +477,7 @@ proptest! {
 
         // -- Compare the matched study UID sets --
         let btree_uids: Vec<String> = btree.iter().map(|r| r.study_uid.clone()).collect();
-        prop_assert_eq!(&btree_uids, &ref_uids, "B-tree and SQLite question UID sets differ");
+prop_assert_eq!(&btree_uids, &ref_uids, "B-tree and model study UID sets differ");
 
         // -- Byte-for-byte JSON for a matched subset --
         // Both tiers stream from the same attrs through the same writer, so any
@@ -488,20 +499,23 @@ proptest! {
             prop_assert_eq!(
                 &buf_btree[..n_btree],
                 &buf_ref[..n_ref],
-                "streamed JSON differs between SQLite reference and B-tree"
+                "streamed JSON differs between the model and the B-tree scan"
             );
         }
     }
 
     /// series + instance QIDO must agree between the B-tree search path
-    /// and the in-memory SQLite-parity reference: same match set, same sort
+    /// and the in-memory reference model: same match set, same sort
     /// order, byte-for-byte JSON. Runs the full decode -> filter -> sort ->
     /// write pipeline in memory (no disk), so a 10 000+ case sweep is fast.
     #[test]
-    fn sqlite_and_btree_agree_series_instances(
+    fn scan_and_model_agree_on_series_and_instances(
         series in proptest::collection::vec(arb_series(), 0..6),
         sfilter in arb_series_filter(),
         ifilter in arb_instance_filter(),
+        // Forces the POSITIVE branch below: 0 = keep the generated filter,
+        // 1 = aim the UID key at a series that will exist.
+        aim_at_existing in 0u8..2,
     ) {
         let attrs = Attrs {
             patient_name: Some("PROP".to_string()),
@@ -518,9 +532,27 @@ proptest! {
         for (i, s) in series.iter_mut().enumerate() {
             s.series_instance_uid = format!("1.2.840.{i}");
         }
-        // -- B-tree tier: build the in-memory manifest (same encoding the
-        // manifest writer / recovery path would commit to disk) --
-        let manifest = clarus_core::stow::build_manifest_full(&attrs, &series);
+        // `arb_series_filter` builds UIDs of the form `1.2.840.<random>`, which
+        // never equals the `1.2.840.<i>` names assigned above. Left alone, every
+        // UID filter therefore MISSED, both sides agreed on the empty set, and
+        // every instance assertion below was skipped by the `is_some` guard -
+        // the property was vacuous half the time. This branch points the key at
+        // a UID that actually exists, so the positive path is exercised; the
+        // generated value is still used when `aim_at_existing == 0`, keeping an
+        // intentional-miss branch.
+        let mut sfilter = sfilter;
+        if aim_at_existing == 1 && !series.is_empty() {
+            sfilter.series_instance_uid = Some(series[0].series_instance_uid.clone());
+        }
+        // -- B-tree tier: build the in-memory manifest, then ROUND-TRIP it
+        // through the codec before searching. Searching the struct the builder
+        // returned would pass even if encode/decode dropped a series or an
+        // instance attribute: the scan would be reading the very model the
+        // reference was derived from. The decoded form is what production
+        // reads back off disk. --
+        let built = clarus_core::stow::build_manifest_full(&attrs, &series);
+        let encoded = built.encode().expect("encode");
+        let manifest = clarus_core::manifest::read_manifest_at(&encoded).expect("decode");
 
         // -- Reference tier: filter + sort the in-memory models --
         let mut ref_series: Vec<&SeriesModel> = series
@@ -648,7 +680,10 @@ proptest! {
 
         // Index path: attach a RAM index built from the same manifests.
         let mut with_index = scan.clone();
-        with_index.attach_index(clarus_core::query::StudyQidoIndex::build_from_dir(&manifests));
+        let (index, corrupt) =
+            clarus_core::query::StudyQidoIndex::build_with_corrupt(&manifests);
+        prop_assert_eq!(corrupt, 0, "the generated manifests are all readable");
+        with_index.attach_index(index);
         let (index_res, _) = with_index.search(&filter).expect("index-path search");
 
         // Same matched UID set + order.

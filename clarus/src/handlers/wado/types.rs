@@ -9,30 +9,62 @@
 
 #![forbid(unsafe_code)]
 
-/// URL-decode a percent-encoded query value (`%XX` and `+` -> space).
+/// URL-decode a percent-encoded form value (`%XX`, and `+` -> space).
 ///
-/// Precedent: the `url_decode` helper in `qido_pure.rs`.
+/// This is the application/x-www-form-urlencoded rule, which is what the
+/// WADO-URI and WADO-RS query parsers here use. It is deliberately NOT
+/// `json_common::form_decode_query_str`: that one keeps `+` literal, because
+/// PS3.18 8.3.1 lists `+` in `qp-special` for DICOMweb query values. The two
+/// contracts differ, so the two functions stay separate.
+///
+/// A `%` starts an escape ONLY when the next two bytes are both ASCII hex
+/// digits; otherwise it is a literal `%`. The old code consumed the next two
+/// bytes unconditionally and pushed NOTHING when they were not hex, so
+/// `1.2%GG3` decoded to `1.23` - a different, perfectly valid UID that selected
+/// a different instance. Leaving `%GG` intact lets UID validation reject the
+/// value instead of silently reinterpreting it.
 pub fn url_decode(s: &str) -> String {
-    let mut result = Vec::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next().unwrap_or(b'0');
-            let lo = chars.next().unwrap_or(b'0');
-            if let Ok(decoded) =
-                u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap_or("00"), 16)
-            {
-                result.push(decoded);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let (hi, lo) = (bytes[i + 1], bytes[i + 2]);
+                if hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit() {
+                    out.push((hex_val(hi) << 4) | hex_val(lo));
+                    i += 3;
+                } else {
+                    // Not an escape: keep the '%' and advance by ONE, so the
+                    // bytes after it are revisited as ordinary input.
+                    out.push(b'%');
+                    i += 1;
+                }
             }
-        } else if b == b'+' {
-            result.push(b' ');
-        } else {
-            result.push(b);
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
         }
     }
     // UTF-8 multi-byte sequences decode into BYTES, not Latin-1 scalars:
     // %D0%BC is "м", not "Ð¼".
-    String::from_utf8_lossy(&result).into_owned()
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Value of one ASCII hex digit (0-15). The caller has already checked it is
+/// Value of one ASCII hex digit (0-15). The caller has already checked it is
+/// hex, so this cannot fail.
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => b - b'A' + 10,
+    }
 }
 
 /// Decode a query string into `(key, value)` pairs (both URL-decoded).
@@ -220,31 +252,100 @@ fn fit_in_box(src_w: u32, src_h: u32, box_w: u32, box_h: u32) -> (u32, u32) {
 ///
 /// Returns `None` if no `transfer-syntax` parameter is found or the header
 /// is missing/malformed.
+///
+/// The range's `q` value decides the ORDER, not the presence: PS3.18 10.4.3.1
+/// says the origin server "shall" return a representation acceptable to the
+/// client, and RFC 9110 12.5.1 makes `q` the client's relative preference. So
+/// `transfer-syntax=...4.50;q=0, ...1.2.1;q=1` asks for Explicit VR LE, and
+/// returning the JPEG Baseline range because it was listed first ignores the
+/// client. `q=0` means "not acceptable" (RFC 9110 12.5.1), so such a range is
+/// never selected.
 pub fn extract_transfer_syntax_from_accept_str(accept: Option<&str>) -> Option<String> {
     let accept = accept?;
+    let mut best: Option<(u16, &str)> = None;
     // RFC 9110 8.3: media ranges are comma-separated and each carries its own
     // parameter list, so split on ',' FIRST - a `transfer-syntax` in one range
     // must not leak across a range boundary. Within a range, parameters are
     // ';'-separated `name=value` pairs; the first segment is the media type
     // itself (no '='), so it is skipped by `split_once`.
     for range in accept.split(',') {
+        let mut transfer_syntax: Option<&str> = None;
+        let mut weight: u16 = 1000;
         for param in range.split(';') {
             let Some((name, value)) = param.split_once('=') else {
                 continue;
             };
             // Parameter names are case-insensitive and may be padded around
             // '=' (RFC 9110 5.6.1); the value may be quoted.
-            if name.trim().eq_ignore_ascii_case("transfer-syntax") {
-                return Some(value.trim().trim_matches('"').trim().to_string());
+            let name = name.trim();
+            let value = value.trim().trim_matches('"').trim();
+            if name.eq_ignore_ascii_case("transfer-syntax") {
+                transfer_syntax = Some(value);
+            } else if name.eq_ignore_ascii_case("q") {
+                // An unparsable q makes the range unusable: falling back to
+                // 1.0 would silently promote a range the client marked down.
+                match crate::handlers::accept::parse_weight_pub(value) {
+                    Some(w) => weight = w,
+                    None => {
+                        transfer_syntax = None;
+                        break;
+                    }
+                }
             }
         }
+        let Some(uid) = transfer_syntax else {
+            continue;
+        };
+        // RFC 9110 12.5.1: `q=0` means "not acceptable at all".
+        if weight == 0 {
+            continue;
+        }
+        // `>` not `>=`: among equal weights the first range listed wins, which
+        // keeps the selection deterministic and matches the client's own order.
+        if best.is_none_or(|(w, _)| weight > w) {
+            best = Some((weight, uid));
+        }
     }
-    None
+    best.map(|(_, uid)| uid.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A malformed escape must be PRESERVED, not deleted.
+    ///
+    /// `1.2%GG3` used to decode to `1.23`: the decoder consumed `%GG`, failed
+    /// to read it as hex, and pushed nothing. The result is a different, valid
+    /// UID that selects a different instance, so a typo in the request silently
+    /// retrieved someone else's object.
+    #[test]
+    fn a_malformed_percent_escape_is_preserved() {
+        assert_eq!(url_decode("1.2%GG3"), "1.2%GG3", "a bad escape is literal");
+        assert_eq!(url_decode("%G1"), "%G1");
+        assert_eq!(url_decode("%1G"), "%1G");
+        // A trailing or dangling '%' stays.
+        assert_eq!(url_decode("abc%"), "abc%");
+        assert_eq!(url_decode("%"), "%");
+        assert_eq!(url_decode("%2"), "%2");
+        // The value must not become a VALID uid by losing bytes.
+        assert_ne!(url_decode("1.2%GG3"), "1.23");
+    }
+
+    /// Valid escapes still decode, including one at the very end.
+    #[test]
+    fn a_valid_percent_escape_still_decodes() {
+        assert_eq!(url_decode("%2E"), ".");
+        assert_eq!(url_decode("1%2E2%2E3"), "1.2.3");
+        // Mixed case hex is legal. `%AB` alone is a bare byte that is not valid
+        // UTF-8, so the lossy conversion replaces it - what matters here is
+        // that the escape was CONSUMED, not that the byte was a character.
+        assert_eq!(url_decode("%2e"), ".");
+        assert_eq!(url_decode("%AB"), "\u{fffd}", "a lone byte is not UTF-8");
+        // A literal '%' followed by a real escape: only the escape is consumed.
+        assert_eq!(url_decode("a%25b"), "a%b");
+        assert_eq!(url_decode("%25%41"), "%A");
+    }
 
     /// The `transfer-syntax` value ends at the next `;`, because the parameters
     /// are split on it. A trailing `q=` therefore cannot leak into the UID.
@@ -299,6 +400,77 @@ mod tests {
                 "multipart/related; Transfer-Syntax = 1.2.840.10008.1.2.1"
             )),
             Some("1.2.840.10008.1.2.1".to_string())
+        );
+    }
+
+    /// `q` decides which range wins, not the order they are listed in.
+    ///
+    /// PS3.18 10.4.3.1 requires a representation the client finds acceptable
+    /// and RFC 9110 12.5.1 makes `q` that preference. A client asking for
+    /// JPEG Baseline first at `q=0` and Explicit VR LE second at `q=1` wants
+    /// Explicit VR LE; the previous implementation returned the first range
+    /// carrying the parameter, i.e. the one the client refused.
+    #[test]
+    fn the_highest_weighted_transfer_syntax_wins() {
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; type=\"application/dicom\"; \
+                 transfer-syntax=1.2.840.10008.1.2.4.50; q=0, \
+                 multipart/related; type=\"application/dicom\"; \
+                 transfer-syntax=1.2.840.10008.1.2.1; q=1"
+            )),
+            Some("1.2.840.10008.1.2.1".to_string()),
+            "the q=1 range beats the q=0 range it follows"
+        );
+        // Same header with the weights swapped must select the other UID, so
+        // the choice really follows `q` and is not a fixed position.
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; type=\"application/dicom\"; \
+                 transfer-syntax=1.2.840.10008.1.2.4.50; q=1, \
+                 multipart/related; type=\"application/dicom\"; \
+                 transfer-syntax=1.2.840.10008.1.2.1; q=0"
+            )),
+            Some("1.2.840.10008.1.2.4.50".to_string())
+        );
+    }
+
+    /// `q=0` alone means "not acceptable" (RFC 9110 12.5.1), so no syntax is
+    /// selected and the caller falls back to the stored transfer syntax.
+    #[test]
+    fn a_zero_weighted_transfer_syntax_is_not_selected() {
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; type=\"application/dicom\"; \
+                 transfer-syntax=1.2.840.10008.1.2.4.80; q=0"
+            )),
+            None
+        );
+    }
+
+    /// Equal weights keep the client's own order (the first listed wins), so
+    /// the selection is deterministic.
+    #[test]
+    fn equal_weights_keep_the_listed_order() {
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; transfer-syntax=1.2.840.10008.1.2.1; q=0.5, \
+                 multipart/related; transfer-syntax=1.2.840.10008.1.2.4.80; q=0.5"
+            )),
+            Some("1.2.840.10008.1.2.1".to_string())
+        );
+    }
+
+    /// An unparsable `q` drops that range instead of promoting it to 1.0.
+    #[test]
+    fn a_malformed_weight_drops_the_range() {
+        assert_eq!(
+            extract_transfer_syntax_from_accept_str(Some(
+                "multipart/related; transfer-syntax=1.2.840.10008.1.2.4.80; q=5, \
+                 multipart/related; transfer-syntax=1.2.840.10008.1.2.1; q=0.1"
+            )),
+            Some("1.2.840.10008.1.2.1".to_string()),
+            "the q=5 range is invalid and must not outrank the q=0.1 range"
         );
     }
 }

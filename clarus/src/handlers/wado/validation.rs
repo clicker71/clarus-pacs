@@ -87,6 +87,26 @@ pub fn validate_dicom_uid(uid: &str) -> Result<(), WadoError> {
         return Err(WadoError::InvalidUid(uid.to_string()));
     }
 
+    // Check 8: COMPONENT rules, not just the character set.
+    //
+    // PS3.5 9.1 (`standard/ps3.5/uid-encoding-rules.json`, UID-1/UID-2):
+    // every component is "one or more digits", and its first digit must not be
+    // zero unless the component is a single digit. The character checks above
+    // admit `.1`, `1.` and `1.02`, which are all malformed but pass the lookup
+    // - so an invalid UID became a 404 "not found" instead of the correct
+    // 400-class InvalidUid.
+    for component in uid.split('.') {
+        if component.is_empty() {
+            // Leading, trailing or doubled '.'. UID-1.
+            return Err(WadoError::InvalidUid(uid.to_string()));
+        }
+        // UID-1 is already implied by the digits-only check above, but the
+        // leading-zero rule is new: multi-digit components may not start '0'.
+        if component.len() > 1 && component.starts_with('0') {
+            return Err(WadoError::InvalidUid(uid.to_string()));
+        }
+    }
+
     Ok(())
 }
 
@@ -101,6 +121,48 @@ mod tests {
         assert!(validate_dicom_uid("1.2.840.10008.5.1.4.1.1.2").is_ok());
         assert!(validate_dicom_uid("1.2.840.113619.2.5.1762383155.1317.1160492719").is_ok());
         assert!(validate_dicom_uid("1").is_ok());
+        // A single-digit component may be ZERO (PS3.5 9.1 UID-2), and a
+        // multi-digit component may not start with one.
+        assert!(
+            validate_dicom_uid("1.0.2").is_ok(),
+            "single-digit zero is legal"
+        );
+        assert!(validate_dicom_uid("0").is_ok(), "a lone zero is legal");
+    }
+
+    /// Component structure is checked, not just the character set.
+    ///
+    /// PS3.5 9.1 UID-1/UID-2 (`standard/ps3.5/uid-encoding-rules.json`): each
+    /// component is one or more digits, and its first digit is not zero unless
+    /// it is a single-digit component. `.1`, `1.` and `1.02` passed the
+    /// digits-and-dots check, so an invalid UID reached lookup and answered
+    /// "not found" instead of being refused.
+    #[test]
+    fn test_uid_component_structure() {
+        // Empty components: leading, trailing, doubled.
+        assert!(validate_dicom_uid(".1").is_err(), "leading empty component");
+        assert!(
+            validate_dicom_uid("1.").is_err(),
+            "trailing empty component"
+        );
+        assert!(validate_dicom_uid("1..2").is_err(), "doubled dot");
+        assert!(validate_dicom_uid(".").is_err());
+        // Leading zero in a MULTI-digit component.
+        assert!(validate_dicom_uid("1.02").is_err(), "leading zero in '02'");
+        assert!(validate_dicom_uid("007").is_err(), "leading zeros");
+        assert!(validate_dicom_uid("1.2.03.4").is_err());
+        // The single-digit-zero form stays valid, so the fix is not a blanket
+        // ban on zeros inside a UID.
+        assert!(validate_dicom_uid("1.2.0.4").is_ok());
+        // A 64-char UID is still accepted; 65 is not. Built from exact pieces
+        // so the length is arithmetic, not hand-counted.
+        let ok64 = format!("1.{}1", "2".repeat(61));
+        assert_eq!(ok64.len(), 64, "fixture is exactly 64");
+        assert!(validate_dicom_uid(&ok64).is_ok());
+        assert!(validate_dicom_uid(&format!("{ok64}5")).is_err());
+        // Path separators are still refused.
+        assert!(validate_dicom_uid("1.2/3").is_err());
+        assert!(validate_dicom_uid("1.2\\3").is_err());
     }
 
     #[test]

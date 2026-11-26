@@ -24,7 +24,7 @@ use crate::handlers::json_common::{JsonVal, err_msg_json, push_json_str};
 use crate::handlers::ups::json::extract_tag;
 use crate::handlers::ups_pure::{now_stamp, single_dataset};
 use crate::handlers::workflow_response::{
-    WorkflowErr, WorkflowResp, bad_request, duplicate_instance, not_found,
+    HTTP_CREATED, HTTP_OK, WorkflowErr, WorkflowResp, bad_request, duplicate_instance, not_found,
 };
 use crate::state::AppState;
 
@@ -57,13 +57,56 @@ fn extract_performed_series(obj: &JsonVal) -> Option<Vec<PerformedSeries>> {
     let mut out = Vec::new();
     for item in items {
         let series_instance_uid = extract_tag(item, "0020000E").unwrap_or_default();
+        // Series Instance UID (0020,000E) is Type 1 inside the item (PS3.4 F.7
+        // performed-series item, `standard/ps3.4/mpps-f.7-state-attributes.json`):
+        // a supplied item without a valid UID names no series. Filling it with
+        // an empty string let the non-empty-sequence check pass while the
+        // record carried a series that does not exist, and the final state then
+        // locked the step against correction through N-SET.
+        if series_instance_uid.is_empty() {
+            return None;
+        }
         let references = extract_references(item);
+        let non_image_refs = extract_non_image_references(item);
         out.push(PerformedSeries {
             series_instance_uid,
             references,
+            non_image_refs,
         });
     }
     Some(out)
+}
+
+/// Read the (0040,0220) > (0008,1150)/(0008,1155) pairs of one performed
+/// series item.
+///
+/// (0040,0220) Referenced Non-Image Composite Object Sequence is where a
+/// modality records a NON-image composite it produced (SR, Presentation State,
+/// a structured report). PS3.4 Table F.7.2-1 gives it its own sequence beside
+/// Referenced Image Sequence (0008,1140), so the two are stored apart: folding
+/// them together would report a report as an image.
+fn extract_non_image_references(item: &JsonVal) -> Vec<MppsReference> {
+    let Some(items) = item
+        .obj_get("00400220")
+        .and_then(|s| s.obj_get("Value"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for it in items {
+        let sop_instance_uid = extract_tag(it, "00081155").unwrap_or_default();
+        // A reference with no instance UID names nothing, the same rule the
+        // image list applies.
+        if sop_instance_uid.is_empty() {
+            continue;
+        }
+        out.push(MppsReference {
+            sop_class_uid: extract_tag(it, "00081150").unwrap_or_default(),
+            sop_instance_uid,
+        });
+    }
+    out
 }
 
 /// Read the (0008,1150)/(0008,1155) reference pairs out of one Performed
@@ -116,15 +159,18 @@ fn extract_study_uid(obj: &JsonVal) -> Option<String> {
     items.first().and_then(|item| extract_tag(item, "0020000D"))
 }
 
-/// Read the discontinuation reason out of (0040,0281) > (0040,0282).
+/// Read the discontinuation reason out of (0040,0281) > (0008,0100).
 ///
-/// (0040,0281) is a Code Sequence: the reason is the Code Value of its first
-/// item. Reading the outer element with the scalar helper cannot work, because
-/// its `Value` holds items, not strings.
+/// (0040,0281) is a Code Sequence, so its first item is a Code Sequence Macro
+/// (PS3.3 Table 8.8-1, `standard/ps3.3/code-sequence-macro-8.8-1.json`): the
+/// reason is the item's Code Value (0008,0100) VR SH, with Coding Scheme
+/// Designator (0008,0102) and Code Meaning (0008,0104) beside it. Reading the
+/// outer element with the scalar helper cannot work, because its `Value` holds
+/// items, not strings.
 fn extract_code_reason(obj: &JsonVal) -> Option<String> {
     let seq = obj.obj_get("00400281")?;
     let items = seq.obj_get("Value").and_then(|v| v.as_array())?;
-    items.first().and_then(|item| extract_tag(item, "00400282"))
+    items.first().and_then(|item| extract_tag(item, "00080100"))
 }
 
 /// `POST /dicomweb/modality-performed-procedure-steps/{mppsUID}` - N-CREATE.
@@ -191,7 +237,12 @@ pub fn create(
         "created",
         rec.status
     );
-    render(201, &rec, accept)
+    let _ = accept;
+    // PS3.18 15.4.3.3: a successful Create carries NO payload - the record is
+    // retrieved with GET. Returning the dataset here made a 201 look like a
+    // retrieve, and a client that parsed the body as the created resource
+    // could not tell it from a 200.
+    Ok(WorkflowResp::empty(HTTP_CREATED))
 }
 
 /// `POST .../modality-performed-procedure-steps/{mppsUID}?update` - N-SET.
@@ -306,7 +357,7 @@ pub fn update(
         previous,
         rec.status
     );
-    render(200, &rec, accept)
+    render(HTTP_OK, &rec, accept)
 }
 
 /// `GET .../modality-performed-procedure-steps/{mppsUID}` - N-GET.
@@ -420,20 +471,19 @@ fn write_mpps_json(out: &mut Vec<u8>, rec: &MppsRecord) {
         push_json_str(out, study_uid);
         out.extend_from_slice(b"],\"vr\":\"UI\"}}],\"vr\":\"SQ\"}");
     }
-    // (0040,0281) is a SEQUENCE whose first item carries the reason text in
-    // (0040,0282) Code Value. It used to be rendered as a bare string under
-    // vr SQ, which is not a legal DICOM JSON sequence at all: PS3.18 F.2.5
-    // makes a sequence's Value an array of ITEMS, and a JSON string is not an
-    // item. A reader that validates the payload rejects the whole instance,
-    // so the shape has to match the VR the tag declares.
+    // (0040,0281) is a Code Sequence: PS3.3 Table 8.8-1 puts the reason in the
+    // item's Code Value (0008,0100) VR SH. It used to be rendered under
+    // (0040,0282) - a tag the Code Sequence Macro does not define - so a
+    // conformant reader found no code and this server could not round-trip the
+    // reason it had accepted.
     if let Some(reason) = &rec.discontinuation_reason {
         if wrote {
             out.push(b',');
         }
         wrote = true;
-        out.extend_from_slice(b"\"00400281\":{\"Value\":[{\"00400282\":{\"Value\":[");
+        out.extend_from_slice(b"\"00400281\":{\"Value\":[{\"00080100\":{\"Value\":[");
         push_json_str(out, reason);
-        out.extend_from_slice(b"],\"vr\":\"LO\"}}],\"vr\":\"SQ\"}");
+        out.extend_from_slice(b"],\"vr\":\"SH\"}}],\"vr\":\"SQ\"}");
     }
     // (0040,0340) the performed series references.
     if let Some(series) = &rec.performed_series {
@@ -458,6 +508,25 @@ fn write_mpps_json(out: &mut Vec<u8>, rec: &MppsRecord) {
             if !s.references.is_empty() {
                 out.extend_from_slice(b",\"00081140\":{\"Value\":[");
                 for (j, r) in s.references.iter().enumerate() {
+                    if j > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(b"{\"00081150\":{\"Value\":[");
+                    push_json_str(out, &r.sop_class_uid);
+                    out.extend_from_slice(b"],\"vr\":\"UI\"},\"00081155\":{\"Value\":[");
+                    push_json_str(out, &r.sop_instance_uid);
+                    out.extend_from_slice(b"],\"vr\":\"UI\"}");
+                    out.push(b'}');
+                }
+                out.extend_from_slice(b"],\"vr\":\"SQ\"}");
+            }
+            // (0040,0220) Referenced Non-Image Composite Object Sequence - a
+            // SEPARATE sequence from the image list (PS3.4 Table F.7.2-1), so
+            // a structured report the performer recorded here is not reported
+            // as an image.
+            if !s.non_image_refs.is_empty() {
+                out.extend_from_slice(b",\"00400220\":{\"Value\":[");
+                for (j, r) in s.non_image_refs.iter().enumerate() {
                     if j > 0 {
                         out.push(b',');
                     }
@@ -506,16 +575,15 @@ fn mpps_to_xml(rec: &MppsRecord) -> String {
         xml_value(&mut out, "0020000D", "UI", Some(study_uid));
         out.push_str("</Item></DicomAttribute>");
     }
-    // Same sequence shape as the JSON renderer: vr="SQ" means Items, and the
-    // reason text lives in (0040,0282) inside the first one (PS3.18 F.2.5
-    // makes the DICOM-XML and JSON Models agree item for item).
+    // Same sequence shape as the JSON renderer: a Code Item whose Code Value
+    // (0008,0100, VR SH) carries the reason (PS3.3 Table 8.8-1).
     if let Some(reason) = &rec.discontinuation_reason {
         out.push_str(
             "<DicomAttribute tag=\"00400281\" vr=\"SQ\" \
              keyword=\"PerformedProcedureStepDiscontinuationReasonCodeSequence\">",
         );
         out.push_str("<Item number=\"1\">");
-        xml_value(&mut out, "00400282", "LO", Some(reason));
+        xml_value(&mut out, "00080100", "SH", Some(reason));
         out.push_str("</Item></DicomAttribute>");
     }
     if let Some(series) = &rec.performed_series {
@@ -535,6 +603,21 @@ fn mpps_to_xml(rec: &MppsRecord) -> String {
                      keyword=\"ReferencedImageSequence\">",
                 );
                 for (j, r) in s.references.iter().enumerate() {
+                    out.push_str(&format!("<Item number=\"{}\">", j + 1));
+                    xml_value(&mut out, "00081150", "UI", Some(&r.sop_class_uid));
+                    xml_value(&mut out, "00081155", "UI", Some(&r.sop_instance_uid));
+                    out.push_str("</Item>");
+                }
+                out.push_str("</DicomAttribute>");
+            }
+            // Same separate sequence the JSON renderer emits (PS3.18 F.2.5
+            // makes the two models agree item for item).
+            if !s.non_image_refs.is_empty() {
+                out.push_str(
+                    "<DicomAttribute tag=\"00400220\" vr=\"SQ\" \
+                     keyword=\"ReferencedNonImageCompositeObjectSequence\">",
+                );
+                for (j, r) in s.non_image_refs.iter().enumerate() {
                     out.push_str(&format!("<Item number=\"{}\">", j + 1));
                     xml_value(&mut out, "00081150", "UI", Some(&r.sop_class_uid));
                     xml_value(&mut out, "00081155", "UI", Some(&r.sop_instance_uid));
@@ -592,16 +675,31 @@ mod tests {
         let v = obj(r#"{"00400340":{"vr":"SQ","Value":[
                  {"0020000E":{"vr":"UI","Value":["1.2.3.99"]},
                   "00081150":{"vr":"UI","Value":["1.2.3"]},"00081155":{"vr":"UI","Value":["4.5.6"]}},
-                 {"00081150":{"vr":"UI","Value":["1.2.3"]},"00081155":{"vr":"UI","Value":[""]}}]}}"#);
+                 {"0020000E":{"vr":"UI","Value":["1.2.3.98"]},
+                  "00081150":{"vr":"UI","Value":["1.2.3"]},"00081155":{"vr":"UI","Value":[""]}}]}}"#);
         let series = extract_performed_series(&v).expect("Some");
         assert_eq!(series.len(), 2, "one series per 00400340 item");
         assert_eq!(series[0].series_instance_uid, "1.2.3.99");
         assert_eq!(series[0].references.len(), 1);
         assert_eq!(series[0].references[0].sop_instance_uid, "4.5.6");
-        assert_eq!(series[1].series_instance_uid, "");
         assert!(
             series[1].references.is_empty(),
             "an empty instance UID names nothing"
+        );
+    }
+
+    /// Series Instance UID (0020,000E) is Type 1 inside a performed-series item
+    /// (PS3.4 Table F.7.2-1): an item without one names no series, so the
+    /// sequence is not stored at all rather than carrying an empty UID that
+    /// matches nothing and passes the non-empty-sequence check.
+    #[test]
+    fn an_item_with_no_series_instance_uid_is_refused() {
+        let v = obj(r#"{"00400340":{"vr":"SQ","Value":[
+                 {"00081150":{"vr":"UI","Value":["1.2.3"]},
+                  "00081155":{"vr":"UI","Value":["4.5.6"]}}]}}"#);
+        assert!(
+            extract_performed_series(&v).is_none(),
+            "an item with no series UID must not become a stored series"
         );
     }
 
@@ -651,9 +749,9 @@ mod tests {
         let text = String::from_utf8(body).expect("utf-8");
         assert!(
             text.contains(
-                r#""00400281":{"Value":[{"00400282":{"Value":["Equipment failure"],"vr":"LO"}}],"vr":"SQ"}"#
+                r#""00400281":{"Value":[{"00080100":{"Value":["Equipment failure"],"vr":"SH"}}],"vr":"SQ"}"#
             ),
-            "sequence must carry an item, got {text}"
+            "the item's Code Value (0008,0100) carries the reason, got {text}"
         );
         // The XML model must agree with the JSON model, item for item.
         let xml = mpps_to_xml(&rec);
@@ -673,7 +771,7 @@ mod tests {
     #[test]
     fn the_discontinuation_reason_round_trips_through_both_shapes() {
         let sequenced = obj(
-            r#"{"00400281":{"vr":"SQ","Value":[{"00400282":{"vr":"LO","Value":["Broken"]}}]}}"#,
+            r#"{"00400281":{"vr":"SQ","Value":[{"00080100":{"vr":"SH","Value":["Broken"]}}]}}"#,
         );
         assert_eq!(extract_code_reason(&sequenced).as_deref(), Some("Broken"));
         let flattened = obj(r#"{"00400281":{"vr":"LO","Value":["Broken"]}}"#);
@@ -703,6 +801,7 @@ mod tests {
                     sop_class_uid: "1.2.3".to_string(),
                     sop_instance_uid: "4.5.6".to_string(),
                 }],
+                non_image_refs: Vec::new(),
             }]),
             discontinuation_reason: None,
             created_at: None,

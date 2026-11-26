@@ -267,9 +267,18 @@ fn write_workitem_attrs(out: &mut String, wi: &WorkItem) {
     // PS3.4 Table CC.2.5-1 lists it as its own row, Type 2, beside the Type 1
     // nested study of the Referenced Request Sequence. Emitting it here is not a
     // duplicate: one says where the results go, the other which study was read.
-    if let Some(v) = wi.output_study_uid.as_deref().filter(|u| !u.is_empty()) {
-        write_scalar(out, "0020000D", "UI", v);
-    }
+    //
+    // Type 2: the element is ALWAYS present and may hold no `<Value>` child, so
+    // an unassigned output study is stated as an empty element rather than by
+    // omitting the attribute - the JSON renderer states the same fact with
+    // `{"vr":"UI"}`, and a consumer could not otherwise tell "not assigned" from
+    // "not rendered".
+    write_scalar(
+        out,
+        "0020000D",
+        "UI",
+        wi.output_study_uid.as_deref().unwrap_or(""),
+    );
     // (0040,0002) ScheduledProcedureStepStartDate - DA.
     if let Some(v) = wi.procedure_step_start_date.as_deref() {
         write_scalar(out, "00400002", "DA", v);
@@ -1187,6 +1196,34 @@ mod tests {
                           <Value number=\"1\">1.2.3.4.5</Value>"
             ) || xml.contains("<Value number=\"1\">1.2.3.4.5</Value>"),
             "the input study stays nested: {xml}"
+        );
+    }
+
+    /// The dataset-root (0020,000D) is Type 2 (PS3.4 Table CC.2.5-1): always
+    /// present, possibly with no `<Value>` child. Omitting it left a consumer
+    /// unable to tell "no output study assigned" from "not rendered".
+    #[test]
+    fn the_root_study_is_present_and_empty_when_unassigned() {
+        let mut wi = workitem("1.2.3.9");
+        wi.output_study_uid = None;
+        wi.input_study_uid = Some("1.2.3.4.5".to_string());
+        let xml = workitem_to_xml(&wi);
+
+        let start = xml
+            .find("tag=\"0020000D\" vr=\"UI\" keyword=\"StudyInstanceUID\"")
+            .expect("the root study element is present");
+        let element = &xml[start..];
+        let end = element
+            .find("</DicomAttribute>")
+            .expect("the element closes");
+        assert!(
+            !element[..end].contains("<Value"),
+            "the unassigned root study carries no Value: {xml}"
+        );
+        // The input study is a DIFFERENT attribute and must not fill the slot.
+        assert!(
+            !element[..end].contains("1.2.3.4.5"),
+            "the input study stays nested, not at the root: {xml}"
         );
     }
 

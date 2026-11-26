@@ -190,18 +190,31 @@ fn conf(
     workers: Option<u32>,
     timeout_secs: u32,
 ) -> clinfer::conf::Conf {
-    let mut models = String::new();
-    let mut rules = String::new();
+    // One model FILE per script: the model layer is a directory now, and the
+    // base config carries only the directory's name.
+    let models_dir = dir.join("models");
+    std::fs::create_dir_all(&models_dir).expect("models directory");
     for (index, (id, script)) in scripts.iter().enumerate() {
-        models.push_str(&format!(
-            "  {id}:\n    script: \"{}\"\n    interpreter: \"{python}\"\n    timeout_secs: {timeout_secs}\n",
-            script.display()
-        ));
-        rules.push_str(&format!(
-            "  - match:\n      modality: [DX]\n    model: \"{id}\"\n    result:\n      kind: pr\n\
-             \x20     color: \"#FF3B30\"\n      profile_version: {}\n",
-            index + 1
-        ));
+        let text = format!(
+            r#"enabled: true
+output_capabilities:
+  sop_classes:
+    - 1.2.840.10008.5.1.4.1.1.11.1
+match:
+  modality:
+    - DX
+runtime:
+  script: "{script}"
+  interpreter: "{python}"
+  timeout_secs: {timeout_secs}
+outputs:
+  - kind: pr
+    profile_version: {version}
+"#,
+            script = script.display(),
+            version = index + 1,
+        );
+        std::fs::write(models_dir.join(format!("{id}.yaml")), text).expect("model");
     }
     let key = workers.map_or(String::new(), |value| format!("  workers: {value}\n"));
     let text = format!(
@@ -211,9 +224,8 @@ fn conf(
   listen: "127.0.0.1:18199"
 engine:
   cache_dir: "{cache}"
-{key}models:
-{models}rules:
-{rules}default_rule: cancel
+{key}models_dir: ./models
+default_rule: cancel
 "#,
         cache = dir.join("cache").display(),
     );
@@ -949,17 +961,35 @@ fn conf_with_kinds(
     python: &str,
     timeout_secs: u32,
 ) -> clinfer::conf::Conf {
-    let mut models = String::new();
-    let mut rules = String::new();
+    // One FILE per model, which is the layer the sidecar reads: the config
+    // beside them names the directory and nothing about a model.
+    let models_dir = dir.join("models");
+    std::fs::create_dir_all(&models_dir).expect("models directory");
     for (id, script, kind) in scripts {
-        models.push_str(&format!(
-            "  {id}:\n    script: \"{}\"\n    interpreter: \"{python}\"\n    timeout_secs: {timeout_secs}\n",
-            script.display()
-        ));
-        rules.push_str(&format!(
-            "  - match:\n      modality: [DX]\n    model: \"{id}\"\n    result:\n      kind: {kind}\n      \
-             profile_version: 1\n"
-        ));
+        let sop_class = match *kind {
+            "pr" => "1.2.840.10008.5.1.4.1.1.11.1",
+            // A text report is the Basic Text SR this build writes.
+            _ => "1.2.840.10008.5.1.4.1.1.88.11",
+        };
+        let text = format!(
+            r#"enabled: true
+output_capabilities:
+  sop_classes:
+    - {sop_class}
+match:
+  modality:
+    - DX
+runtime:
+  script: "{script}"
+  interpreter: "{python}"
+  timeout_secs: {timeout_secs}
+outputs:
+  - kind: {kind}
+    profile_version: 1
+"#,
+            script = script.display(),
+        );
+        std::fs::write(models_dir.join(format!("{id}.yaml")), text).expect("model");
     }
     let text = format!(
         r#"server:
@@ -968,9 +998,8 @@ fn conf_with_kinds(
   listen: "127.0.0.1:18199"
 engine:
   cache_dir: "{cache}"
-models:
-{models}rules:
-{rules}default_rule: cancel
+models_dir: ./models
+default_rule: cancel
 "#,
         cache = dir.join("cache").display(),
     );

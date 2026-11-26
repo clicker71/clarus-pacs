@@ -89,6 +89,15 @@ pub fn resolve_identity(
         return Identity::LocalViewer;
     }
 
+    // A header that is present but carries no name is not an identity.
+    //
+    // `X-Authenticated-User: ` is a slice of one space. Treating its presence
+    // as "the proxy authenticated someone" put the request in `Proxied` with an
+    // empty user, so strict mode accepted a request that named nobody - the
+    // exact case `MissingIdentity` exists for. Blank means missing, and a
+    // nonempty name stays valid.
+    let auth_user = auth_user.filter(|u| !u.iter().all(|&b| b == b' ' || b == b'\t'));
+
     match auth_user {
         Some(user) => {
             let ip = real_ip
@@ -177,6 +186,34 @@ mod tests {
         // Header present but no user -> MissingIdentity, not LocalViewer.
         let id = resolve_identity(b"127.0.0.1", true, None, Some(b"192.0.2.1"), None);
         assert_eq!(id, Identity::MissingIdentity);
+    }
+
+    /// A blank `X-Authenticated-User` is a MISSING identity, not an empty one.
+    ///
+    /// The header's presence was taken as proof that the proxy authenticated
+    /// someone, so a whitespace-only value produced `Proxied { user: [] }` and
+    /// strict mode accepted a request that named nobody.
+    #[test]
+    fn a_blank_authenticated_user_is_missing_identity() {
+        for blank in [b"".as_slice(), b" ", b"\t", b"  \t "] {
+            let id = resolve_identity(b"127.0.0.1", true, Some(b"10.0.0.5"), None, Some(blank));
+            assert_eq!(
+                id,
+                Identity::MissingIdentity,
+                "blank user {:?} must not authenticate",
+                String::from_utf8_lossy(blank)
+            );
+            assert_eq!(enforce(&id, true), Err(502));
+        }
+        // A real name still resolves, so the filter is not blanket-rejecting.
+        let id = resolve_identity(b"127.0.0.1", true, Some(b"10.0.0.5"), None, Some(b"alice"));
+        assert_eq!(
+            id,
+            Identity::Proxied {
+                ip: b"10.0.0.5".to_vec(),
+                user: b"alice".to_vec(),
+            }
+        );
     }
 
     #[test]

@@ -133,27 +133,32 @@ fn qido_stream_is_allocation_free() {
         "requested tag must be emitted"
     );
 
-    // -- Filtered writer, 40-tag includefield (capacity overflow): 0 alloc ---
-    // The 40-tag request string is built OUTSIDE the measured window; the
-    // filter itself stays on the stack ([u32; 64]) and must not heap.
-    let forty: String = (0..40)
+    // -- Filtered writer, includefield BEYOND capacity: 0 alloc -------------
+    // The request string is built OUTSIDE the measured window; the filter
+    // itself stays on the stack and must not heap even when it has to REFUSE
+    // tags.
+    //
+    // The count must exceed `MAX_TAGS` (64) minus the 13-tag baseline, i.e.
+    // more than 51 user tags. The previous 40 left 11 slots free, so the
+    // overflow path was never taken and the gate passed regardless.
+    let sixty: String = (0..52)
         .map(|i| format!("{:08X}", 0x1000_0001u32 + i))
         .collect::<Vec<_>>()
         .join(",");
     let (n, buf) = run_zero_alloc(|| {
         let mut buf = [0u8; 1024];
-        let n = write_study_json(&mut buf, &study, Some(&forty), None).expect("fits");
+        let n = write_study_json(&mut buf, &study, Some(&sixty), None).expect("fits");
         std::hint::black_box(&buf);
         (n, buf)
     });
     assert!(
         n > 0,
-        "40-tag filtered streaming must produce non-empty JSON"
+        "52-tag filtered streaming must produce non-empty JSON"
     );
     let f40 = String::from_utf8(buf[..n].to_vec()).expect("valid UTF-8 JSON");
     assert!(
         f40.contains("\"0020000D\""),
-        "mandatory StudyInstanceUID must survive a 40-tag includefield: {f40}"
+        "mandatory StudyInstanceUID must survive a beyond-capacity includefield: {f40}"
     );
 
     // Finally, sanity on actual bytes (allocates only outside the windows).

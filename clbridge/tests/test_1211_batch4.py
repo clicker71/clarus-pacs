@@ -426,22 +426,40 @@ class TestCfindStatusMapping:
 # ---------------------------------------------------------------------------
 # R15 - the batch result list follows payload order
 # ---------------------------------------------------------------------------
-def test_unmatched_failure_results_follow_payload_order():
+def test_unmatched_failure_results_follow_payload_order(monkeypatch):
     """The per-SOP results were built from a set, so the outbox - which
-    matches by index - associated outcomes with the wrong instances."""
-    import inspect
+    matches by index - associated outcomes with the wrong instances.
+
+    Checked by BEHAVIOUR: a failure the origin reports for a SOP that was
+    never sent makes the whole batch retryable, and the caller must still
+    receive one verdict per payload, in payload order.
+    """
+    import json
 
     import clean_code.http_helpers as hh
 
-    src = inspect.getsource(hh.stow_batch_instances)
-    code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
-    # Take the text between the `unmatched` test and the return it guards.
-    after = code.split("if unmatched:")[1]
-    branch = after.split("return")[1].split("], None")[0]
-    assert "for uid, _ds, _raw in live_payloads" in branch, (
-        f"the unmatched branch must iterate the payloads actually sent, "
-        f"not the `sent` set: {branch!r}"
-    )
+    class _Resp:
+        status_code = 202
+        text = json.dumps(
+            {
+                "00081198": {
+                    "Value": [
+                        {
+                            "00081155": {"Value": ["9.9.9.not-sent"]},
+                            "00081197": {"Value": [272]},
+                            "00000902": {"Value": ["nope"]},
+                        }
+                    ]
+                }
+            }
+        )
+        content = text.encode()
+
+    monkeypatch.setattr(hh, "_http_retry", lambda fn, **_kwargs: _Resp())
+    payloads = [("1.2.3.A", None, b"a"), ("1.2.3.B", None, b"b")]
+    results, _backoff = hh.stow_batch_instances(payloads, "http://127.0.0.1:1")
+    assert [r[0] for r in results] == ["1.2.3.A", "1.2.3.B"]
+    assert [r[1] for r in results] == [0xA700, 0xA700]
 
 
 # ---------------------------------------------------------------------------

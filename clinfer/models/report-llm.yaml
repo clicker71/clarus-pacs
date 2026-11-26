@@ -1,0 +1,49 @@
+# Report: a text report as a Basic Text SR.
+#
+# DISABLED by default. To enable: install the OpenAI client
+# (`pip install openai`) and set SR_LLM_MODEL / SR_LLM_BASE_URL in a site
+# wrapper used as runtime.interpreter. The script calls its endpoint itself;
+# check the site's data policy before enabling anything that leaves the
+# machine.
+
+enabled: false
+
+title: "Chest X-ray report draft (LLM)"
+description: "A per-frame narrative report drafted by an OpenAI-compatible endpoint."
+
+provider:
+  name: "SR-llm"
+  vendor: "Clarus"
+  version: "1.0"
+
+input_requirements:
+  modalities: [DX, CR]
+  anatomy:
+    - system: "http://snomed.info/sct"
+      code: "51185008"
+      meaning: "Thoracic structure"
+
+output_capabilities:
+  sop_classes: ["1.2.840.10008.5.1.4.1.1.88.11"]
+
+parameters:
+  - code: MAX_IMAGES
+    type: integer
+    text: "Frames sent to the model"
+    default: 1
+    min: 1
+    max: 16
+
+match:
+  modality: [DX, CR]
+  study_description_contains: ["*chest*"]
+
+runtime:
+  script: "../abi/SR-llm.py"
+  interpreter: "python3"
+  timeout_secs: 300
+
+outputs:
+  - kind: sr
+    series_description: "LLM Findings"
+    profile_version: 1

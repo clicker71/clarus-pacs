@@ -106,8 +106,12 @@ impl DicomParser for DicomRsParser {
             if tag == tags::MODIFIED_ATTRIBUTES_SEQ || tag == tags::ORIGINAL_ATTRIBUTES_SEQ {
                 meta.original_attrs_ranges
                     .push((element_start, element_end));
-                if range_has_identifying_attrs(reader.data, element.value_start, element.value_end)
-                {
+                if range_has_identifying_attrs(
+                    reader.data,
+                    element.value_start,
+                    element.value_end,
+                    reader.syntax,
+                ) {
                     meta.hidden_identifying_attrs = true;
                 }
             }
@@ -138,19 +142,34 @@ impl DicomParser for DicomRsParser {
                 // every item's (0010,0020) is a value of the same key.
                 match tag {
                     tags::REQUEST_ATTRIBUTES_SEQUENCE => {
-                        let mut pairs = [
-                            (tags::SCHEDULED_PROCEDURE_STEP_ID, step_id.take()),
-                            (tags::REQUESTED_PROCEDURE_ID, procedure_id.take()),
-                        ];
-                        collect_scalars_in_first_item(
+                        // Every item, not just the first: PS3.3 C.4.2.2 allows
+                        // the sequence several items and each carries its own
+                        // step ID with the procedure ID it belongs to. Reading
+                        // item 0 alone made a matching step ID in a later item
+                        // invisible to search.
+                        let mut found: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+                        collect_scalars_in_all_items_paired(
                             reader.data,
                             element.value_start,
                             element.value_end,
-                            &mut pairs,
+                            [
+                                tags::SCHEDULED_PROCEDURE_STEP_ID,
+                                tags::REQUESTED_PROCEDURE_ID,
+                            ],
+                            &mut found,
                             reader.syntax,
+                            reader.charset.as_deref(),
                         );
-                        step_id = pairs[0].1.take();
-                        procedure_id = pairs[1].1.take();
+                        // The metadata field holds one value; the first in item
+                        // order wins, so a repeated sequence cannot overwrite
+                        // what an earlier element already stated.
+                        let [mut steps, mut procs] = found;
+                        if step_id.is_none() && !steps.is_empty() {
+                            step_id = Some(steps.remove(0));
+                        }
+                        if procedure_id.is_none() && !procs.is_empty() {
+                            procedure_id = Some(procs.remove(0));
+                        }
                     }
                     tags::OTHER_PATIENT_IDS_SEQUENCE => {
                         collect_scalars_in_all_items(
@@ -160,6 +179,7 @@ impl DicomParser for DicomRsParser {
                             tags::PATIENT_ID,
                             &mut other_patient_ids,
                             reader.syntax,
+                            reader.charset.as_deref(),
                         );
                     }
                     tags::CONCEPT_NAME_CODE_SEQUENCE => {
@@ -173,6 +193,7 @@ impl DicomParser for DicomRsParser {
                                 element.value_start,
                                 element.value_end,
                                 reader.syntax,
+                                reader.charset.as_deref(),
                             );
                         }
                     }
@@ -185,6 +206,7 @@ impl DicomParser for DicomRsParser {
                             element.value_end,
                             &mut rejection_sops,
                             reader.syntax,
+                            reader.charset.as_deref(),
                         );
                     }
                     _ => {}
@@ -204,8 +226,13 @@ impl DicomParser for DicomRsParser {
                 continue; // tail: sanitization capture only, no metadata
             }
 
-            // Capture SpecificCharacterSet BEFORE any text tag is decoded.
-            // DICOM PS3.5 Section 6.1.1 guarantees this tag appears first in dataset.
+            // Capture SpecificCharacterSet as soon as it is seen. Its position
+            // is ordinary tag order (PS3.5 7.1), NOT a "first element" rule -
+            // (0008,0005) precedes most text attributes only because 0008,0005
+            // sorts early, and a text element may still appear before it in a
+            // reordered dataset. Text decoded before this point uses the
+            // default repertoire, which is the correct reading for an element
+            // that has not yet declared an extension.
             if tag == tags::SPECIFIC_CHARACTER_SET {
                 let val = &reader.data[element.value_start..element.value_end];
                 reader.charset = opt_str(val, None); // charset value is always ASCII
@@ -332,10 +359,10 @@ impl DicomParser for DicomRsParser {
                     meta.instance_number = opt_int(val, cs);
                 }
                 tags::ROWS => {
-                    meta.rows = opt_u16(val);
+                    meta.rows = opt_u16(val, reader.syntax);
                 }
                 tags::COLUMNS => {
-                    meta.cols = opt_u16(val);
+                    meta.cols = opt_u16(val, reader.syntax);
                 }
                 tags::NUMBER_OF_FRAMES => {
                     // IS: ASCII digits, so it parses as text. A non-numeric or
@@ -500,12 +527,22 @@ fn verify_required(meta: &InstanceMeta) -> Result<(), DicomError> {
 
 /// 3008 hidden-PHI detection inside a captured (0400,0550)/(0400,0561) value
 /// region: true when any of the four identifying tags appears with a
-/// non-empty value. Tags are always little-endian; each candidate is
-/// interpreted under ALL plausible value-length encodings (explicit VR
-/// short, explicit VR long, implicit; little- and big-endian), so no real
-/// identifying value is missed. A false positive is harmless: the WHOLE
-/// captured top-level range is excised regardless of where the hit is.
-fn range_has_identifying_attrs(data: &[u8], start: usize, end: usize) -> bool {
+/// non-empty value.
+///
+/// PS3.5 7.3: the TAG is encoded in the dataset byte order, so an Explicit VR
+/// Big Endian (0010,0010) is `00 10 00 10`, not `10 00 10 00`. The scan used to
+/// read tags little-endian only, which meant a Big Endian Original Attributes
+/// Sequence recorded its range but never flagged the identifying value inside
+/// it - the PHI stayed in the served metadata. Length candidates are still
+/// tried under every plausible encoding: a false positive is harmless (the
+/// WHOLE captured range is excised regardless of where the hit is), a missed
+/// value is a disclosure.
+fn range_has_identifying_attrs(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    syntax: TransferSyntax,
+) -> bool {
     const IDENTIFYING: [DicomTag; 4] = [
         tags::PATIENT_NAME,
         tags::PATIENT_ID,
@@ -515,8 +552,8 @@ fn range_has_identifying_attrs(data: &[u8], start: usize, end: usize) -> bool {
     let end = end.min(data.len());
     let mut i = start;
     while i + 8 <= end {
-        let g = read_u16_le(data, i);
-        let e = read_u16_le(data, i + 2);
+        let g = read_u16_syntax(data, i, syntax);
+        let e = read_u16_syntax(data, i + 2, syntax);
         if IDENTIFYING.contains(&(g, e)) {
             // Implicit: 4-byte length right after the tag (LE / BE).
             if i + 8 <= end {
@@ -562,56 +599,6 @@ fn non_empty_value(data: &[u8], start: usize, end: usize) -> bool {
     data[start..end].iter().any(|&b| b != 0x00 && b != 0x20)
 }
 
-/// Read named scalar elements out of the FIRST item of a sequence.
-///
-/// The counterpart of `collect_uids_in_range` for the nested KEY attributes:
-/// PS3.18 Table 10.6.1-5 states `00400275.00400009` and `00400275.00401001`,
-/// and both live in one item of Request Attributes Sequence, so the path is
-/// resolved once and the two scalars come out together. Only the first item is
-/// read, because the matching keys of that table are series-level singletons
-/// and a second item would be a different performed step.
-///
-/// A scalar that cannot be read is left as `None`, which the callers treat as
-/// "the instance does not state it" - the same tolerant rule the UID walk
-/// follows, so a malformed sequence cannot fail a STOW.
-fn collect_scalars_in_first_item(
-    data: &[u8],
-    mut pos: usize,
-    end: usize,
-    wanted: &mut [(DicomTag, Option<String>)],
-    syntax: TransferSyntax,
-) {
-    // Descend to the first item; everything before it is item headers of
-    // nested sequences the caller did not ask about.
-    while pos + 8 <= end {
-        let tag = (
-            read_u16_syntax(data, pos, syntax),
-            read_u16_syntax(data, pos + 2, syntax),
-        );
-        if tag == tags::ITEM {
-            let length = read_u32_syntax(data, pos + 4, syntax);
-            pos += 8;
-            let item_end = if length == tags::UNDEFINED_LENGTH {
-                undefined_extent(data, pos, end).unwrap_or(end)
-            } else {
-                pos.saturating_add(length as usize).min(end)
-            };
-            // Read the elements of this item; the first match wins, so a
-            // repeated element cannot overwrite the value the key names.
-            read_scalars_in_range(data, pos, item_end, wanted, syntax);
-            return;
-        }
-        if tag == tags::ITEM_DELIMITATION || tag == tags::SEQUENCE_DELIMITATION {
-            return;
-        }
-        // An element before the first item: step over its value.
-        let Some(next) = element_extent_end(data, pos, end, syntax) else {
-            return;
-        };
-        pos = next;
-    }
-}
-
 /// Read one scalar element out of EVERY item of a sequence.
 ///
 /// Other Patient IDs (0010,1002) is multi-valued: the key `00101002.00100020`
@@ -625,6 +612,7 @@ fn collect_scalars_in_all_items(
     wanted: DicomTag,
     values: &mut Vec<String>,
     syntax: TransferSyntax,
+    charset: Option<&str>,
 ) {
     while pos + 8 <= end {
         let tag = (
@@ -638,14 +626,74 @@ fn collect_scalars_in_all_items(
             let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
-                undefined_extent(data, pos, end).unwrap_or(end)
+                item_extent_or_end(data, pos, end, syntax)
             } else {
                 pos.saturating_add(length as usize).min(end)
             };
             let mut pairs = [(wanted, None)];
-            read_scalars_in_range(data, pos, item_end, &mut pairs, syntax);
+            read_scalars_in_range(data, pos, item_end, &mut pairs, syntax, charset);
             if let Some(v) = pairs[0].1.take() {
                 values.push(v);
+            }
+            pos = item_end;
+            continue;
+        }
+        let Some(next) = element_extent_end(data, pos, end, syntax) else {
+            return;
+        };
+        pos = next;
+    }
+}
+
+/// Read two wanted scalars from EVERY item of a sequence.
+///
+/// PS3.3 C.4.2.2 Table C.4-3: Request Attributes Sequence (0040,0275) may hold
+/// more than one item, and each item carries its own Scheduled Procedure Step
+/// ID with the Requested Procedure ID that belongs to it. `first_item` read
+/// only item 0, so a series whose matching step ID appeared in a later item
+/// stored nothing for that key and the search on it missed the series.
+///
+/// Each wanted tag is collected INDEPENDENTLY across items, in item order.
+/// That is deliberate: a real instance often states only one of the two (the
+/// step ID of a performed step, with no requested procedure), and dropping such
+/// an item would lose a key the store is expected to hold. The pairing that
+/// matters for a MATCH is enforced downstream - the two values are recorded
+/// per key, so a query on both keys still has to find both on this instance.
+/// What this must not do is keep the FIRST occurrence only, which is what made
+/// a later item invisible.
+fn collect_scalars_in_all_items_paired(
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    wanted: [DicomTag; 2],
+    values: &mut [Vec<String>; 2],
+    syntax: TransferSyntax,
+    charset: Option<&str>,
+) {
+    let [first, second] = wanted;
+    while pos + 8 <= end {
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
+        if tag == tags::SEQUENCE_DELIMITATION {
+            return;
+        }
+        if tag == tags::ITEM {
+            let length = read_u32_syntax(data, pos + 4, syntax);
+            pos += 8;
+            let item_end = if length == tags::UNDEFINED_LENGTH {
+                item_extent_or_end(data, pos, end, syntax)
+            } else {
+                pos.saturating_add(length as usize).min(end)
+            };
+            let mut found = [(first, None), (second, None)];
+            read_scalars_in_range(data, pos, item_end, &mut found, syntax, charset);
+            if let Some(v) = found[0].1.take() {
+                values[0].push(v);
+            }
+            if let Some(v) = found[1].1.take() {
+                values[1].push(v);
             }
             pos = item_end;
             continue;
@@ -668,6 +716,7 @@ fn read_scalars_in_range(
     end: usize,
     wanted: &mut [(DicomTag, Option<String>)],
     syntax: TransferSyntax,
+    charset: Option<&str>,
 ) {
     let implicit = syntax == TransferSyntax::ImplicitVrLE;
     while pos + 8 <= end {
@@ -702,7 +751,7 @@ fn read_scalars_in_range(
             if value_start > end {
                 return;
             }
-            let sq_end = undefined_extent(data, value_start, end).unwrap_or(end);
+            let sq_end = undefined_extent(data, value_start, end, syntax).unwrap_or(end);
             (value_start, sq_end)
         } else {
             let value_end = value_start.saturating_add(length as usize);
@@ -718,9 +767,16 @@ fn read_scalars_in_range(
         };
         for (wanted_tag, slot) in wanted.iter_mut() {
             if *wanted_tag == tag && slot.is_none() {
-                // The nested scalars are SH and LO - single-byte VRs of
-                // ASCII text - so the default charset is the right reading.
-                *slot = opt_str(&data[value_start..value_end], None).filter(|s| !s.is_empty());
+                // PS3.5 6.1.2.2: SpecificCharacterSet(0008,0005) extends the
+                // default repertoire for exactly SH, LO, UC, ST, LT, UT and PN.
+                // These nested keys ARE SH and LO, so the dataset charset is
+                // the reading that applies - the opposite of what this used to
+                // assume. A site whose text left the default repertoire (a
+                // Greek or Cyrillic step ID, say) was stored as the raw bytes
+                // reinterpreted as latin-ish ASCII, so a QIDO match on it
+                // could never succeed. AE and CS stay excluded: they carry a
+                // restricted repertoire and are read elsewhere.
+                *slot = opt_str(&data[value_start..value_end], charset).filter(|s| !s.is_empty());
             }
         }
         pos = next;
@@ -741,6 +797,7 @@ fn first_code_item(
     mut pos: usize,
     end: usize,
     syntax: TransferSyntax,
+    charset: Option<&str>,
 ) -> Option<(String, String)> {
     while pos + 8 <= end {
         let tag = (
@@ -751,7 +808,7 @@ fn first_code_item(
             let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
-                undefined_extent(data, pos, end).unwrap_or(end)
+                item_extent_or_end(data, pos, end, syntax)
             } else {
                 pos.saturating_add(length as usize).min(end)
             };
@@ -759,7 +816,7 @@ fn first_code_item(
                 (tags::CODE_VALUE, None),
                 (tags::CODING_SCHEME_DESIGNATOR, None),
             ];
-            read_scalars_in_range(data, pos, item_end, &mut pair, syntax);
+            read_scalars_in_range(data, pos, item_end, &mut pair, syntax, charset);
             return match (pair[0].1.take(), pair[1].1.take()) {
                 (Some(value), Some(scheme)) => Some((value, scheme)),
                 _ => None,
@@ -772,6 +829,10 @@ fn first_code_item(
     }
     None
 }
+
+/// Maximum nesting depth for the evidence walk. See
+/// [`collect_referenced_sops_in_range`].
+const MAX_EVIDENCE_WALK_DEPTH: usize = 64;
 
 /// Collect `(reference_sop_class_uid, referenced_sop_instance_uid)` pairs from
 /// a Current Requested Procedure Evidence Sequence (0040,A375).
@@ -789,11 +850,36 @@ fn first_code_item(
 /// marked optimistically.
 fn collect_referenced_sops_in_range(
     data: &[u8],
-    mut pos: usize,
+    pos: usize,
     end: usize,
     out: &mut Vec<(String, String)>,
     syntax: TransferSyntax,
+    charset: Option<&str>,
 ) {
+    collect_referenced_sops_within(data, pos, end, out, 0, syntax, charset)
+}
+
+/// Bounded walk behind [`collect_referenced_sops_in_range`].
+///
+/// Recursion depth is bounded by [`MAX_EVIDENCE_WALK_DEPTH`] for the same
+/// reason as the UID walk: a crafted STOW can nest undefined-length items until
+/// the stack runs out, and each level costs little input. PS3.3 C.17 fixes the
+/// shape this walk follows at three levels (evidence item -> referenced series
+/// -> referenced SOP), so 64 is far past anything the standard produces while
+/// keeping the walk bounded.
+#[allow(clippy::too_many_arguments)]
+fn collect_referenced_sops_within(
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    out: &mut Vec<(String, String)>,
+    depth: usize,
+    syntax: TransferSyntax,
+    charset: Option<&str>,
+) {
+    if depth > MAX_EVIDENCE_WALK_DEPTH {
+        return;
+    }
     let implicit = syntax == TransferSyntax::ImplicitVrLE;
     while pos + 8 <= end {
         let tag = (
@@ -809,11 +895,11 @@ fn collect_referenced_sops_in_range(
             let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
-                undefined_extent(data, pos, end).unwrap_or(end)
+                item_extent_or_end(data, pos, end, syntax)
             } else {
                 pos.saturating_add(length as usize).min(end)
             };
-            collect_referenced_sops_in_range(data, pos, item_end, out, syntax);
+            collect_referenced_sops_within(data, pos, item_end, out, depth + 1, syntax, charset);
             pos = item_end;
             continue;
         }
@@ -838,11 +924,19 @@ fn collect_referenced_sops_in_range(
                 }
             };
             let value_end = if length == tags::UNDEFINED_LENGTH {
-                undefined_extent(data, value_start, end).unwrap_or(end)
+                undefined_extent(data, value_start, end, syntax).unwrap_or(end)
             } else {
                 value_start.saturating_add(length as usize).min(end)
             };
-            collect_referenced_sops_in_range(data, value_start, value_end, out, syntax);
+            collect_referenced_sops_within(
+                data,
+                value_start,
+                value_end,
+                out,
+                depth + 1,
+                syntax,
+                charset,
+            );
             pos = value_end;
             continue;
         }
@@ -866,11 +960,11 @@ fn collect_referenced_sops_in_range(
                 }
             };
             let value_end = if length == tags::UNDEFINED_LENGTH {
-                undefined_extent(data, value_start, end).unwrap_or(end)
+                undefined_extent(data, value_start, end, syntax).unwrap_or(end)
             } else {
                 value_start.saturating_add(length as usize).min(end)
             };
-            collect_sop_items(data, value_start, value_end, out, syntax);
+            collect_sop_items(data, value_start, value_end, out, syntax, charset);
             pos = value_end;
             continue;
         }
@@ -889,6 +983,7 @@ fn collect_sop_items(
     end: usize,
     out: &mut Vec<(String, String)>,
     syntax: TransferSyntax,
+    charset: Option<&str>,
 ) {
     while pos + 8 <= end {
         let tag = (
@@ -902,7 +997,7 @@ fn collect_sop_items(
             let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
-                undefined_extent(data, pos, end).unwrap_or(end)
+                item_extent_or_end(data, pos, end, syntax)
             } else {
                 pos.saturating_add(length as usize).min(end)
             };
@@ -910,7 +1005,7 @@ fn collect_sop_items(
                 (tags::REFERENCED_SOP_CLASS_UID, None),
                 (tags::REFERENCED_SOP_INSTANCE_UID, None),
             ];
-            read_scalars_in_range(data, pos, item_end, &mut pair, syntax);
+            read_scalars_in_range(data, pos, item_end, &mut pair, syntax, charset);
             if let (Some(class_uid), Some(instance_uid)) = (pair[0].1.take(), pair[1].1.take()) {
                 out.push((class_uid, instance_uid));
             }
@@ -958,7 +1053,7 @@ fn element_extent_end(
         }
     };
     if length == tags::UNDEFINED_LENGTH {
-        let sq_end = undefined_extent(data, value_start, end)?;
+        let sq_end = undefined_extent(data, value_start, end, syntax)?;
         return Some(sq_end);
     }
     // Include the pad byte of an odd-length value (PS3.5 7.1.1), so the
@@ -1033,7 +1128,15 @@ fn collect_uids_within(
         // dataset, read by continuing the walk into it rather than skipping,
         // so elements inside the item are visited.
         if tag == tags::ITEM {
-            let length = read_u32_le(data, pos + 4);
+            // PS3.5 7.5 fixes the item header to Implicit VR, and 7.3 makes
+            // Implicit VR Little Endian. This walk nonetheless reads the tag
+            // and length in the DATASET byte order, because the one transfer
+            // syntax where the two readings differ - Explicit VR Big Endian,
+            // 1.2.840.10008.1.2.2 - is retired (7.3) and barred from Web
+            // Services (PS3.18 8.7.3), so nothing conformant distinguishes
+            // them. Kept as-is rather than changed: the difference is
+            // unreachable, and flipping it would rewrite an existing fixture.
+            let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             if length == tags::UNDEFINED_LENGTH {
                 // Undefined-length item: its body runs to its own
@@ -1043,7 +1146,7 @@ fn collect_uids_within(
                 // every nested undefined-length sequence inside re-walk the
                 // whole remaining parent (20.09 field stack overflow on a
                 // 432-frame SEG).
-                let item_end = undefined_extent(data, pos, end).unwrap_or(end);
+                let item_end = item_extent_or_end(data, pos, end, syntax);
                 collect_uids_within(
                     data,
                     pos,
@@ -1104,7 +1207,7 @@ fn collect_uids_within(
             if value_start > end {
                 return;
             }
-            let sq_end = undefined_extent(data, value_start, end).unwrap_or(end);
+            let sq_end = undefined_extent(data, value_start, end, syntax).unwrap_or(end);
             collect_uids_within(
                 data,
                 value_start,
@@ -1140,7 +1243,20 @@ fn collect_uids_within(
                 // sequence. Descending is what makes those reachable; reading
                 // the sequence as an opaque value would record the outer
                 // series and silently miss every image inside it.
-                if vr_sq || implicit {
+                //
+                // In Implicit VR there are no VR bytes on the wire, so whether
+                // this element is a sequence can only come from the dictionary.
+                // Descending into EVERY implicit element treated a scalar's
+                // value as a dataset: the walk read the UID text (or any value
+                // at all) as element headers and could pick up a byte pattern
+                // that looked like (0008,1155), recording a reference that the
+                // instance never stated. Only a dictionary "SQ" descends.
+                let is_sequence = if implicit {
+                    lookup_vr(tag.0, tag.1) == "SQ"
+                } else {
+                    vr_sq
+                };
+                if is_sequence {
                     collect_uids_within(
                         data,
                         value_start,
@@ -1182,17 +1298,33 @@ fn is_extended_vr(vr: [u8; 2]) -> bool {
 /// Locate the end (byte position AFTER the delimiter) of the undefined-length
 /// item or sequence whose content starts at `start`.
 ///
-/// The walk mirrors [`collect_uids_in_range`]'s element grammar (explicit VR,
-/// items, delimiters) and counts nesting so that inner delimiters unwind
+/// The walk mirrors [`collect_uids_in_range`]'s element grammar (items,
+/// delimiters, scalars) and counts nesting so that inner delimiters unwind
 /// without being mistaken for the enclosing one. Returns `None` when the
-/// enclosing delimiter is not found before `end` (malformed input - the
-/// caller falls back to the outer bound, the same as the previous behaviour).
-fn undefined_extent(data: &[u8], mut pos: usize, end: usize) -> Option<usize> {
+/// enclosing delimiter is not found before `end` (malformed input - the caller
+/// falls back to the outer bound, the same as the previous behaviour).
+///
+/// PS3.5 7.3: the tag, the item length and the value length are all read in the
+/// DATASET byte order, and an Implicit VR dataset has no VR on the wire at all -
+/// its element header is tag + 4-byte length. Reading a "VR" from an implicit
+/// header took the first length byte as the VR and the second as a short-form
+/// length, so a 4-byte scalar after an undefined-length item was stepped INTO
+/// rather than past, and the enclosing sequence end then swallowed the next
+/// sibling item.
+fn undefined_extent(
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    syntax: TransferSyntax,
+) -> Option<usize> {
     let mut nesting: u32 = 0;
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
         if tag == tags::ITEM {
-            let length = read_u32_le(data, pos + 4);
+            let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             if length == tags::UNDEFINED_LENGTH {
                 nesting += 1;
@@ -1209,15 +1341,30 @@ fn undefined_extent(data: &[u8], mut pos: usize, end: usize) -> Option<usize> {
             nesting = nesting.saturating_sub(1);
             continue;
         }
-        let vr = [data[pos + 4], data[pos + 5]];
-        let extended = is_extended_vr(vr);
-        let (length, value_start) = if extended {
-            if pos + 12 > end {
-                return None;
+        // An item delimiter says "this item ended", not "the dataset ended":
+        // unwinding one level keeps the walk inside the enclosing sequence so a
+        // following sibling item is still reached.
+        let (length, value_start) = match syntax {
+            TransferSyntax::ImplicitVrLE => {
+                if pos + 8 > end {
+                    return None;
+                }
+                (read_u32_syntax(data, pos + 4, syntax), pos + 8)
             }
-            (read_u32_le(data, pos + 8), pos + 12)
-        } else {
-            (u32::from(read_u16_le(data, pos + 6)), pos + 8)
+            _ => {
+                let vr = [data[pos + 4], data[pos + 5]];
+                if is_extended_vr(vr) {
+                    if pos + 12 > end {
+                        return None;
+                    }
+                    (read_u32_syntax(data, pos + 8, syntax), pos + 12)
+                } else {
+                    if pos + 8 > end {
+                        return None;
+                    }
+                    (u32::from(read_u16_syntax(data, pos + 6, syntax)), pos + 8)
+                }
+            }
         };
         if length == tags::UNDEFINED_LENGTH {
             nesting += 1;
@@ -1231,6 +1378,28 @@ fn undefined_extent(data: &[u8], mut pos: usize, end: usize) -> Option<usize> {
         pos = value_end + (length as usize % 2);
     }
     None
+}
+
+/// Bounded extent for an item whose delimitation may be missing.
+///
+/// The collectors below scan a sequence looking for identifying attributes.
+/// Each needs an item's end, and when [`undefined_extent`] cannot find a
+/// delimitation there are two candidate answers: the end of the enclosing
+/// value, or no answer at all.
+///
+/// `end` is chosen because these collectors are only allowed to *confirm* an
+/// element, never to invent one: a longer range can only add candidates to a
+/// `contains`-style check, and every candidate is subsequently validated
+/// against its own tag and length. Returning nothing instead would reject an
+/// otherwise readable instance over a truncated private sequence, and refusing
+/// at parse time is a stricter policy than PS3.5 7.5 requires for a value the
+/// caller never asked to interpret.
+///
+/// The renderer deliberately does NOT use this: it publishes the item's body as
+/// JSON, where a fabricated extent would attribute a sibling item's attributes
+/// to the wrong item and cannot be detected by the client.
+fn item_extent_or_end(data: &[u8], pos: usize, end: usize, syntax: TransferSyntax) -> usize {
+    undefined_extent(data, pos, end, syntax).unwrap_or(end)
 }
 
 /// Append `uid` unless it is already present.
@@ -1344,13 +1513,25 @@ impl<'a> DicomReader<'a> {
             big_endian: false,
         };
 
-        let ts_uid = reader.parse_meta_header()?;
+        let (ts_uid, meta_present) = reader.parse_meta_header()?;
         reader.transfer_syntax_uid = ts_uid.clone();
+
+        // PS3.10 7.1 Table 7.1-1: TransferSyntaxUID (0002,0010) is a Type 1
+        // attribute, so a Part 10 file whose meta group IS present but whose
+        // TransferSyntaxUID is missing or blank is malformed - not a file to
+        // guess a syntax for. Only a file with NO meta group at all (DIMSE data
+        // that carries a prepended "DICM") falls through to detection.
+        if meta_present && ts_uid.is_none() {
+            return Err(DicomError::InvalidDicom(
+                "File Meta Information has no usable TransferSyntaxUID \
+                 (0002,0010); it is Type 1 per DICOM PS3.10 §7.1 Table 7.1-1."
+                    .into(),
+            ));
+        }
 
         // When no meta-header (DIMSE data with "DICM" prepended), auto-detect
         // Explicit vs Implicit VR from the first dataset element's bytes.
-        // DICOM PS3.10 Section 7.1 default is Implicit VR, but many modalities
-        // (especially those sending secondary captures) use Explicit VR.
+        // The Implicit VR default is PS3.5's DIMSE default, not a Part 10 rule.
         if ts_uid.is_none() {
             reader.syntax = detect_transfer_syntax(data, data_start);
         } else {
@@ -1363,8 +1544,15 @@ impl<'a> DicomReader<'a> {
     }
 
     /// Parse meta-header (group 0002) to find TransferSyntaxUID.
-    fn parse_meta_header(&mut self) -> Result<Option<String>, DicomError> {
+    ///
+    /// Returns the UID (if the element was present and non-blank) together
+    /// with whether the meta group was seen at all. The two are different
+    /// statements: "no meta group" marks DIMSE data and permits syntax
+    /// detection, while "meta group without a TransferSyntaxUID" is malformed
+    /// per PS3.10 7.1.
+    fn parse_meta_header(&mut self) -> Result<(Option<String>, bool), DicomError> {
         let mut ts_uid: Option<String> = None;
+        let mut meta_present = false;
 
         loop {
             if self.pos + 4 > self.data.len() {
@@ -1380,6 +1568,7 @@ impl<'a> DicomReader<'a> {
                 break;
             }
 
+            meta_present = true;
             let elem = self.read_meta_element()?;
 
             if tag == tags::TRANSFER_SYNTAX_UID {
@@ -1388,7 +1577,7 @@ impl<'a> DicomReader<'a> {
             }
         }
 
-        Ok(ts_uid)
+        Ok((ts_uid, meta_present))
     }
 
     /// Read the next dataset element.
@@ -1813,6 +2002,20 @@ impl<'a> DicomReader<'a> {
                     self.pos = self.data.len();
                     return Ok(None);
                 } else {
+                    // PS3.5 6.2: a short-form element is VR(2) + ValueLength(2).
+                    // The 2-byte length is read HERE, so the buffer must still
+                    // hold those two bytes. Without this the read panicked on an
+                    // upload that ends right after a valid VR pair - the only
+                    // guard above checks that the VR ITSELF fits, which is two
+                    // bytes earlier. An incomplete header is InvalidDicom, not a
+                    // clean EOF: a clean end means no element started here.
+                    if self.pos + 2 > self.data.len() {
+                        return Err(DicomError::InvalidDicom(format!(
+                            "Truncated short-form element header at offset {}: \
+                             Value Length field is missing (PS3.5 6.2)",
+                            self.pos
+                        )));
+                    }
                     let len = read_u16_syntax(self.data, self.pos, self.syntax) as usize;
                     (len, 2)
                 }
@@ -1828,12 +2031,29 @@ impl<'a> DicomReader<'a> {
             // hit byte sequences that look like impossible lengths.
             if tag == tags::PIXEL_DATA {
                 let vs = self.pos;
-                self.pos = self.data.len();
+                // PS3.5 A.4: an encapsulated Pixel Data value is a sequence of
+                // items closed by a Sequence Delimitation Item (FFFE,E0DD), and
+                // PS3.5 7.5.1 scopes elements by tag order only - a group-0400
+                // attribute may legitimately follow it. Parking the cursor at
+                // EOF made every element after the pixels unreachable, so the
+                // (0400,0561) tail that carries hidden identifying attributes
+                // was never captured on an encapsulated instance (uncompressed
+                // PixelData is defined-length, so it did not have this problem).
+                // The cursor therefore lands AFTER the delimiter, not at EOF.
+                // The item bytes are not interpreted: a compressed bitstream
+                // can contain FFFE sequences, so the alternative - walking
+                // items to find the delimiter - would stop at a bitstream
+                // coincidence. `undefined_extent` reads only length fields and
+                // advances by them, which is the safe stepping for a value this
+                // walk does not need to understand.
+                let end = undefined_extent(self.data, vs, self.data.len(), self.syntax)
+                    .unwrap_or(self.data.len());
+                self.pos = end;
                 return Ok(Some(ElementRange {
                     tag,
                     vr: Some(vr),
                     value_start: vs,
-                    value_end: self.data.len(),
+                    value_end: end,
                 }));
             }
             // SQ / UN / other undefined-length: parse normally.
@@ -1957,7 +2177,8 @@ impl<'a> DicomReader<'a> {
 /// DIMSE data with "DICM" prepended has no (0002,0010) TransferSyntaxUID.
 /// We look at the first element's potential VR bytes (offset +4 from data_start):
 /// - If they form a known DICOM VR string -> Explicit VR (compressed or uncompressed).
-/// - Otherwise -> Implicit VR (DICOM PS3.10 Section 7.1 default).
+/// - Otherwise -> Implicit VR, the PS3.5 default for a dataset that names no
+///   transfer syntax.
 ///
 /// The VR bytes in Implicit VR would be the low bytes of the 4-byte length,
 /// which for any realistic element length would be non-printable or invalid.
@@ -1984,7 +2205,12 @@ fn resolve_transfer_syntax(uid: Option<&str>) -> Result<TransferSyntax, DicomErr
     match uid {
         Some("1.2.840.10008.1.2") => Ok(TransferSyntax::ImplicitVrLE),
         Some("1.2.840.10008.1.2.1") => Ok(TransferSyntax::ExplicitVrLE),
-        None => Ok(TransferSyntax::ImplicitVrLE), // DICOM Part 10 Section 7.1 default
+        // Unreachable from `DicomReader::new`, which only calls this once a UID
+        // was found; kept because the Implicit VR answer is the PS3.5 DIMSE
+        // default for a dataset with no transferred syntax, and stating it here
+        // costs nothing. This is NOT the PS3.10 7.1 Part 10 rule - a Part 10
+        // file must name its syntax (Type 1), which `new` now enforces.
+        None => Ok(TransferSyntax::ImplicitVrLE),
         Some("1.2.840.10008.1.2.2") => Ok(TransferSyntax::ExplicitVrBE),
         Some("1.2.840.10008.1.2.1.99") => Err(DicomError::InvalidDicom(
             "Deflated transfer syntax (1.2.840.10008.1.2.1.99) is not supported \
@@ -2224,9 +2450,52 @@ fn decode_cjk_string(bytes: &[u8], charset: &str) -> String {
     cow.into_owned()
 }
 
+/// Whether the value contains an ISO 2022 escape sequence (ESC, 0x1B).
+///
+/// PS3.5 6.1.2.5.2: in DICOM the only escape sequences that may appear are the
+/// PS3.3-specified ones, and they always begin with ESC. A value carrying ESC
+/// therefore asserts that Code Extension is in effect for it.
+fn has_iso2022_escape(bytes: &[u8]) -> bool {
+    bytes.contains(&0x1B)
+}
+
+/// Decode a value whose Specific Character Set puts Code Extension in effect.
+///
+/// PS3.5 6.1.2.5.4(c): a MULTI-VALUED Specific Character Set is the one case
+/// where escape sequences may appear inside the stream, switching G1 between
+/// the designated sets mid-value. This decoder does not implement that
+/// switching (see D1 in
+/// `analysis/2011_writer_rabbit_a4b_dicomrs_REPORT.md`: building a real ISO 2022
+/// decoder was explicitly out of scope).
+///
+/// What it must NOT do is hand the bytes to a plain EUC_JP decoder, which would
+/// read the ESC and its designator as ordinary EUC bytes and return plausible
+/// but wrong characters - a silent mojibake the caller cannot detect. Instead it
+/// applies the PS3.5 6.1.2.4 unknown-byte fallback (`\nnn` octal escapes) so the
+/// substitution is VISIBLE in the output, and warns. A reader that wants the
+/// real text must decode the escape sequences itself.
+fn decode_code_extension_value(bytes: &[u8]) -> String {
+    log::warn!(
+        "Specific Character Set is multi-valued and the value contains an ISO 2022 \
+         escape sequence; escape-sequence switching is not implemented, so the \
+         affected bytes are rendered as \\nnn octal escapes (PS3.5 6.1.2.4) \
+         instead of being silently mis-decoded."
+    );
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        // Printable ASCII passes through so the surrounding text stays legible.
+        if (0x20..0x7F).contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\{b:03o}"));
+        }
+    }
+    out
+}
+
 #[cfg(all(test, feature = "cjk-charsets"))]
 mod cjk_decode_tests {
-    use super::{decode_cjk_string, is_cjk_charset};
+    use super::{decode_cjk_string, decode_dicom_string, is_cjk_charset};
 
     // Golden byte fixtures. Each was produced out-of-tree with Python's codecs
     // (`text.encode(codec)`), which keeps the bytes independent of the Rust
@@ -2334,6 +2603,46 @@ mod cjk_decode_tests {
         assert_eq!(out, "\u{5C71}\u{FFFD}");
     }
 
+    /// D1 / :2246: a MULTI-valued Specific Character Set with an ESC sequence in
+    /// the value must NOT be decoded by a plain EUC_JP decoder.
+    ///
+    /// PS3.5 6.1.2.5.4(c) allows Code Extension only for a multi-valued SCS, and
+    /// then ESC sequences may switch G1 mid-value. Feeding such a stream to
+    /// EUC_JP reads the ESC and its designator as ordinary EUC bytes and returns
+    /// plausible but WRONG characters - a mojibake the caller cannot detect.
+    #[test]
+    fn a_multi_valued_scs_with_escapes_is_not_silently_decoded_as_euc_jp() {
+        // ESC ( B = designate ASCII to G0; ESC $ B = JIS X 0208 to G1.
+        let bytes = [b'A', 0x1B, b'$', b'B', 0xC5, 0xEC, 0x1B, b'(', b'B', b'Z'];
+        let cs = "ISO_IR 144\\ISO 2022 IR 87";
+
+        let out = decode_dicom_string(&bytes, Some(cs));
+
+        // The ESC bytes must be VISIBLE as octal escapes, not consumed.
+        assert!(
+            out.contains("\\033"),
+            "the escape bytes must be rendered, not silently swallowed: {out:?}"
+        );
+        // And the result must not be the EUC_JP reading of the same bytes, which
+        // is what the old path produced.
+        let euc_reading = decode_cjk_string(&bytes, "ISO 2022 IR 87");
+        assert_ne!(
+            out, euc_reading,
+            "a code-extended value must not decode as plain EUC_JP"
+        );
+    }
+
+    /// The narrowed scope: a SINGLE-valued ISO 2022 term still decodes as EUC,
+    /// because 6.1.2.5.1 puts G1 in GR and 6.1.2.5.4(b) forbids Code Extension
+    /// there. Only the multi-valued case changes behaviour.
+    #[test]
+    fn a_single_valued_iso_2022_term_still_decodes_as_euc() {
+        // U+6771 U+4EAC in the EUC-JP layout, no ESC.
+        let bytes = [0xC5, 0xEC, 0xB5, 0xFE];
+        let out = decode_dicom_string(&bytes, Some("ISO 2022 IR 87"));
+        assert_eq!(out, "\u{6771}\u{4EAC}");
+    }
+
     #[test]
     fn ascii_passes_through_every_charset() {
         // A CJK charset must not disturb the ASCII range (PS3.5 6.1.2: the
@@ -2381,6 +2690,19 @@ mod cjk_decode_tests {
 /// - ISO 2022 -> log warning, fallback to Latin-1 (tracked as #P7-ISO2022)
 /// - Unknown charset -> log warning, fallback to Latin-1
 fn decode_dicom_string(bytes: &[u8], charset: Option<&str>) -> String {
+    // PS3.5 6.1.2.5.4(c): a multi-valued Specific Character Set is the only case
+    // where Code Extension may be in effect, i.e. where ESC sequences can occur
+    // inside a value. The recognised terms are stored backslash-joined, so a
+    // separator means "more than one value". Single-valued ISO 2022 IR 87 / 159
+    // / ISO_IR 149 stay on the EUC decode path: 6.1.2.5.1 makes GR = the EUC
+    // layout and 6.1.2.5.4(b) forbids Code Extension there, so those bytes are
+    // correct as-is.
+    if let Some(cs) = charset
+        && cs.contains('\\')
+        && has_iso2022_escape(bytes)
+    {
+        return decode_code_extension_value(bytes);
+    }
     // Select lookup table based on SpecificCharacterSet
     let table: Option<&[char; 96]> = match charset {
         Some("ISO_IR 192") => {
@@ -2607,14 +2929,18 @@ fn opt_int(value: &[u8], charset: Option<&str>) -> Option<i32> {
 ///
 /// DICOM US/SS/OW are binary - NOT ASCII strings. `opt_int` uses
 /// `decode_dicom_string` -> `parse::<i32>()` which fails on raw bytes.
-/// This function reads 2 bytes as little-endian u16 directly.
+///
+/// PS3.5 7.3: the byte order of a binary value follows the dataset encoding,
+/// so an Explicit VR Big Endian Rows/Columns is big-endian. Reading it as
+/// little-endian turned 512x256 into 2x1 - a wrong frame size that then sized
+/// every frame chunk.
 ///
 /// Returns `None` if the value has fewer than 2 bytes.
-fn opt_u16(value: &[u8]) -> Option<u16> {
+fn opt_u16(value: &[u8], syntax: TransferSyntax) -> Option<u16> {
     if value.len() < 2 {
         return None;
     }
-    Some(u16::from_le_bytes([value[0], value[1]]))
+    Some(read_u16_syntax(value, 0, syntax))
 }
 
 fn trim_trailing(bytes: &[u8]) -> &[u8] {
@@ -2636,133 +2962,18 @@ fn trim_trailing(bytes: &[u8]) -> &[u8] {
 ///
 /// PS3.5 6.2: an Implicit VR dataset carries no VR at the element, so the VR
 /// exists only in the dictionary (PS3.6 6) - a tag missing from it renders as
-/// `UN` and loses its type, its JSON shape and its numeric conversion. The
-/// hand-kept table below once covered a few dozen tags and left everything
-/// else `UN`; the generated PS3.6 table now answers first.
-fn lookup_vr(group: u16, element: u16) -> &'static str {
-    // Group-length tags always have VR=UL (PS3.5 7.2, Table 7.2-1).
-    if element == 0x0000 {
-        return "UL";
-    }
-    // The generated PS3.6 table. A tag absent from it falls through to the
-    // local overrides, then to UN.
-    if let Some(vr) = crate::codec::vr_dict_std::standard_vr(group, element) {
-        return vr;
-    }
-    lookup_vr_local(group, element)
-}
-
-/// Hand-kept VRs for the tags the renderer treats specially.
+/// `UN` and loses its type, its JSON shape and its numeric conversion.
 ///
-/// Kept after the dictionary so the explicit list still documents which tags
-/// this renderer depends on; `standard_vr` already answers all of them.
-fn lookup_vr_local(group: u16, element: u16) -> &'static str {
-    match (group, element) {
-        // -- Group 0002: Meta-header (always Explicit VR, included for completeness) -
-        (0x0002, 0x0010) => "UI", // TransferSyntaxUID
-        (0x0002, 0x0012) => "UI", // ImplementationClassUID
-        (0x0002, 0x0013) => "SH", // ImplementationVersionName
-
-        // -- Group 0008: Identifying --------------------------------------
-        (0x0008, 0x0005) => "CS", // SpecificCharacterSet
-        (0x0008, 0x0008) => "CS", // ImageType
-        (0x0008, 0x0012) => "DA", // InstanceCreationDate
-        (0x0008, 0x0013) => "TM", // InstanceCreationTime
-        (0x0008, 0x0016) => "UI", // SOPClassUID
-        (0x0008, 0x0018) => "UI", // SOPInstanceUID
-        (0x0008, 0x0020) => "DA", // StudyDate
-        (0x0008, 0x0021) => "DA", // SeriesDate
-        (0x0008, 0x0022) => "DA", // AcquisitionDate
-        (0x0008, 0x0023) => "DA", // ContentDate
-        (0x0008, 0x0030) => "TM", // StudyTime
-        (0x0008, 0x0031) => "TM", // SeriesTime
-        (0x0008, 0x0032) => "TM", // AcquisitionTime
-        (0x0008, 0x0033) => "TM", // ContentTime
-        (0x0008, 0x0050) => "SH", // AccessionNumber
-        (0x0008, 0x0060) => "CS", // Modality
-        (0x0008, 0x0070) => "LO", // Manufacturer
-        (0x0008, 0x0080) => "LO", // InstitutionName
-        (0x0008, 0x0090) => "PN", // ReferringPhysicianName
-        (0x0008, 0x1010) => "SH", // StationName
-        (0x0008, 0x1030) => "LO", // StudyDescription
-        (0x0008, 0x103E) => "LO", // SeriesDescription
-        (0x0008, 0x1090) => "LO", // ManufacturerModelName
-
-        // -- Group 0010: Patient ------------------------------------------
-        (0x0010, 0x0010) => "PN", // PatientName
-        (0x0010, 0x0020) => "LO", // PatientID
-        (0x0010, 0x0030) => "DA", // PatientBirthDate
-        (0x0010, 0x0040) => "CS", // PatientSex
-        (0x0010, 0x1010) => "AS", // PatientAge
-        (0x0010, 0x1020) => "DS", // PatientSize
-        (0x0010, 0x1030) => "DS", // PatientWeight
-
-        // -- Group 0018: Acquisition --------------------------------------
-        (0x0018, 0x0010) => "LO", // ContrastBolusAgent
-        (0x0018, 0x0015) => "CS", // BodyPartExamined
-        (0x0018, 0x0022) => "CS", // ScanOptions
-        (0x0018, 0x0050) => "DS", // SliceThickness
-        (0x0018, 0x0060) => "DS", // KVP
-        (0x0018, 0x0088) => "DS", // SpacingBetweenSlices
-        (0x0018, 0x1030) => "LO", // ProtocolName
-        (0x0018, 0x5100) => "CS", // PatientPosition
-
-        // -- Group 0020: Image --------------------------------------------
-        (0x0020, 0x000D) => "UI", // StudyInstanceUID
-        (0x0020, 0x000E) => "UI", // SeriesInstanceUID
-        (0x0020, 0x0010) => "SH", // StudyID
-        (0x0020, 0x0011) => "IS", // SeriesNumber
-        (0x0020, 0x0013) => "IS", // InstanceNumber
-        (0x0020, 0x0020) => "CS", // PatientOrientation
-        (0x0020, 0x0032) => "DS", // ImagePositionPatient
-        (0x0020, 0x0037) => "DS", // ImageOrientationPatient
-        (0x0020, 0x0052) => "UI", // FrameOfReferenceUID
-        (0x0020, 0x0060) => "CS", // Laterality
-        (0x0020, 0x1041) => "DS", // SliceLocation
-        (0x0020, 0x1206) => "IS", // NumberOfStudyRelatedSeries
-        (0x0020, 0x1208) => "IS", // NumberOfStudyRelatedInstances
-
-        // -- Group 0028: Image Presentation -------------------------------
-        (0x0028, 0x0002) => "US", // SamplesPerPixel
-        (0x0028, 0x0004) => "CS", // PhotometricInterpretation
-        (0x0028, 0x0006) => "US", // PlanarConfiguration
-        (0x0028, 0x0008) => "IS", // NumberOfFrames
-        (0x0028, 0x0010) => "US", // Rows
-        (0x0028, 0x0011) => "US", // Columns
-        (0x0028, 0x0030) => "DS", // PixelSpacing
-        (0x0028, 0x0100) => "US", // BitsAllocated
-        (0x0028, 0x0101) => "US", // BitsStored
-        (0x0028, 0x0102) => "US", // HighBit
-        (0x0028, 0x0103) => "US", // PixelRepresentation
-        (0x0028, 0x0106) => "US", // SmallestImagePixelValue
-        (0x0028, 0x0107) => "US", // LargestImagePixelValue
-        (0x0028, 0x1050) => "DS", // WindowCenter
-        (0x0028, 0x1051) => "DS", // WindowWidth
-        (0x0028, 0x1052) => "DS", // RescaleIntercept
-        (0x0028, 0x1053) => "DS", // RescaleSlope
-        (0x0028, 0x1054) => "LO", // RescaleType
-        (0x0028, 0x2110) => "CS", // LossyImageCompression
-        (0x0028, 0x2112) => "DS", // LossyImageCompressionRatio
-
-        // -- Group 0032: Study -------------------------------------------
-        (0x0032, 0x000A) => "CS", // StudyStatusID
-        (0x0032, 0x1032) => "PN", // RequestingPhysician
-        (0x0032, 0x1060) => "LO", // RequestedProcedureDescription
-
-        // -- Group 0040: Procedure ----------------------------------------
-        (0x0040, 0x0002) => "DA", // ScheduledProcedureStepStartDate
-        (0x0040, 0x0003) => "TM", // ScheduledProcedureStepStartTime
-        (0x0040, 0x0004) => "DA", // ScheduledProcedureStepEndDate
-        (0x0040, 0x0005) => "TM", // ScheduledProcedureStepEndTime
-        (0x0040, 0x0253) => "SH", // PerformedProcedureStepID
-        (0x0040, 0x0254) => "LO", // PerformedProcedureStepDescription
-        (0x0040, 0x1001) => "SH", // RequestedProcedureID
-
-        // -- Group 7FE0: Pixel Data ---------------------------------------
-        (0x7FE0, 0x0010) => "OW", // PixelData
-
-        _ => "UN",
-    }
+/// This delegates to [`crate::codec::vr_dict::vr_for_tag`], which is the one
+/// place the VR facts live: the generated PS3.6 table first, then the two
+/// overrides the table cannot answer - the PS3.5 7.8.1 Private Creator rule
+/// and the PS3.10 7.1 File Meta group (PS3.6 does not list meta attributes, so
+/// three of them would otherwise fall to `UN`). A local hand-kept table used to
+/// sit here duplicating 85 of those answers; it also disagreed with the
+/// dictionary on (7FE0,0010), pinning `OW` where PS3.6 says `OB`, so the same
+/// tag resolved differently depending on which path rendered it.
+fn lookup_vr(group: u16, element: u16) -> &'static str {
+    crate::codec::vr_dict::vr_for_tag(group, element)
 }
 
 // ===========================================================================
@@ -2775,7 +2986,13 @@ const STRING_VRS: &[&str] = &[
 ];
 
 /// Numeric VRs: value is a number array.
-const NUMERIC_VRS: &[&str] = &["FL", "FD", "SL", "SS", "UL", "US"];
+///
+/// PS3.18 F.2.3 Table F.2.3-1 maps FL, FD, SL, SS, SV, UL, US and UV to the
+/// JSON Data Type "Number". SV/UV belong here even though they are 8 bytes
+/// wide: leaving them out sent them down the binary arm, which base64-encodes a
+/// value the standard requires to be a number. See
+/// `standard/ps3.18/dicom-json-numeric-vr-F.2.3.json`.
+const NUMERIC_VRS: &[&str] = &["FL", "FD", "SL", "SS", "SV", "UL", "US", "UV"];
 
 /// Binary VRs: value is a single inline-base64 string under `InlineBinary`.
 const BINARY_VRS: &[&str] = &["OB", "OD", "OF", "OL", "OV", "OW", "UN"];
@@ -2919,6 +3136,13 @@ impl DicomRsParser {
         depth: usize,
     ) -> Result<bool, DicomError> {
         let mut v = Vec::new();
+        // PS3.18 F.2.5: a present attribute of zero Value Length is the VR-only
+        // object `{"vr":"VR"}` with NO Value / InlineBinary / BulkDataURI
+        // member. Every VR class below follows that: a zero-length SQ must not
+        // emit `"Value":[]` and a zero-length binary must not emit
+        // `"InlineBinary":""`, because both assert a payload that the
+        // instance did not state. The caller supplies the `{"vr":...}` object
+        // when this returns false.
         match vr {
             "PN" => {
                 let trimmed = trim_trailing(raw);
@@ -2926,27 +3150,55 @@ impl DicomRsParser {
                     // Zero-length scalar: omit the attribute (see caller).
                     return Ok(false);
                 }
+                // PS3.18 F.2.2: Value is an ARRAY, one entry per attribute
+                // VALUE, and a PN attribute may be multi-valued (PS3.5 6.2: the
+                // values are separated by the same 5CH backslash as any other
+                // multi-valued element). Grouping the whole decoded string
+                // first treated "A^B\C^D" as ONE name whose Alphabetic group
+                // carried the backslash, so a second operator's name never
+                // appeared as its own object.
                 let decoded = decode_dicom_string(trimmed, charset);
-                let groups = split_pn_groups(&decoded);
-                let mut obj = Vec::new();
-                obj.extend_from_slice(br#"{"Alphabetic":"#);
-                push_json_str_native(&mut obj, &groups.alphabetic);
-                if let Some(ideo) = groups.ideographic {
-                    obj.extend_from_slice(br#","Ideographic":"#);
-                    push_json_str_native(&mut obj, &ideo);
-                }
-                if let Some(phone) = groups.phonetic {
-                    obj.extend_from_slice(br#","Phonetic":"#);
-                    push_json_str_native(&mut obj, &phone);
-                }
-                obj.push(b'}');
                 v.extend_from_slice(b"\"Value\":[");
-                v.extend_from_slice(&obj);
+                let mut first_value = true;
+                for name in decoded.split('\\') {
+                    // An empty component is still a value slot; PS3.18 F.2.2
+                    // keeps the array position, and it renders as {} because no
+                    // group carries text.
+                    if !first_value {
+                        v.push(b',');
+                    }
+                    first_value = false;
+                    let groups = split_pn_groups(name);
+                    if groups.alphabetic.is_empty()
+                        && groups.ideographic.is_none()
+                        && groups.phonetic.is_none()
+                    {
+                        v.extend_from_slice(b"{}");
+                        continue;
+                    }
+                    let mut obj = Vec::new();
+                    if !groups.alphabetic.is_empty() {
+                        obj.extend_from_slice(br#"{"Alphabetic":"#);
+                        push_json_str_native(&mut obj, &groups.alphabetic);
+                    } else {
+                        obj.push(b'{');
+                    }
+                    if let Some(ideo) = groups.ideographic {
+                        obj.extend_from_slice(br#","Ideographic":"#);
+                        push_json_str_native(&mut obj, &ideo);
+                    }
+                    if let Some(phone) = groups.phonetic {
+                        obj.extend_from_slice(br#","Phonetic":"#);
+                        push_json_str_native(&mut obj, &phone);
+                    }
+                    obj.push(b'}');
+                    v.extend_from_slice(&obj);
+                }
                 v.push(b']');
                 write_tag_value_object_native(out, vr, &v);
             }
             "AT" => {
-                let tags = decode_at_values_count(raw);
+                let tags = decode_at_values_count(raw, syntax);
                 if tags.is_empty() {
                     // An empty collection is not a value. Emitting
                     // `"Value":[]` produced an attribute a consumer must
@@ -3013,6 +3265,12 @@ impl DicomRsParser {
                 write_tag_value_object_native(out, vr, &v);
             }
             vr if BINARY_VRS.contains(&vr) => {
+                // PS3.18 F.2.5: zero Value Length is the VR-only object, not
+                // `"InlineBinary":""` - an empty base64 string claims a
+                // zero-byte payload was stored.
+                if raw.is_empty() {
+                    return Ok(false);
+                }
                 // PS3.18 F.2.2: a binary VR carries a SINGLE base64 string
                 // under `InlineBinary`, not a `Value` array. Slim
                 // (dicom-microscopy-viewer) decodes binary base64 only from
@@ -3023,6 +3281,14 @@ impl DicomRsParser {
                 write_tag_value_object_native(out, vr, &v);
             }
             "SQ" => {
+                // PS3.18 F.2.5: zero Value Length is the VR-only object, not
+                // `"Value":[]` - an empty array is indistinguishable from an
+                // attribute that stated an empty sequence, and F.2.5 makes
+                // "present and empty" a VR-only object specifically so those
+                // two statements stay distinct.
+                if raw.is_empty() {
+                    return Ok(false);
+                }
                 // Nested sequence: render each item as a JSON object, so the
                 // value is an array of objects (PS3.18 8.7.3.2). An empty
                 // sequence stays an empty array. Beyond the depth cap the
@@ -3035,6 +3301,10 @@ impl DicomRsParser {
                 write_tag_value_object_native(out, vr, &v);
             }
             _ => {
+                // PS3.18 F.2.5: zero Value Length is the VR-only object.
+                if raw.is_empty() {
+                    return Ok(false);
+                }
                 // Unknown VR: render as a binary value, i.e. a single inline
                 // base64 string under `InlineBinary` (same shape as the
                 // known binary VRs above).
@@ -3081,7 +3351,18 @@ fn write_sq_items_json_native(
     let mut first_item = true;
 
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        // PS3.5 7.5 fixes the item header to Implicit VR, and 7.3 makes Implicit
+        // VR Little Endian, so a strictly conformant item header is little-endian
+        // whatever the transfer syntax. This walk reads it in the DATASET byte
+        // order instead. The two readings differ only for Explicit VR Big Endian
+        // (1.2.840.10008.1.2.2), which 7.3 retires and PS3.18 8.7.3 bars from Web
+        // Services, so no conformant instance can tell them apart. Left as-is
+        // because changing it would rewrite an existing fixture for a case that
+        // cannot arrive.
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
 
         // An item delimiter ends the enclosing item and a sequence delimiter
         // ends the enclosing sequence; neither carries a value.
@@ -3093,10 +3374,30 @@ fn write_sq_items_json_native(
         // Item header: tag + 4-byte length, no VR. Its body is a dataset, read
         // by continuing into it rather than skipping.
         if tag == tags::ITEM {
-            let length = read_u32_le(data, pos + 4);
+            let length = read_u32_syntax(data, pos + 4, syntax);
             pos += 8;
             let item_end = if length == tags::UNDEFINED_LENGTH {
-                undefined_extent(data, pos, end).unwrap_or(end)
+                // PS3.5 7.5: an undefined-length item is closed by its own Item
+                // Delimitation, which is what `undefined_extent` steps past. If
+                // there is none, the extent is UNKNOWN. Falling back to `end`
+                // used to be harmless-looking but fabricated a body: the
+                // subtraction below then removed 8 bytes that were never read,
+                // so the item absorbed every following sibling and the sequence
+                // silently lost its tail. The rendered JSON would give one
+                // item another item's attributes, and no client can detect
+                // that - unlike the collectors, the renderer publishes what it
+                // finds. An unterminated item is malformed input, and saying so
+                // is the only answer that cannot be mistaken for data.
+                match undefined_extent(data, pos, end, syntax) {
+                    Some(item_end) => item_end,
+                    None => {
+                        return Err(DicomError::InvalidDicom(format!(
+                            "Unterminated undefined-length sequence item at offset \
+                             {pos}: no Item Delimitation before the end of the \
+                             sequence value (PS3.5 7.5)"
+                        )));
+                    }
+                }
             } else {
                 pos.saturating_add(length as usize).min(end)
             };
@@ -3138,7 +3439,11 @@ fn write_sq_dataset_json_native(
 ) -> Result<(), DicomError> {
     let mut first = true;
     while pos + 8 <= end {
-        let tag = (read_u16_le(data, pos), read_u16_le(data, pos + 2));
+        // PS3.5 7.3: nested element tags follow the dataset byte order too.
+        let tag = (
+            read_u16_syntax(data, pos, syntax),
+            read_u16_syntax(data, pos + 2, syntax),
+        );
 
         // Defensive: an inner delimiter ends this item's dataset early.
         if tag == tags::ITEM_DELIMITATION || tag == tags::SEQUENCE_DELIMITATION {
@@ -3158,7 +3463,7 @@ fn write_sq_dataset_json_native(
                 if pos + 8 > end {
                     return Ok(());
                 }
-                (None, read_u32_le(data, pos + 4), pos + 8)
+                (None, read_u32_syntax(data, pos + 4, syntax), pos + 8)
             }
             _ => {
                 vr_bytes = [data[pos + 4], data[pos + 5]];
@@ -3166,11 +3471,15 @@ fn write_sq_dataset_json_native(
                     if pos + 12 > end {
                         return Ok(());
                     }
-                    (Some(vr_bytes), read_u32_le(data, pos + 8), pos + 12)
+                    (
+                        Some(vr_bytes),
+                        read_u32_syntax(data, pos + 8, syntax),
+                        pos + 12,
+                    )
                 } else {
                     (
                         Some(vr_bytes),
-                        u32::from(read_u16_le(data, pos + 6)),
+                        u32::from(read_u16_syntax(data, pos + 6, syntax)),
                         pos + 8,
                     )
                 }
@@ -3186,7 +3495,7 @@ fn write_sq_dataset_json_native(
             if value_start > end {
                 return Ok(());
             }
-            let sq_end = undefined_extent(data, value_start, end).unwrap_or(end);
+            let sq_end = undefined_extent(data, value_start, end, syntax).unwrap_or(end);
             (sq_end.saturating_sub(8), sq_end)
         } else {
             let ve = value_start.saturating_add(length as usize);
@@ -3198,8 +3507,14 @@ fn write_sq_dataset_json_native(
         };
 
         // Emit `"TAG":<value-object>`; the value object carries its own braces.
-        // Zero-length scalar values are omitted, mirroring the top-level
-        // renderer (extract_full_metadata_bytes).
+        //
+        // PS3.18 F.2.5: a present attribute of zero Value Length inside a
+        // sequence item is the VR-only object `{"vr":"VR"}`, not an omission.
+        // Skipping it stated that the item does not carry the attribute, which
+        // is a different assertion - and one a client cannot distinguish from a
+        // genuinely absent key. The top-level renderer already emits the
+        // VR-only form, so dropping it here made the same attribute render
+        // differently depending on its nesting depth.
         let mut value_json = Vec::new();
         if !DicomRsParser::write_element_json_native(
             &mut value_json,
@@ -3209,8 +3524,10 @@ fn write_sq_dataset_json_native(
             syntax,
             depth + 1,
         )? {
-            pos = next_pos;
-            continue;
+            value_json.clear();
+            value_json.extend_from_slice(b"{\"vr\":\"");
+            value_json.extend_from_slice(vr.as_bytes());
+            value_json.extend_from_slice(b"\"}");
         }
         if !first {
             out.push(b',');
@@ -3369,7 +3686,10 @@ fn decode_numeric_values_raw(bytes: &[u8], vr: &str, syntax: TransferSyntax) -> 
     let width: usize = match vr {
         "US" | "SS" => 2,
         "UL" | "SL" | "FL" => 4,
-        "FD" => 8,
+        // FD/SV/UV are the 8-byte VRs. UV is unsigned and SV signed, both full
+        // 64-bit - they must not be narrowed through i32/u32 casts that lose
+        // the top bit for UV and the sign for SV.
+        "FD" | "SV" | "UV" => 8,
         _ => return vec![],
     };
     if bytes.len() < width {
@@ -3430,14 +3750,46 @@ fn decode_numeric_values_raw(bytes: &[u8], vr: &str, syntax: TransferSyntax) -> 
                     values.push(NativeJsonNum::F64(v));
                 }
             }
+            // PS3.18 F.2.3: SV and UV are Numbers. Both are 8 bytes, so they
+            // share FD's byte-order handling; only the interpretation differs.
+            // u64/i64 carry the full width, so UV above i64::MAX and SV below
+            // zero survive intact.
+            "SV" | "UV" => {
+                let bits = if be {
+                    u64::from_be_bytes([
+                        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
+                        slice[7],
+                    ])
+                } else {
+                    u64::from_le_bytes([
+                        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
+                        slice[7],
+                    ])
+                };
+                if vr == "UV" {
+                    values.push(NativeJsonNum::U64(bits));
+                } else {
+                    values.push(NativeJsonNum::I64(bits as i64));
+                }
+            }
             _ => {}
         }
     }
     values
 }
 
-/// Decode AT values as the serde-era quoted `"GGGG,EEEE"` strings.
-fn decode_at_values_count(bytes: &[u8]) -> Vec<String> {
+/// Decode AT values as DICOM JSON tag strings.
+///
+/// PS3.18 F.2.3: an AT value "shall be restricted to eight character uppercase
+/// hexadecimal representation of a DICOM Tag" - group then element, no
+/// separator. The comma form this used to emit (`"0008,0060"`) is not a
+/// conformant AT value, so a client matching on an AT attribute never matched.
+///
+/// PS3.5 7.3 decides the byte order of a VALUE, and an AT value is a pair of
+/// binary u16s, so an Explicit VR Big Endian AT is big-endian on the wire. The
+/// rendered string is the same either way: the tag is the identified
+/// attribute, not a byte pattern.
+fn decode_at_values_count(bytes: &[u8], syntax: TransferSyntax) -> Vec<String> {
     if bytes.len() < 4 {
         return vec![];
     }
@@ -3445,9 +3797,9 @@ fn decode_at_values_count(bytes: &[u8]) -> Vec<String> {
     let mut values = Vec::with_capacity(count);
     for i in 0..count {
         let start = i * 4;
-        let group = u16::from_le_bytes([bytes[start], bytes[start + 1]]);
-        let elem = u16::from_le_bytes([bytes[start + 2], bytes[start + 3]]);
-        values.push(format!("{:04X},{:04X}", group, elem));
+        let group = read_u16_syntax(bytes, start, syntax);
+        let elem = read_u16_syntax(bytes, start + 2, syntax);
+        values.push(format!("{group:04X}{elem:04X}"));
     }
     values
 }
@@ -3577,10 +3929,11 @@ mod tests {
             self.buf.extend_from_slice(vr);
 
             let vr_str = std::str::from_utf8(vr).unwrap_or("");
-            let is_long = matches!(
-                vr_str,
-                "OB" | "OD" | "OF" | "OL" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT"
-            );
+            // PS3.5 Table 6.2-1 width classes from the one shared statement.
+            // A local list here omitted SV, UV and OV, so a fixture built with
+            // any of them got a short-form header and the reader decoded the
+            // reserved bytes as a zero length.
+            let is_long = crate::codec::is_long_form_vr_str(vr_str);
 
             if is_long {
                 self.buf.extend_from_slice(&[0u8, 0u8]); // reserved
@@ -3620,6 +3973,39 @@ mod tests {
 
         fn build(self) -> Vec<u8> {
             self.buf
+        }
+
+        /// Add an Explicit VR BIG ENDIAN element (PS3.5 7.3).
+        ///
+        /// The tag, the length and the value itself are all big-endian in this
+        /// encoding, which is the whole point of the case: a builder that wrote
+        /// the header big-endian but the value little-endian would test
+        /// nothing.
+        fn add_element_be(mut self, group: u16, elem: u16, vr: &[u8; 2], value: &[u8]) -> Self {
+            self.buf.extend_from_slice(&group.to_be_bytes());
+            self.buf.extend_from_slice(&elem.to_be_bytes());
+            self.buf.extend_from_slice(vr);
+
+            let vr_str = std::str::from_utf8(vr).unwrap_or("");
+            let is_long = crate::codec::is_long_form_vr_str(vr_str);
+            if is_long {
+                self.buf.extend_from_slice(&[0u8, 0u8]); // reserved
+                self.buf
+                    .extend_from_slice(&(value.len() as u32).to_be_bytes());
+            } else {
+                self.buf
+                    .extend_from_slice(&(value.len() as u16).to_be_bytes());
+            }
+            self.buf.extend_from_slice(value);
+            if !value.len().is_multiple_of(2) {
+                let pad = if vr_str == "UI" || vr_str == "OB" || vr_str == "US" {
+                    0x00
+                } else {
+                    0x20
+                };
+                self.buf.push(pad);
+            }
+            self
         }
     }
 
@@ -3773,10 +4159,7 @@ mod tests {
         buf.extend_from_slice(&elem.to_le_bytes());
         buf.extend_from_slice(vr);
         let vr_str = std::str::from_utf8(vr).unwrap_or("");
-        let is_long = matches!(
-            vr_str,
-            "OB" | "OD" | "OF" | "OL" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT"
-        );
+        let is_long = crate::codec::is_long_form_vr_str(vr_str);
         if is_long {
             buf.extend_from_slice(&[0u8, 0u8]);
             buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -3852,6 +4235,81 @@ mod tests {
         );
     }
 
+    /// PS3.18 F.2.5 inside a sequence item: a present-but-empty attribute is a
+    /// VR-only object, not an omission.
+    ///
+    /// The item renderer skipped the attribute entirely, which asserted the item
+    /// does not carry it - a different statement from "carried and empty", and
+    /// one that also made the same attribute render differently at top level
+    /// than inside a sequence.
+    #[test]
+    fn a_zero_length_attribute_inside_a_sequence_item_is_kept() {
+        // One item holding a zero-length Patient ID (0010,0020) LO plus a
+        // populated Patient Name, so the item is non-empty overall.
+        let mut item = Vec::new();
+        explicit_element(&mut item, 0x0010, 0x0020, b"LO", b"");
+        explicit_element(&mut item, 0x0010, 0x0010, b"PN", b"INNER^EMPTY");
+        let mut sq = Vec::new();
+        item_defined(&mut sq, &item);
+
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0010, 0x0010, b"PN", b"OUTER^PATIENT")
+            .add_element(0x0040, 0xA730, b"SQ", &sq)
+            .build();
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            s.contains("\"00100020\":{\"vr\":\"LO\"}"),
+            "a present-but-empty attribute inside an item must render as a \
+             VR-only object: {s}"
+        );
+        assert!(
+            s.contains("INNER^EMPTY"),
+            "the populated sibling must still render: {s}"
+        );
+    }
+
+    /// PS3.18 F.2.5: a zero-length binary attribute is a VR-only object.
+    ///
+    /// `"InlineBinary":""` claims a zero-byte payload was stored, which is a
+    /// different statement from "the attribute is present and states no value".
+    /// The empty base64 string is exactly the shape F.2.5 forbids, so this
+    /// asserts both the required form and the absence of that member.
+    #[test]
+    fn a_zero_length_binary_attribute_has_no_payload_member() {
+        // (7FE0,0010) is skipped by the renderer, so use a non-pixel OB: the
+        // Icon Image Sequence is an SQ, but Private Creator (0009,0010) accepts
+        // an arbitrary VR through the builder, and the renderer looks the VR up
+        // from the tag - so pick a tag the dictionary knows as OB. (0028,1201)
+        // Red Palette Color Lookup Table Data is OW.
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0010, 0x0010, b"PN", b"ZERO^BIN")
+            .add_element(0x0028, 0x1201, b"OW", b"")
+            .build();
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            !s.contains("\"InlineBinary\":\"\""),
+            "no zero-length binary may emit an empty InlineBinary: {s}"
+        );
+        assert!(
+            s.contains("\"00281201\":{\"vr\":\"OW\"}"),
+            "a zero-length OW must render as a VR-only object: {s}"
+        );
+    }
+
+    /// PS3.18 F.2.5: a zero-length SQ is the VR-only object, NOT `"Value":[]`.
+    ///
+    /// An empty array is the shape of a sequence that stated zero items; a
+    /// zero Value Length states no value at all. F.2.5 keeps those two
+    /// statements apart by rendering the latter as `{"vr":"SQ"}`, so this test
+    /// asserts the VR-only form.
     #[test]
     fn empty_sq_stays_empty_array() {
         let mut d = DicomBuilder::new().meta_header("1.2.840.10008.1.2.1");
@@ -3862,8 +4320,12 @@ mod tests {
             .expect("empty SQ renders");
         let s = String::from_utf8_lossy(&bytes).into_owned();
         assert!(
-            s.contains("\"0040A730\":{\"Value\":[],\"vr\":\"SQ\"}"),
-            "empty SQ must stay an empty array: {s}"
+            s.contains("\"0040A730\":{\"vr\":\"SQ\"}"),
+            "a zero-length SQ must render as a VR-only object: {s}"
+        );
+        assert!(
+            !s.contains("\"0040A730\":{\"Value\":[]"),
+            "a zero-length SQ must not claim an empty array: {s}"
         );
     }
 
@@ -4216,6 +4678,231 @@ mod tests {
             .build()
     }
 
+    /// A tail attribute after encapsulated Pixel Data must still be reachable.
+    ///
+    /// PS3.5 7.5.1 scopes elements by tag order only, so Original Attributes
+    /// Sequence (0400,0561) may follow the pixels. An encapsulated PixelData
+    /// has undefined length; parking the cursor at EOF made every following
+    /// element unreachable, so an instance that records hidden identifying
+    /// attributes in that tail was stored as if it had none - the PHI was
+    /// served. The cursor must land after the Sequence Delimitation Item.
+    #[test]
+    fn a_tail_attribute_after_encapsulated_pixel_data_is_reachable() {
+        let mut data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.4.70")
+            .add_element(0x0008, 0x0016, b"UI", b"1.2.840.10008.5.1.4.1.1.2")
+            .add_element(0x0008, 0x0018, b"UI", b"1.3")
+            .add_element(0x0008, 0x0060, b"CS", b"CT")
+            .add_element(0x0010, 0x0010, b"PN", b"PHI^TAIL")
+            .add_element(0x0010, 0x0020, b"LO", b"PAT-TAIL")
+            .add_element(0x0020, 0x000D, b"UI", b"1.1")
+            .add_element(0x0020, 0x000E, b"UI", b"1.2")
+            .build();
+
+        // Encapsulated PixelData: tag + OB + reserved + FFFFFFFF, one basic
+        // offset table item, one data fragment, then Sequence Delimitation.
+        let mut pixel = Vec::new();
+        pixel.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        pixel.extend_from_slice(&0x0010u16.to_le_bytes());
+        pixel.extend_from_slice(b"OB");
+        pixel.extend_from_slice(&[0u8, 0u8]);
+        pixel.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Basic Offset Table item, empty.
+        pixel.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        pixel.extend_from_slice(&0xE000u16.to_le_bytes());
+        pixel.extend_from_slice(&0u32.to_le_bytes());
+        // One fragment item with 4 bytes of payload.
+        pixel.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        pixel.extend_from_slice(&0xE000u16.to_le_bytes());
+        pixel.extend_from_slice(&4u32.to_le_bytes());
+        pixel.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
+        // Sequence Delimitation Item closes the value.
+        pixel.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        pixel.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        pixel.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&pixel);
+
+        // The tail: Original Attributes Sequence (0400,0561) holding a
+        // Patient ID (0010,0020) - the hidden-identifier signal.
+        let mut inner = Vec::new();
+        explicit_element(&mut inner, 0x0010, 0x0020, b"LO", b"TAIL-PATIENT");
+        let mut oas = Vec::new();
+        item_defined(&mut oas, &inner);
+        let tail_at = data.len();
+        explicit_element(&mut data, 0x0400, 0x0561, b"SQ", &oas);
+
+        let meta = DicomRsParser.extract_metadata(&data).expect("valid DICOM");
+        assert_eq!(
+            meta.pixel_data_offset.map(|o| o as usize),
+            Some(tail_at - pixel.len()),
+            "PixelData offset must be the tag position"
+        );
+        assert!(
+            !meta.original_attrs_ranges.is_empty(),
+            "the tail sequence after encapsulated PixelData must be captured"
+        );
+        assert!(
+            meta.hidden_identifying_attrs,
+            "the identifying value inside the tail must be flagged"
+        );
+    }
+
+    /// An Implicit VR scalar must not be walked as a nested dataset.
+    ///
+    /// Implicit VR carries no VR on the wire, so "descend into everything" was
+    /// a guess that read each scalar's VALUE as element headers. A value whose
+    /// bytes happened to lay out like (0008,1155) then produced a referenced
+    /// SOP Instance UID the instance never stated - a fabricated reference that
+    /// the deletion cascade would act on. The dictionary decides instead.
+    #[test]
+    fn an_implicit_scalar_is_not_read_as_a_nested_dataset() {
+        // Outer element: Study Description (0008,1030), a scalar LO that the
+        // walk does not interpret. Its VALUE is crafted so that reading those
+        // bytes as element headers would find a (0008,1155) element with 4
+        // bytes of value.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0x0008u16.to_le_bytes());
+        payload.extend_from_slice(&0x1155u16.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&[0x31; 4]); // '1111'
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&0x0008u16.to_le_bytes());
+        value.extend_from_slice(&0x1030u16.to_le_bytes());
+        value.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        value.extend_from_slice(&payload);
+
+        let mut series_uids = Vec::new();
+        let mut instance_uids = Vec::new();
+        collect_uids_in_range(
+            &value,
+            0,
+            value.len(),
+            &mut series_uids,
+            &mut instance_uids,
+            TransferSyntax::ImplicitVrLE,
+        );
+        assert!(
+            instance_uids.is_empty(),
+            "a scalar's value must not yield a reference, got {instance_uids:?}"
+        );
+    }
+
+    /// The dictionary still finds real sequences in Implicit VR, so the fix
+    /// does not stop the walk from reaching genuinely nested references.
+    #[test]
+    fn an_implicit_sequence_is_still_descended() {
+        // Referenced Series Sequence (0008,1115): no VR on the wire, 4-byte
+        // length, holding one item with Series Instance UID (0020,000E).
+        let mut item = Vec::new();
+        let series_uid = b"1.2.3.4";
+        item.extend_from_slice(&0x0020u16.to_le_bytes());
+        item.extend_from_slice(&0x000Eu16.to_le_bytes());
+        item.extend_from_slice(&(series_uid.len() as u32).to_le_bytes());
+        item.extend_from_slice(series_uid);
+
+        let mut sq = Vec::new();
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE000u16.to_le_bytes());
+        sq.extend_from_slice(&(item.len() as u32).to_le_bytes());
+        sq.extend_from_slice(&item);
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&0x0008u16.to_le_bytes());
+        value.extend_from_slice(&0x1115u16.to_le_bytes());
+        value.extend_from_slice(&(sq.len() as u32).to_le_bytes());
+        value.extend_from_slice(&sq);
+
+        let mut series_uids = Vec::new();
+        let mut instance_uids = Vec::new();
+        collect_uids_in_range(
+            &value,
+            0,
+            value.len(),
+            &mut series_uids,
+            &mut instance_uids,
+            TransferSyntax::ImplicitVrLE,
+        );
+        assert_eq!(
+            series_uids,
+            vec!["1.2.3.4".to_string()],
+            "a real implicit sequence must still be descended"
+        );
+    }
+
+    /// A deeply nested evidence sequence must not exhaust the stack.
+    ///
+    /// The rejection-evidence walk descends into items, and each level costs
+    /// only 8 bytes of input for an undefined-length item. Without the depth
+    /// bound a crafted STOW nests the walk until the stack runs out, which is a
+    /// crash on untrusted input rather than a parse error. The walk is allowed
+    /// to find nothing; what it must not do is recurse without limit.
+    #[test]
+    fn deeply_nested_evidence_sequence_does_not_exhaust_the_stack() {
+        // 4000 nested undefined-length items, far past the 64-level bound but
+        // cheap in input: 8 bytes per level.
+        const LEVELS: usize = 4000;
+        let mut sq = Vec::new();
+        for _ in 0..LEVELS {
+            sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+            sq.extend_from_slice(&0xE000u16.to_le_bytes());
+            sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        collect_referenced_sops_in_range(
+            &sq,
+            0,
+            sq.len(),
+            &mut out,
+            TransferSyntax::ExplicitVrLE,
+            None,
+        );
+        // Reaching here at all is the assertion; the bound stops the descent.
+        assert!(
+            out.is_empty(),
+            "a nesting-only sequence yields no SOP pairs"
+        );
+    }
+
+    /// A nested search value must be decoded with the dataset's declared
+    /// character set, not with the default repertoire.
+    ///
+    /// PS3.5 6.1.2.2 scopes SpecificCharacterSet(0008,0005) to exactly SH, LO,
+    /// UC, ST, LT, UT and PN - which is every VR these nested keys use. Reading
+    /// them with no charset stored the raw extended bytes reinterpreted as
+    /// Latin-1, so a Cyrillic step ID was held as mojibake and a QIDO match on
+    /// the real spelling could never succeed. ISO_IR 144 is ISO-8859-5, kept
+    /// out of the feature-gated arms so this test runs in every configuration.
+    #[test]
+    fn nested_search_values_use_the_dataset_character_set() {
+        // ISO-8859-5: 0xC8 0xD0 0xD3 = CYRILLIC "Shag" (step).
+        let cyrillic_step: &[u8] = &[0xC8, 0xD0, 0xD3];
+        let mut item0 = Vec::new();
+        explicit_element(&mut item0, 0x0040, 0x0009, b"SH", cyrillic_step);
+        let mut ras = Vec::new();
+        item_defined(&mut ras, &item0);
+
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0008, 0x0005, b"CS", b"ISO_IR 144")
+            .add_element(0x0008, 0x0016, b"UI", b"1.2.840.10008.5.1.4.1.1.2")
+            .add_element(0x0008, 0x0018, b"UI", b"1.3")
+            .add_element(0x0008, 0x0060, b"CS", b"CT")
+            .add_element(0x0010, 0x0010, b"PN", b"CYR^PATIENT")
+            .add_element(0x0010, 0x0020, b"LO", b"PAT-CYR")
+            .add_element(0x0020, 0x000D, b"UI", b"1.1")
+            .add_element(0x0020, 0x000E, b"UI", b"1.2")
+            .add_element(0x0040, 0x0275, b"SQ", &ras)
+            .build();
+
+        let meta = DicomRsParser.extract_metadata(&data).expect("valid DICOM");
+        assert_eq!(
+            meta.scheduled_procedure_step_id.as_deref(),
+            Some("\u{0428}\u{0430}\u{0433}"),
+            "the declared charset must decode the nested SH value"
+        );
+    }
+
     /// PS3.18 Table 10.6.1-5 makes `00400275.00400009` and
     /// `00400275.00401001` REQUIRED series matching attributes, so both nested
     /// scalars are captured from the sequence's first item - a key a search
@@ -4232,6 +4919,49 @@ mod tests {
         let plain_meta = DicomRsParser.extract_metadata(&plain).expect("valid DICOM");
         assert_eq!(plain_meta.scheduled_procedure_step_id, None);
         assert_eq!(plain_meta.requested_procedure_id, None);
+    }
+
+    /// The nested scalars must be read from EVERY item of Request Attributes
+    /// Sequence, not just the first.
+    ///
+    /// PS3.3 C.4.2.2 lets the sequence hold more than one item. Reading only
+    /// item 0 left a series silent for a step ID that appears in item 1, so a
+    /// search on that key missed the series. Each key is collected in item
+    /// order; the metadata field keeps the first, which is the item the
+    /// sequence names first.
+    #[test]
+    fn request_scalars_are_read_from_every_item_not_just_the_first() {
+        // Item 0 states ONLY the requested procedure ID; item 1 states both.
+        let mut item0 = Vec::new();
+        explicit_element(&mut item0, 0x0040, 0x1001, b"SH", b"RP-FIRST");
+        let mut item1 = Vec::new();
+        explicit_element(&mut item1, 0x0040, 0x0009, b"SH", b"SPS-SECOND");
+        explicit_element(&mut item1, 0x0040, 0x1001, b"SH", b"RP-SECOND");
+        let mut ras = Vec::new();
+        item_defined(&mut ras, &item0);
+        item_defined(&mut ras, &item1);
+
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0008, 0x0016, b"UI", b"1.2.840.10008.5.1.4.1.1.2")
+            .add_element(0x0008, 0x0018, b"UI", b"1.3")
+            .add_element(0x0008, 0x0060, b"CS", b"CT")
+            .add_element(0x0010, 0x0010, b"PN", b"LATER^ITEM")
+            .add_element(0x0010, 0x0020, b"LO", b"PAT-002")
+            .add_element(0x0020, 0x000D, b"UI", b"1.1")
+            .add_element(0x0020, 0x000E, b"UI", b"1.2")
+            .add_element(0x0040, 0x0275, b"SQ", &ras)
+            .build();
+
+        let meta = DicomRsParser.extract_metadata(&data).expect("valid DICOM");
+        // The step ID lives only in item 1; the first-item-only walk lost it.
+        assert_eq!(
+            meta.scheduled_procedure_step_id.as_deref(),
+            Some("SPS-SECOND")
+        );
+        // The procedure ID is stated by both items; the first in item order is
+        // item 0's, so that is what the single metadata field keeps.
+        assert_eq!(meta.requested_procedure_id.as_deref(), Some("RP-FIRST"));
     }
 
     /// `00101002.00100020` is MULTI-VALUED: every item of OtherPatientIDsSequence
@@ -4427,6 +5157,258 @@ mod tests {
         let meta = DicomRsParser.extract_metadata(&data).expect("valid DICOM");
         assert_eq!(meta.rows, Some(776), "Rows should be 776 (US binary)");
         assert_eq!(meta.cols, Some(776), "Columns should be 776 (US binary)");
+    }
+
+    /// PS3.5 7.3: a defined-length SQ renders its items in a Big Endian file.
+    ///
+    /// The item walker read the item tag and length little-endian, so the first
+    /// Item of a valid Big Endian sequence was not recognised and the response
+    /// carried an empty array for the sequence.
+    #[test]
+    fn big_endian_sequences_render_their_items() {
+        // One item holding (0008,0100) SH "ABC" (padded), all big-endian.
+        let mut item_body: Vec<u8> = Vec::new();
+        item_body.extend_from_slice(&0x0008_u16.to_be_bytes());
+        item_body.extend_from_slice(&0x0100_u16.to_be_bytes());
+        item_body.extend_from_slice(b"SH");
+        item_body.extend_from_slice(&4u16.to_be_bytes());
+        item_body.extend_from_slice(b"ABC ");
+
+        // Defined-length SQ: tag + VR + reserved + 4-byte length + item(s).
+        let mut sq_value: Vec<u8> = Vec::new();
+        sq_value.extend_from_slice(&0xFFFE_u16.to_be_bytes());
+        sq_value.extend_from_slice(&0xE000_u16.to_be_bytes());
+        sq_value.extend_from_slice(&(item_body.len() as u32).to_be_bytes());
+        sq_value.extend_from_slice(&item_body);
+
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.2")
+            .add_element_be(0x0010, 0x0010, b"PN", b"DOE^JOHN")
+            .add_element_be(0x0010, 0x0020, b"LO", b"PAT-001")
+            .add_element_be(0x0020, 0x000D, b"UI", b"1.2.840.113619.2.55.3.1.2.1")
+            .add_element_be(0x0020, 0x000E, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1")
+            .add_element_be(0x0008, 0x0018, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1.1")
+            .add_element_be(0x0008, 0x0060, b"CS", b"CT")
+            .add_element_be(0x0040, 0x0260, b"SQ", &sq_value)
+            .build();
+        let json = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("valid Big Endian DICOM");
+        let text = String::from_utf8_lossy(&json);
+        let at = text.find("00400260").unwrap_or(0);
+        let window = &text[at..(at + 200).min(text.len())];
+        assert!(
+            window.contains(r#""00080100""#),
+            "the Big Endian item's nested element must be rendered, got: {window}"
+        );
+        assert!(
+            window.contains(r#""ABC ""#) || window.contains(r#""ABC"#),
+            "the nested value must survive, got: {window}"
+        );
+    }
+
+    /// PS3.18 F.2.3: an AT value is EIGHT uppercase hex digits, no separator.
+    ///
+    /// The renderer emitted `"0008,0060"`, which is not a conformant AT value,
+    /// so a client building an attribute selector from an AT attribute never
+    /// matched. `standard/ps3.18/dicom-json-at-F.2.3.json` records the wording.
+    ///
+    /// This is asserted here rather than in the golden corpus on purpose: the
+    /// corpus carries the comma form, and regenerating it is an owner decision.
+    #[test]
+    fn at_values_render_as_eight_hex_digits() {
+        // (0008,0008) AT pointing at (0008,0060), Explicit VR Little Endian.
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0010, 0x0010, b"PN", b"DOE^JOHN")
+            .add_element(0x0010, 0x0020, b"LO", b"PAT-001")
+            .add_element(0x0020, 0x000D, b"UI", b"1.2.840.113619.2.55.3.1.2.1")
+            .add_element(0x0020, 0x000E, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1")
+            .add_element(0x0008, 0x0018, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1.1")
+            .add_element(0x0008, 0x0060, b"CS", b"CT")
+            .add_element(0x0008, 0x0008, b"AT", &[0x08u8, 0x00, 0x60, 0x00])
+            .build();
+        let json = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("valid DICOM");
+        let text = String::from_utf8_lossy(&json);
+        assert!(
+            text.contains(r#""00080008":{"Value":["00080060"]"#),
+            "AT must render as eight hex digits, got: {}",
+            &text[text.find("00080008").unwrap_or(0)..][..200.min(text.len())]
+        );
+        assert!(
+            !text.contains("0008,0060"),
+            "the comma form is not a conformant AT value"
+        );
+    }
+
+    /// PS3.5 7.3: an AT value is a pair of binary u16s, so its byte order
+    /// follows the dataset.
+    ///
+    /// The tag used here is deliberately asymmetric: (0028,0010) is `00 28
+    /// 00 10` big-endian and would read as (10240,4096) if the value were
+    /// decoded little-endian, so the rendered string differs between the two
+    /// readings. A symmetric tag such as (0008,0060) cannot tell them apart.
+    #[test]
+    fn at_values_are_decoded_in_the_dataset_byte_order() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.2")
+            .add_element_be(0x0010, 0x0010, b"PN", b"DOE^JOHN")
+            .add_element_be(0x0010, 0x0020, b"LO", b"PAT-001")
+            .add_element_be(0x0020, 0x000D, b"UI", b"1.2.840.113619.2.55.3.1.2.1")
+            .add_element_be(0x0020, 0x000E, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1")
+            .add_element_be(0x0008, 0x0018, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1.1")
+            .add_element_be(0x0008, 0x0060, b"CS", b"CT")
+            // (0008,0008) AT = (0028,0010), big-endian on the wire.
+            .add_element_be(0x0008, 0x0008, b"AT", &[0x00u8, 0x28, 0x00, 0x10])
+            .build();
+        let json = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("valid Big Endian DICOM");
+        let text = String::from_utf8_lossy(&json);
+        assert!(
+            text.contains(r#""00080008":{"Value":["00280010"]"#),
+            "a big-endian AT must decode to (0028,0010), got: {}",
+            &text[text.find("00080008").unwrap_or(0)..][..220.min(text.len())]
+        );
+    }
+
+    /// PS3.5 7.3: an identifying tag in a Big Endian dataset is big-endian.
+    ///
+    /// The hidden-PHI scan read tags little-endian only, so a Big Endian
+    /// Original Attributes Sequence containing a non-empty Patient ID recorded
+    /// its range and left `hidden_identifying_attrs` false - the served metadata
+    /// then kept a value RBC-003 is supposed to hide.
+    #[test]
+    fn hidden_identifying_attrs_are_found_in_big_endian() {
+        // (0400,0561) with a defined length, holding (0010,0020) LO "PHI-1",
+        // all big-endian.
+        let mut inner: Vec<u8> = Vec::new();
+        inner.extend_from_slice(&0x0010_u16.to_be_bytes());
+        inner.extend_from_slice(&0x0020_u16.to_be_bytes());
+        inner.extend_from_slice(b"LO");
+        inner.extend_from_slice(&5u16.to_be_bytes());
+        inner.extend_from_slice(b"PHI-1");
+        inner.push(0x20); // even-length pad
+
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.2") // Explicit VR Big Endian
+            .add_element_be(0x0010, 0x0010, b"PN", b"CURRENT^PATIENT")
+            .add_element_be(0x0010, 0x0020, b"LO", b"VISIBLE")
+            .add_element_be(0x0020, 0x000D, b"UI", b"1.2.840.113619.2.55.3.1.2.1")
+            .add_element_be(0x0020, 0x000E, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1")
+            .add_element_be(0x0008, 0x0018, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1.1")
+            .add_element_be(0x0008, 0x0060, b"CS", b"CT")
+            .add_element_be(0x0400, 0x0561, b"SQ", &inner)
+            .build();
+
+        let meta = DicomRsParser
+            .extract_metadata(&data)
+            .expect("valid Big Endian DICOM");
+        assert!(
+            meta.hidden_identifying_attrs,
+            "the Patient ID inside the Big Endian Original Attributes Sequence must be flagged"
+        );
+    }
+
+    /// PS3.5 7.3: an Implicit VR element has NO VR on the wire.
+    ///
+    /// The undefined-length walker used to read a "VR" out of every scalar
+    /// header. In Implicit VR LE the bytes after the tag are a 4-byte length, so
+    /// a 4-byte scalar read as VR + short-form length and the walker stepped
+    /// INTO the value; the enclosing sequence end then swallowed the next
+    /// sibling item. Two siblings plus a following attribute is the shape that
+    /// catches it: the second item must still be reported.
+    #[test]
+    fn undefined_length_walk_reaches_every_sibling_item_in_implicit_vr() {
+        // Build the raw value of an undefined-length SQ holding two items, each
+        // carrying one (0008,0100) Code Value scalar, then a following
+        // top-level attribute.
+        let mut sq: Vec<u8> = Vec::new();
+        for value in [b"AAA".as_slice(), b"BBBBBBBB".as_slice()] {
+            // Item, undefined length.
+            sq.extend_from_slice(&0xFFFE_u16.to_le_bytes());
+            sq.extend_from_slice(&0xE000_u16.to_le_bytes());
+            sq.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
+            // (0008,0100) SH "AAA"/"BBBBBBBB", Implicit VR: tag + 4-byte length.
+            sq.extend_from_slice(&0x0008_u16.to_le_bytes());
+            sq.extend_from_slice(&0x0100_u16.to_le_bytes());
+            sq.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            sq.extend_from_slice(value);
+            if !value.len().is_multiple_of(2) {
+                sq.push(0x20);
+            }
+            // Item Delimitation.
+            sq.extend_from_slice(&0xFFFE_u16.to_le_bytes());
+            sq.extend_from_slice(&0xE00D_u16.to_le_bytes());
+            sq.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        // Sequence Delimitation.
+        sq.extend_from_slice(&0xFFFE_u16.to_le_bytes());
+        sq.extend_from_slice(&0xE0DD_u16.to_le_bytes());
+        sq.extend_from_slice(&0_u32.to_le_bytes());
+
+        let extent = undefined_extent(&sq, 0, sq.len(), TransferSyntax::ImplicitVrLE)
+            .expect("the sequence delimiter must be found");
+        assert_eq!(
+            extent,
+            sq.len(),
+            "the walk must pass through both sibling items"
+        );
+
+        // The SECOND item's Code Value must also be reachable: that is what the
+        // old walker lost when it stepped into the first item's scalar.
+        let mut sq_second_only: Vec<u8> = Vec::new();
+        sq_second_only.extend_from_slice(&0xFFFE_u16.to_le_bytes());
+        sq_second_only.extend_from_slice(&0xE000_u16.to_le_bytes());
+        sq_second_only.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
+        sq_second_only.extend_from_slice(&0x0008_u16.to_le_bytes());
+        sq_second_only.extend_from_slice(&0x0100_u16.to_le_bytes());
+        sq_second_only.extend_from_slice(&8u32.to_le_bytes());
+        sq_second_only.extend_from_slice(b"BBBBBBBB");
+        sq_second_only.extend_from_slice(&0xFFFE_u16.to_le_bytes());
+        sq_second_only.extend_from_slice(&0xE00D_u16.to_le_bytes());
+        sq_second_only.extend_from_slice(&0_u32.to_le_bytes());
+        sq_second_only.extend_from_slice(&0xFFFE_u16.to_le_bytes());
+        sq_second_only.extend_from_slice(&0xE0DD_u16.to_le_bytes());
+        sq_second_only.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            undefined_extent(
+                &sq_second_only,
+                0,
+                sq_second_only.len(),
+                TransferSyntax::ImplicitVrLE
+            ),
+            Some(sq_second_only.len()),
+            "an 8-byte scalar must be stepped over, not entered"
+        );
+    }
+
+    /// PS3.5 7.3: an Explicit VR Big Endian Rows/Columns value is big-endian.
+    ///
+    /// The old reader took both as little-endian, so a 512x256 image came back
+    /// as 2x1 - a wrong frame size that then sized every frame chunk. The
+    /// values here are deliberately asymmetric (512 vs 256) and chosen so the
+    /// byte-swapped reading differs from the correct one.
+    #[test]
+    fn extract_metadata_decodes_rows_columns_in_the_dataset_byte_order() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.2") // Explicit VR Big Endian
+            .add_element_be(0x0010, 0x0010, b"PN", b"DOE^JOHN")
+            .add_element_be(0x0010, 0x0020, b"LO", b"PAT-001")
+            .add_element_be(0x0020, 0x000D, b"UI", b"1.2.840.113619.2.55.3.1.2.1")
+            .add_element_be(0x0020, 0x000E, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1")
+            .add_element_be(0x0008, 0x0018, b"UI", b"1.2.840.113619.2.55.3.1.2.1.1.1")
+            .add_element_be(0x0008, 0x0060, b"CS", b"CT")
+            .add_element_be(0x0028, 0x0010, b"US", &512u16.to_be_bytes()) // Rows
+            .add_element_be(0x0028, 0x0011, b"US", &256u16.to_be_bytes()) // Columns
+            .build();
+        let meta = DicomRsParser
+            .extract_metadata(&data)
+            .expect("valid Big Endian DICOM");
+        assert_eq!(meta.rows, Some(512), "Rows is big-endian 512");
+        assert_eq!(meta.cols, Some(256), "Columns is big-endian 256");
     }
 
     #[test]
@@ -4771,6 +5753,177 @@ mod tests {
         );
     }
 
+    /// PS3.18 F.2.2: `Value` is an array with one entry per attribute VALUE.
+    /// A multi-valued PN attribute (PS3.5 6.2: values separated by 5CH) must
+    /// therefore produce one object per name, not one object whose Alphabetic
+    /// group carries the separator and swallows the second name.
+    ///
+    /// Before this, `OperatorsName = "A^B\C^D"` rendered as a single object with
+    /// `Alphabetic: "A^B\\C^D"`, so the second operator was unreadable and a
+    /// consumer could not tell one name from two.
+    #[test]
+    fn a_multi_valued_pn_emits_one_object_per_name() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0010, 0x0010, b"PN", b"ONE^A\\TWO^B")
+            .build();
+
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("\"Value\":[{\"Alphabetic\":\"ONE^A\"},{\"Alphabetic\":\"TWO^B\"}]"),
+            "each name must be its own object: {s}"
+        );
+        assert!(
+            !s.contains("ONE^A\\\\TWO^B"),
+            "the separator must not survive inside a single name: {s}"
+        );
+    }
+
+    /// A single-valued PN keeps its shape, and an empty component inside a
+    /// multi-valued PN stays as a value slot (`{}`) rather than collapsing the
+    /// array - PS3.18 F.2.2 keeps the position.
+    #[test]
+    fn single_and_empty_pn_components_keep_their_shape() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0010, 0x0010, b"PN", b"SOLO^NAME")
+            .add_element(0x0008, 0x0090, b"PN", b"A^B\\\\C^D")
+            .build();
+
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("\"00100010\":{\"Value\":[{\"Alphabetic\":\"SOLO^NAME\"}],\"vr\":\"PN\"}"),
+            "a single name stays one object: {s}"
+        );
+        // "A^B\\C^D" has three slots, the middle one empty.
+        assert!(
+            s.contains(
+                "\"00080090\":{\"Value\":[{\"Alphabetic\":\"A^B\"},{},{\"Alphabetic\":\"C^D\"}],\"vr\":\"PN\"}"
+            ),
+            "an empty value keeps its array position: {s}"
+        );
+    }
+
+    /// An Explicit VR element that ends immediately after its 2-byte VR must
+    /// produce an error, not a panic.
+    ///
+    /// PS3.5 6.2: a short-form header is VR(2) + ValueLength(2). The guard above
+    /// the VR check only proves the VR pair fits; the length read two bytes
+    /// later had no bound, so an upload truncated exactly there indexed past the
+    /// buffer. That is a remote panic on untrusted input, which is why the test
+    /// asserts the error rather than merely "did not panic".
+    #[test]
+    fn a_truncated_short_form_header_is_an_error_not_a_panic() {
+        let mut d = DicomBuilder::new().meta_header("1.2.840.10008.1.2.1");
+        d = d.add_element(0x0010, 0x0010, b"PN", b"TRUNC^TEST");
+        let mut bytes = d.build();
+        // Append a tag and its VR but stop before the Value Length.
+        bytes.extend_from_slice(&0x0008u16.to_le_bytes());
+        bytes.extend_from_slice(&0x0060u16.to_le_bytes());
+        bytes.extend_from_slice(b"CS");
+
+        let result = DicomRsParser.extract_full_metadata_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "a header cut before its Value Length must be rejected: {result:?}"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Truncated short-form element header"),
+            "the error must name the truncation: {msg}"
+        );
+    }
+
+    /// An undefined-length sequence item that is never delimitation-terminated
+    /// must fail the render, not be given an invented extent.
+    ///
+    /// PS3.5 7.5: the item's end is its Item Delimitation. Without one the
+    /// extent is unknown. The previous fallback used the end of the sequence
+    /// value and then subtracted those 8 delimiter bytes anyway, so the item
+    /// reported a body that ran to the end of the value and swallowed the
+    /// following sibling item - attributes attributed to the wrong item, which
+    /// the test detects by requiring the error rather than a rendered array.
+    #[test]
+    fn an_unterminated_sequence_item_is_rejected_rather_than_guessed() {
+        let mut sq = Vec::new();
+        // One defined-length item, then an undefined-length item with no
+        // Item Delimitation anywhere after it.
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE000u16.to_le_bytes());
+        sq.extend_from_slice(&4u32.to_le_bytes());
+        sq.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE000u16.to_le_bytes());
+        sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+        let mut out = Vec::new();
+        let result =
+            write_sq_items_json_native(&mut out, &sq, TransferSyntax::ExplicitVrLE, None, 0);
+        assert!(
+            result.is_err(),
+            "an item with no delimitation must be rejected, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Unterminated undefined-length sequence item"),
+            "the error must name the missing delimiter: {msg}"
+        );
+    }
+
+    /// A properly terminated undefined-length item still renders, so the new
+    /// check does not reject the legitimate form.
+    #[test]
+    fn a_terminated_undefined_length_item_still_renders() {
+        let mut sq = Vec::new();
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE000u16.to_le_bytes());
+        sq.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Patient Name, explicit VR LE.
+        sq.extend_from_slice(&0x0010u16.to_le_bytes());
+        sq.extend_from_slice(&0x0010u16.to_le_bytes());
+        sq.extend_from_slice(b"PN");
+        sq.extend_from_slice(&4u16.to_le_bytes());
+        sq.extend_from_slice(b"OK^A");
+        // Item DelimitationItem, then SequenceDelimitationItem.
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE00Du16.to_le_bytes());
+        sq.extend_from_slice(&0u32.to_le_bytes());
+        sq.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        sq.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        sq.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut out = Vec::new();
+        write_sq_items_json_native(&mut out, &sq, TransferSyntax::ExplicitVrLE, None, 0)
+            .expect("a terminated item renders");
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            text.contains("00100010"),
+            "attribute must be present: {text}"
+        );
+        assert!(text.contains("OK^A"), "value must be present: {text}");
+    }
+
+    /// A clean end of input between elements stays a successful parse, so the
+    /// new check does not turn ordinary EOF into a failure.
+    #[test]
+    fn a_clean_end_between_elements_still_parses() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0010, 0x0010, b"PN", b"WHOLE^INSTANCE")
+            .build();
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("a complete instance parses");
+        assert!(String::from_utf8_lossy(&bytes).contains("WHOLE^INSTANCE"));
+    }
+
     /// The native renderer output must be byte-identical to the frozen
     /// serde-era goldens. Over a deliberately synthetic corpus covering the
     /// VR / charset / padding variants the WADO `/metadata` path must keep
@@ -4847,10 +6000,13 @@ mod tests {
                 .add_element(0x7FE0, 0x0010, b"OB", &[0x00u8; 8])
                 .build(),
             // SpecificCharacterSet ISO_IR 144 (Cyrillic) PN + padded string VR.
+            // The PN bytes are ISO 8859-5 for "Testov" (the same bytes
+            // edge_cyrillic.dcm carries); a glyph that the declared term must
+            // map is what makes the charset arm falsifiable.
             DicomBuilder::new()
                 .meta_header("1.2.840.10008.1.2.1")
                 .add_element(0x0008, 0x0005, b"CS", b"ISO_IR 144")
-                .add_element(0x0010, 0x0010, b"PN", b"\x18\x18\x20\x41\x42\x20") // Cyrillic + trailing space pad
+                .add_element(0x0010, 0x0010, b"PN", b"\xc2\xd5\xe1\xe2\xde\xd2") // "Testov" in ISO 8859-5
                 .add_element(0x0008, 0x0060, b"CS", b"CT ") // space-padded string VR
                 .add_element(0x0010, 0x1001, b"SH", b"Name ") // space-padded SH
                 .add_element(0x7FE0, 0x0010, b"OB", &[0x00u8; 8])
@@ -4911,8 +6067,16 @@ mod tests {
     /// replaced by `.json`, e.g. `dicoms/real/CT_pydicom.dcm.json`). They were
     /// captured from the serde-era renderer during the Commit-A freeze (native
     /// was asserted equal to serde at that time). A DICOM with no golden is one
-    /// the serde-era renderer failed to parse - the native renderer must ERROR
-    /// on it too. This test is serde-free: it only compares against goldens.
+    /// the renderer must REJECT. The set is exactly four files today:
+    ///
+    /// - `dicoms/edge/gen_broken.dcm` - garbage before the `DICM` magic
+    /// - `dicoms/edge/gen_deflated_ts.dcm` - Deflated TS is not supported
+    /// - `dicoms/edge/gen_no_transfer_syntax.dcm` - meta group present but
+    ///   (0002,0010) is twenty spaces, a Type 1 attribute left empty
+    ///   (PS3.10 7.1 Table 7.1-1)
+    /// - `dicoms/real/orthanc_mr_flair.dcm` - no `DICM` magic
+    ///
+    /// This test is serde-free: it only compares against goldens.
     fn real_golden_path(dcm_abs: &std::path::Path) -> std::path::PathBuf {
         let root = std::path::Path::new(REAL_CORPUS_DIR);
         let rel = dcm_abs.strip_prefix(root).unwrap_or(dcm_abs);
@@ -4932,11 +6096,17 @@ mod tests {
         let mut dcm_files = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
+            // A corpus directory that cannot be listed must FAIL the comparison,
+            // not shrink it. Skipping it silently left the golden check running
+            // over fewer files - or none - and still passing, so a permissions
+            // change or an unreadable share would turn the byte-for-byte
+            // contract into a no-op that reports success.
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("corpus dir unreadable: {}: {e}", dir.display()));
+            for entry in entries {
+                let entry = entry.unwrap_or_else(|e| {
+                    panic!("corpus entry unreadable in {}: {e}", dir.display())
+                });
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
@@ -4976,14 +6146,174 @@ mod tests {
                     .unwrap_or_else(|e| panic!("read golden {}: {e}", golden_path.display()));
                 assert_byte_eq(&native, &golden, &format!("{ctx} (vs golden)"));
             } else {
-                // No golden: the serde-era freeze recorded that this file was
-                // unparseable. The native renderer must error on it too.
+                // No golden: the renderer must reject this file (see the set
+                // documented on `real_golden_path`).
                 assert!(
                     DicomRsParser.extract_full_metadata_bytes(&data).is_err(),
-                    "{ctx}: expected error (serde-era freeze: no golden)"
+                    "{ctx}: expected error (no golden: unparseable fixture)"
                 );
             }
         }
+    }
+
+    /// A Part 10 file whose meta group exists but whose TransferSyntaxUID is
+    /// blank (twenty spaces, as `gen_no_transfer_syntax.dcm` writes it) must be
+    /// rejected, not guessed at.
+    ///
+    /// PS3.10 7.1 Table 7.1-1 makes (0002,0010) Type 1: a Part 10 file names
+    /// its transfer syntax. The pre-fix behaviour was the class-A bug this
+    /// suite keeps meeting - `opt_str` trimmed the spaces to `None`, which was
+    /// indistinguishable from "no meta group", so the reader silently fell
+    /// through to `detect_transfer_syntax` and rendered 890 bytes of metadata
+    /// for a file that states no syntax at all.
+    #[test]
+    fn a_part10_file_with_a_blank_transfer_syntax_is_refused() {
+        let mut builder = DicomBuilder::new();
+        builder.buf.extend_from_slice(&0x0002_u16.to_le_bytes());
+        builder.buf.extend_from_slice(&0x0010_u16.to_le_bytes());
+        builder.buf.extend_from_slice(b"UI");
+        builder.buf.extend_from_slice(&[0u8, 0u8]);
+        builder.buf.extend_from_slice(&20u32.to_le_bytes());
+        builder.buf.extend_from_slice(&[0x20u8; 20]);
+        let data = builder.add_element(0x0010, 0x0010, b"PN", b"NO^TS").build();
+
+        let err = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect_err("blank TransferSyntaxUID must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("TransferSyntaxUID"), "{msg}");
+        assert!(msg.contains("PS3.10"), "{msg}");
+    }
+
+    /// The same rule when (0002,0010) is absent altogether while other
+    /// meta-group elements are present: the meta group is there, so the file
+    /// claims to be Part 10 and must name a syntax.
+    #[test]
+    fn a_part10_file_without_a_transfer_syntax_element_is_refused() {
+        let mut builder = DicomBuilder::new();
+        // (0002,0002) MediaStorageSOPClassUID, and no (0002,0010).
+        builder.buf.extend_from_slice(&0x0002_u16.to_le_bytes());
+        builder.buf.extend_from_slice(&0x0002_u16.to_le_bytes());
+        builder.buf.extend_from_slice(b"UI");
+        builder.buf.extend_from_slice(&[0u8, 0u8]);
+        let uid = b"1.2.840.10008.5.1.4.1.1.2";
+        builder
+            .buf
+            .extend_from_slice(&(uid.len() as u32).to_le_bytes());
+        builder.buf.extend_from_slice(uid);
+        let data = builder.add_element(0x0010, 0x0010, b"PN", b"NO^TS").build();
+
+        let err = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect_err("meta group without TransferSyntaxUID must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("TransferSyntaxUID"), "{msg}");
+    }
+
+    /// The complement: DIMSE data with a prepended `DICM` and NO meta group is
+    /// still accepted, because there is nothing to contradict - the syntax is
+    /// detected from the first element. Rejecting this would break every C-STORE
+    /// payload the bridge receives.
+    #[test]
+    fn a_dicom_with_no_meta_group_at_all_is_still_detected() {
+        // "DICM" with no preamble and no group 0002 element, then an Explicit
+        // VR LE dataset whose first element's VR bytes drive the detection.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"DICM");
+        let name = b"DIMSE^NOMETA";
+        buf.extend_from_slice(&0x0010_u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010_u16.to_le_bytes());
+        buf.extend_from_slice(b"PN");
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name);
+
+        let data = DicomRsParser
+            .extract_full_metadata_bytes(&buf)
+            .expect("DIMSE data with no meta group must still render");
+        let s = String::from_utf8_lossy(&data);
+        assert!(s.contains("DIMSE^NOMETA"), "{s}");
+    }
+
+    /// PS3.5 7.8.1: the Private Creator Data Element is (gggg,0010-00FF) of an
+    /// ODD group and its VR is LO. In an Implicit VR dataset the VR exists only
+    /// in the dictionary, and PS3.6 lists no creator elements, so before this
+    /// rule the vendor string rendered as an opaque `UN` blob.
+    #[test]
+    fn an_implicit_vr_private_creator_renders_as_lo_text() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2") // Implicit VR LE: no VR on the wire
+            .add_implicit_element(0x0009, 0x0010, b"ACME 1.1")
+            .add_implicit_element(0x0009, 0x1001, &[0x01, 0x02, 0x03, 0x04])
+            .build();
+
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("\"00090010\":{\"Value\":[\"ACME 1.1\"],\"vr\":\"LO\"}"),
+            "private creator must be LO text: {s}"
+        );
+        // The block the creator names is NOT a creator: it keeps its UN form.
+        assert!(
+            s.contains("\"00091001\":{\"InlineBinary\":"),
+            "claimed block must stay UN: {s}"
+        );
+    }
+
+    /// A dataset with no SpecificCharacterSet falls back to the ISO_IR 100
+    /// (Latin-1) default range, so Windows-1251 bytes render as their Latin-1
+    /// reading. That mojibake is the CORRECT output of the default rule, not a
+    /// decoding bug - the fixture name says `nocharset` for that reason. Pinned
+    /// here so a future "fix" that silently guesses cp1251 is caught.
+    #[test]
+    fn a_dataset_with_no_charset_renders_the_latin1_default() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            // The same bytes gorbunkov_nocharset_cp1251.dcm carries.
+            .add_element(
+                0x0010,
+                0x0010,
+                b"PN",
+                b"\xc3\xee\xf0\xe1\xf3\xed\xea\xee\xe2^\xd1\xe5\xec",
+            )
+            .build();
+
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes);
+        // U+00C3 U+00EE ... is the Latin-1 reading; the cp1251 reading would be
+        // "Gorbunkov in Cyrillic" and must NOT appear.
+        assert!(
+            s.contains("\"Alphabetic\":\"\u{C3}\u{EE}\u{F0}\u{E1}\u{F3}\u{ED}\u{EA}\u{EE}\u{E2}"),
+            "default range must render Latin-1: {s}"
+        );
+        assert!(
+            !s.contains('\u{413}'),
+            "must not guess cp1251 without a charset: {s}"
+        );
+    }
+
+    /// ISO_IR 192 (UTF-8) must carry Cyrillic and Latin accented text in the
+    /// same dataset. The g_ct family needs this: PatientName is Cyrillic while
+    /// StudyDescription is French. A single-byte term cannot describe both -
+    /// ISO_IR 144 maps the French 0xE9 byte to U+0449.
+    #[test]
+    fn iso_ir_192_carries_two_scripts_in_one_dataset() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            .add_element(0x0008, 0x0005, b"CS", b"ISO_IR 192")
+            .add_element(0x0008, 0x1030, b"LO", "Extr\u{e9}mit\u{e9}s".as_bytes())
+            .add_element(0x0010, 0x0010, b"PN", "\u{421}\u{435}\u{43c}".as_bytes())
+            .build();
+
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\"Extr\u{e9}mit\u{e9}s\""), "Latin accent: {s}");
+        assert!(s.contains("\u{421}\u{435}\u{43c}"), "Cyrillic: {s}");
     }
 
     #[test]
@@ -5068,9 +6398,9 @@ mod tests {
             .extract_full_metadata_bytes(&data)
             .expect("valid DICOM");
         let s = String::from_utf8_lossy(&json_bytes);
-        // AT: group,elem pair formatted as "XXXX,XXXX"
+        // PS3.18 F.2.3: eight uppercase hex digits, no separator.
         assert!(
-            s.contains("\"00080008\":{\"Value\":[\"0008,0060\"],\"vr\":\"AT\"}"),
+            s.contains("\"00080008\":{\"Value\":[\"00080060\"],\"vr\":\"AT\"}"),
             "{s}"
         );
     }
@@ -5101,6 +6431,80 @@ mod tests {
         assert_eq!(lookup_vr(0x0028, 0x0000), "UL");
         // An unknown tag still has no invented VR.
         assert_eq!(lookup_vr(0xFFFF, 0xEEEE), "UN");
+    }
+
+    /// `lookup_vr` must give the SAME answer as the shared dictionary for every
+    /// tag, because both paths render the same instance.
+    ///
+    /// Before this was delegated, a hand-kept table duplicated 85 of the
+    /// dictionary's answers and disagreed on (7FE0,0010): it pinned `OW` while
+    /// PS3.6 says `OB`. That tag is never rendered (the metadata walk stops
+    /// before PixelData), so no golden caught it - which is why this needs a
+    /// direct assertion rather than an end-to-end one. The meta-group and
+    /// private-creator entries are included because PS3.6 carries neither, so a
+    /// local table would silently diverge on them too.
+    #[test]
+    fn lookup_vr_agrees_with_the_shared_dictionary() {
+        let tags: &[(u16, u16)] = &[
+            (0x7FE0, 0x0010), // PixelData: the one the old table got wrong
+            (0x0002, 0x0010), // TransferSyntaxUID: meta, absent from PS3.6
+            (0x0002, 0x0013), // ImplementationVersionName: meta, absent
+            (0x0009, 0x0010), // Private Creator: PS3.5 7.8.1, absent
+            (0x0008, 0x0005), // SpecificCharacterSet
+            (0x0010, 0x0010), // PatientName
+            (0x0028, 0x0010), // Rows
+            (0x0028, 0x0000), // group length: PS3.5 7.2, absent from PS3.6
+            (0x1234, 0x5678), // not in any table
+        ];
+        for &(g, e) in tags {
+            assert_eq!(
+                lookup_vr(g, e),
+                crate::codec::vr_dict::vr_for_tag(g, e),
+                "({g:04X},{e:04X}) must resolve identically on both paths"
+            );
+        }
+        assert_eq!(lookup_vr(0x7FE0, 0x0010), "OB");
+        assert_eq!(lookup_vr(0x0002, 0x0010), "UI");
+        assert_eq!(lookup_vr(0x0009, 0x0010), "LO");
+        assert_eq!(lookup_vr(0x0028, 0x0000), "UL");
+    }
+
+    /// PS3.18 F.2.3 Table F.2.3-1 maps SV and UV to the JSON Data Type
+    /// "Number". They were absent from `NUMERIC_VRS`, so both fell to the
+    /// binary arm and were base64-encoded - a value the standard says is a
+    /// number shipped as an opaque blob.
+    ///
+    /// The extrema matter: UV above i64::MAX only survives if the value is
+    /// carried at full 64-bit width rather than narrowed.
+    #[test]
+    fn sv_and_uv_render_as_numbers_not_base64() {
+        let data = DicomBuilder::new()
+            .meta_header("1.2.840.10008.1.2.1")
+            // (0072,0062) Selector SV and (0072,0064) Selector UV are SV/UV in
+            // PS3.6; both are LONG-form VRs (PS3.5 Table 6.2-1).
+            .add_element(0x0072, 0x0062, b"SV", &(-9i64).to_le_bytes())
+            .add_element(0x0072, 0x0064, b"UV", &u64::MAX.to_le_bytes())
+            .build();
+
+        let bytes = DicomRsParser
+            .extract_full_metadata_bytes(&data)
+            .expect("renders");
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("\"00720062\":{\"Value\":[-9],\"vr\":\"SV\"}"),
+            "SV must render as a JSON number: {s}"
+        );
+        assert!(
+            s.contains(&format!(
+                "\"00720064\":{{\"Value\":[{}],\"vr\":\"UV\"}}",
+                u64::MAX
+            )),
+            "UV must keep all 64 bits as a JSON number: {s}"
+        );
+        assert!(
+            !s.contains("\"00720062\":{\"InlineBinary\""),
+            "SV must not be base64-encoded: {s}"
+        );
     }
 
     /// PS3.5 7.1: an Explicit VR Big Endian source stores every binary VR

@@ -26,7 +26,7 @@
 //! [`ManifestReadError`] of a failed decode - the cache stores only
 //! successful decodes.
 
-use crate::manifest::{Manifest, ManifestReadError, TrustedManifestDir, read_manifest_published};
+use crate::manifest::{Manifest, ManifestReadError, TrustedManifestDir};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -268,13 +268,20 @@ impl WriteGuard {
 
     /// Install the post-commit entry. Consumes the guard: the registration is
     /// released by [`end_write`] itself.
-    pub fn commit(mut self, manifest: Arc<Manifest>, encoded_len: u64, manifests_dir: &Path) {
+    ///
+    /// The directory is the one the guard registered under, NOT a caller
+    /// argument. A guard for directory A that committed into directory B would
+    /// leave A's registration pinned (this consumes the guard, so `Drop` no
+    /// longer releases it) and, if B's slot happened to share the version,
+    /// publish A's manifest into B's cache slot - one study's manifest served
+    /// under another's key.
+    pub fn commit(mut self, manifest: Arc<Manifest>, encoded_len: u64) {
         end_write(
             &self.study,
             self.version,
             manifest,
             encoded_len,
-            manifests_dir,
+            &self.manifests_dir,
         );
         self.committed = true;
     }
@@ -378,20 +385,38 @@ pub fn get_or_load(
         (slot.v, ticket)
     };
     // Miss path (allocates by design - decode + owned strings; not gated).
-    let manifest_path = dir.join(format!("{study}.manifest"));
+    //
+    // The name is validated BEFORE any filesystem path is built from it. A
+    // StudyInstanceUID is interpolated into a file name, so an unvalidated one
+    // (`../x`, `C:`) would make the `metadata` call below stat a path OUTSIDE
+    // the manifest directory - a lookup the caller has no business causing,
+    // whether or not the function then refuses the load. `PublishedManifest`
+    // is the one place that owns the rule, so the path comes from it rather
+    // than from a raw `dir.join(...)` that duplicates (and lags) it.
+    //
     // The cache is keyed by (directory, study) and only ever loads a manifest
     // the stow writer published - the same two halves `PublishedManifest` is
     // built from, so a caller cannot route an arbitrary path into a mapping.
     let published = crate::manifest::PublishedManifest::new(dir, study);
     let decoded = match published.as_ref() {
-        Some(p) => read_manifest_published(p),
+        Some(p) => crate::manifest::read_manifest_published_sized(p),
         None => Err(ManifestReadError::Io(std::io::Error::from(
             std::io::ErrorKind::InvalidInput,
         ))),
     };
-    let encoded_len = std::fs::metadata(&manifest_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    // The size charged to the cache budget must describe the bytes that were
+    // actually DECODED, so it comes back from the same mapping that produced
+    // the buffer. A separate `metadata` call was a second observation of the
+    // path: it could fail (recording the entry as zero bytes, which made an
+    // oversized manifest look free) or report a different file entirely, since
+    // the name is re-resolved between the read and the stat.
+    let (decoded, encoded_len): (Result<Manifest, ManifestReadError>, u64) = match decoded {
+        // A manifest mapping cannot exceed `u64` on any target this runs on
+        // (usize is at most 64 bits), so `try_from` is infallible here; the
+        // saturating form keeps the cast explicit rather than a bare `as`.
+        Ok((manifest, len)) => (Ok(manifest), u64::try_from(len).unwrap_or(u64::MAX)),
+        Err(e) => (Err(e), 0),
+    };
     // The registration, the insert decision and the release all happen under
     // ONE write lock. Releasing the count first opened a window in which an
     // eviction could clear the slot, a fresh one could start at `v = 0` again,
@@ -417,7 +442,24 @@ pub fn get_or_load(
                     readers: 0,
                 });
                 slot.readers = slot.readers.saturating_sub(1);
-                if try_insert(
+                // Re-check the budget on the LAST READER OUT, not only on
+                // insert.
+                //
+                // `evict_lru_locked` refuses to evict a slot whose `readers`
+                // is non-zero, because the reader may still be decoding the
+                // pre-commit bytes. Two writer commits landing while a reader
+                // pins the first entry therefore both install, both find no
+                // eligible victim, and leave TWO oversized entries behind -
+                // and because the budget was only ever re-checked on an
+                // insert, nothing ran again when those readers finished. The
+                // entries then stayed for the life of the process, with every
+                // later hit keeping them hot.
+                //
+                // Running the check here - even for a reader that installed
+                // nothing - is what makes the one-oversized-entry exception
+                // hold as an INVARIANT rather than as a property of whichever
+                // insert happened to run last.
+                let releasable = try_insert(
                     slot,
                     v0,
                     ArcEntry {
@@ -429,7 +471,8 @@ pub fn get_or_load(
                         // began rather than when it happened to finish.
                         last_use: AtomicU64::new(ticket),
                     },
-                ) {
+                );
+                if releasable || slot.readers == 0 {
                     evict_lru_locked(&mut cache, &key);
                 }
                 manifest
@@ -444,6 +487,11 @@ pub fn get_or_load(
                     // the slot's fate.
                     if slot.entry.is_none() && slot.readers == 0 && slot.writers == 0 {
                         cache.remove(&key);
+                    } else if slot.readers == 0 {
+                        // Same last-reader-out budget recheck as the success
+                        // path: this decode failed, but it was still holding a
+                        // pin that may have blocked an eviction.
+                        evict_lru_locked(&mut cache, &key);
                     }
                 }
                 return Err(error);

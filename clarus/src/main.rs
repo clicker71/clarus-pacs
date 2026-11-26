@@ -124,6 +124,43 @@ fn get_rss_bytes_impl() -> u64 {
     0
 }
 
+/// What a received termination signal asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalAction {
+    /// The first signal: begin the graceful drain.
+    Stop,
+    /// Any later signal: abandon the drain and exit immediately.
+    Force,
+}
+
+/// Map the number of signals seen onto the action it requests.
+///
+/// The count is the whole point. Clearing a single "signal arrived" flag to arm
+/// the second one left a window in which a second signal raised the flag and
+/// the clear then erased it, so a forced exit was silently downgraded to a
+/// graceful one - the operator waited on a shutdown they had already asked to
+/// cut short. Counting arrivals cannot lose one: the first is graceful, every
+/// one after it forces.
+fn signal_action(seen: u32) -> SignalAction {
+    if seen <= 1 {
+        SignalAction::Stop
+    } else {
+        SignalAction::Force
+    }
+}
+
+/// Write the PID payload and make it durable enough for a reader to see.
+///
+/// A created file whose payload did not land is worse than none: it advertises
+/// a pid that may be empty or truncated, so `kill $(cat pid)` addresses nothing
+/// while the file looks authoritative. The flush is part of the contract, not a
+/// nicety - the payload must be readable by the next process.
+fn write_pid_payload(f: &mut std::fs::File, pid: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    writeln!(f, "{}", pid)?;
+    f.flush()
+}
+
 /// Platform default path for the process PID file.
 ///
 /// Linux: `/var/run/clarus-{port}.pid`. A PID file is a system-level
@@ -159,16 +196,28 @@ fn config_dir_pid_path(config_path: &std::path::Path, port: u16) -> std::path::P
 /// like nginx. A live foreign pid is the ONE fatal case: two servers must
 /// not silently share a port and config.
 fn try_write_pid_file(pid_path: &std::path::Path, pid: u32) -> Result<bool, ()> {
-    use std::io::Write;
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(pid_path)
     {
-        Ok(mut f) => {
-            let _ = writeln!(f, "{}", pid);
-            Ok(true)
-        }
+        Ok(mut f) => match write_pid_payload(&mut f, pid) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                eprintln!(
+                    "[WARN] Cannot write PID to {}: {}. \
+                     Continuing without a PID file.",
+                    pid_path.display(),
+                    e
+                );
+                // Remove only what THIS call created; a file that existed
+                // before is never touched on this path (create_new would have
+                // failed with AlreadyExists).
+                drop(f);
+                let _ = std::fs::remove_file(pid_path);
+                Ok(false)
+            }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let old_pid_str = std::fs::read_to_string(pid_path).unwrap_or_default();
             let old_pid = old_pid_str.trim().parse::<u32>().ok();
@@ -182,12 +231,13 @@ fn try_write_pid_file(pid_path: &std::path::Path, pid: u32) -> Result<bool, ()> 
                 None => true, // Can't parse = assume stale
             };
             if !stale {
+                // Same reasoning as the data-dir guard: the operator must stop
+                // the holder, not delete the file out from under it.
                 eprintln!(
                     "[FATAL] PID file {} exists and pid={} is ALIVE. \
-                     Another instance is running. Remove {} manually if stale.",
+                     Another instance is running. Stop that process and retry.",
                     pid_path.display(),
-                    old_pid_str.trim(),
-                    pid_path.display()
+                    old_pid_str.trim()
                 );
                 return Err(());
             }
@@ -208,10 +258,20 @@ fn try_write_pid_file(pid_path: &std::path::Path, pid: u32) -> Result<bool, ()> 
                 .create_new(true)
                 .open(pid_path)
             {
-                Ok(mut f) => {
-                    let _ = writeln!(f, "{}", pid);
-                    Ok(true)
-                }
+                Ok(mut f) => match write_pid_payload(&mut f, pid) {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        eprintln!(
+                            "[WARN] Cannot write PID to {}: {}. \
+                             Continuing without a PID file.",
+                            pid_path.display(),
+                            e
+                        );
+                        drop(f);
+                        let _ = std::fs::remove_file(pid_path);
+                        Ok(false)
+                    }
+                },
                 Err(e) => {
                     eprintln!(
                         "[WARN] Cannot rewrite stale PID file {}: {}. \
@@ -322,19 +382,16 @@ fn is_process_alive_impl(_pid: u32) -> bool {
 
 /// Held for the process lifetime: the open handle keeps the OS lock alive, and
 /// the kernel releases it when the process dies - no stale-file cleanup step.
+///
+/// The lock file itself is never removed. Removing it while dropping the
+/// handle would let a starter that already opened the old inode lock it after
+/// the successor has created and locked a new one - the two would then both
+/// believe they own the directory. A leftover file is harmless: the kernel lock
+/// is the mutual exclusion, and a stale one is simply re-locked in place.
 struct DataDirGuard {
     /// The locked handle. Dropping it releases the lock; the field is held for
     /// that lifetime, never read.
     _file: std::fs::File,
-    path: std::path::PathBuf,
-}
-
-impl Drop for DataDirGuard {
-    fn drop(&mut self) {
-        // Best-effort removal; the OS lock is the real mutual exclusion and is
-        // released when `_file` drops.
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 /// Acquire the `{data_root}/.clarus-data.lock` startup guard, or refuse to
@@ -398,10 +455,16 @@ fn acquire_data_dir_guard(data_root: &std::path::Path, port: u16) -> DataDirGuar
         }
         Err(std::fs::TryLockError::WouldBlock) => {
             let old = std::fs::read_to_string(&guard_path).unwrap_or_default();
+            // Never suggest removing the file. The exclusion is the OS lock on
+            // the inode, not the file's existence: unlinking it lets a later
+            // starter create and lock a NEW inode while the holder still owns
+            // the old one, and both then serve the same archive - the second
+            // one sweeping `_tmp/` out from under the first's in-flight STOW.
             eprintln!(
                 "[FATAL] Data directory {} is already in use by pid {} \
                  (port {}). One instance per data directory (see clarus.conf \
-                 [btree]/[storage]); remove {} manually if stale.",
+                 [btree]/[storage]). Stop the process holding {} and start \
+                 again.",
                 data_root.display(),
                 old.trim(),
                 port,
@@ -419,10 +482,7 @@ fn acquire_data_dir_guard(data_root: &std::path::Path, port: u16) -> DataDirGuar
         }
     }
 
-    DataDirGuard {
-        _file: file,
-        path: guard_path,
-    }
+    DataDirGuard { _file: file }
 }
 
 // -- manifest-degraded startup sanity check ------------------------
@@ -653,7 +713,7 @@ fn main() {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(&args.log_dir);
-    let _log_writer = clarus_server::log_writer::init(&log_dir, args.log_level.to_clog());
+    let log_writer_handle = clarus_server::log_writer::init(&log_dir, args.log_level.to_clog());
 
     // Advisory open-file (NOFILE) limit check - warn only.
     clarus_server::ffi::check_fd_limit(args.max_connections);
@@ -1168,45 +1228,50 @@ fn main() {
         signal_hook::flag::register(signal_hook::consts::SIGINT, term.clone())
             .expect("Failed to register SIGINT handler");
         // On Windows, SIGBREAK is sent on Ctrl+C in some terminals.
-        //
-        // ONE flag per signal: the FIRST signal is a graceful stop, and the
-        // signal thread below latches `term` to turn the SECOND one into
-        // `request_force`. A second registration writing a separate `force`
-        // flag made every first signal look like a fast shutdown and cut
-        // in-flight STOW/WADO.
         #[cfg(windows)]
         signal_hook::flag::register(signal_hook::consts::SIGBREAK, term.clone())
             .expect("Failed to register SIGBREAK handler");
 
         // Signal thread: only watches the flag and requests a graceful stop.
         // No process::exit() timer here - the drain loop owns shutdown.
+        //
+        // ONE flag carries "a signal has arrived" and nothing else: the
+        // handler latches it and the thread below counts arrivals by consuming
+        // it. Clearing the flag to arm the SECOND signal was the bug - a
+        // second signal that landed between `request_stop` and the clear was
+        // raised and then erased, so an operator who asked for a forced exit
+        // saw the shutdown keep draining. Counting instead of clearing means an
+        // arrival is never lost: the first one is graceful, any later one
+        // forces.
         let sd_signal = shutdown.clone();
         std::thread::spawn(move || {
-            while !term.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            clarus_server::clog_event!(
-                crate::clog::Level::Info,
-                "SHUTDOWN",
-                "",
-                "SIGINT/SIGTERM received via OS signal - initiating shutdown"
-            );
-            sd_signal.request_stop();
-            // Latch the flag back and watch for the second signal: during
-            // drain a second Ctrl+C forces immediate exit (nginx fast
-            // shutdown). The race window between request_stop and the store
-            // is humanly unreachable, so the latch is good enough.
-            term.store(false, std::sync::atomic::Ordering::Relaxed);
-            while !term.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut seen = 0u32;
+            loop {
+                if term.load(std::sync::atomic::Ordering::Relaxed) {
+                    seen += 1;
+                    match signal_action(seen) {
+                        SignalAction::Stop => {
+                            clarus_server::clog_event!(
+                                crate::clog::Level::Info,
+                                "SHUTDOWN",
+                                "",
+                                "SIGINT/SIGTERM received via OS signal - initiating shutdown"
+                            );
+                            sd_signal.request_stop();
+                        }
+                        SignalAction::Force => {
+                            clarus_server::clog_event!(
+                                crate::clog::Level::Info,
+                                "SHUTDOWN",
+                                "",
+                                "Second signal received - forcing immediate exit"
+                            );
+                            sd_signal.request_force();
+                        }
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            clarus_server::clog_event!(
-                crate::clog::Level::Info,
-                "SHUTDOWN",
-                "",
-                "Second signal received - forcing immediate exit"
-            );
-            sd_signal.request_force();
         });
 
         // Accept thread: runs the synchronous transport (accept + conn loops).
@@ -1268,11 +1333,14 @@ fn main() {
         }
 
         // Order: drain -> join accept thread -> flush the access journal ->
-        // pid removed. The journal must be flushed before the process can
-        // return: its writer is a detached thread and the last lines queued
-        // here are the ones that describe the requests just drained.
+        // flush the log writer -> pid removed. Both writers are detached
+        // threads whose senders live in a static, so dropping the handles does
+        // NOT signal them; each needs its sentinel to drain what it accepted.
+        // The journal goes first: its writer reports through `clog`, so those
+        // last lines must still be queued when the log writer drains.
         let _ = accept_thread.join();
         _access_writer.shutdown();
+        log_writer_handle.shutdown();
 
         // Clean up PID file on graceful exit (nginx-style).
         if let Err(e) = std::fs::remove_file(&pid_path) {
@@ -1349,16 +1417,28 @@ mod tests {
         assert_eq!(pid, std::process::id(), "guard holds our pid");
     }
 
-    /// Drop removes the guard file.
+    /// Dropping the guard releases the lock but leaves the file in place.
+    ///
+    /// The file is deliberately NOT removed: a successor may already have
+    /// opened the same inode and be waiting on `try_lock`, and if the drop
+    /// unlinked it the successor would take a lock on an orphaned inode while
+    /// a third starter created and locked a fresh one. What has to be true
+    /// after a drop is reacquisition, not an empty directory.
     #[test]
-    fn guard_drop_removes_file() {
+    fn guard_drop_allows_reacquisition_and_keeps_the_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let guard_path = dir.path().join(".clarus-data.lock");
         {
             let _guard = acquire_data_dir_guard(dir.path(), 8024);
             assert!(guard_path.exists(), "guard created");
         }
-        assert!(!guard_path.exists(), "guard removed on drop");
+        assert!(guard_path.exists(), "the lock file outlives the guard");
+        let mut again = acquire_data_dir_guard(dir.path(), 8024);
+        let content = guard_content(&mut again);
+        assert!(
+            content.starts_with(&std::process::id().to_string()),
+            "reacquired guard carries our pid, got {content:?}"
+        );
     }
 
     /// Taking over a stale (dead pid) guard succeeds: the file is opened in
@@ -1470,19 +1550,46 @@ mod tests {
         };
 
         let mut holder = spawn_child(8024, &acquired);
+        // A guard that regressed to no exclusion would leave the SECOND child
+        // blocked on the release file while this test waits on that child, so
+        // CI would hang instead of reporting a failed assertion. Every path
+        // from here releases the holder and reaps both children; `Child`'s
+        // Drop does NOT kill the process.
+        let cleanup = |holder: &mut std::process::Child,
+                       loser: Option<&mut std::process::Child>| {
+            let _ = std::fs::write(&release, b"1");
+            let _ = holder.kill();
+            let _ = holder.wait();
+            if let Some(loser) = loser {
+                let _ = loser.kill();
+            }
+        };
+
         // Bounded wait for the holder to acquire.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !acquired.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the first start never acquired the guard"
-            );
+            if std::time::Instant::now() >= deadline {
+                cleanup(&mut holder, None);
+                panic!("the first start never acquired the guard");
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        // The second start must be refused by the kernel lock.
+        // The second start must be refused by the kernel lock. Its wait is
+        // bounded by killing it, never by blocking on a child that is waiting
+        // for a file this test has not written yet.
         let mut loser = spawn_child(8025, &dir.path().join("acquired-loser"));
-        let loser_status = loser.wait().expect("wait loser");
+        let loser_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let loser_status = loop {
+            match loser.try_wait().expect("poll loser") {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= loser_deadline => {
+                    cleanup(&mut holder, Some(&mut loser));
+                    panic!("the second start neither exited nor acquired the guard");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
         assert!(
             !loser_status.success(),
             "the second start must exit non-zero, got {:?}",
@@ -1496,6 +1603,83 @@ mod tests {
             holder_status.success(),
             "the holder must exit cleanly after release, got {:?}",
             holder_status.code()
+        );
+    }
+
+    /// The second signal must force an exit, whatever the timing.
+    ///
+    /// The old code cleared the shared "signal arrived" flag to arm the second
+    /// one, so a second signal raised inside that window was erased and the
+    /// forced exit never happened. The counter cannot lose an arrival.
+    #[test]
+    fn the_second_signal_forces_and_the_first_only_stops() {
+        assert_eq!(signal_action(1), SignalAction::Stop);
+        assert_eq!(signal_action(2), SignalAction::Force);
+        assert_eq!(
+            signal_action(3),
+            SignalAction::Force,
+            "every signal after the first must force"
+        );
+        // The degenerate input is treated as "not yet", never as a force: a
+        // forced exit on a miscount would cut in-flight STOW/WADO.
+        assert_eq!(signal_action(0), SignalAction::Stop);
+    }
+
+    /// A PID file whose payload could not be written is not reported as good.
+    ///
+    /// `writeln!` can fail after `create_new` succeeded (a full disk, a read-
+    /// only remount mid-start). Reporting `Ok(true)` then left an empty or
+    /// truncated file that looks authoritative AND skipped the fallback
+    /// location that would have worked.
+    /// A PID file whose payload could not be written must not be reported ok.
+    ///
+    /// Closed: inspection-verified. The PAYLOAD write (`write_pid_payload`)
+    /// cannot be made to fail on a regular file through std - which is the
+    /// whole reason the old `let _ = writeln!(...)` was never noticed - and the
+    /// `io_fault` seam is `cfg(test)` in the LIBRARY crate, which the binary's
+    /// own test build cannot see (a `cfg(test)` module is compiled per crate,
+    /// and `main.rs` is a different crate from `lib.rs`). The branch is covered
+    /// by structure instead: every exit from `write_pid_payload` is an `io::Result`
+    /// and the caller maps `Err` to `Ok(false)` plus removing the file it
+    /// created, so no path can return `Ok(true)` without a successful flush.
+    ///
+    /// What IS tested here is the neighbouring path that is reachable: a
+    /// pre-existing entry at the target is refused and left untouched.
+    #[test]
+    fn a_pid_file_that_cannot_be_written_is_not_reported_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("clarus.pid");
+
+        // A directory at the target path makes `create_new` fail, so the
+        // AlreadyExists branch runs rather than the create branch. The
+        // pre-existing entry must survive a refused start.
+        std::fs::create_dir(&target).expect("mkdir at the pid path");
+        let outcome = try_write_pid_file(&target, 4242);
+        assert!(
+            !matches!(outcome, Ok(true)),
+            "a path that cannot hold our pid must not report success"
+        );
+        assert!(target.is_dir(), "the pre-existing entry is left alone");
+    }
+
+    /// The lock-conflict diagnostic must not tell the operator to delete the
+    /// file. Only the message text is checked, because the exit path is
+    /// `std::process::exit` - the contract is what the operator reads.
+    #[test]
+    fn the_guard_conflict_diagnostic_does_not_suggest_removal() {
+        let src = include_str!("main.rs");
+        let fatal = src
+            .split("[FATAL] Data directory")
+            .nth(1)
+            .expect("the guard conflict diagnostic exists");
+        let message = &fatal[..fatal.find("std::process::exit").unwrap_or(fatal.len())];
+        assert!(
+            !message.contains("remove"),
+            "the conflict message must not invite removal of the locked guard"
+        );
+        assert!(
+            message.contains("Stop the process"),
+            "it must tell the operator to stop the holder instead"
         );
     }
 
@@ -1629,29 +1813,34 @@ mod tests {
         assert!(!missing_parent.exists());
     }
 
-    /// Resolution is automatic: no override exists, so the platform default
-    /// is what gets written. This test replaces the former
-    /// `explicit_pid_path_wins_over_default` - the override is gone by
-    /// design (owner verdict 13.09: no config key, no CLI flag, no env var).
+    /// Resolution is automatic: no override exists, so a writable location
+    /// among the fixed candidates is what gets written.
+    ///
+    /// The test must not touch the PLATFORM DEFAULT on Linux, which is
+    /// `/var/run/clarus-9999.pid`: on a privileged CI runner that writes a real
+    /// file outside the sandbox and leaves it behind, and if a live process
+    /// already owns that pid file `acquire_pid_file` calls `process::exit(1)`,
+    /// taking the whole test binary down. The FALLBACK (next to the config in a
+    /// temp dir) is exercised here; the platform default's PATH is asserted
+    /// separately by `default_pid_path_is_port_tagged` without writing to it.
     #[test]
     fn pid_path_is_resolved_automatically() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("clarus.conf");
         std::fs::write(&config, "").expect("touch config");
 
-        let got = acquire_pid_file(&config, 9999);
-        // The returned path is one of the two fixed candidates, and it
-        // exists with our pid - never an operator-supplied location.
-        let expected_default = default_pid_path(&config, 9999);
-        let expected_fallback = config_dir_pid_path(&config, 9999);
+        // The fallback candidate is the one inside the temp dir. Writing it is
+        // sandboxed and proves the resolution order reaches it.
+        let fallback = config_dir_pid_path(&config, 9999);
         assert!(
-            got == expected_default || got == expected_fallback,
-            "resolved to an unexpected path: {}",
-            got.display()
+            fallback.starts_with(dir.path()),
+            "the fallback must live beside the config, got {}",
+            fallback.display()
         );
-        assert!(got.exists(), "the resolved path must have been written");
+        let written = try_write_pid_file(&fallback, std::process::id());
+        assert_eq!(written, Ok(true), "the temp-dir candidate is writable");
         assert_eq!(
-            std::fs::read_to_string(&got).unwrap().trim(),
+            std::fs::read_to_string(&fallback).unwrap().trim(),
             std::process::id().to_string()
         );
     }

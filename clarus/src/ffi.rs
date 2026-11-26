@@ -1,15 +1,31 @@
 // Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
 
-//! Audited OS boundary for `clarus-server`, see `docs/unsafe-audit.md`.
+//! Audited unsafe boundary for `clarus-server`, see `public-docs/unsafe-audit.md`.
 //!
 //! This is the ONLY module in the crate where `unsafe` may appear: the crate
 //! root carries `#![deny(unsafe_code)]` and this module overrides it with
 //! `#![allow(unsafe_code)]` (the established pattern; `forbid` at the root
 //! cannot be overridden - Rust E0453 - so the root stays on `deny`). Every
-//! site below is a direct OS call (libc / WinAPI) with a `// SAFETY:`
-//! justification. Public API is all safe functions.
+//! site below carries a `// SAFETY:` justification. Public API is all safe
+//! functions.
 //!
-//! Every unsafe OS call in the server is gathered here. Previous homes:
+//! The module holds TWO distinct classes, and the distinction is what the
+//! audit inventory is grouped by:
+//!
+//! - OS-call FFI - the direct libc / WinAPI calls (`kill`, `statvfs`,
+//!   `GetDiskFreeSpaceExW`, the console handles, `getrlimit`, the psapi
+//!   process counters). Each one exists because the standard library has no
+//!   safe equivalent; none of them can be replaced without dropping the
+//!   feature it serves.
+//! - Trust assertions - [`AppState::trusted_manifest_dir`], which vests the
+//!   manifest-directory immutability invariant through
+//!   `TrustedManifestDir::new_unchecked`. This is NOT an OS call: it asserts a
+//!   property of the publication protocol (tmp-file + rename, never rewritten
+//!   in place) that a bare `&Path` cannot express, and it is the same
+//!   pointer-class obligation as the two `memmap2` mapping sites in
+//!   `clarus-core`.
+//!
+//! Every unsafe site in the server is gathered here. Previous homes:
 //! `disk_utils.rs` (statvfs / GetDiskFreeSpaceExW) and `main.rs`
 //! (console mode, getrlimit).
 
@@ -104,8 +120,13 @@ pub fn process_exists(pid: u32) -> bool {
 pub fn statvfs_mb(path: &Path) -> Option<(f64, f64)> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
 
-    let c_path = path.to_str().and_then(|s| CString::new(s).ok())?;
+    // `as_bytes()`, not `to_str()`: a directory whose name is not valid UTF-8
+    // is still a real directory, and `to_str()` turned it into `None` - which
+    // the callers report as missing or zero capacity. An embedded NUL is still
+    // rejected, because `CString::new` refuses it.
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
 
     // `MaybeUninit` instead of `zeroed()`: all-zeroes is not a valid value
     // for every C struct (Rust >= 1.53 UB rules).
@@ -126,6 +147,50 @@ pub fn statvfs_mb(path: &Path) -> Option<(f64, f64)> {
         stat.f_blocks as f64 * block_size / MB,
         stat.f_bavail as f64 * block_size / MB,
     ))
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    /// A directory whose name is not valid UTF-8 is still a directory.
+    ///
+    /// `path.to_str()` returned `None` for such a name, so `statvfs_mb`
+    /// answered `None` and the callers reported a missing or zero-capacity
+    /// disk for a perfectly good filesystem. The bytes go to the syscall
+    /// untouched now.
+    #[test]
+    fn a_non_utf8_directory_still_reports_capacity() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        // 0xFF is never valid UTF-8, and is legal in a Unix filename.
+        let name = std::ffi::OsStr::from_bytes(b"non\xffutf8-dir");
+        let dir = base.path().join(name);
+        std::fs::create_dir(&dir).expect("create dir");
+
+        assert!(
+            dir.to_str().is_none(),
+            "the fixture must really be non-UTF-8, or the test proves nothing"
+        );
+        let (total, available) = statvfs_mb(&dir).expect("a real directory has capacity");
+        assert!(total > 0.0, "total capacity is reported, got {total}");
+        assert!(available >= 0.0, "available is reported, got {available}");
+    }
+
+    /// An embedded NUL is refused rather than truncated.
+    ///
+    /// `CString::new` fails on a NUL, and a path that could be truncated at it
+    /// would silently name a DIFFERENT directory.
+    #[test]
+    fn a_path_with_an_embedded_nul_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"/tmp/a\0b");
+        assert!(
+            statvfs_mb(std::path::Path::new(bad)).is_none(),
+            "a path with an embedded NUL must be refused"
+        );
+    }
 }
 
 /// `GetDiskFreeSpaceExW` at `path`: `(total_mb, available_mb)`. `None` on
@@ -175,14 +240,29 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// The stdin console mode with Quick Edit disabled.
+///
+/// Windows requires `ENABLE_EXTENDED_FLAGS` to be SET and
+/// `ENABLE_QUICK_EDIT_MODE` to be clear for this operation. Clearing BOTH (as
+/// this once did) drops the console into the legacy mode set, which changes
+/// unrelated behaviour such as Insert mode.
+///
+/// A plain `const fn` rather than an inline expression so the rule is testable
+/// on every platform; it stays `cfg(windows)` in the FFI function that uses it.
+#[cfg(windows)]
+#[must_use]
+pub const fn stdin_mode_without_quick_edit(mode: u32) -> u32 {
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+}
+
 /// Windows console setup: disable Quick Edit on stdin (click-to-freeze
 /// footgun) and enable ANSI escape processing on stdout/stderr for the log
 /// console mirror. Best-effort: no-op when there is no console.
 #[cfg(windows)]
 pub fn configure_windows_console() {
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
-    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
     const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6u32; // -10
     const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5u32; // -11
     const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4u32; // -12
@@ -198,14 +278,16 @@ pub fn configure_windows_console() {
     // value. All calls are best-effort (return codes ignored) and no Rust
     // data is aliased.
     unsafe {
-        // Disable Quick Edit on stdin - prevents click-to-freeze
+        // Disable Quick Edit on stdin - prevents click-to-freeze.
+        //
+        // ENABLE_EXTENDED_FLAGS must STAY SET: Windows requires it set and
+        // ENABLE_QUICK_EDIT_MODE clear for this operation, and clearing both
+        // (as this did) drops the console into the legacy mode set, which
+        // changes unrelated behaviour such as Insert mode.
         let handle = GetStdHandle(STD_INPUT_HANDLE);
         let mut mode: u32 = 0;
         if GetConsoleMode(handle, &mut mode) != 0 {
-            SetConsoleMode(
-                handle,
-                mode & !(ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS),
-            );
+            SetConsoleMode(handle, stdin_mode_without_quick_edit(mode));
         }
         // Enable ANSI escape code processing on stdout
         let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -339,4 +421,44 @@ pub fn process_rss_bytes() -> u64 {
         return 0;
     }
     counters.working_set_size as u64
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// Disabling Quick Edit must KEEP `ENABLE_EXTENDED_FLAGS` set.
+    ///
+    /// Windows requires it set and `ENABLE_QUICK_EDIT_MODE` clear for this
+    /// operation. The old expression cleared both, which drops the console
+    /// into the legacy mode set and changes unrelated behaviour such as
+    /// Insert mode.
+    #[test]
+    fn quick_edit_is_cleared_but_extended_flags_stays_set() {
+        const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+        const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+
+        // A mode with Quick Edit ON and extended flags absent.
+        let out = stdin_mode_without_quick_edit(ENABLE_QUICK_EDIT_MODE);
+        assert_eq!(
+            out & ENABLE_QUICK_EDIT_MODE,
+            0,
+            "Quick Edit must be cleared"
+        );
+        assert_ne!(
+            out & ENABLE_EXTENDED_FLAGS,
+            0,
+            "ENABLE_EXTENDED_FLAGS must STAY SET"
+        );
+
+        // Unrelated bits survive.
+        const LINE_INPUT: u32 = 0x0002;
+        let out = stdin_mode_without_quick_edit(LINE_INPUT | ENABLE_QUICK_EDIT_MODE);
+        assert_ne!(out & LINE_INPUT, 0, "unrelated mode bits are untouched");
+        assert_ne!(
+            out & ENABLE_EXTENDED_FLAGS,
+            0,
+            "extended flags are set even when absent on input"
+        );
+    }
 }

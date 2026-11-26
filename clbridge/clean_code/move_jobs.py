@@ -71,6 +71,49 @@ def _migrate_move_jobs(conn):
         conn.execute(
             "ALTER TABLE move_jobs ADD COLUMN request_sop_uid TEXT NOT NULL DEFAULT ''"
         )
+    # The peers.conf KEY the destination was matched under. For a CIDR entry
+    # that is the subnet ("192.168.1.0/24"), not the client IP the association
+    # actually goes to: `scp_targets` is keyed by that configured host, so
+    # recording success/failure against the client IP updated no row and a
+    # subnet-backed peer never accumulated (or cleared) its failure streak.
+    if "registry_host" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN registry_host TEXT NOT NULL DEFAULT ''"
+        )
+    # SOP instance UIDs this job has DELIVERED, newline-joined, written as the
+    # peer acknowledges each one. The pass's returned list is the other carrier
+    # and a raising pass never produces it, so without this column a mid-stream
+    # exception wiped the resume skip set and the resumed pass re-sent instances
+    # the destination already held.
+    if "delivered_sops" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN delivered_sops TEXT NOT NULL DEFAULT ''"
+        )
+
+    # Instances the destination ACCEPTED with a C-STORE Warning (PS3.4 B.2.3.1)
+    # across every pass. They are delivered, so they are not in failed_sops -
+    # but Table C.4-2 gives "sub-operations completed with warnings" its own
+    # status (0xB000), and the reactor builds that response, not the worker.
+    if "warning_count" not in cols:
+        conn.execute(
+            "ALTER TABLE move_jobs ADD COLUMN warning_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+    # One row per DELIVERED SOP. The `delivered_sops` TEXT column above holds
+    # the same information as a newline-joined blob, and each acknowledgement
+    # read it, split it, appended and wrote the WHOLE value back under the
+    # shared DB lock: a 5000-instance study did 12.5 M string copies while
+    # blocking every progress poll and every other worker's claim. A child
+    # table makes one acknowledgement one INSERT, and the primary key makes a
+    # duplicate acknowledgement idempotent without a read-modify-write.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS move_job_delivered ("
+        "  job_id INTEGER NOT NULL,"
+        "  sop_uid TEXT NOT NULL,"
+        "  sop_class TEXT NOT NULL DEFAULT '',"
+        "  PRIMARY KEY (job_id, sop_uid)"
+        ")"
+    )
 
 
 def _migrate_scp_targets(conn):
@@ -197,6 +240,7 @@ class MoveJobManager:
                 "  failed_instances INTEGER DEFAULT 0,"
                 "  error_message TEXT,"
                 "  failed_sops TEXT NOT NULL DEFAULT '',"
+                "  warning_count INTEGER NOT NULL DEFAULT 0,"
                 "  created_at INTEGER NOT NULL,"
                 "  updated_at INTEGER NOT NULL,"
                 "  attempts INTEGER DEFAULT 0,"
@@ -230,6 +274,8 @@ class MoveJobManager:
         request_level="",
         request_series_uid="",
         request_sop_uid="",
+        registry_host="",
+        claimable=True,
     ):
         """Create a new pending C-MOVE job. Returns job id.
 
@@ -241,26 +287,40 @@ class MoveJobManager:
         request_level/request_series_uid/request_sop_uid: the Query/Retrieve
         scope of the request (PS3.4 C.4.2.1.2), stored for the same reason -
         a SERIES-level C-MOVE must not retrieve the whole study.
+        registry_host: the peers.conf key the destination matched under. For a
+        CIDR entry this is the SUBNET while `target_host` is the client IP the
+        association goes to; SCP health is recorded against the key.
+        claimable: when False the row is inserted as 'held', which no worker
+        picks. A multi-scope request publishes all of its jobs this way and
+        then calls `release_held_jobs()`, so no worker can start the first
+        scope while the handler is still submitting the rest (a second insert
+        that then failed left a job already sending while the SCU got an
+        error, and the worker could observe `is_job_cancelled()` as False
+        before the cancel callback was installed).
         """
         now = int(time.time())
+        initial_status = "pending" if claimable else "held"
         with self._db.locked() as conn:
             cur = conn.execute(
                 "INSERT INTO move_jobs"
                 " (study_uid, move_dest_ae, target_host, target_port,"
                 "  status, created_at, updated_at, expose_rejected,"
-                "  request_level, request_series_uid, request_sop_uid)"
-                " VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                "  request_level, request_series_uid, request_sop_uid,"
+                "  registry_host)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     study_uid,
                     move_dest_ae,
                     target_host,
                     target_port,
+                    initial_status,
                     now,
                     now,
                     1 if expose_rejected else 0,
                     str(request_level or ""),
                     str(request_series_uid or ""),
                     str(request_sop_uid or ""),
+                    str(registry_host or target_host or ""),
                 ),
             )
             conn.commit()
@@ -293,6 +353,32 @@ class MoveJobManager:
         except Exception:
             return 0
 
+    def release_held_jobs(self, job_ids):
+        """Make `held` rows claimable. Returns how many were released.
+
+        The publication step of a multi-scope C-MOVE request: every scope is
+        inserted as 'held' (see `create_job`), the request's cancellation
+        state is installed, and only then are all of them made pending
+        together. A single UPDATE is the barrier - no worker can observe a
+        partial set, and no scope can start before the request is ready.
+        """
+        ids = [int(i) for i in job_ids if i is not None]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._db.locked() as conn:
+            cur = conn.execute(
+                f"UPDATE move_jobs SET status = 'pending'"
+                f" WHERE status = 'held' AND id IN ({placeholders})",
+                ids,
+            )
+            conn.commit()
+            released = cur.rowcount or 0
+        if released:
+            with self._cond:
+                self._cond.notify_all()
+        return released
+
     def _select_pending(self):
         """The pending-row SELECT used by `pick_pending_job`.
 
@@ -308,13 +394,21 @@ class MoveJobManager:
                 " ORDER BY created_at ASC"
             ).fetchall()
 
-    def pick_pending_job(self, timeout=5.0, skip=None):
-        """Atomically pick one pending job.
+    def pick_pending_job(self, timeout=5.0, skip=None, reserve=None, release=None):
+        """Atomically pick one pending job, optionally RESERVING its peer.
 
-        `skip(host, port, ae) -> bool` marks rows that must not be claimed
-        yet (a peer another worker is streaming to). A skipped row stays
-        pending and visible to the other workers; when every pending row is
-        skipped the caller waits exactly as for an empty queue.
+        `reserve(host, port, ae) -> bool` is a non-blocking claim of the peer
+        (a per-peer gate in the worker). It runs while the pick is still a
+        candidate, BEFORE the row is claimed: a peer that cannot be reserved is
+        skipped, so the caller never holds a claimed job it cannot start. That
+        is what keeps two workers from claiming two jobs for the same peer and
+        leaving a job for a DIFFERENT peer unserved behind a blocking wait.
+
+        A candidate that is claimed but then found gone (another worker won the
+        race) releases its reservation through `release`, so the gate is not
+        leaked by the losing thread.
+
+        `skip(host, port, ae) -> bool` remains as an advisory filter.
 
         Returns dict or None.
         """
@@ -336,45 +430,111 @@ class MoveJobManager:
                         return None
                     continue
 
-            row = rows[0]
-            job_id = row[0]
-            now = int(time.time())
-            with self._db.locked() as conn:
-                row2 = conn.execute(
-                    "SELECT id, study_uid, move_dest_ae, attempts,"
-                    " target_host, target_port, expose_rejected,"
-                    " request_level, request_series_uid, request_sop_uid"
-                    " FROM move_jobs WHERE status = 'pending' AND id = ?",
-                    (job_id,),
-                ).fetchone()
-                if not row2:
-                    continue  # Another worker claimed it
+            claimed = None
+            for row in rows:
+                if reserve is not None and not reserve(
+                    row[4] or "", row[5] or 0, row[2] or ""
+                ):
+                    # Another worker holds this peer: leave the row pending and
+                    # look at the next one, so a job for a different peer is
+                    # still served by THIS worker.
+                    continue
+                # The claim can RAISE - a SQLite error while the row is being
+                # updated - and an exception escaping here skipped `release`,
+                # leaking the peer reservation for the life of the process. The
+                # leaked gate then made every other worker skip that peer, and
+                # because the raise also escaped the worker loop's SELECT the
+                # worker itself died. Every unsuccessful claim therefore
+                # releases, and a claim error is retried against the next
+                # candidate instead of killing the worker.
+                try:
+                    claimed = self._claim_row(row[0])
+                except Exception as claim_err:
+                    logging.error(
+                        "[MOVE-JOBS] claim of job %s failed (%s) - releasing "
+                        "the peer reservation and trying the next candidate",
+                        row[0],
+                        claim_err,
+                    )
+                    claimed = None
+                    if release is not None:
+                        try:
+                            release(row[4] or "", row[5] or 0, row[2] or "")
+                        except Exception:
+                            pass
+                    continue
+                if claimed is not None:
+                    return claimed
+                # Lost the claim race: hand the reservation back.
+                if release is not None:
+                    release(row[4] or "", row[5] or 0, row[2] or "")
+            # Every candidate was either busy or lost: wait like an empty queue.
+            with self._cond:
+                if not self._cond.wait(timeout=timeout):
+                    return None
 
-                conn.execute(
-                    "UPDATE move_jobs SET status = 'in_progress',"
-                    " updated_at = ?, attempts = attempts + 1"
-                    " WHERE id = ?",
-                    (now, job_id),
-                )
-                conn.commit()
-                return {
-                    "id": job_id,
-                    "study_uid": row2[1],
-                    "move_dest_ae": row2[2],
-                    "attempts": row2[3],
-                    "target_host": row2[4],
-                    "target_port": row2[5],
-                    # The worker outlives the association that queued the job,
-                    # so which base URL to stream from has to come from the
-                    # row. Omitting it here silently sent every QA job to
-                    # clarus_url, i.e. the sequester was never lifted.
-                    "expose_rejected": int(row2[6] or 0),
-                    # PS3.4 C.4.2.1.2: the scope travels with the job for the
-                    # same reason - the worker no longer has the event.
-                    "request_level": str(row2[7] or ""),
-                    "request_series_uid": str(row2[8] or ""),
-                    "request_sop_uid": str(row2[9] or ""),
-                }
+    def job_has_live_worker(self, job_id):
+        """True when `job_id` may still be read by a worker.
+
+        That is 'in_progress' (a worker owns it now) AND 'pending' (no worker
+        has claimed it yet, but one can, and it must observe a cancel that was
+        latched before it started). Only a TERMINAL job has nobody left to
+        read the latch: installing one there leaves a callback in the registry
+        that no worker would ever clear.
+        """
+        try:
+            with self._db.locked() as conn:
+                row = conn.execute(
+                    "SELECT status FROM move_jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+            return bool(row) and row[0] in ("pending", "in_progress")
+        except Exception:
+            return False
+
+    def _claim_row(self, job_id):
+        """Claim `job_id` for this worker, or None when another worker won it."""
+        now = int(time.time())
+        with self._db.locked() as conn:
+            row2 = conn.execute(
+                "SELECT id, study_uid, move_dest_ae, attempts,"
+                " target_host, target_port, expose_rejected,"
+                " request_level, request_series_uid, request_sop_uid,"
+                " registry_host"
+                " FROM move_jobs WHERE status = 'pending' AND id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row2:
+                return None  # Another worker claimed it
+
+            conn.execute(
+                "UPDATE move_jobs SET status = 'in_progress',"
+                " updated_at = ?, attempts = attempts + 1"
+                " WHERE id = ? AND status = 'pending'",
+                (now, job_id),
+            )
+            conn.commit()
+            return {
+                "id": job_id,
+                "study_uid": row2[1],
+                "move_dest_ae": row2[2],
+                "attempts": row2[3],
+                "target_host": row2[4],
+                "target_port": row2[5],
+                # The worker outlives the association that queued the job,
+                # so which base URL to stream from has to come from the
+                # row. Omitting it here silently sent every QA job to
+                # clarus_url, i.e. the sequester was never lifted.
+                "expose_rejected": int(row2[6] or 0),
+                # PS3.4 C.4.2.1.2: the scope travels with the job for the
+                # same reason - the worker no longer has the event.
+                "request_level": str(row2[7] or ""),
+                "request_series_uid": str(row2[8] or ""),
+                "request_sop_uid": str(row2[9] or ""),
+                # The peers.conf key, NOT the connection address: for a
+                # CIDR peer the two differ and SCP health is keyed by the
+                # former.
+                "registry_host": str(row2[10] or row2[4] or ""),
+            }
 
     def requeue_job_without_retry(self, job_id):
         """Return a claimed job to pending without charging it an attempt (R9).
@@ -429,8 +589,47 @@ class MoveJobManager:
                 return (0, 0, "unknown")
             return (row[0], row[1], row[2])
 
+    def add_job_delivered_sop(self, job_id, sop_uid, sop_class=""):
+        """Record one DELIVERED SOP instance (and its class) for the job.
+
+        Written as the peer acknowledges each instance, not at the end of the
+        pass: the pass's own list is lost when it raises, and the resume uses
+        this record to skip what has already arrived.
+
+        ONE INSERT into the child table. `INSERT OR IGNORE` keyed on
+        (job_id, sop_uid) makes a duplicate acknowledgement idempotent without
+        reading the previous value, so an acknowledgement costs the same
+        whether the study holds ten instances or ten thousand.
+        """
+        if not sop_uid:
+            return
+        with self._db.locked() as conn:
+            row = conn.execute(
+                "SELECT id FROM move_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                # The job row was already retired; recording a delivery for a
+                # row that no longer exists would resurrect nothing.
+                return
+            conn.execute(
+                "INSERT OR IGNORE INTO move_job_delivered"
+                " (job_id, sop_uid, sop_class) VALUES (?, ?, ?)",
+                (job_id, str(sop_uid), str(sop_class or "")),
+            )
+            conn.commit()
+
+    def get_job_delivered_sops(self, job_id):
+        """`[(sop_class, sop_uid), ...]` recorded as delivered for this job."""
+        with self._db.locked() as conn:
+            rows = conn.execute(
+                "SELECT sop_class, sop_uid FROM move_job_delivered"
+                " WHERE job_id = ? ORDER BY rowid",
+                (job_id,),
+            ).fetchall()
+        return [(str(r[0] or ""), str(r[1])) for r in rows]
+
     def set_job_failed_sops(self, job_id, uids):
-        """Record the (0008,0058) Failed SOP Instance UID List for a job.
+        """Store the (0008,0058) Failed SOP Instance UID List for a job.
 
         newline-joined UIDs of the slices that were attempted but not
         delivered. Read back by the C-MOVE generator so the final
@@ -445,6 +644,38 @@ class MoveJobManager:
                 (text, now, job_id),
             )
             conn.commit()
+
+    def set_job_warning_count(self, job_id, count):
+        """Record how many instances the destination accepted WITH a warning.
+
+        PS3.4 B.2.3.1: a C-STORE Warning means the SCP stored the instance, so
+        those UIDs are delivered and never belong in the failed tail. They are
+        still not plain successes: PS3.4 Table C.4-2 reserves 0xB000 for
+        "sub-operations completed with warnings", so the tally has to survive
+        the worker that computed it - the reactor builds the final response.
+        """
+        try:
+            value = max(0, int(count or 0))
+        except (TypeError, ValueError):
+            value = 0
+        now = int(time.time())
+        with self._db.locked() as conn:
+            conn.execute(
+                "UPDATE move_jobs SET warning_count = ?, updated_at = ? WHERE id = ?",
+                (value, now, job_id),
+            )
+            conn.commit()
+
+    def get_job_warning_count(self, job_id):
+        """The warning tally recorded by `set_job_warning_count`. 0 if unset."""
+        try:
+            with self._db.locked() as conn:
+                row = conn.execute(
+                    "SELECT warning_count FROM move_jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception:
+            return 0
 
     def get_job_failed_sops(self, job_id):
         """Return the (0008,0058) Failed SOP Instance UID list for a job."""
@@ -554,6 +785,20 @@ class MoveJobManager:
             port,
         )
 
+    def _lookup_target(self, ae_title, host):
+        """(host, port) stored for the exact (ae_title, host) key, or None.
+
+        Read in its own lock: `reload_peers_from_file` calls this BEFORE
+        delegating the upsert to `register_peer`, which acquires the same
+        lock, so the existing row cannot be read while the upsert lock is held.
+        """
+        with self._db.locked() as conn:
+            row = conn.execute(
+                "SELECT host, port FROM scp_targets WHERE ae_title = ? AND host = ?",
+                (ae_title, host),
+            ).fetchone()
+        return (row[0], row[1]) if row else None
+
     # --- SCP peer lookup with subnet support --------------------
 
     def lookup_scp(self, ae_title, client_ip=None):
@@ -627,6 +872,12 @@ class MoveJobManager:
 
         Respects lazyload_peers_interval. Composite key (ae_title, host)
          -  multiple entries per AE (CIDR + exact) are preserved.
+
+        Per-entry upsert delegates to `register_peer`, the single INSERT path:
+        the reload used to run its own INSERT OR REPLACE here, so the two
+        write paths drifted (register_peer's "one exact entry per AE"
+        semantics were not applied by the file path). The file-sync half
+        (removing peers the file no longer names) stays here.
         """
         if self.lazyload_peers_interval > 0:
             elapsed = time.time() - self._last_peers_reload
@@ -636,43 +887,40 @@ class MoveJobManager:
         from clean_code.config import parse_peers_conf
 
         self._last_peers_reload = time.time()
-        new_count = 0
+        parsed = list(parse_peers_conf(peers_file))
+        if not parsed:
+            # An EMPTY parse result must not delete anything: a file mid-save,
+            # a truncated write or a crash leaves a config that parses to zero
+            # peers, and treating that as "every peer was removed" silently
+            # unregistered the whole peer table.
+            logging.warning(
+                "[PEER] %s parsed to no peers - keeping the existing table "
+                "(a truncated or empty file must not wipe routing)",
+                peers_file,
+            )
+            return 0
+
         seen = set()
+        new_count = 0
+        for ae_title, host, port in parsed:
+            seen.add((ae_title, host))
+            existing = self._lookup_target(ae_title, host)
+            if existing == (host, port):
+                # Unchanged entry: leave the row ALONE. `register_peer` writes
+                # `consecutive_failures = 0`, so re-registering an identical
+                # peer wiped its failure streak - a peer that had failed twice
+                # (one short of the eviction threshold) started again from
+                # zero at every reload, so the configured threshold was never
+                # reached and a dead destination kept receiving jobs.
+                continue
+            new_count += 1
+            self.register_peer(ae_title, host, port)
+
+        # A peer removed from peers.conf is gone from the operator's view,
+        # so routing to the stale row was a destination the config no
+        # longer names. Deleting by (ae_title, host) keeps a peer that is
+        # still listed under a different port.
         with self._db.locked() as conn:
-            for ae_title, host, port in parse_peers_conf(peers_file):
-                seen.add((ae_title, host))
-                row = conn.execute(
-                    "SELECT host, port FROM scp_targets"
-                    " WHERE ae_title = ? AND host = ?",
-                    (ae_title, host),
-                ).fetchone()
-                existing = (row[0], row[1]) if row else None
-                if existing is None or existing != (host, port):
-                    now = int(time.time())
-                    conn.execute(
-                        "INSERT OR REPLACE INTO scp_targets"
-                        " (ae_title, host, port, last_seen, consecutive_failures)"
-                        " VALUES (?, ?, ?, ?, 0)",
-                        (ae_title, host, port, now),
-                    )
-                    new_count += 1
-            # A peer removed from peers.conf is gone from the operator's view,
-            # so routing to the stale row was a destination the config no
-            # longer names. Deleting by (ae_title, host) keeps a peer that is
-            # still listed under a different port.
-            #
-            # An EMPTY parse result is the one case that must not delete
-            # anything: a file mid-save, a truncated write or a crash leaves a
-            # config that parses to zero peers, and treating that as "every
-            # peer was removed" silently unregistered the whole peer table.
-            if not seen:
-                logging.warning(
-                    "[PEER] %s parsed to no peers - keeping the existing table "
-                    "(a truncated or empty file must not wipe routing)",
-                    peers_file,
-                )
-                conn.commit()
-                return 0
             stale = [
                 (ae, host)
                 for ae, host in conn.execute("SELECT ae_title, host FROM scp_targets")

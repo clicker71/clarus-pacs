@@ -1,0 +1,72 @@
+# CLAHE - contrast-limited adaptive histogram equalisation.
+#
+# The out-of-the-box model: a DERIVED image function with no weights, no GPU
+# and no model download, so a fresh install runs a real study end to end.
+#
+# The script is `abi/DERIVED-clahe.py` beside this directory; it needs
+# opencv-python and numpy (see abi/requirements.txt).
+#
+# Fields above `match`/`runtime`/`outputs` are the model's DECLARATION -
+# what a consumer of AI service properties reads, and what clinfer SERVES at
+# /processors/Questionnaire. The three below them are clinfer's own: which
+# study the model is for, how to run it, and what it produces.
+
+enabled: true
+
+title: "CLAHE contrast enhancement"
+description: "Local contrast equalisation over every frame, returning a new image of the source modality."
+
+provider:
+  name: "clinfer-clahe"
+  vendor: "Clarus"
+  version: "1.0"
+
+procedure_code:
+  value: "IMG-CLAHE"
+  scheme: "99CLARUS"
+  meaning: "Adaptive Histogram Equalization (CLAHE)"
+
+input_requirements:
+  # Any grayscale modality: the filter is contrast-only and carries no claim
+  # about the anatomy, so the modality list is what it accepts.
+  modalities: [DX, CR, CT, MR]
+  photometric_interpretation: [MONOCHROME1, MONOCHROME2]
+  anatomy:
+    - system: "http://snomed.info/sct"
+      code: "51185008"
+      meaning: "Thoracic structure"
+
+output_capabilities:
+  # A derived image is a new instance of the SOURCE modality's class. The
+  # Secondary Capture class is the one this build writes.
+  sop_classes: ["1.2.840.10008.5.1.4.1.1.7"]
+
+parameters:
+  # The same names `abi/DERIVED-clahe.py` reads from the workitem's
+  # Scheduled Processing Parameters Sequence (0074,1210).
+  - code: CLIP_LIMIT
+    type: decimal
+    text: "Clip limit"
+    default: 2.0
+    min: 0.1
+    max: 40.0
+  - code: TILE_GRID
+    type: integer
+    text: "Tile grid"
+    default: 8
+    min: 2
+    max: 64
+
+match:
+  modality: [DX, CR, CT, MR]
+  study_description_contains: ["*chest*", "*thorax*"]
+
+runtime:
+  script: "../abi/DERIVED-clahe.py"
+  interpreter: "python3"
+  timeout_secs: 300
+
+outputs:
+  - kind: derived
+    series_description: "CLAHE"
+    profile_version: 1

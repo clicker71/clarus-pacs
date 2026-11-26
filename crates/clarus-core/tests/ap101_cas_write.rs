@@ -78,26 +78,32 @@ fn cas_write_fold_is_zero_alloc_per_chunk() {
     let mut sink = FixedSink::new(CHUNK * CHUNKS);
     assert_eq!(sink.buf.capacity(), sink.cap, "sink must be pre-reserved");
 
-    let ((count, bytes), _digest) = measure(|| {
-        let mut w = CasWrite::new(&mut sink);
+    // Construct INSIDE its own budget, then measure ONLY the write loop.
+    //
+    // The previous shape wrapped construction + the whole loop + `finish` in
+    // one window and allowed `< 64` allocations. With 4096 chunks, one
+    // allocation every 128 chunks adds 32 - inside that budget - so the gate
+    // could not see an allocation count that GROWS WITH THE STREAM, which is
+    // exactly the regression it exists to catch.
+    let mut w = CasWrite::new(&mut sink);
+    let ((count, bytes), ()) = measure(|| {
         for _ in 0..CHUNKS {
             w.write_all(&chunk).expect("write");
         }
-        w.finish().0
     });
+    // `finish` has its own budget: it is not part of the per-chunk fold.
+    let _ = measure(|| w.finish());
 
-    // The measured window holds: N `extend_from_slice` (0 alloc, capacity
-    // reserved) + the hasher update/finalize (stack-only). The ONLY allocations
-    // allowed are the handful inside hasher construction/handling - a small
-    // constant, NOT one-per-chunk.
-    assert!(
-        count < 64,
-        "CasWrite fold must not allocate per chunk: {CHUNKS} chunks produced \
-         {count} allocations"
+    // The fold itself: `extend_from_slice` into a pre-reserved buffer plus a
+    // stack-only hasher update. ZERO, not "fewer than 64".
+    assert_eq!(
+        count, 0,
+        "CasWrite::write_all must not allocate per chunk: {CHUNKS} chunks \
+         produced {count} allocations"
     );
-    assert!(
-        bytes < 64 * 1024,
-        "CasWrite fold allocated {bytes} bytes for {CHUNKS} stack-sized chunks"
+    assert_eq!(
+        bytes, 0,
+        "CasWrite::write_all allocated {bytes} bytes across {CHUNKS} chunks"
     );
     // Sanity: all bytes reached the sink.
     assert_eq!(sink.buf.len(), CHUNK * CHUNKS);

@@ -150,8 +150,15 @@ fn day_filename(day: &DayKey) -> String {
 }
 
 impl SeriesOwnerIndex {
-    /// Append one `(series, study)` row with a single write.
-    pub fn append(&mut self, row: &[u8]) -> Result<(), SeriesOwnerError> {
+    /// Append exactly one complete row (a single `write_all`).
+    ///
+    /// Private on purpose: the segment is a FIXED-WIDTH format, so a caller
+    /// passing a short or long slice would write a misaligned record and every
+    /// later row (and every reader) would start at the wrong offset. The only
+    /// public path is [`SeriesOwnerIndex::append_pair`], which builds the row
+    /// and so cannot get the length wrong.
+    fn append(&mut self, row: &[u8]) -> Result<(), SeriesOwnerError> {
+        debug_assert_eq!(row.len(), ROW_LEN, "a segment row is fixed width");
         if self.poisoned {
             return Err(SeriesOwnerError::Io(io::Error::from(
                 io::ErrorKind::BrokenPipe,
@@ -160,6 +167,9 @@ impl SeriesOwnerIndex {
         match self.file.write_all(row) {
             Ok(()) => Ok(()),
             Err(e) => {
+                // A short write leaves the file mid-record, so this handle
+                // must never be used again: `poisoned` is what makes the next
+                // caller reopen and repair instead of appending onto the tail.
                 self.poisoned = true;
                 Err(SeriesOwnerError::Io(e))
             }
@@ -176,6 +186,18 @@ impl SeriesOwnerIndex {
     /// Whether a failed append left this handle unusable.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Mark the handle unusable, as a failed `write_all` would.
+    ///
+    /// Test-only: a real poisoning needs an I/O failure on an ALREADY-OPEN
+    /// handle, which cannot be produced portably (closing the fd under Unix
+    /// is a bug, and a full disk is not arrangeable in a test). The recovery
+    /// path in `shadow.rs` is what is under test, so the state is injected
+    /// rather than the failure.
+    #[cfg(test)]
+    pub fn poison_for_test(&mut self) {
+        self.poisoned = true;
     }
 }
 
@@ -217,6 +239,24 @@ fn read_segment(path: &Path) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(rows)
 }
 
+/// Fold a day's rows into distinct-series entries, LAST row winning.
+///
+/// Used for both the initial load and an incremental append, so the two paths
+/// cannot disagree about which owner a repeated series has. The result is
+/// sorted by Series UID for binary search.
+///
+/// Sorting the raw rows first is not enough: `sort_by` is not stable in a way
+/// that preserves "latest row wins" once the duplicates are adjacent, so the
+/// fold is done in FILE ORDER and the map is sorted at the end.
+fn collapse_rows(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut map: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
+    for (series, study) in rows {
+        // Insert overwrites, so the LAST row for a series wins.
+        map.insert(series, study);
+    }
+    map.into_iter().collect()
+}
+
 /// An in-memory, sorted snapshot of one day's `series_owner` segment.
 ///
 /// Memoization unit for the lookup: loaded and sorted once, then
@@ -224,7 +264,23 @@ fn read_segment(path: &Path) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
 pub struct SeriesOwnerSnapshot {
     /// Segment file length at snapshot time (bytes).
     pub file_len: u64,
-    /// Rows sorted by Series (in-memory copy).
+    /// DISTINCT series, sorted by Series UID, each with its owning study.
+    ///
+    /// One entry per series, not one per ROW. The on-disk format appends a row
+    /// per accepted instance, so a busy day holds many rows that repeat a
+    /// series already present. Indexing rows directly made folding one more
+    /// instance an O(n) `Vec::insert` that shifted every row after it - and
+    /// with the shadow mutex held, adding instances to a series near the front
+    /// of the vector made a day's ingest quadratic in its own row count.
+    ///
+    /// Collapsing to distinct series removes that: a repeated series is found
+    /// by binary search and either ignored or resolved in place, and only a
+    /// GENUINELY new series inserts - which is bounded by the number of series
+    /// in the day, not by the number of instances.
+    ///
+    /// Owner resolution: the LAST row written for a series wins, matching a
+    /// sequential read of the segment (which is what the pre-snapshot path
+    /// did, and what a reader replaying the append log would conclude).
     rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -249,8 +305,16 @@ impl SeriesOwnerSnapshot {
                 return Ok(None);
             }
         };
-        let mut rows = read_segment(&path).map_err(SeriesOwnerError::Io)?;
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let rows = read_segment(&path).map_err(SeriesOwnerError::Io)?;
+        // Collapse repeated series to ONE entry with the LAST row winning.
+        //
+        // The fold is over the rows in FILE ORDER (which `read_segment`
+        // preserves) into a map, then sorted once. That is exactly "a reader
+        // replaying the append log" - the semantics the pre-snapshot path
+        // had - and it makes the in-memory index proportional to the number of
+        // distinct SERIES, not the number of instances. No `Vec::insert` on
+        // the ingest path, so adding instances to a day cannot shift rows.
+        let rows = collapse_rows(rows);
         Ok(Some(SeriesOwnerSnapshot { file_len, rows }))
     }
 
@@ -259,15 +323,31 @@ impl SeriesOwnerSnapshot {
         self.file_len
     }
 
-    /// Fold one appended row into the in-memory snapshot (B1, mirror of the
-    /// `sop_owner` writer: inserted in sorted position, length advances by
-    /// exactly [`ROW_LEN`]).
+    /// Fold one appended row into the in-memory snapshot.
+    ///
+    /// Located by BINARY SEARCH, not `Vec::insert` on a row-indexed vector.
+    /// The on-disk format appends one row per accepted INSTANCE, so most rows
+    /// name a series already indexed: those resolve in place (`&mut`, no
+    /// shift). Only a genuinely NEW series inserts, and the insert is over the
+    /// distinct-series vector - bounded by the day's series count, not its
+    /// instance count. Previously every append shifted the remainder of the
+    /// day's rows while the shadow mutex was held, which made a day's ingest
+    /// quadratic in its own size.
+    ///
+    /// The study is overwritten, not ignored: the last row written for a
+    /// series wins, which is what [`collapse_rows`] produces for the same
+    /// segment read from disk, so a warm snapshot and a cold reload agree.
     pub fn append_row(&mut self, series: &[u8], study: &[u8]) {
-        let pos = self
-            .rows
-            .binary_search_by(|r| r.0.as_slice().cmp(series))
-            .unwrap_or_else(|i| i);
-        self.rows.insert(pos, (series.to_vec(), study.to_vec()));
+        match self.rows.binary_search_by(|r| r.0.as_slice().cmp(series)) {
+            Ok(pos) => {
+                // Same series, again: keep one entry, record the new owner.
+                if self.rows[pos].1 != study {
+                    self.rows[pos].1.clear();
+                    self.rows[pos].1.extend_from_slice(study);
+                }
+            }
+            Err(pos) => self.rows.insert(pos, (series.to_vec(), study.to_vec())),
+        }
         self.file_len += ROW_LEN as u64;
     }
 
@@ -326,5 +406,53 @@ mod tests {
         assert_eq!(snap.find_warm(b"1.2.5").unwrap(), b"study-5");
         assert!(snap.find(b"1.2.3").is_none());
         assert!(snap.find_warm(b"1.2.9").is_none());
+    }
+
+    /// A repeated series must not grow the in-memory index, and a warm
+    /// snapshot must agree with a cold reload about the owner.
+    ///
+    /// The disk format appends one row per INSTANCE, so a day carries many
+    /// rows naming the same series. Indexing rows directly made each append a
+    /// `Vec::insert` over the day's row count (quadratic ingest); collapsing
+    /// to distinct series is what bounds it. The LAST row wins, which is what
+    /// a reader replaying the segment would conclude.
+    #[test]
+    fn repeated_series_collapse_to_one_entry_and_last_row_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut idx = open_appender(dir.path(), b"20240116").expect("open");
+        // Ten instances of one series, then a second series.
+        for _ in 0..10 {
+            idx.append_pair(b"1.2.5", b"study-a").expect("repeat");
+        }
+        idx.append_pair(b"1.2.6", b"study-b").expect("other");
+        // The series changes owner: the LAST row must win.
+        idx.append_pair(b"1.2.5", b"study-z").expect("owner change");
+        drop(idx);
+
+        let snap = SeriesOwnerSnapshot::load(dir.path(), b"20240116")
+            .expect("load")
+            .expect("segment exists");
+        // Eleven rows on disk, two distinct series in memory.
+        assert_eq!(snap.file_len, 12 * ROW_LEN as u64, "every row is counted");
+        assert_eq!(snap.rows.len(), 2, "one entry per distinct series");
+        assert_eq!(snap.find(b"1.2.5").unwrap(), b"study-z", "last row wins");
+        assert_eq!(snap.find_warm(b"1.2.6").unwrap(), b"study-b");
+
+        // A warm append of the SAME series must not add an entry either.
+        let mut warm = SeriesOwnerSnapshot::load(dir.path(), b"20240116")
+            .expect("load")
+            .expect("segment exists");
+        warm.append_row(b"1.2.5", b"study-w");
+        assert_eq!(warm.rows.len(), 2, "a repeated series adds no entry");
+        assert_eq!(
+            warm.find(b"1.2.5").unwrap(),
+            b"study-w",
+            "the warm fold also keeps the newest owner"
+        );
+
+        // A genuinely new series does add one, in sorted position.
+        warm.append_row(b"1.2.4", b"study-c");
+        assert_eq!(warm.rows.len(), 3);
+        assert_eq!(warm.find(b"1.2.4").unwrap(), b"study-c");
     }
 }

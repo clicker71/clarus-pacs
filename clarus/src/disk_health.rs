@@ -26,18 +26,22 @@ struct ProbeState {
     last_ms: Option<u64>,
     /// `Some(t)` while a probe write is running and has not yet returned.
     in_flight_since: Option<Instant>,
+    /// Whether the last COMPLETED probe failed to write its file.
+    ///
+    /// Held under the SAME lock as the two fields above. It used to be a
+    /// separate atomic read BEFORE the lock was taken, which meant a hung
+    /// retry after a failure was invisible: the flag short-circuited
+    /// [`probe_latency_ms`] to `None` before anyone could look at
+    /// `in_flight_since`, so the one state that most needs a growing number -
+    /// a failed disk now hanging - reported "unknown" forever.
+    failed: bool,
 }
 
 static PROBE_STATE: Mutex<ProbeState> = Mutex::new(ProbeState {
     last_ms: None,
     in_flight_since: None,
+    failed: false,
 });
-
-/// 1 when the last probe failed to write its file. Starts at 0: the probe has
-/// not run yet, and reporting a not-yet-measured disk as failed would make
-/// `/health` answer 503 in the first moments of every start, turning a restart
-/// window into a disk alert.
-static PROBE_FAILED: AtomicU64 = AtomicU64::new(0);
 
 /// 1 once at least one probe pass has completed, success or failure.
 static PROBE_RAN: AtomicU64 = AtomicU64::new(0);
@@ -54,29 +58,35 @@ static PROBE_RAN: AtomicU64 = AtomicU64::new(0);
 /// failure and the gauge is then omitted, which is what "unknown" means for a
 /// gauge.
 ///
-/// A HUNG write is the opposite case: it reports the time spent waiting, which
-/// grows without bound and therefore crosses the 30 s degraded rule. It is
-/// folded in as `max(last_ms, now - in_flight_since)`.
+/// A HUNG write is the opposite case and OUTRANKS the failure flag: it reports
+/// the time spent waiting, which grows without bound and therefore crosses the
+/// 30 s degraded rule. The failure suppression applies only to a COMPLETED
+/// failed pass; an in-flight write is measured first, whatever the previous
+/// pass did.
 pub fn probe_latency_ms() -> Option<u64> {
-    if PROBE_FAILED.load(Ordering::Relaxed) != 0 {
-        return None;
-    }
     let state = PROBE_STATE.lock().unwrap_or_else(|e| e.into_inner());
     probe_latency_from_state(&state, Instant::now())
 }
 
 /// Pure latency computation over a state snapshot (separated so a test can
 /// inject a fake "now").
+///
+/// Order matters: an in-flight write is measured BEFORE the failure flag can
+/// suppress anything. A completed failure yields `None` (unknown latency);
+/// a hung retry after a failure yields its growing elapsed time.
 fn probe_latency_from_state(state: &ProbeState, now: Instant) -> Option<u64> {
     let hung = state
         .in_flight_since
         .map(|t| now.duration_since(t).as_millis() as u64);
-    match (state.last_ms, hung) {
-        (None, None) => None,
-        (Some(last), None) => Some(last),
-        (None, Some(h)) => Some(h),
-        (Some(last), Some(h)) => Some(last.max(h)),
+    if let Some(h) = hung {
+        // Still running: the elapsed wait is a real measurement, and the
+        // previous pass's outcome says nothing about this one.
+        return Some(state.last_ms.map_or(h, |last| last.max(h)));
     }
+    if state.failed {
+        return None;
+    }
+    state.last_ms
 }
 
 /// Whether any probe pass has completed yet.
@@ -118,11 +128,11 @@ fn probe_once(
         st.in_flight_since = None;
         if wrote {
             st.last_ms = Some(ms);
-            PROBE_FAILED.store(0, Ordering::Relaxed);
+            st.failed = false;
         } else {
             // Keep the last good reading and mark the gauge unknown instead:
             // the elapsed time of a rejection is not latency.
-            PROBE_FAILED.store(1, Ordering::Relaxed);
+            st.failed = true;
         }
     }
     PROBE_RAN.store(1, Ordering::Relaxed);
@@ -170,7 +180,7 @@ mod tests {
     use std::time::Duration;
 
     /// Serializes the two probe tests: both touch the process-global
-    /// `PROBE_FAILED`/`PROBE_RAN` statics (probe_once always updates them),
+    /// `PROBE_STATE`/`PROBE_RAN` statics (probe_once always updates them),
     /// and a parallel run would interleave their stores.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -183,6 +193,7 @@ mod tests {
         let state = Mutex::new(ProbeState {
             last_ms: Some(7),
             in_flight_since: None,
+            failed: false,
         });
         let shared = Arc::new(state);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -226,39 +237,88 @@ mod tests {
         worker.join().expect("probe thread joins");
     }
 
-    /// A failed write still yields `None` from the public gauge (the elapsed
-    /// time of a rejection is not latency), even with a previous good reading.
+    /// A hung retry AFTER a failed probe must be reported, not suppressed.
+    ///
+    /// The failure flag used to be a separate atomic read BEFORE the lock, so
+    /// `probe_latency_ms` returned `None` at the first test and never looked
+    /// at `in_flight_since`. A disk that rejected a write and then HUNG on the
+    /// retry - the exactly-worst state - therefore reported "unknown" forever
+    /// instead of the growing number the alerting rule needs.
     #[test]
-    fn failed_write_keeps_the_gauge_unknown() {
+    fn a_hung_retry_after_a_failure_is_reported() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = Instant::now();
+        let state = ProbeState {
+            last_ms: Some(11),
+            in_flight_since: None,
+            // The previous pass failed; this one has not returned.
+            failed: true,
+        };
+        // Completed failure: unknown latency, as before.
+        assert_eq!(probe_latency_from_state(&state, base), None);
+
+        // Now a retry is in flight and has been hanging for 40 s.
+        let hung = ProbeState {
+            in_flight_since: Some(base),
+            ..state
+        };
+        let ms = probe_latency_from_state(&hung, base + Duration::from_secs(40));
+        assert_eq!(
+            ms,
+            Some(40_000),
+            "an in-flight write outranks the previous pass's failure flag"
+        );
+    }
+
+    /// The public gauge must follow the probe's OWN transitions: omit latency
+    /// after a failed write, publish it again after a success.
+    ///
+    /// The previous version set the flags by hand and would have passed even
+    /// if `probe_once` stopped publishing either transition. This one injects
+    /// the write outcome through `probe_once`, so the transition itself is
+    /// under test.
+    #[test]
+    fn the_gauge_follows_the_probe_through_failure_and_recovery() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         {
             let mut st = PROBE_STATE.lock().unwrap_or_else(|e| e.into_inner());
-            st.last_ms = Some(11);
+            *st = ProbeState {
+                last_ms: None,
+                in_flight_since: None,
+                failed: false,
+            };
         }
-        PROBE_FAILED.store(1, Ordering::Relaxed);
+
+        // A successful pass publishes a reading.
+        probe_once(&PROBE_STATE, || true, Instant::now);
+        assert!(
+            probe_latency_ms().is_some(),
+            "a successful probe publishes its latency"
+        );
+
+        // A failed pass makes the gauge unknown, even though a good reading
+        // exists: the elapsed time of a rejection is not latency.
+        probe_once(&PROBE_STATE, || false, Instant::now);
         assert!(
             probe_latency_ms().is_none(),
-            "a failed probe must be unknown"
+            "a failed probe must be unknown, not the previous reading"
+        );
+
+        // Recovery: the next successful pass publishes again.
+        probe_once(&PROBE_STATE, || true, Instant::now);
+        assert!(
+            probe_latency_ms().is_some(),
+            "a recovered disk must publish its latency again"
         );
 
         // Cleanup: restore the global to its not-yet-run state.
-        PROBE_FAILED.store(0, Ordering::Relaxed);
         {
             let mut st = PROBE_STATE.lock().unwrap_or_else(|e| e.into_inner());
-            st.last_ms = None;
-            st.in_flight_since = None;
+            *st = ProbeState {
+                last_ms: None,
+                in_flight_since: None,
+                failed: false,
+            };
         }
-        // A successful pass publishes a reading again.
-        PROBE_STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .last_ms = Some(11);
-        PROBE_FAILED.store(0, Ordering::Relaxed);
-        assert!(probe_latency_ms().is_some());
-        // Cleanup.
-        PROBE_STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .last_ms = None;
     }
 }

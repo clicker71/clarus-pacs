@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
 
-//! The inbound listener: `/health`, `/metrics`, `/processors`.
+//! The inbound listener: `/health`, `/metrics`, `/processors/Questionnaire`.
 //!
 //! One `TcpListener` on `server.listen`, no framework.
 //!
@@ -12,7 +12,8 @@
 //! has to be able to reach clinfer inbound, and the push handler is gone.
 //!
 //! The listener STAYS because it serves the operational endpoints an operator
-//! and a monitoring system read: `/health`, `/metrics` and `/processors`.
+//! and a monitoring system read: `/health`, `/metrics` and the model
+//! declaration at `/processors/Questionnaire`.
 //! `server.listen`, `trusted_proxies` and `require_proxy_identity` therefore
 //! still govern those endpoints - see the note on each in `conf.rs`.
 //!
@@ -42,6 +43,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// misdirected client (or a peer with the wrong port in mind) from making
 /// the sidecar hold an arbitrary buffer.
 const MAX_REQUEST_BODY: usize = 64 * 1024;
+
+/// The extension StructureDefinitions, compiled in so the local mirror at
+/// `/fhir/StructureDefinition/*.json` can never drift from the binary that
+/// publishes the canonical URLs. The on-disk copies under `fhir/` are the
+/// single source of truth this build embeds.
+const PROVIDER_DEFINITION: &str = include_str!("../fhir/StructureDefinition/clinfer-provider.json");
+const INPUT_ANATOMY_DEFINITION: &str =
+    include_str!("../fhir/StructureDefinition/clinfer-input-anatomy.json");
+const OUTPUT_SOP_CLASSES_DEFINITION: &str =
+    include_str!("../fhir/StructureDefinition/clinfer-output-sop-classes.json");
 
 /// Depth of the queue between the listener and the worker.
 ///
@@ -752,100 +763,39 @@ impl Policy {
 /// as a drop.
 pub type Deliver = Box<dyn Fn(String) -> bool + Send + Sync>;
 
-/// The configured external processors, in configuration order.
+/// The models as FHIR R4 `Questionnaire` resources.
 ///
-/// `GET /processors` answers with this and nothing else: the configuration
-/// is the single source of truth for which processors exist (owner decision,
-/// 19.09), and a menu built from any other source would eventually disagree
-/// with what the sidecar actually runs. Configuration order is kept rather
-/// than sorted, so the menu is stable across restarts and matches the file
-/// an operator is reading.
-#[derive(Debug, Clone, Default)]
-pub struct Processors {
-    entries: Vec<ProcessorEntry>,
-}
-
-/// One configured processor: the id it was declared under and the result
-/// kind its rule produces.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessorEntry {
-    pub id: String,
-    pub kind: String,
-}
-
-impl Processors {
-    /// Build the list from the configuration's processors.
-    ///
-    /// Every model is an external processor, so this lists them all. The
-    /// kind is taken from the rule bound to the model, which is what
-    /// decides the object clinfer writes; a processor with no rule is not
-    /// listed, because it produces nothing.
-    #[must_use]
-    pub fn from_conf(conf: &crate::conf::Conf) -> Self {
-        let entries = conf
-            .models
-            .iter()
-            .filter(|model| model.script.is_some())
-            .filter_map(|model| {
-                let rule = conf.rules.iter().find(|rule| rule.model == model.id)?;
-                Some(ProcessorEntry {
-                    id: model.id.clone(),
-                    kind: rule.result.kind.as_str().to_string(),
-                })
-            })
-            .collect();
-        Self { entries }
-    }
-
-    /// The list as the endpoint's JSON body.
-    #[must_use]
-    pub fn render(&self) -> String {
-        let mut out = String::from("{\"processors\":[");
-        for (index, entry) in self.entries.iter().enumerate() {
-            if index > 0 {
-                out.push(',');
+/// `GET /processors/Questionnaire` answers a `searchset` Bundle, and
+/// `GET /processors/Questionnaire/{id}` answers one resource or nothing.
+/// The standard REST shape is the point: a consumer reads a model's
+/// declared capabilities the same way from clinfer and from a FHIR server,
+/// so only the base URL differs.
+///
+/// The configuration is the only source. A model appears because its file
+/// is enabled, so a reload changes what is served and what the worker runs
+/// together, and the two can never drift apart.
+fn questionnaire_route(
+    models: &crate::models::Models,
+    path: &str,
+    base: &str,
+    extension_base: &str,
+) -> Option<crate::models::fhir::Answer> {
+    let rest = path.strip_prefix("/processors/Questionnaire")?;
+    match rest {
+        "" | "/" => Some(crate::models::fhir::Answer::Bundle(
+            crate::models::fhir::search_bundle(models, None, base, extension_base),
+        )),
+        rest => {
+            let id = rest.strip_prefix('/')?;
+            // An id is ONE path segment: a second slash or a query string
+            // is not part of it, so the request names nothing rather than
+            // being trimmed into a resource that does exist.
+            if id.is_empty() || id.contains('/') || id.contains('?') {
+                return Some(crate::models::fhir::Answer::NotFound);
             }
-            // Both values are configuration identifiers, but they are
-            // escaped rather than trusted: an id is operator text and a
-            // raw quote in one would produce a body no client can parse.
-            out.push_str("{\"id\":");
-            push_json_string(&mut out, &entry.id);
-            out.push_str(",\"kind\":");
-            push_json_string(&mut out, &entry.kind);
-            out.push('}');
-        }
-        out.push_str("]}");
-        out
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-/// Append one JSON string literal, escaping what has to be escaped.
-fn push_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            control if control < ' ' => {
-                out.push_str(&format!("\\u{:04x}", control as u32));
-            }
-            other => out.push(other),
+            Some(crate::models::fhir::by_id(models, id, extension_base))
         }
     }
-    out.push('"');
 }
 
 /// Run the listener on an already-bound socket.
@@ -893,6 +843,24 @@ pub fn serve(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(listen)?;
     serve_bound(listener, policy, counters, live, deliver, shutdown)
+}
+
+/// The local mirror map for `/fhir/StructureDefinition/*.json`.
+///
+/// Returns `(content_type, body)` for a known definition, `None` otherwise.
+fn structure_definition(path: &str) -> Option<(&'static str, &'static str)> {
+    match path {
+        "/fhir/StructureDefinition/clinfer-provider.json" => {
+            Some(("application/fhir+json", PROVIDER_DEFINITION))
+        }
+        "/fhir/StructureDefinition/clinfer-input-anatomy.json" => {
+            Some(("application/fhir+json", INPUT_ANATOMY_DEFINITION))
+        }
+        "/fhir/StructureDefinition/clinfer-output-sop-classes.json" => {
+            Some(("application/fhir+json", OUTPUT_SOP_CLASSES_DEFINITION))
+        }
+        _ => None,
+    }
 }
 
 /// Handle one inbound connection.
@@ -982,19 +950,52 @@ fn handle(
             let body = format!("clinfer {}\n", crate::VERSION);
             respond(&mut stream, 200, "text/plain", body.as_bytes());
         }
-        ("GET", "/processors") => {
-            // The menu ClarityX builds its "Processors" list from. A
-            // private clinfer extension, not an ABI surface: the answer is
-            // the configured external processors and nothing else, so the
-            // configuration file is the single source of truth.
+        ("GET", path) if path.starts_with("/fhir/StructureDefinition/") => {
+            // A local mirror of the extension definitions, so offline tools
+            // and validators can dereference the canonical URLs without
+            // reaching the public copy. The bytes are compiled in, so the
+            // mirror can never drift from the binary that publishes them.
+            match structure_definition(path) {
+                Some((content_type, body)) => {
+                    respond(&mut stream, 200, content_type, body.as_bytes())
+                }
+                None => respond(&mut stream, 404, "text/plain", b"not found\n"),
+            }
+        }
+        ("GET", path) if path.starts_with("/processors/Questionnaire") => {
+            // The models, in the FHIR REST shape a consumer already speaks:
+            // a search Bundle at the resource root and one Questionnaire at
+            // an id. Served from the shared cell at request time, so a
+            // reloaded configuration changes this answer and the worker's
+            // behaviour together.
             //
-            // Read through the shared cell at request time, so a reloaded
-            // configuration changes this answer and the worker's behaviour
-            // together. An empty configuration is an empty list rather than
-            // an error - a sidecar with no processors is a valid
-            // deployment.
-            let body = Processors::from_conf(&live.current()).render();
-            respond(&mut stream, 200, "application/json", body.as_bytes());
+            // An empty models directory is an empty `entry` array, not an
+            // error: a sidecar that serves nothing is a valid deployment.
+            let conf = live.current();
+            let models = crate::models::Models::from_conf(&conf);
+            // The extension URLs follow the configured `fhir.extension_base`,
+            // so an operator points them at whatever hosts the definitions
+            // (their own site, a national mirror, or a local schema).
+            let extension_base = conf.fhir.extension_base.clone();
+            // The Bundle URLs are absolute, so they are built from the
+            // request's own Host header; without one (a bare HTTP/1.0
+            // request) localhost is the honest base.
+            let base = request
+                .host
+                .as_deref()
+                .map(|host| format!("http://{host}"))
+                .unwrap_or_else(|| "http://localhost".to_string());
+            match questionnaire_route(&models, path, &base, &extension_base) {
+                Some(crate::models::fhir::Answer::Bundle(body)) => {
+                    respond(&mut stream, 200, "application/fhir+json", body.as_bytes())
+                }
+                Some(crate::models::fhir::Answer::Resource(body)) => {
+                    respond(&mut stream, 200, "application/fhir+json", body.as_bytes())
+                }
+                Some(crate::models::fhir::Answer::NotFound) | None => {
+                    respond(&mut stream, 404, "text/plain", b"not found\n");
+                }
+            }
         }
         // The `POST /workitems/{uid}` push route is GONE. The sidecar opens the
         // WebSocket Notification Connection itself and claims on the SCHEDULED
@@ -1031,6 +1032,9 @@ fn workitem_uid(body: &[u8]) -> Option<String> {
 struct Inbound {
     method: String,
     path: String,
+    /// The `Host` header, used to build the absolute URLs in the
+    /// Questionnaire Bundle (`link.url` and each `fullUrl`).
+    host: Option<String>,
     /// The identity the peer presented; `handle` passes it to the trust
     /// policy before routing, so a deployment that requires a proxy identity
     /// refuses a request without one.
@@ -1080,6 +1084,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Inbound> {
     let path = parts.next()?.to_string();
 
     let mut identity = None;
+    let mut host = None;
     let mut content_length = 0usize;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -1088,6 +1093,8 @@ fn read_request(stream: &mut TcpStream) -> Option<Inbound> {
         let value = value.trim();
         if name.eq_ignore_ascii_case("x-authenticated-user") {
             identity = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("host") {
+            host = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("content-length") {
             content_length = value.parse().unwrap_or(0);
         }
@@ -1112,6 +1119,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Inbound> {
     Some(Inbound {
         method,
         path,
+        host,
         identity,
         body,
     })
@@ -1155,6 +1163,52 @@ pub fn accepted_content_type() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extension base the test configuration publishes its definitions
+    /// under; different from the default so the test proves the value is READ
+    /// from the configuration rather than hardcoded.
+    const EXT_BASE: &str = "http://example.org/fhir/StructureDefinition";
+
+    #[test]
+    fn the_local_mirror_serves_every_shipped_definition() {
+        let expect = [
+            (
+                "/fhir/StructureDefinition/clinfer-provider.json",
+                "clinfer-provider.json",
+            ),
+            (
+                "/fhir/StructureDefinition/clinfer-input-anatomy.json",
+                "clinfer-input-anatomy.json",
+            ),
+            (
+                "/fhir/StructureDefinition/clinfer-output-sop-classes.json",
+                "clinfer-output-sop-classes.json",
+            ),
+        ];
+        for (path, file) in expect {
+            let (content_type, body) =
+                structure_definition(path).unwrap_or_else(|| panic!("missing mirror for {path}"));
+            assert_eq!(content_type, "application/fhir+json");
+            let canonical = format!(
+                "https://github.com/clicker71/clarus-pacs/blob/main/clinfer/fhir/StructureDefinition/{file}"
+            );
+            assert!(
+                body.contains(&canonical),
+                "definition {file} does not carry its canonical URL"
+            );
+            // The identity is a canonical URL, never the loopback mirror.
+            assert!(
+                !body.contains("127.0.0.1"),
+                "definition {file} leaked a loopback identity"
+            );
+        }
+        assert_eq!(
+            structure_definition("/fhir/StructureDefinition/nope.json"),
+            None
+        );
+        assert_eq!(structure_definition("/fhir/StructureDefinition/"), None);
+        assert_eq!(structure_definition("/processors/Questionnaire"), None);
+    }
 
     fn policy(trusted: &[&str], require: bool) -> Policy {
         let owned: Vec<String> = trusted.iter().map(|s| (*s).to_string()).collect();
@@ -1227,8 +1281,6 @@ mod tests {
         assert!(workitem_uid(br#"{"00080018":{"Value":["  "]}}"#).is_none());
     }
 
-    /// Send one request to a live `handle` and return the raw response.
-    ///
     /// The trust policy is only real if it is applied where requests arrive,
     /// so this drives `handle` over a socket rather than calling the policy
     /// directly - a policy that is correct but never consulted is exactly the
@@ -1240,7 +1292,7 @@ mod tests {
         let policy_for_thread = policy.clone();
         let counters_shared = Arc::clone(counters);
         let live = Arc::new(crate::worker::Shared::new(Arc::new(
-            crate::conf::load(&write_config(ONE_PROCESSOR)).expect("the harness config parses"),
+            crate::conf::load(&write_config()).expect("the harness config parses"),
         )));
         let deliver: Deliver = Box::new(|_| true);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1275,7 +1327,12 @@ mod tests {
 
     #[test]
     fn an_untrusted_peer_is_refused_on_the_operational_endpoints() {
-        for path in ["/metrics", "/processors", "/version"] {
+        for path in [
+            "/metrics",
+            "/processors/Questionnaire",
+            "/processors/Questionnaire/proc",
+            "/version",
+        ] {
             let counters = Arc::new(Counters::default());
             // Empty trust list: everyone is untrusted.
             let (raw, rejected) = ask(policy(&[], false), &format!("GET {path}"), &counters);
@@ -1474,167 +1531,219 @@ mod tests {
         }
     }
 
-    // -- /processors ------------------------------------------------------
+    // -- /processors/Questionnaire ----------------------------------------
 
     #[test]
-    fn the_processor_menu_names_each_configured_processor_and_its_kind() {
-        // The list is the configured external processors in configuration
-        // order. The kind is the rule's, because that is what decides the
-        // object clinfer writes, and a menu that guessed the kind would
-        // offer an action the sidecar cannot perform.
-        let conf = crate::conf::load(&write_config(ONE_PROCESSOR)).expect("parses");
-        let menu = Processors::from_conf(&conf);
-        assert_eq!(menu.len(), 1);
+    fn the_questionnaire_route_answers_a_searchset_for_the_resource_root() {
+        let models =
+            crate::models::Models::from_conf(&crate::conf::load(&write_config()).expect("parses"));
+        let Some(crate::models::fhir::Answer::Bundle(body)) = questionnaire_route(
+            &models,
+            "/processors/Questionnaire",
+            "http://127.0.0.1:8124",
+            EXT_BASE,
+        ) else {
+            panic!("the resource root answers a Bundle");
+        };
+        assert!(body.contains("\"resourceType\":\"Bundle\""), "{body}");
+        assert!(body.contains("\"type\":\"searchset\""), "{body}");
+        // The fullUrl is ABSOLUTE (FHIR: absolute URL or UUID/OID URI), so a
+        // client follows it without guessing the base it used.
+        assert!(
+            body.contains("\"fullUrl\":\"http://127.0.0.1:8124/processors/Questionnaire/proc\""),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "\"relation\":\"self\",\"url\":\"http://127.0.0.1:8124/processors/Questionnaire\""
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"resourceType\":\"Questionnaire\""),
+            "{body}"
+        );
+        // Coding.system is a URI: the parameter codes use the local URN, and
+        // the private DICOM scheme maps to a URN rather than a bare designator.
+        assert!(
+            body.contains("\"system\":\"urn:clarus:codes:parameter\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"system\":\"urn:clarus:scheme:99clarus\""),
+            "{body}"
+        );
+        // Extension urls are absolute URLs, not URNs.
+        assert!(
+            body.contains("http://example.org/fhir/StructureDefinition/clinfer-provider.json"),
+            "{body}"
+        );
+        // The provider is a complex extension (child valueStrings), never a
+        // JSON object carried inside a valueString.
+        assert!(
+            body.contains("\"url\":\"name\",\"valueString\":\"clinfer-proc\""),
+            "{body}"
+        );
+        assert!(!body.contains("\"valueString\":{"), "{body}");
+    }
+
+    #[test]
+    fn a_questionnaire_by_id_answers_that_model_and_an_unknown_id_is_404() {
+        let models =
+            crate::models::Models::from_conf(&crate::conf::load(&write_config()).expect("parses"));
+        match questionnaire_route(
+            &models,
+            "/processors/Questionnaire/proc",
+            "http://127.0.0.1:8124",
+            EXT_BASE,
+        ) {
+            Some(crate::models::fhir::Answer::Resource(body)) => {
+                assert!(body.contains("\"id\":\"proc\""), "{body}");
+                // The clinfer-only block never leaves the process: a workdir
+                // path in a capability document is deployment detail.
+                assert!(!body.contains("runtime"), "{body}");
+                assert!(!body.contains("proc.py"), "{body}");
+            }
+            other => panic!("expected one resource, got {other:?}"),
+        }
         assert_eq!(
-            menu.render(),
-            r#"{"processors":[{"id":"proc","kind":"pr"}]}"#
+            questionnaire_route(
+                &models,
+                "/processors/Questionnaire/nowhere",
+                "http://127.0.0.1:8124",
+                EXT_BASE
+            ),
+            Some(crate::models::fhir::Answer::NotFound)
         );
     }
 
     #[test]
-    fn only_the_processor_a_rule_names_is_listed() {
-        // Two script models are declared but only one has a rule, and the
-        // loader rejects a configuration whose `rules` list is empty - so
-        // a model that no rule names is a model that produces nothing.
-        // Listing it would offer a menu entry that can never run.
-        let conf = crate::conf::load(&write_config(PROCESSOR_WITHOUT_RULE)).expect("parses");
-        let menu = Processors::from_conf(&conf);
+    fn an_id_with_a_second_segment_names_nothing() {
+        // A query string or a nested path is not part of an id; answering it
+        // would mean trimming the request into a resource that does exist.
+        let models =
+            crate::models::Models::from_conf(&crate::conf::load(&write_config()).expect("parses"));
         assert_eq!(
-            menu.render(),
-            r#"{"processors":[{"id":"other","kind":"pr"}]}"#
+            questionnaire_route(
+                &models,
+                "/processors/Questionnaire/proc/extra",
+                "http://127.0.0.1:8124",
+                EXT_BASE
+            ),
+            Some(crate::models::fhir::Answer::NotFound)
+        );
+        assert_eq!(
+            questionnaire_route(
+                &models,
+                "/processors/Questionnaire/proc?_count=1",
+                "http://127.0.0.1:8124",
+                EXT_BASE
+            ),
+            Some(crate::models::fhir::Answer::NotFound)
         );
     }
 
     #[test]
-    fn the_menu_keeps_configuration_order() {
-        // Stable across restarts and matching the file an operator reads,
-        // which is what makes the menu usable as a configuration view.
-        //
-        // Both processors declare `pr` because a script model cannot
-        // declare anything else: a processor's output is `result.json`,
-        // and clinfer reads the kind from the rule. What this pins is the
-        // ORDER, and the id is enough to show it.
-        let conf = crate::conf::load(&write_config(TWO_PROCESSORS)).expect("parses");
-        let menu = Processors::from_conf(&conf);
+    fn a_path_outside_the_questionnaire_route_is_not_the_route() {
+        let models =
+            crate::models::Models::from_conf(&crate::conf::load(&write_config()).expect("parses"));
         assert_eq!(
-            menu.render(),
-            r#"{"processors":[{"id":"first","kind":"pr"},{"id":"second","kind":"pr"}]}"#
+            questionnaire_route(&models, "/processors", "http://127.0.0.1:8124", EXT_BASE),
+            None
         );
-    }
-
-    #[test]
-    fn an_identifier_with_a_quote_is_escaped_rather_than_breaking_the_body() {
-        // The ids are operator text. A raw quote in one would produce a
-        // body no client can parse, so the escape is the difference
-        // between a usable menu and a broken one.
-        let mut out = String::new();
-        push_json_string(&mut out, "a\"b\\c");
-        assert_eq!(out, r#""a\"b\\c""#);
-    }
-
-    #[test]
-    fn a_control_character_in_an_identifier_is_escaped() {
-        // A raw control character is not legal inside a JSON string. An id
-        // is operator text read from a file, so a stray newline or tab is
-        // possible and has to survive as an escape rather than a literal
-        // byte that breaks the parse.
-        let mut out = String::new();
-        push_json_string(&mut out, "a\nb\tc");
-        assert_eq!(out, r#""a\nb\tc""#);
-        // And a character with no short escape gets the \u form.
-        let mut out = String::new();
-        push_json_string(&mut out, "a\u{1}b");
-        assert_eq!(out, r#""a\u0001b""#);
+        assert_eq!(
+            questionnaire_route(&models, "/processors/", "http://127.0.0.1:8124", EXT_BASE),
+            None
+        );
+        assert_eq!(
+            questionnaire_route(&models, "/metrics", "http://127.0.0.1:8124", EXT_BASE),
+            None
+        );
     }
 
     /// Write a configuration to a fresh file and return its path.
-    fn write_config(text: &str) -> std::path::PathBuf {
+    ///
+    /// The models live in a directory beside it, because the base file no
+    /// longer carries a model: this IS the two-layer shape, exercised through
+    /// the real loader.
+    fn write_config() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "clinfer-menu-conf-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).expect("scratch directory");
+        std::fs::write(
+            models.join("proc.yaml"),
+            "\
+enabled: true
+title: Process
+procedure_code:
+  value: PROC-AI
+  scheme: 99CLARUS
+  meaning: Process AI
+provider:
+  name: clinfer-proc
+  vendor: Clarus
+  version: \"1.0\"
+input_requirements:
+  modalities:
+    - CT
+  anatomy:
+    - system: http://snomed.info/sct
+      code: T-D0050
+      meaning: Lung structure
+output_capabilities:
+  sop_classes:
+    - 1.2.840.10008.5.1.4.1.1.11.1
+parameters:
+  - code: CLIP_LIMIT
+    type: decimal
+    default: 2.5
+    min: 1.0
+    max: 10.0
+  - code: ALGORITHM
+    type: choice
+    options:
+      - clahe
+      - none
+    default: clahe
+match:
+  modality: [DX]
+runtime:
+  script: proc.py
+  timeout_secs: 60
+outputs:
+  - kind: pr
+    profile_version: 1
+",
+        )
+        .expect("write the model");
+        // The script the model names must EXIST: an enabled model whose
+        // script is missing is refused at load, by the tier that checks
+        // exactly that. It is never executed here - these tests ask the
+        // listener what it SERVES, not what it runs.
+        std::fs::write(models.join("proc.py"), b"#!/usr/bin/env python3\n").expect("write script");
         let path = dir.join("clinfer.conf");
-        std::fs::write(&path, text).expect("write the config");
+        std::fs::write(
+            &path,
+            "\
+server:
+  base_url: \"http://127.0.0.1:1/dicomweb\"
+  identity_user: \"clinfer\"
+  listen: \"127.0.0.1:18124\"
+engine:
+  cache_dir: \"/tmp/clinfer-menu-cache\"
+models_dir: ./models
+fhir:
+  extension_base: \"http://example.org/fhir/StructureDefinition\"
+default_rule: cancel
+",
+        )
+        .expect("write the config");
         path
     }
-
-    /// The shared preamble every fixture below needs.
-    const ONE_PROCESSOR: &str = "\
-server:
-  base_url: \"http://127.0.0.1:1/dicomweb\"
-  identity_user: \"clinfer\"
-  listen: \"127.0.0.1:18124\"
-engine:
-  cache_dir: \"/tmp/clinfer-menu-cache\"
-models:
-  proc:
-    script: \"/bin/true\"
-    timeout_secs: 60
-rules:
-  - match:
-      modality: [DX]
-    model: \"proc\"
-    result:
-      kind: pr
-      profile_version: 1
-default_rule: cancel
-";
-
-    const TWO_PROCESSORS: &str = "\
-server:
-  base_url: \"http://127.0.0.1:1/dicomweb\"
-  identity_user: \"clinfer\"
-  listen: \"127.0.0.1:18124\"
-engine:
-  cache_dir: \"/tmp/clinfer-menu-cache\"
-models:
-  first:
-    script: \"/bin/true\"
-    timeout_secs: 60
-  second:
-    script: \"/bin/true\"
-    timeout_secs: 60
-rules:
-  - match:
-      modality: [DX]
-    model: \"first\"
-    result:
-      kind: pr
-      profile_version: 1
-  - match:
-      modality: [CT]
-    model: \"second\"
-    result:
-      kind: pr
-      profile_version: 1
-default_rule: cancel
-";
-
-    const PROCESSOR_WITHOUT_RULE: &str = "\
-server:
-  base_url: \"http://127.0.0.1:1/dicomweb\"
-  identity_user: \"clinfer\"
-  listen: \"127.0.0.1:18124\"
-engine:
-  cache_dir: \"/tmp/clinfer-menu-cache\"
-models:
-  proc:
-    script: \"/bin/true\"
-    timeout_secs: 60
-  other:
-    script: \"/bin/true\"
-    timeout_secs: 60
-rules:
-  - match:
-      modality: [DX]
-    model: \"other\"
-    result:
-      kind: pr
-      profile_version: 1
-default_rule: cancel
-";
 
     // -- The shutdown refusal ---------------------------------------------
 
@@ -1667,44 +1776,13 @@ default_rule: cancel
     /// Built through the public loader from a file, which is how a
     /// deployment configures a sidecar, so the value is a real parsed
     /// configuration rather than a struct literal a test invented. The
-    /// configuration declares one processor, because that is what
-    /// `/processors` reads.
+    /// model file beside it is what gives `/processors/Questionnaire`
+    /// something to answer.
     fn listener_config() -> Arc<crate::worker::Shared> {
-        let dir = std::env::temp_dir().join(format!(
-            "clinfer-receiver-conf-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch directory");
-        let path = dir.join("clinfer.conf");
-        std::fs::write(&path, LISTENER_CONF).expect("write the config");
+        let path = write_config();
         let conf = crate::conf::load(&path).expect("the listener config parses");
-        let _ = std::fs::remove_dir_all(&dir);
         Arc::new(crate::worker::Shared::new(Arc::new(conf)))
     }
-
-    /// One processor, bound to one rule: the smallest configuration the
-    /// loader accepts that also gives `/processors` something to answer.
-    const LISTENER_CONF: &str = "\
-server:
-  base_url: \"http://127.0.0.1:1/dicomweb\"
-  identity_user: \"clinfer\"
-  listen: \"127.0.0.1:18124\"
-engine:
-  cache_dir: \"/tmp/clinfer-receiver-cache\"
-models:
-  proc:
-    script: \"/bin/true\"
-    timeout_secs: 60
-rules:
-  - match:
-      modality: [DX]
-    model: \"proc\"
-    result:
-      kind: pr
-      profile_version: 3
-default_rule: cancel
-";
 
     /// Start the real listener on an ephemeral port and return it.
     fn start_listening(shutdown: Arc<AtomicBool>, stop: Arc<AtomicBool>) -> String {

@@ -29,6 +29,25 @@ pub const DAY_LEN: usize = 8;
 /// The 8-byte `YYYYMMDD` day key shared by every `.idx` writer.
 pub type DayKey = [u8; DAY_LEN];
 
+/// The errno to report for a failed warm append, never zero.
+///
+/// The warm append functions return `Result<(), i32>` where the `i32` is an
+/// errno, so 0 means SUCCESS to any caller that only compares the code.
+/// `write_all` reports a zero-length write as `ErrorKind::WriteZero`, which has
+/// no raw OS code, so `raw_os_error().unwrap_or(0)` handed back exactly that
+/// "success" 0 after a failed write. `EIO` is the POSIX "unspecified I/O error"
+/// and is what the poisoned-writer path already reports.
+pub(crate) const EIO_ERRNO: i32 = 5;
+
+/// The errno for a failed warm append: the real OS code when there is one,
+/// `EIO` otherwise, and never 0.
+pub(crate) fn nonzero_errno(e: &io::Error) -> i32 {
+    match e.raw_os_error() {
+        Some(code) if code != 0 => code,
+        _ => EIO_ERRNO,
+    }
+}
+
 /// Errors produced by [`DateIndex`].
 #[derive(Debug)]
 pub enum DateIndexError {
@@ -200,7 +219,13 @@ impl DateIndex {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.poisoned = true;
-                let code = e.raw_os_error().unwrap_or(0);
+                // NEVER 0: `write_all` reports a zero-length write as
+                // `ErrorKind::WriteZero`, which carries no raw OS code, and
+                // this function's contract is a NONZERO errno on failure. A 0
+                // here reads as success to any caller that only compares the
+                // code, so a failed append left the writer poisoned while its
+                // caller believed the row was stored.
+                let code = nonzero_errno(&e);
                 std::mem::forget(e);
                 Err(code)
             }
@@ -210,6 +235,16 @@ impl DateIndex {
     /// Whether a failed append left this handle unusable.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Test seam: mark the handle poisoned as a failed append would.
+    ///
+    /// Production reaches this state only through an I/O failure, which a test
+    /// cannot provoke portably (a full disk is not arrangeable), so it is set
+    /// directly. Nothing mutates it in a release build.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&mut self) {
+        self.poisoned = true;
     }
 
     /// Replace a poisoned handle with a fresh one, repairing the torn tail.
@@ -244,9 +279,15 @@ impl DateIndex {
 
 /// Read every stored BLAKE3 hash (as `[u8; 32]`) from a day's `.idx` file.
 ///
-/// Parses fixed 65-byte rows (64 hex + newline), skipping a torn trailing row
-/// (a writer may have crashed mid-append). Used by the shadow-read proptest
-/// to compare what the B-tree tier contains against the accepted set.
+/// Parses fixed 65-byte rows (64 hex + newline). A torn TRAILING fragment (a
+/// writer that crashed mid-append) is dropped, as before.
+///
+/// A complete row that is not `[0-9a-f] x 64` + `\n` is `InvalidData`. Two
+/// silent folds used to hide corruption here: `hex_val` mapped any non-hex
+/// digit to 0, and the newline byte was never examined, so a row of garbage
+/// parsed into a plausible hash that was NEVER stored. A shadow reader
+/// comparing against that value would report a mismatch about a hash the index
+/// does not contain.
 pub fn read_hashes(dir: &Path, day: &[u8; DAY_LEN]) -> io::Result<Vec<[u8; 32]>> {
     let data = std::fs::read(file_path(dir, day))?;
     let mut rows: Vec<[u8; 32]> = Vec::with_capacity(data.len() / ROW_LEN);
@@ -256,11 +297,18 @@ pub fn read_hashes(dir: &Path, day: &[u8; DAY_LEN]) -> io::Result<Vec<[u8; 32]>>
         chunk = &chunk[..chunk.len() - (chunk.len() % ROW_LEN)];
     }
     for row in chunk.as_chunks::<ROW_LEN>().0 {
-        // row == 64 hex + '\n'. Parse the 64 hex chars into 32 bytes.
+        // row == 64 hex + '\n', exactly. A complete row with any other shape
+        // is corruption, not a hash.
+        if row[ROW_LEN - 1] != b'\n' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "date index row is missing its newline terminator",
+            ));
+        }
         let mut h = [0u8; 32];
         for (i, byte) in h.iter_mut().enumerate() {
-            let hi = hex_val(row[i * 2]);
-            let lo = hex_val(row[i * 2 + 1]);
+            let hi = hex_val(row[i * 2])?;
+            let lo = hex_val(row[i * 2 + 1])?;
             *byte = (hi << 4) | lo;
         }
         rows.push(h);
@@ -268,12 +316,20 @@ pub fn read_hashes(dir: &Path, day: &[u8; DAY_LEN]) -> io::Result<Vec<[u8; 32]>>
     Ok(rows)
 }
 
-fn hex_val(b: u8) -> u8 {
+/// One hex digit, or `InvalidData` for anything else.
+///
+/// It used to return 0 for an invalid digit, which turned a corrupt row into a
+/// VALID-LOOKING hash: every non-hex byte became a nibble of zero, so the
+/// parsed value was a real-looking 32-byte digest that no writer ever produced.
+fn hex_val(b: u8) -> io::Result<u8> {
     match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "date index row contains a non-hex digit",
+        )),
     }
 }
 
@@ -359,5 +415,74 @@ mod tests {
         idx.append(&[2u8; 32], &mut staging).expect("b");
         let data = std::fs::read(&path).expect("read");
         assert_eq!(data.len(), 2 * ROW_LEN, "rows stay 65-byte aligned");
+    }
+
+    /// A complete row that is not hex is `InvalidData`, not a plausible hash.
+    ///
+    /// `hex_val` mapped any invalid digit to 0 and the terminator was never
+    /// checked, so 64 bytes of garbage parsed into a real-looking 32-byte
+    /// digest that no writer ever produced. A shadow reader comparing against
+    /// that value reports a mismatch about a record the index does not contain.
+    #[test]
+    fn a_malformed_complete_row_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = *b"20240115";
+        let path = file_path(dir.path(), &day);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+
+        // A well-formed row still reads.
+        let mut row = [b'0'; ROW_LEN];
+        row[ROW_LEN - 1] = b'\n';
+        std::fs::write(&path, row).expect("write");
+        assert_eq!(read_hashes(dir.path(), &day).expect("valid").len(), 1);
+
+        // A non-hex digit in a COMPLETE row.
+        let mut bad = [b'0'; ROW_LEN];
+        bad[ROW_LEN - 1] = b'\n';
+        bad[3] = b'z';
+        std::fs::write(&path, bad).expect("write");
+        let err = read_hashes(dir.path(), &day).expect_err("non-hex must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // A complete row with no terminator.
+        let no_nl = [b'0'; ROW_LEN];
+        std::fs::write(&path, no_nl).expect("write");
+        let err = read_hashes(dir.path(), &day).expect_err("a missing newline must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // A torn TRAILING fragment is still tolerated (a crash mid-append):
+        // only the complete rows are read.
+        std::fs::write(&path, row).expect("write good");
+        let mut torn = std::fs::read(&path).expect("read");
+        torn.extend_from_slice(b"abc");
+        std::fs::write(&path, torn).expect("write torn");
+        assert_eq!(
+            read_hashes(dir.path(), &day)
+                .expect("torn tail tolerated")
+                .len(),
+            1
+        );
+    }
+
+    /// A warm append reports a NONZERO errno even when the error has no OS code.
+    ///
+    /// The contract is `Result<(), i32>` where 0 means success. `write_all`
+    /// reports a zero-length write as `ErrorKind::WriteZero`, which has no raw
+    /// OS code, so `unwrap_or(0)` returned 0 after a FAILED append - a caller
+    /// checking `code != 0` treated the loss as success.
+    #[test]
+    fn a_warm_append_error_never_reports_errno_zero() {
+        // The mapping itself, independent of how the error arose.
+        let no_code = io::Error::new(io::ErrorKind::WriteZero, "zero-length write");
+        assert_eq!(no_code.raw_os_error(), None);
+        assert_ne!(nonzero_errno(&no_code), 0, "errno 0 means success");
+
+        // A real OS code is preserved rather than replaced.
+        let with_code = io::Error::from_raw_os_error(28); // ENOSPC on Linux
+        assert_eq!(nonzero_errno(&with_code), 28);
+
+        // And a synthetic code of 0 still cannot escape as 0.
+        let zero_code = io::Error::from_raw_os_error(0);
+        assert_ne!(nonzero_errno(&zero_code), 0);
     }
 }

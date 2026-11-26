@@ -332,7 +332,7 @@ type SlotOutcome = (usize, RuleOutcome);
 /// root, the version stamp).
 struct Job {
     rule: crate::conf::Rule,
-    model: crate::conf::Model,
+    model: crate::models::Model,
     conf: Arc<Conf>,
     origin: Arc<Dicomweb>,
     counters: Arc<Counters>,
@@ -413,7 +413,11 @@ impl ModelThreads {
         let mut senders = std::collections::HashMap::new();
         let mut joins = Vec::new();
 
-        for model in conf.models.iter().filter(|model| model.script.is_some()) {
+        for model in conf
+            .models
+            .iter()
+            .filter(|model| model.enabled && model.script().is_some())
+        {
             // The pair is created here and the receiver moves wholesale into
             // the thread: leaving it in a map the caller could reach would
             // be a second owner of one channel.
@@ -507,7 +511,7 @@ fn model_loop(queue: Receiver<Job>, semaphore: Arc<Semaphore>, shutdown: Arc<Ato
 /// This is the body the coordinator used to execute inline: fetch, build,
 /// spawn, validate, store. Nothing about it changed except who runs it.
 fn run_job(job: &Job) -> RuleOutcome {
-    let Some(script) = job.model.script.as_deref() else {
+    let Some(script) = job.model.script() else {
         // Only models with a script get a thread, so this is unreachable
         // from `spawn`; it is the honest answer rather than a panic for a
         // job built by hand.
@@ -520,7 +524,7 @@ fn run_job(job: &Job) -> RuleOutcome {
         &job.workitem,
         &job.rule,
         &job.model,
-        script,
+        &script,
     )
 }
 
@@ -928,7 +932,7 @@ fn run_chain(
     // of them. A configuration hole at rule N would otherwise store the
     // results of rules 0..N-1 first and only then cancel the workitem -
     // objects for a step the archive reports as not done.
-    let mut resolved: Vec<(&crate::conf::Rule, &crate::conf::Model, &SyncSender<Job>)> =
+    let mut resolved: Vec<(&crate::conf::Rule, &crate::models::Model, &SyncSender<Job>)> =
         Vec::with_capacity(rule_indices.len());
     for index in rule_indices {
         let Some(rule) = conf.rules.get(*index) else {
@@ -1099,7 +1103,7 @@ fn run_external(
     counters: &Counters,
     workitem: &WorkItem,
     rule: &crate::conf::Rule,
-    model: &crate::conf::Model,
+    model: &crate::models::Model,
     script: &std::path::Path,
 ) -> Result<Vec<OutputRef>, String> {
     use crate::abi::workdir::{self, Frame};
@@ -1109,7 +1113,14 @@ fn run_external(
         .study_instance_uid
         .as_deref()
         .ok_or_else(|| "workitem names no study".to_string())?;
-    let interpreter = model
+    // The script and its budgets come from the model's runtime block, which
+    // the configuration loader has already checked: a model with no runtime
+    // never reached a thread.
+    let runtime = model
+        .runtime
+        .as_ref()
+        .ok_or_else(|| format!("model '{}' has no runtime block", model.id))?;
+    let interpreter = runtime
         .interpreter
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from(crate::conf::DEFAULT_INTERPRETER));
@@ -1117,8 +1128,8 @@ fn run_external(
         id: model.id.clone(),
         interpreter,
         script: script.to_path_buf(),
-        timeout_secs: model.timeout_secs,
-        max_result_bytes: model.max_result_bytes,
+        timeout_secs: runtime.timeout_secs,
+        max_result_bytes: runtime.max_result_bytes,
     };
 
     // -- 1. Fetch the frames ------------------------------------------
@@ -1498,7 +1509,7 @@ fn run_external(
 /// and the workitem is about to COMPLETE, so turning a leftover directory
 /// into a cancelled workitem would trade a real result for hygiene. The
 /// 24-hour sweep is the backstop.
-fn remove_workdir(path: &std::path::Path, model: &crate::conf::Model, study_uid: &str) {
+fn remove_workdir(path: &std::path::Path, model: &crate::models::Model, study_uid: &str) {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {}
         Err(error) => println!(
@@ -1551,7 +1562,7 @@ struct FrameMeta {
 struct DerivedTarget<'a> {
     study_uid: &'a str,
     rule: &'a crate::conf::Rule,
-    model: &'a crate::conf::Model,
+    model: &'a crate::models::Model,
     /// AIW-I Appendix V identity, already resolved workitem-first (see
     /// [`ResultIdentity`]). Borrowed so the per-frame loop clones a field
     /// at a time instead of the whole struct.
@@ -1720,7 +1731,7 @@ fn store_derived(
 /// one.
 fn derived_uid(
     study_uid: &str,
-    model: &crate::conf::Model,
+    model: &crate::models::Model,
     profile: u32,
     position: usize,
 ) -> String {
@@ -1731,7 +1742,7 @@ fn derived_uid(
 }
 
 /// The series the derived images of one model and profile go into.
-fn derived_series_uid(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn derived_series_uid(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!(
         "derived-series:{study_uid}:{}:{profile}",
         model.id
@@ -2082,12 +2093,12 @@ fn identity_label(rule: &crate::conf::Rule, seg: &crate::abi::schema::Seg) -> St
 /// Derived over the study, the model and the profile version, so a rerun
 /// reproduces the same UID and a bumped profile produces a genuinely new
 /// object rather than overwriting the previous generation.
-fn seg_uid_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn seg_uid_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!("external-seg:{study_uid}:{}:{profile}", model.id))
 }
 
 /// The series one external model's segmentation goes into.
-fn seg_series_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn seg_series_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!(
         "external-seg-series:{study_uid}:{}:{profile}",
         model.id
@@ -2279,7 +2290,7 @@ fn rtstruct_source(frame: &FrameMeta) -> crate::rtstruct::RtSource {
 /// an SH as text, so a value split mid-sequence is not decodable. The
 /// fallback is the word `RTSTRUCT`, used when the cut would leave nothing
 /// (a model id of multi-byte glyphs only).
-fn rtstruct_label(model: &crate::conf::Model, profile: u32) -> String {
+fn rtstruct_label(model: &crate::models::Model, profile: u32) -> String {
     let candidate = if model.id.is_empty() {
         crate::rtstruct::RTSTRUCT_FALLBACK_LABEL.to_string()
     } else {
@@ -2303,7 +2314,7 @@ fn rtstruct_label(model: &crate::conf::Model, profile: u32) -> String {
 /// Derived over the study, the model and the profile version, so a rerun
 /// reproduces the same UID and a bumped profile produces a genuinely new
 /// object rather than overwriting the previous generation.
-fn rtstruct_uid_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn rtstruct_uid_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!(
         "external-rtstruct:{study_uid}:{}:{profile}",
         model.id
@@ -2311,7 +2322,7 @@ fn rtstruct_uid_of_model(study_uid: &str, model: &crate::conf::Model, profile: u
 }
 
 /// The series one external model's structure set goes into.
-fn rtstruct_series_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn rtstruct_series_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!(
         "external-rtstruct-series:{study_uid}:{}:{profile}",
         model.id
@@ -2408,12 +2419,12 @@ fn store_surface(
 }
 
 /// The SOP Instance UID of one external model's surface mesh.
-fn stl_uid_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn stl_uid_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!("external-stl:{study_uid}:{}:{profile}", model.id))
 }
 
 /// The series one external model's surface mesh goes into.
-fn stl_series_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn stl_series_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!(
         "external-stl-series:{study_uid}:{}:{profile}",
         model.id
@@ -2432,7 +2443,7 @@ fn stl_series_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32
 /// frame nothing else knows about.
 fn stl_frame_of_reference(
     study_uid: &str,
-    model: &crate::conf::Model,
+    model: &crate::models::Model,
     profile: u32,
     source: Option<String>,
 ) -> String {
@@ -2711,7 +2722,7 @@ fn store_measurements(
 /// used by the derived-image UIDs' neighbours and the two must not collide.
 fn pr_uid_of_model(
     study_uid: &str,
-    model: &crate::conf::Model,
+    model: &crate::models::Model,
     profile: u32,
     frame_number: u32,
 ) -> String {
@@ -2722,7 +2733,7 @@ fn pr_uid_of_model(
 }
 
 /// The series the overlays of one model and profile go into.
-fn pr_series_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn pr_series_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!(
         "external-pr-series:{study_uid}:{}:{profile}",
         model.id
@@ -2730,12 +2741,12 @@ fn pr_series_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32)
 }
 
 /// The SOP Instance UID of one external model's report.
-fn sr_uid_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn sr_uid_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!("external-sr:{study_uid}:{}:{profile}", model.id))
 }
 
 /// The series one external model's report goes into.
-fn sr_series_uid_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn sr_series_uid_of_model(study_uid: &str, model: &crate::models::Model, profile: u32) -> String {
     digest128(&format!(
         "external-sr-series:{study_uid}:{}:{profile}",
         model.id
@@ -2748,7 +2759,11 @@ fn sr_series_uid_of_model(study_uid: &str, model: &crate::conf::Model, profile: 
 /// measurements report of the SAME model and profile describe two different
 /// documents with different SOP classes, and deriving them from one string
 /// would make them collide the moment both blocks are present.
-fn measurements_uid_of_model(study_uid: &str, model: &crate::conf::Model, profile: u32) -> String {
+fn measurements_uid_of_model(
+    study_uid: &str,
+    model: &crate::models::Model,
+    profile: u32,
+) -> String {
     digest128(&format!(
         "external-measurements:{study_uid}:{}:{profile}",
         model.id
@@ -2758,7 +2773,7 @@ fn measurements_uid_of_model(study_uid: &str, model: &crate::conf::Model, profil
 /// The series one external model's measurement report goes into.
 fn measurements_series_uid_of_model(
     study_uid: &str,
-    model: &crate::conf::Model,
+    model: &crate::models::Model,
     profile: u32,
 ) -> String {
     digest128(&format!(
@@ -3717,6 +3732,10 @@ mod tests {
                 cache_dir: std::path::PathBuf::from("."),
                 workers: None,
             },
+            fhir: crate::conf::FhirConf {
+                extension_base: crate::conf::DEFAULT_EXTENSION_BASE.to_string(),
+            },
+            models_dir: std::path::PathBuf::from("models"),
             models: vec![model("a"), model("b")],
             rules: Vec::new(),
             default_rule: crate::conf::DefaultRule::Off,
@@ -3734,12 +3753,9 @@ mod tests {
                 model: (*id).to_string(),
                 result: crate::conf::RuleResult {
                     kind: crate::conf::ResultKind::Pr,
-                    color: None,
                     profile_version: 1,
                     series_description: None,
                     label: crate::conf::LabelProfile::default(),
-                    sr: None,
-                    measurements: None,
                 },
                 index,
             });
@@ -4077,12 +4093,9 @@ mod tests {
             model: "cxr10".to_string(),
             result: crate::conf::RuleResult {
                 kind: crate::conf::ResultKind::Pr,
-                color: None,
                 profile_version: 1,
                 series_description: None,
                 label: crate::conf::LabelProfile::default(),
-                sr: None,
-                measurements: None,
             },
             index: 0,
         };
@@ -4154,12 +4167,9 @@ mod tests {
             model: "cxr10".to_string(),
             result: crate::conf::RuleResult {
                 kind: crate::conf::ResultKind::Pr,
-                color: None,
                 profile_version: 1,
                 series_description: None,
                 label: crate::conf::LabelProfile::default(),
-                sr: None,
-                measurements: None,
             },
             index: 0,
         }
@@ -4182,12 +4192,9 @@ mod tests {
             model: "cxr10".to_string(),
             result: crate::conf::RuleResult {
                 kind: crate::conf::ResultKind::Pr,
-                color: None,
                 profile_version: 1,
                 series_description: None,
                 label: crate::conf::LabelProfile::default(),
-                sr: None,
-                measurements: None,
             },
             index: 0,
         };
@@ -4210,12 +4217,9 @@ mod tests {
             model: "cxr10".to_string(),
             result: crate::conf::RuleResult {
                 kind: crate::conf::ResultKind::Pr,
-                color: None,
                 profile_version: 1,
                 series_description: None,
                 label: crate::conf::LabelProfile::default(),
-                sr: None,
-                measurements: None,
             },
             index: 0,
         };
@@ -4224,13 +4228,25 @@ mod tests {
     }
 
     /// A model literal for the UID-derivation tests.
-    fn model(id: &str) -> crate::conf::Model {
-        crate::conf::Model {
+    fn model(id: &str) -> crate::models::Model {
+        crate::models::Model {
             id: id.to_string(),
-            script: Some(std::path::PathBuf::from("proc.py")),
-            interpreter: None,
-            timeout_secs: 300,
-            max_result_bytes: crate::conf::DEFAULT_MAX_RESULT_BYTES,
+            enabled: true,
+            title: None,
+            description: None,
+            provider: None,
+            procedure_code: None,
+            input_requirements: crate::models::InputRequirements::default(),
+            output_capabilities: crate::models::OutputCapabilities::default(),
+            parameters: Vec::new(),
+            r#match: crate::conf::Match::default(),
+            runtime: Some(crate::models::Runtime {
+                script: std::path::PathBuf::from("proc.py"),
+                interpreter: None,
+                timeout_secs: 300,
+                max_result_bytes: crate::conf::DEFAULT_MAX_RESULT_BYTES,
+            }),
+            outputs: Vec::new(),
         }
     }
 
@@ -4357,6 +4373,9 @@ mod tests {
         let attrs = crate::matcher::StudyAttrs {
             modalities: vec!["CT".into()],
             code_meanings: study_code_meanings(&study),
+            // The shipped rule carries the model's procedure code, so the
+            // workitem's code must name it for the meaning match to apply.
+            code: Some("IMG-CLAHE".into()),
             ..crate::matcher::StudyAttrs::default()
         };
         assert!(

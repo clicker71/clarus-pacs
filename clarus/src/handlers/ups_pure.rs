@@ -58,6 +58,18 @@ pub trait EventSink: Send + Sync {
         new: &str,
         filter: super::ups::event_bus::FilterRouting,
     );
+    /// Publish a change of (0040,4041) Input Readiness State.
+    ///
+    /// PS3.4 CC.2.4.1 reports readiness separately from the workflow state,
+    /// and the workflow state does not move when inputs arrive, so this edge
+    /// cannot ride on `notify_state_change`.
+    fn notify_readiness_change(
+        &self,
+        workitem_uid: &str,
+        previous_readiness: &str,
+        new_readiness: &str,
+        filter: super::ups::event_bus::FilterRouting,
+    );
 }
 
 impl EventSink for super::ups::event_bus::UpsEventBus {
@@ -78,6 +90,16 @@ impl EventSink for super::ups::event_bus::UpsEventBus {
         filter: super::ups::event_bus::FilterRouting,
     ) {
         self.notify_state_change(workitem_uid, previous, new, filter);
+    }
+
+    fn notify_readiness_change(
+        &self,
+        workitem_uid: &str,
+        previous_readiness: &str,
+        new_readiness: &str,
+        filter: super::ups::event_bus::FilterRouting,
+    ) {
+        self.notify_readiness_change(workitem_uid, previous_readiness, new_readiness, filter);
     }
 }
 
@@ -110,7 +132,39 @@ fn invalid_uid() -> UpsErr {
 }
 
 fn is_valid_uid(uid: &str) -> bool {
-    !uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit() || c == '.')
+    // PS3.5 9.1 (`standard/ps3.5/uid-encoding-rules.json`, UID-1/UID-2): a UID is
+    // dot-separated components of one or more digits, each with no leading zero
+    // unless it IS the single digit. The previous character test accepted `1..2`,
+    // so a malformed UID could become the TransACTION UID lock on a successful
+    // claim - the one value a later state change must present.
+    crate::handlers::wado::validation::validate_dicom_uid(uid).is_ok()
+}
+
+/// The Final-State obligation this workitem still breaks, if any.
+///
+/// PS3.4 CC.2.5.1.1 (Table CC.2.5-1 Final State Codes applied to Table
+/// CC.2.5-3; `standard/ps3.4/ups-cc-2.5.1.1-final-state.json`) forbids setting
+/// (0074,1000) to COMPLETED while an attribute whose code is `P` has no value.
+///
+/// Change State (11.7) carries the state and the Transaction UID and nothing
+/// else - 11.7.1.4 reads no other attribute - so the only obligation decidable
+/// from THIS request is the one the performer report supplies when it exists:
+/// a report that states a start must also state an end, because
+/// Performed Procedure Step End DateTime (0040,4051) is `P` and Type 1C
+/// "required if set". A workitem whose report was never supplied at all is
+/// left alone here: refusing it would make the documented flow impossible,
+/// where a performer reports through Update and then changes state, and an
+/// empty output list is legal (Table CC.2.5-3 gives (0040,4033) Type 2).
+///
+/// Returns `None` when the workitem may complete.
+fn missing_final_state_attributes(w: &WorkItem) -> Option<&'static str> {
+    if w.performed_start_datetime.is_some() && w.performed_end_datetime.is_none() {
+        return Some(
+            "Performed Procedure Step End DateTime (0040,4051) has no value while \
+             (0040,4050) does",
+        );
+    }
+    None
 }
 
 fn internal_err(message: &str) -> UpsErr {
@@ -293,6 +347,11 @@ fn workitem_to_record(wi: &WorkItem) -> clarus_core::ups::WorkItemRecord {
         // it submits; 0 here means "this caller observed nothing", which
         // `cas_update` treats as no revision precondition.
         revision: 0,
+        // Provenance is a property of the STORE record, never of a ports-shaped
+        // `WorkItem`: a value arriving over the wire cannot claim to have been
+        // minted here, so the boundary drops it. The one writer that sets it is
+        // the readiness producer, which builds a record directly.
+        minted_by: None,
     }
 }
 
@@ -537,7 +596,14 @@ pub fn ups_create(
         // from the sequence item only - there is no bare-tag fallback,
         // because the standard names no bare attribute for it.
         requested_procedure_id: extract_first_item_tag(body_obj, "0040A370", "00401001"),
-        requesting_physician: extract_pn(body_obj, "00321032")
+        // Requesting Physician (0032,1032) is an attribute of the Referenced
+        // Request Sequence item, not a root attribute: PS3.3 Table 10-4 puts
+        // it among the procedure-request attributes that travel inside
+        // (0040,A370), and a UPS Create body repeats that sequence verbatim.
+        // The bare root spelling is kept as a fallback because it was this
+        // server's only carriage before and clients still send it.
+        requesting_physician: extract_single_item_pn(body_obj, "0040A370", "00321032")
+            .or_else(|| extract_pn(body_obj, "00321032"))
             .or_else(|| extract_tag(body_obj, "00321032")),
         // (0008,0060) is NOT read from the body. The UPS IOD (PS3.4 Table
         // CC.2.5-3) defines no Modality, so a client cannot state one, and the
@@ -741,9 +807,14 @@ pub fn ups_update(
             }
         }
         Some(stored) if stored != request_transaction_uid => {
-            return Err(bad_request(&format!(
-                "Transaction UID mismatch: expected '{stored}', got '{request_transaction_uid}'"
-            )));
+            // The stored Transaction UID is NOT echoed. It is exactly the lock a
+            // caller must present to change a claimed workitem, so returning it
+            // in the rejection handed the value to a caller that could not
+            // produce it. The comparison and the status are unchanged.
+            return Err(bad_request(
+                "Transaction UID mismatch: the request does not match the UID that \
+                 claimed this workitem",
+            ));
         }
         Some(_) => {}
     }
@@ -774,6 +845,24 @@ pub fn ups_update(
 
     let state_changed = new_state != existing.workflow_state;
     let previous_state = existing.workflow_state.clone();
+
+    // PS3.4 CC.2.5.1.1 (Table CC.2.5-1/-3, `standard/ps3.4/
+    // ups-cc-2.5.1.1-final-state.json`): the Attributes the Final State column
+    // marks `P` (Prohibited when empty for COMPLETED) must HAVE a value before
+    // (0074,1000) is set to COMPLETED. The performer report is one of them, so a
+    // performer could claim a READY workitem and immediately mark it COMPLETED
+    // with no report at all - after which the workitem is final and the next
+    // Update is refused, leaving a completed step that records nothing it did.
+    // Refusing HERE keeps the workitem IN PROGRESS so the performer can still
+    // supply the report.
+    if new_state == "COMPLETED"
+        && let Some(missing) = missing_final_state_attributes(&existing)
+    {
+        return Err(bad_request(&format!(
+            "Cannot set Procedure Step State to COMPLETED: {missing} \
+             (PS3.4 CC.2.5.1.1 Final State requirements)"
+        )));
+    }
 
     // The lock the workitem holds after this request. A claim installs the
     // caller's UID; later transitions keep the stored one. It is never
@@ -1175,6 +1264,7 @@ fn cancel_cas_conflict() -> UpsErr {
 /// concurrent write between the read and the CAS write is 409.
 pub fn ups_update_attributes(
     state: &AppState,
+    sink: &dyn EventSink,
     workitem_uid: &str,
     body: &[u8],
     transaction_uid_query: Option<&str>,
@@ -1337,6 +1427,12 @@ pub fn ups_update_attributes(
         ));
     }
 
+    // PS3.4 CC.2.4.1: a subscriber that waits for inputs to become ready has
+    // no other way to learn that they are. The N-SET below is the only
+    // transaction that can move (0040,4041), so the observed value is kept
+    // here and compared after the merge decides whether to publish.
+    let previous_readiness = existing.input_readiness.clone();
+
     let mut updated = existing.clone();
 
     // (0074,1204) Procedure Step Label and (0074,1200) Scheduled Procedure
@@ -1432,13 +1528,14 @@ pub fn ups_update_attributes(
         // success, which is the one statement AIW-I 4.84.4.1.2.1 exists to
         // prevent.
         if let Some(sequence) = item.obj_get("00404033") {
+            // Type 2 at the Final State (PS3.4 CC.2.5.1.1, Table CC.2.5-3,
+            // `standard/ps3.4/ups-cc-2.5.1.1-final-state.json`): the attribute
+            // must be PRESENT and may hold ZERO items, because a step that
+            // produced no relevant output has none to list. Refusing the
+            // zero-length form made that legal statement impossible to send, so
+            // a performer with nothing to report could not complete the step.
+            // Malformed reference ITEMS are still refused by the extractor.
             let outputs = extract_output_information(sequence)?;
-            if outputs.is_empty() {
-                return Err(bad_request(
-                    "(0040,4033) Output Information Sequence is present but empty; \
-                     omit it to say nothing, or list the created instances",
-                ));
-            }
             updated.output_information = Some(outputs);
         }
 
@@ -1466,11 +1563,12 @@ pub fn ups_update_attributes(
         // erase children a previous update stored. The base is the stored
         // element, or the materialized typed projection for a legacy record,
         // so the transition to lossless keeps the old children.
-        updated.performed_procedure_information = Some(merge_performed_information(
+        let merged = merge_performed_information(
             existing.performed_procedure_information.as_deref(),
             &existing,
             item,
-        )?);
+        )?;
+        updated.performed_procedure_information = Some(merged);
     }
 
     // The state is carried over untouched, and nothing is published: this is
@@ -1494,7 +1592,28 @@ pub fn ups_update_attributes(
         in_progress.then_some(request_transaction_uid),
         Some(observed_revision),
     ) {
-        Ok(()) => render_workitem_response(200, &updated, accept),
+        Ok(()) => {
+            // CC.2.4.1: the workitem became performable, which is the fact the
+            // readiness report exists to announce. Published AFTER the write
+            // committed, so a subscriber never sees a state a failed CAS
+            // rolled back. Only the INCOMPLETE -> READY edge is news: any
+            // other readiness change is either a no-op for the performer or a
+            // withdrawal already covered by the Workitem Selection state.
+            let became_ready = previous_readiness.as_deref()
+                == Some(super::readiness::READINESS_INCOMPLETE)
+                && updated.input_readiness.as_deref() == Some(super::readiness::READINESS_READY);
+            if became_ready {
+                sink.notify_readiness_change(
+                    workitem_uid,
+                    super::readiness::READINESS_INCOMPLETE,
+                    super::readiness::READINESS_READY,
+                    super::ups::event_bus::FilterRouting::from_record(&workitem_to_record(
+                        &updated,
+                    )),
+                );
+            }
+            render_workitem_response(200, &updated, accept)
+        }
         Err(clarus_core::ups::StoreError::CasConflict(_)) => Err(UpsErr {
             status: 409,
             body: err_msg_json(
@@ -1532,7 +1651,21 @@ fn performed_item(
              present but empty; omit it to say nothing, or send the one item that \
              reports the performance",
         )),
-        1 => Ok(items.first()),
+        1 => {
+            // The item is a DATA SET: `{"00404050": {...}, ...}`. Anything
+            // else - a bare null, a string, a number - reaches no child and
+            // would be read as "the performer reports nothing", which is the
+            // silent acceptance this server refuses elsewhere. Answering 200
+            // would tell the performer its report landed when no attribute
+            // was ever read out of it.
+            match items.first() {
+                Some(item @ crate::handlers::json_common::JsonVal::Obj(_)) => Ok(Some(item)),
+                _ => Err(bad_request(
+                    "(0074,1216) carries an item that is not a data set; the one item \
+                     reports the performance as an object of its attributes",
+                )),
+            }
+        }
         _ => Err(bad_request(
             "(0074,1216) carries more than one item; Table C.30.3-1 allows zero or one",
         )),
@@ -1802,11 +1935,19 @@ fn code_sequence_element(code: &WorkItemCode) -> JsonVal {
 
 /// (0040,4033) Output Information Sequence as a DICOM JSON sequence element,
 /// one item per reference in the same shape `emit_output_information` emits.
+///
+/// The item is a Referenced Instances and Access Macro item (PS3.3 Table
+/// 10-3b): the SOP pair sits in a NESTED (0008,1199) Referenced SOP Sequence,
+/// not flat on the item, and (0020,000D) Study Instance UID is the macro's 1C
+/// study. This element becomes the stored opaque report, and the JSON render
+/// prefers that report over the typed fields - so a shape that differs from the
+/// renderer does not merely look different, it CHANGES the references a reader
+/// sees after an update that only touched the end time.
 fn output_sequence_element(outputs: &[OutputReference]) -> JsonVal {
     let items: Vec<JsonVal> = outputs
         .iter()
         .map(|output| {
-            let mut pairs = vec![
+            let inner = JsonVal::Obj(vec![
                 (
                     "00081150".to_string(),
                     scalar_element("UI", &output.sop_class_uid),
@@ -1815,7 +1956,22 @@ fn output_sequence_element(outputs: &[OutputReference]) -> JsonVal {
                     "00081155".to_string(),
                     scalar_element("UI", &output.sop_instance_uid),
                 ),
-            ];
+            ]);
+            let mut pairs = vec![(
+                "00081199".to_string(),
+                JsonVal::Obj(vec![
+                    ("Value".to_string(), JsonVal::Arr(vec![inner])),
+                    ("vr".to_string(), JsonVal::Str("SQ".to_string())),
+                ]),
+            )];
+            // (0020,000D) is 1C in the macro: present when the reference names
+            // a study, omitted otherwise rather than stated empty.
+            if !output.study_instance_uid.is_empty() {
+                pairs.push((
+                    "0020000D".to_string(),
+                    scalar_element("UI", &output.study_instance_uid),
+                ));
+            }
             // Omitted when the performer named no series, mirroring the render.
             if !output.series_instance_uid.is_empty() {
                 pairs.push((
@@ -1823,6 +1979,8 @@ fn output_sequence_element(outputs: &[OutputReference]) -> JsonVal {
                     scalar_element("UI", &output.series_instance_uid),
                 ));
             }
+            // (0040,E020) Type of Instances is Type 1 in the macro.
+            pairs.push(("0040E020".to_string(), scalar_element("CS", "DICOM")));
             JsonVal::Obj(pairs)
         })
         .collect();
@@ -1921,6 +2079,17 @@ fn merge_performed_information(
     let mut out = Vec::with_capacity(128);
     crate::handlers::json_common::write_json_val(&mut out, &element);
     Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The first string value of a scalar child of a sequence item, empty -> None.
+#[cfg(test)]
+fn scalar_child_text(item: &JsonVal, tag: &str) -> Option<String> {
+    item.obj_get(tag)?
+        .obj_get("Value")?
+        .first_of_array()?
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
 }
 
 /// Read a one-item `CodeSequenceMacro` attribute: value, scheme, meaning.
@@ -2064,6 +2233,21 @@ fn extract_first_item_tag(
 ) -> Option<String> {
     let first = body.obj_get(seq_tag)?.obj_get("Value")?.first_of_array()?;
     extract_tag(first, item_tag)
+}
+
+/// Read the Person Name `item_tag` from the first item of a one-level
+/// sequence, keeping the value in the PN carriage the writer emits.
+///
+/// `extract_first_item_tag` goes through `extract_tag`, which reads a PN as a
+/// plain string and loses the letter groups; going through `extract_pn` keeps
+/// the `/an|alpha=^beta` form so a name stored here reads back unchanged.
+fn extract_single_item_pn(
+    body: &crate::handlers::json_common::JsonVal,
+    seq_tag: &str,
+    item_tag: &str,
+) -> Option<String> {
+    let first = body.obj_get(seq_tag)?.obj_get("Value")?.first_of_array()?;
+    extract_pn(first, item_tag)
 }
 
 /// Read a one-item code sequence: the first item's Code Value, Coding Scheme
@@ -2217,24 +2401,26 @@ fn extract_scheduled_processing_parameters(
     let Some(entry) = body.obj_get("00741210") else {
         return Ok(None);
     };
-    let Some(value) = entry.obj_get("Value") else {
-        return Err(UpsErr {
-            status: 400,
-            body: err_msg_json(
-                "Bad Request",
-                "Scheduled Processing Parameters Sequence (0074,1210) has no Value array",
-            ),
-        });
+    // A present sequence with no `Value` member is the zero-length form
+    // (PS3.18 F.2.5: an attribute that is present but empty carries no
+    // `Value`). It states "this sequence is here and holds nothing", which is
+    // a different statement from the absent attribute handled above - and it
+    // is the only way a client can CLEAR the sequence. A `Value` that is not
+    // an array is still refused: that is a malformed element, not an empty one.
+    let empty = crate::handlers::json_common::JsonVal::Arr(Vec::new());
+    let value = match entry.obj_get("Value") {
+        Some(v @ crate::handlers::json_common::JsonVal::Arr(_)) => v,
+        None => &empty,
+        Some(_) => {
+            return Err(UpsErr {
+                status: 400,
+                body: err_msg_json(
+                    "Bad Request",
+                    "Scheduled Processing Parameters Sequence (0074,1210) Value must be an array",
+                ),
+            });
+        }
     };
-    if !matches!(value, crate::handlers::json_common::JsonVal::Arr(_)) {
-        return Err(UpsErr {
-            status: 400,
-            body: err_msg_json(
-                "Bad Request",
-                "Scheduled Processing Parameters Sequence (0074,1210) Value must be an array",
-            ),
-        });
-    }
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(br#"{"Value":"#);
     crate::handlers::json_common::write_json_val(&mut out, value);
@@ -2262,24 +2448,26 @@ fn extract_input_information(
     let Some(entry) = body.obj_get("00404021") else {
         return Ok(None);
     };
-    let Some(value) = entry.obj_get("Value") else {
-        return Err(UpsErr {
-            status: 400,
-            body: err_msg_json(
-                "Bad Request",
-                "Input Information Sequence (0040,4021) has no Value array",
-            ),
-        });
+    // A present sequence with no `Value` member is the zero-length form
+    // (PS3.18 F.2.5: an attribute that is present but empty carries no
+    // `Value`). It states "this sequence is here and holds nothing", which is
+    // a different statement from the absent attribute handled above - and it
+    // is the only way a client can CLEAR the sequence. A `Value` that is not
+    // an array is still refused: that is a malformed element, not an empty one.
+    let empty = crate::handlers::json_common::JsonVal::Arr(Vec::new());
+    let value = match entry.obj_get("Value") {
+        Some(v @ crate::handlers::json_common::JsonVal::Arr(_)) => v,
+        None => &empty,
+        Some(_) => {
+            return Err(UpsErr {
+                status: 400,
+                body: err_msg_json(
+                    "Bad Request",
+                    "Input Information Sequence (0040,4021) Value must be an array",
+                ),
+            });
+        }
     };
-    if !matches!(value, crate::handlers::json_common::JsonVal::Arr(_)) {
-        return Err(UpsErr {
-            status: 400,
-            body: err_msg_json(
-                "Bad Request",
-                "Input Information Sequence (0040,4021) Value must be an array",
-            ),
-        });
-    }
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(br#"{"Value":"#);
     crate::handlers::json_common::write_json_val(&mut out, value);
@@ -2376,6 +2564,24 @@ pub fn ups_search(
         }
     }
 
+    // PS3.18 8.4: an option this server does not apply is a WARNING, not a
+    // silent fallback. The three *matching flags are parsed and retained, but
+    // UPS matching here is exact (the store compares values), so a client that
+    // asked for fuzzy or empty-value matching and silently got the default has
+    // no way to tell its answer is narrower than it asked for.
+    let mut option_warnings: Vec<String> = Vec::new();
+    for (key, flag) in [
+        ("fuzzymatching", query.fuzzymatching),
+        ("emptyvaluematching", query.empty_value_matching),
+        ("multiplevaluematching", query.multiple_value_matching),
+    ] {
+        if flag == Some(true) {
+            option_warnings.push(format!(
+                "299 {service}: The '{key}' query parameter is not supported and was ignored"
+            ));
+        }
+    }
+
     // Validate workflow_state if provided
     if let Some(ref state_val) = query.workflow_state
         && !is_valid_state(state_val)
@@ -2427,6 +2633,7 @@ pub fn ups_search(
         // all, which is the DICOMweb convention for a zero-length key.
         modality: query.modality.as_deref().filter(|m| !m.is_empty()),
         workflow_state: query.workflow_state.as_deref(),
+        input_readiness: query.input_readiness.as_deref().filter(|s| !s.is_empty()),
         limit: query.limit,
         offset: query.offset,
         default_offset_secs: state.config.ups.local_utc_offset_secs,
@@ -2451,6 +2658,9 @@ pub fn ups_search(
                         "299 {service}: There are {remaining} additional results that can be requested"
                     ),
                 ));
+            }
+            for warning in option_warnings {
+                headers.push(("Warning", warning));
             }
 
             // -- XML path (typed writer, always-on) ---------
@@ -2569,7 +2779,30 @@ pub fn ups_search_from_body(
 /// only way to catch one is to assert on the query it parsed.
 fn query_from_body(obj: &JsonVal) -> Result<UpsQuery, UpsErr> {
     let mut query = UpsQuery::default();
-    if let Some(v) = extract_tag(obj, "0020000D") {
+    // (0020,000D) Study Instance UID appears BOTH at the root and inside the
+    // Referenced Request Sequence, exactly as Create accepts it. Reading only
+    // the root meant a body that states the study the standard's way - the
+    // nested 1C study of PS3.3 Table 10-4 - passed the outer-key allowlist and
+    // then searched with NO study filter, answering with unrelated workitems.
+    // Two spellings that disagree are refused: picking one silently would make
+    // the answer depend on which carriage the client happened to use.
+    let root_study = extract_tag(obj, "0020000D");
+    let nested_study = extract_first_item_tag(obj, "0040A370", "0020000D");
+    match (&root_study, &nested_study) {
+        (Some(root), Some(nested)) if root != nested => {
+            return Err(UpsErr {
+                status: 400,
+                body: err_msg_json(
+                    "Bad Request",
+                    "Study Instance UID (0020,000D) is stated twice with different \
+                     values: once at the root of the search body and once in the \
+                     Referenced Request Sequence (0040,A370)",
+                ),
+            });
+        }
+        _ => {}
+    }
+    if let Some(v) = nested_study.or(root_study) {
         query.study_uid = Some(v);
     }
     // (0008,0050) lives INSIDE (0040,0370) Referenced Request Sequence, so the
@@ -2770,6 +3003,48 @@ mod tests {
         assert_eq!(q.study_uid.as_deref(), Some("1.2.3"));
     }
 
+    /// The study filter must be read from the Referenced Request Sequence too,
+    /// and two spellings that disagree must be refused rather than resolved
+    /// silently: a dropped study filter answers with unrelated workitems.
+    #[test]
+    fn a_body_search_reads_the_nested_study_and_refuses_a_conflict() {
+        let nested = parse_json(
+            br#"{"0040A370":{"vr":"SQ","Value":[
+                    {"0020000D":{"vr":"UI","Value":["1.2.3"]}}]}}"#,
+        )
+        .expect("valid json");
+        let obj = single_dataset(&nested).expect("one data set");
+        let q = ok(query_from_body(obj), "a nested-only study");
+        assert_eq!(
+            q.study_uid.as_deref(),
+            Some("1.2.3"),
+            "the nested study must reach the query"
+        );
+
+        let agree = parse_json(
+            br#"{"0020000D":{"vr":"UI","Value":["1.2.3"]},
+                 "0040A370":{"vr":"SQ","Value":[
+                    {"0020000D":{"vr":"UI","Value":["1.2.3"]}}]}}"#,
+        )
+        .expect("valid json");
+        let obj = single_dataset(&agree).expect("one data set");
+        let q = ok(query_from_body(obj), "the same study twice");
+        assert_eq!(q.study_uid.as_deref(), Some("1.2.3"));
+
+        let conflict = parse_json(
+            br#"{"0020000D":{"vr":"UI","Value":["1.2.3"]},
+                 "0040A370":{"vr":"SQ","Value":[
+                    {"0020000D":{"vr":"UI","Value":["9.9.9"]}}]}}"#,
+        )
+        .expect("valid json");
+        let obj = single_dataset(&conflict).expect("one data set");
+        let err = match query_from_body(obj) {
+            Ok(q) => panic!("a conflicting study must be refused, got {q:?}"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, 400);
+    }
+
     /// m19: the station and accession filters must be READ, not silently lost.
     ///
     /// Both attributes are sequences in a conformant body. Reading them with
@@ -2925,6 +3200,56 @@ mod tests {
                 });
             }
         }
+        fn notify_readiness_change(
+            &self,
+            uid: &str,
+            previous_readiness: &str,
+            new_readiness: &str,
+            filter: FilterRouting,
+        ) {
+            // Reference behaviour: an unchanged readiness is not news.
+            if previous_readiness != new_readiness {
+                let mut filter = filter;
+                filter.input_readiness = Some(new_readiness.to_string());
+                self.publish(UpsEvent {
+                    workitem_uid: uid.to_string(),
+                    previous_state: String::new(),
+                    new_state: String::new(),
+                    timestamp: String::new(),
+                    event_id: 0,
+                    step_label: filter.step_label.clone(),
+                    scheduled_code: filter.scheduled_code.clone(),
+                    input_readiness: new_readiness.to_string(),
+                    filter: Box::new(filter),
+                });
+            }
+        }
+    }
+
+    /// PS3.4 CC.2.4.1: a subscriber that waits for inputs to become ready
+    /// learns it from the readiness report, so the INCOMPLETE -> READY edge
+    /// must publish. Any other readiness change is not that edge.
+    #[test]
+    fn the_incomplete_to_ready_edge_is_the_one_that_is_reported() {
+        let sink = RecordingSink::default();
+        let filter = FilterRouting::default();
+
+        sink.notify_readiness_change("1.2.3", "INCOMPLETE", "READY", filter.clone());
+        let events = sink.events();
+        assert_eq!(events.len(), 1, "the readiness edge publishes once");
+        assert_eq!(events[0].workitem_uid, "1.2.3");
+        assert_eq!(
+            events[0].input_readiness, "READY",
+            "the report carries the value just written"
+        );
+        assert!(
+            events[0].previous_state.is_empty() && events[0].new_state.is_empty(),
+            "readiness is not a workflow transition, so neither state field moves"
+        );
+
+        // An unchanged readiness is not news.
+        sink.notify_readiness_change("1.2.3", "READY", "READY", filter);
+        assert_eq!(sink.events().len(), 1, "an unchanged readiness is muted");
     }
 
     /// A fake `AppState` is not cheap to construct here, so we test the pure
@@ -3079,6 +3404,233 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.status, 400);
+    }
+
+    /// PS3.18 F.2.5: an attribute that is present but empty carries no
+    /// `Value`. For the two stored-as-is sequences that form is how a client
+    /// CLEARS the sequence, and it is a different statement from the absent
+    /// attribute. A non-array `Value` is still malformed.
+    #[test]
+    fn a_zero_length_sequence_is_accepted_and_cleared() {
+        let bare = parse_json(br#"{"00741210":{"vr":"SQ"}}"#).expect("json");
+        let stored = ok(
+            extract_scheduled_processing_parameters(&bare),
+            "a zero-length processing sequence",
+        )
+        .expect("present, so Some");
+        let parsed = parse_json(stored.as_bytes()).expect("stored JSON");
+        assert_eq!(
+            parsed
+                .obj_get("Value")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(0),
+            "the zero-length form stores an empty sequence: {stored}"
+        );
+
+        let bare = parse_json(br#"{"00404021":{"vr":"SQ"}}"#).expect("json");
+        let stored = ok(
+            extract_input_information(&bare),
+            "a zero-length input sequence",
+        )
+        .expect("present, so Some");
+        let parsed = parse_json(stored.as_bytes()).expect("stored JSON");
+        assert_eq!(
+            parsed
+                .obj_get("Value")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(0),
+            "the input sequence is cleared the same way: {stored}"
+        );
+
+        // Absent stays absent: a different statement from present-empty.
+        let absent = parse_json(br#"{}"#).expect("json");
+        assert!(
+            ok(
+                extract_scheduled_processing_parameters(&absent),
+                "absent processing sequence"
+            )
+            .is_none(),
+            "an absent attribute is None, not an empty sequence"
+        );
+
+        // A non-array Value is malformed, not empty.
+        let malformed = parse_json(br#"{"00741210":{"vr":"SQ","Value":"x"}}"#).expect("json");
+        let err = match extract_scheduled_processing_parameters(&malformed) {
+            Ok(v) => panic!("a non-array Value must be refused, got {v:?}"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, 400);
+    }
+
+    /// A partial N-SET over a record whose report is only in the TYPED fields
+    /// materializes that report into the stored opaque element. The element
+    /// must use the Referenced Instances and Access Macro shape (PS3.3 Table
+    /// 10-3b), because the JSON render prefers it over the typed fields: a
+    /// flat SOP pair and a dropped (0020,000D) would change the references a
+    /// reader sees after an update that touched only the end time.
+    #[test]
+    fn a_materialized_output_keeps_the_study_and_the_nested_sop_sequence() {
+        let mut legacy = performed_workitem();
+        legacy.output_information = Some(vec![OutputReference {
+            sop_class_uid: "1.2.840.10008.5.1.4.1.1.2".to_string(),
+            sop_instance_uid: "1.2.3.4.5".to_string(),
+            study_instance_uid: "1.2.3.9".to_string(),
+            series_instance_uid: "1.2.3.4".to_string(),
+        }]);
+        legacy.performed_procedure_information = None;
+
+        let incoming = parse_json(br#"{"00404051":{"vr":"DT","Value":["20261109T101500"]}}"#)
+            .expect("valid json");
+        let merged = match merge_performed_information(None, &legacy, &incoming) {
+            Ok(v) => v,
+            Err(e) => panic!("the merge must succeed, got status {}", e.status),
+        };
+        let parsed = parse_json(merged.as_bytes()).expect("the merged element is JSON");
+        let item = parsed
+            .obj_get("Value")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items.first())
+            .expect("one item");
+
+        let outputs = item
+            .obj_get("00404033")
+            .expect("the materialized report carries the output list");
+        let output_item = outputs
+            .obj_get("Value")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items.first())
+            .expect("one output");
+
+        assert!(
+            output_item.obj_get("00081199").is_some(),
+            "the SOP pair sits in the nested (0008,1199), not flat: {merged}"
+        );
+        assert!(
+            output_item.obj_get("00081150").is_none(),
+            "and nothing is left flat on the item: {merged}"
+        );
+        assert_eq!(
+            scalar_child_text(output_item, "0020000D").as_deref(),
+            Some("1.2.3.9"),
+            "the study reference survives: {merged}"
+        );
+        assert_eq!(
+            scalar_child_text(output_item, "0020000E").as_deref(),
+            Some("1.2.3.4"),
+            "the series reference survives: {merged}"
+        );
+    }
+
+    /// The one item of (0074,1216) is a data set. A bare null is not one, and
+    /// accepting it would report success for a payload no attribute was read
+    /// out of.
+    #[test]
+    fn the_performed_item_must_be_a_data_set() {
+        let null_item = parse_json(br#"{"00741216":{"vr":"SQ","Value":[null]}}"#).expect("json");
+        let obj = single_dataset(&null_item).expect("one data set");
+        let err = match performed_item(obj) {
+            Ok(v) => panic!("a null item must be refused, got {v:?}"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, 400);
+
+        let scalar_item = parse_json(br#"{"00741216":{"vr":"SQ","Value":["x"]}}"#).expect("json");
+        let obj = single_dataset(&scalar_item).expect("one data set");
+        assert!(
+            performed_item(obj).is_err(),
+            "a scalar item is not a data set either"
+        );
+
+        let ok_item =
+            parse_json(br#"{"00741216":{"vr":"SQ","Value":[{"00404051":{"vr":"DT","Value":["20261109101500"]}}]}}"#)
+                .expect("json");
+        let obj = single_dataset(&ok_item).expect("one data set");
+        assert!(
+            ok(performed_item(obj), "a data set item").is_some(),
+            "the one data set item reaches the merge"
+        );
+    }
+
+    /// The Referenced Request item's Person Name must be read as PN, not as a
+    /// flattened string: `extract_first_item_tag` would lose the groups.
+    #[test]
+    fn the_requesting_physician_keeps_its_person_name_carriage() {
+        let nested = parse_json(
+            br#"{"0040A370":{"vr":"SQ","Value":[
+                    {"0020000D":{"vr":"UI","Value":["1.2.3"]},
+                     "00321032":{"vr":"PN","Value":[{"Alphabetic":"Doe^Jane"}]}}]}}"#,
+        )
+        .expect("valid json");
+        let got = extract_single_item_pn(&nested, "0040A370", "00321032")
+            .expect("the name inside the item");
+        assert!(
+            got.contains("Doe") && got.contains("Jane"),
+            "the item PN keeps the person-name form: {got}"
+        );
+
+        let bare = parse_json(
+            br#"{"0040A370":{"vr":"SQ","Value":[{"0020000D":{"vr":"UI","Value":["1.2.3"]}}]}}"#,
+        )
+        .expect("valid json");
+        assert!(
+            extract_single_item_pn(&bare, "0040A370", "00321032").is_none(),
+            "an item without the name yields nothing rather than a made-up value"
+        );
+    }
+
+    /// PS3.4 Table CC.2.5-3 gives (0040,4033) Type 2, so a performer may
+    /// report that the step produced nothing with an empty Value array. It is
+    /// a legal report and must read back as an empty list, not an error.
+    #[test]
+    fn an_empty_output_sequence_is_a_legal_report_of_nothing_produced() {
+        let empty = parse_json(br#"{"vr":"SQ","Value":[]}"#).expect("valid json");
+        let outputs = ok(extract_output_information(&empty), "empty sequence");
+        assert!(
+            outputs.is_empty(),
+            "Type 2 means zero items is valid: {outputs:?}"
+        );
+    }
+
+    /// The empty item list and the absent Value array are different requests:
+    /// an empty list is zero outputs, a missing Value is not a sequence.
+    #[test]
+    fn an_output_sequence_without_a_value_array_is_refused() {
+        let bare = parse_json(br#"{"vr":"SQ"}"#).expect("valid json");
+        let err = match extract_output_information(&bare) {
+            Ok(v) => panic!("a sequence with no Value array must be refused, got {v:?}"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, 400);
+    }
+
+    /// CC.2.5.1.1 forbids COMPLETED while a `P` attribute has no value. The
+    /// end datetime (0040,4051) is 1C "required if set", so a report that
+    /// states a start with no end is the one case the Change State request
+    /// can decide on its own.
+    #[test]
+    fn a_started_report_with_no_end_cannot_complete() {
+        let mut w = performed_workitem();
+        w.performed_start_datetime = Some("20261109T100000".to_string());
+        w.performed_end_datetime = None;
+        let reason = missing_final_state_attributes(&w).expect("a start without an end");
+        assert!(
+            reason.contains("0040,4051"),
+            "names the attribute: {reason}"
+        );
+
+        // A report that never started has no end to be missing.
+        w.performed_start_datetime = None;
+        assert!(
+            missing_final_state_attributes(&w).is_none(),
+            "no report at all is not this gate's business"
+        );
+
+        // Both datetimes present is the conformant case.
+        w.performed_start_datetime = Some("20261109T100000".to_string());
+        w.performed_end_datetime = Some("20261109T101000".to_string());
+        assert!(missing_final_state_attributes(&w).is_none());
     }
 
     /// F5: a partial N-SET (only the end datetime) over a legacy record whose

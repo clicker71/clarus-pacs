@@ -61,14 +61,13 @@ class TestRegistryNonBooleanAccept:
     @pytest.mark.parametrize("value", ["yes", "no", "1", "0", "on", "off"])
     def test_a_string_accept_is_rejected(self, tmp_path, caplog, value):
         """`bool("no")` is True: coercing a string accepted a class the
-        operator wrote as refused."""
-        from clean_code.registry import _BUILTIN_SOP_CLASSES
+        operator wrote as refused. With no usable entry left, the file is a
+        configuration error rather than a silent revert to the built-ins."""
+        from clean_code.registry import RegistryConfigError
 
         with caplog.at_level(logging.ERROR):
-            registry = self._load(tmp_path, value)
-        assert (
-            registry == _BUILTIN_SOP_CLASSES()
-        ), f"accept: {value} was coerced instead of refused"
+            with pytest.raises(RegistryConfigError):
+                self._load(tmp_path, value)
         assert any(
             "non-boolean accept" in r.message for r in caplog.records
         ), "the operator must be told which UID and which value"
@@ -233,14 +232,26 @@ def test_a_midstream_raise_in_pass_one_preserves_the_counters():
     ), "the mid-stream handler must recover the counters from the job record"
     # Anchor on the CODE that only the guarded handler contains (the comment
     # wording is stripped above, and comments are not behaviour).
-    anchor = code.index("move_jobs.get_job_progress(job_id)")
+    anchor = code.index("recovered = _delivered_sops_of(")
     handler = code[anchor : code.index("if resumed_lost", anchor)]
     assert "raise" not in handler, "the failure must NOT re-raise out of the worker"
     assert (
         "resumed_lost = True" in handler
     ), "the loss must route into the reconciliation, not out of the worker"
     assert "_c1, _f1, _t1 = 0, 0, 0" in handler, "the fallback must still exist"
-    assert "sent_sop_uids = []" in handler
+    # P6 REPLACED `sent_sop_uids = []` with the recovery of the job's own
+    # delivered list: emptying it was the defect - the resume skip set came
+    # back empty and the second pass re-sent instances the destination had
+    # already acknowledged.
+    assert (
+        "sent_sop_uids = []" not in handler
+    ), "the mid-stream handler must not DISCARD the delivered set"
+    assert (
+        "_delivered_sops_of(" in handler
+    ), "the acknowledged SOP UIDs must be recovered from the job record"
+    assert (
+        "sent_sop_uids = list(recovered)" in handler
+    ), "the recovered set must become the pass's delivered list"
 
 
 # ---------------------------------------------------------------------------

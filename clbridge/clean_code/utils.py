@@ -7,13 +7,13 @@ Contains graceful shutdown event, signal handler, logging setup with rotation,
 and C-STORE dataset size measurement.
 """
 
+import contextlib
 import hashlib
 import hmac
 import io
 import ipaddress
 import logging
 import os
-import signal
 import sys
 import tempfile
 import threading
@@ -38,6 +38,15 @@ def set_pid_path(path: str) -> None:
     _pid_path = path
 
 
+# Set by the signal handler and read by the shutdown monitor, which emits the
+# log line. A signal handler may not log: every logging handler serialises its
+# I/O behind a lock, so if a worker thread is blocked writing to a redirected
+# stderr the handler would wait for that lock here - BEFORE setting the event -
+# and the monitor would never observe SIGTERM. The handler therefore records
+# only the signal it saw.
+_signal_seen = []
+
+
 def _signal_handler(signum, frame):
     """Handle SIGTERM/SIGINT/SIGBREAK  -  initiate graceful shutdown (BR-007).
 
@@ -45,12 +54,32 @@ def _signal_handler(signum, frame):
     The ShutdownMonitor thread (started in main.py) bridges this flag
     to pynetdicom's event loop by calling ae.shutdown() from a regular
     thread context, which is safe (not async-signal-restricted).
+
+    Deliberately NO logging and NO `signal.Signals(signum).name` lookup that
+    could raise: `_shutdown_requested.set()` must run on every path, because a
+    handler that raises before it leaves the bridge ignoring the signal. The
+    monitor reports the signal once it observes the event.
     """
-    sig_name = signal.Signals(signum).name
-    logging.info("Received %s, initiating graceful shutdown...", sig_name)
+    try:
+        _signal_seen.append(signum)
+    except Exception:
+        pass
     _shutdown_requested.set()
     # That's it. Nothing else. No timers, no os._exit, no file I/O.
     # ShutdownMonitor thread handles the rest.
+
+
+def take_signal_seen():
+    """The signal number observed by the handler, or None (consumed once).
+
+    The monitor calls this after it sees `_shutdown_requested`, so the log line
+    is emitted from a normal thread context where blocking on a handler lock is
+    harmless.
+    """
+    try:
+        return _signal_seen.pop() if _signal_seen else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +301,13 @@ def normalize_host(host):
     mapped = getattr(addr, "ipv4_mapped", None)
     if mapped is not None:
         addr = mapped
+    # An unspecified address is the wildcard bind in ANY spelling. The literal
+    # test above only catches the compressed `0.0.0.0` and `::`; the expanded
+    # IPv6 form `0:0:0:0:0:0:0:0` reaches here unchanged and would compare
+    # unequal to the `::` that a peers.conf entry normally writes, so a
+    # configured wildcard peer failed to match a loopback caller.
+    if addr.is_unspecified:
+        return "127.0.0.1"
     # The whole loopback block is one machine: `::1`, `[::1]` and `127.0.0.1`
     # must compare equal or a peers.conf entry saying `localhost` disagrees
     # with an A-ASSOCIATE from `::1`.
@@ -365,6 +401,82 @@ _MASK_KEY_READ_ATTEMPTS = 3
 _MASK_KEY_READ_PAUSE_S = 0.01
 
 
+@contextlib.contextmanager
+def _mask_key_file_lock(root: str):
+    """Hold an INTERPROCESS exclusive lock over the mask-key directory.
+
+    `_mask_key_lock` only serialises threads of one process. Two bridge
+    processes sharing an outbox (a rolling restart, a supervisor that starts
+    the replacement before the old one exits) could each see a missing key,
+    each publish its own, and each cache a DIFFERENT one - so the same
+    PatientID masked to two different tokens and log correlation broke across
+    the restart. That is exactly when an operator is reading both logs.
+
+    The lock file is a sibling of the key, created on demand and left in
+    place: an unlink would race the next opener. Blocking, unlike the startup
+    lock - a producer here holds it for one `os.replace`, so waiting is
+    cheaper than the wrong answer.
+
+    A lock that cannot be taken is not fatal: the in-process lock still holds
+    and the file-level protocol below still picks a single winner. Losing
+    cross-process serialisation degrades to the old behaviour rather than
+    refusing to log.
+    """
+    lock_path = os.path.join(root, ".patient_id_mask.key.lock")
+    handle = None
+    try:
+        os.makedirs(root, exist_ok=True)
+        handle = open(lock_path, "a+b")
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            # LK_LOCK retries for ~10 s internally before raising; the file is
+            # one byte and the holder releases in microseconds.
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError as exc:
+        logging.debug("[MASK] cross-process key lock unavailable (%s)", exc)
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            handle = None
+    except Exception as exc:  # pragma: no cover - platform oddity
+        logging.debug("[MASK] cross-process key lock unusable (%s)", exc)
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            handle = None
+
+    try:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
 def _publish_key(path: str, key: bytes) -> None:
     """Write `key` to `path` so no reader can ever observe a partial file.
 
@@ -439,10 +551,24 @@ def _mask_key() -> bytes:
 
 
 def _load_or_create_key() -> bytes:
-    """The load-or-repair sequence behind `_mask_key`, run under the lock."""
+    """The load-or-repair sequence behind `_mask_key`, run under the lock.
+
+    The whole sequence - read, validate, replace - runs under the interprocess
+    file lock, so only one process at a time can decide the key. Reading
+    before taking it was the race: a creator that paused between the
+    exclusive create and its rename let a second process time out on the
+    short file, publish its own key, and then have the first overwrite it,
+    leaving two live processes with different keys.
+    """
     root = _mask_key_dir_override or _outbox_root()
     path = os.path.join(root, ".patient_id_mask.key")
 
+    with _mask_key_file_lock(root):
+        return _load_or_create_key_locked(root, path)
+
+
+def _load_or_create_key_locked(root: str, path: str) -> bytes:
+    """Body of `_load_or_create_key`; the caller holds the file lock."""
     try:
         with open(path, "rb") as handle:
             existing = handle.read()

@@ -79,10 +79,14 @@ fn manifest(series_uid: &str, modality: &str, desc: &str, sop: &str) -> Manifest
 fn global_qido_scan_is_allocation_free_and_sorted() {
     // Fixtures while counting is disabled.
     ALLOC.set_enabled(false);
-    // Deliberately unsorted across manifests: series B then A, sop Z then A.
     let m_b = manifest("1.2.840.1.2", "CT", "Chest", "1.2.840.1.30");
     let m_a = manifest("1.2.840.1.1", "MR", "Head", "1.2.840.1.20");
-    let manifests = [m_a, m_b]; // [A, B] - already ascending; A holds "Head".
+    // REVERSE UID order. Handing the scans an already-ascending array made
+    // every "sorted" assertion below pass for a scan that merely preserved
+    // input order; with B first, only a real sort can produce A's UIDs at the
+    // head of the results.
+    let visible_sop = sop_uid_of(&m_a.series[0].instances[0]);
+    let manifests = [m_b, m_a];
 
     // -- Global series scan: warm once, then measure steady state --
     let mut sout: Vec<clarus_core::query::GlobalSeries<'_>> = Vec::new();
@@ -123,6 +127,20 @@ fn global_qido_scan_is_allocation_free_and_sorted() {
         "filtered search_all_series (steady state) must not allocate"
     );
     assert_eq!(count, 1, "only the MR series");
+    // WHICH series survived, not merely how many. A scan that returned only
+    // the CT series still gives `count == 1`; the filter's job is to keep MR.
+    let kept = series_uid_of(fout[0].series); // after the allocation window
+    assert_eq!(
+        kept.as_deref(),
+        Some("1.2.840.1.1"),
+        "the modality filter must retain the MR series"
+    );
+    let kept_modality = attr_text(&fout[0].series.attrs, 0x0008_0060);
+    assert_eq!(
+        kept_modality.as_deref(),
+        Some("MR"),
+        "the retained series must actually be the MR one"
+    );
 
     // -- Global instance scan: warm once, then measure --
     let mut iout: Vec<clarus_core::query::GlobalInstance<'_>> = Vec::new();
@@ -160,13 +178,20 @@ fn global_qido_scan_is_allocation_free_and_sorted() {
     );
 
     // -- The hide_rejected=true branch must also be allocation-free --------
-    // The AIRA filter is a `bool` field read on an already-mmap-decoded
-    // record, so it cannot allocate; this asserts that stays true if the
-    // guard is ever rewritten (e.g. into a collecting filter).
+    // Measured on a fixture that ACTUALLY holds a rejected instance and a
+    // visible one. The original block reused `manifests` (every fixture has
+    // `rejection_reason: 0`), so it re-ran the plain scan and could never show
+    // the filter doing anything: a scan that ignored the flag entirely passed.
+    let mut seq = manifest("1.2.840.1.3", "CT", "Sequestrated", "1.2.840.1.40");
+    seq.series[0].instances[0].rejection_reason = 0x0000_0001;
+    // A rejected fixture ALONGSIDE the clean ones: two visible instances
+    // (m_b, m_a) plus this one.
+    let mixed = [manifests[0].clone(), manifests[1].clone(), seq];
+
     let mut rout: Vec<clarus_core::query::GlobalInstance<'_>> = Vec::new();
     ALLOC.set_enabled(false);
     search_all_instances(
-        &manifests,
+        &mixed,
         &InstanceFilter::default(),
         &SeriesFilter::default(),
         None,
@@ -176,7 +201,7 @@ fn global_qido_scan_is_allocation_free_and_sorted() {
     ALLOC.set_enabled(true);
     let (zero_alloc_hide, hidden_count) = allocate_env(|| {
         search_all_instances(
-            &manifests,
+            &mixed,
             &InstanceFilter::default(),
             &SeriesFilter::default(),
             None,
@@ -189,7 +214,19 @@ fn global_qido_scan_is_allocation_free_and_sorted() {
         zero_alloc_hide,
         "search_all_instances with hide_rejected=true must not allocate"
     );
-    assert_eq!(hidden_count, 2, "no instance in the fixture is sequestered");
+    assert_eq!(
+        hidden_count, 2,
+        "the sequestered instance must be hidden from the scan"
+    );
+    let shown: Vec<Option<String>> = rout.iter().map(|r| sop_uid_of(r.instance)).collect();
+    assert!(
+        !shown.contains(&Some("1.2.840.1.40".to_string())),
+        "the rejected SOPInstanceUID must not be returned: {shown:?}"
+    );
+    assert!(
+        shown.contains(&visible_sop),
+        "the visible instance must still be returned: {shown:?}"
+    );
 
     // The borrowed Study/Series UIDs are injected for the renderer.
     assert_eq!(iout[0].study_uid, "1.2.840.1.7");

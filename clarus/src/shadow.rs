@@ -216,14 +216,33 @@ impl ShadowTier {
 
         // COLD: fold this process's own append into the memoized snapshot and
         // the cached segment length (the mutex is already held), so the next
-        // decision lookup skips the file re-load for this row, and make the
-        // cached day list see a day created by this very append.
+        // decision lookup skips the file re-load for this row.
         let day = *guard.index.current_day();
         if let Some(snap) = guard.sop_owner_cache.get_mut(&day) {
             snap.append_row(sop_instance_uid.as_bytes(), study_uid.as_bytes());
         }
         if let Some(len) = guard.sop_owner_lens.get_mut(&day) {
             *len += clarus_core::idx::sop_owner::ROW_LEN as u64;
+        }
+        // The FIRST sop_owner row of a day CREATES that day's file, and the
+        // cached day list (normally rebuilt only at rollover) must see the new
+        // key or a lookup before the next rollover misses the day entirely
+        // (access_journal_smoke's U-line scenario).
+        //
+        // MEMBERSHIP, not a tail comparison. The list is sorted, but
+        // `current_day` is not necessarily its newest key - a directory can
+        // already hold a LATER day (a clock that went backwards, or a
+        // backfill). In that case `last() != Some(&day)` is true on EVERY
+        // append and each one pushes another copy, so the list grows without
+        // bound and the binary search over it stops being deterministic.
+        // `binary_search` answers membership directly, making the push a
+        // one-time event per day.
+        //
+        // It runs HERE, next to the other sop_owner cache updates and before
+        // the fallible series-owner block below: the SOP row is already on
+        // disk, so a series-owner failure must not leave the day unreachable.
+        if let Err(pos) = guard.sop_owner_days.binary_search(&day) {
+            guard.sop_owner_days.insert(pos, day);
         }
 
         // 1611 #14: write the series_owner row (Series -> Study) in the SAME
@@ -232,9 +251,43 @@ impl ShadowTier {
         // appender once and reuse it (the rollover registry in clarus_core is
         // fixed at startup, so `current_day` is the only day this process
         // writes).
+        //
+        // ORDER: the sop_owner day membership is published ABOVE, next to the
+        // other sop_owner cache updates, and BEFORE this fallible block. The
+        // SOP row itself is already on disk by then; if the series-owner open
+        // or append fails, the cached day list still sees the day - otherwise
+        // every later same-day lookup skipped the file holding a row that IS
+        // persisted.
         {
             let writer = match guard.series_owner_writer.as_mut() {
-                Some((d, w)) if *d == day => w,
+                // A POISONED handle must never be reused: its last
+                // `write_all` stopped mid-row, so appending onto its tail
+                // would land the next record at a misaligned offset and every
+                // reader after that would skip a valid row. Reusing it also
+                // made the failure permanent - the handle lives until the day
+                // changes, so the index stayed unwritable long after the disk
+                // recovered. Dropping it here forces a fresh open (which
+                // truncates the torn tail) on the next append.
+                Some((d, w)) if *d == day && !w.is_poisoned() => w,
+                Some((d, _)) if *d == day => {
+                    crate::clog_warn!(
+                        "series_owner: discarding a poisoned appender; the next append reopens and repairs the segment"
+                    );
+                    guard.series_owner_writer = None;
+                    let w = series_owner::open_appender(&self.idx_dir, &day)
+                        .map_err(|e| ShadowError::SeriesOwner(e.to_string()))?;
+                    guard.series_owner_writer = Some((day, w));
+                    // The cached snapshot and length were built from a
+                    // segment that is about to be repaired, so they no longer
+                    // describe the file on disk.
+                    guard.series_owner_cache.remove(&day);
+                    guard.series_owner_lens.remove(&day);
+                    &mut guard
+                        .series_owner_writer
+                        .as_mut()
+                        .expect("just initialised")
+                        .1
+                }
                 _ => {
                     let w = series_owner::open_appender(&self.idx_dir, &day)
                         .map_err(|e| ShadowError::SeriesOwner(e.to_string()))?;
@@ -259,22 +312,6 @@ impl ShadowTier {
         // Same one-entry-per-day membership rule as the sop_owner day list.
         if let Err(pos) = guard.series_owner_days.binary_search(&day) {
             guard.series_owner_days.insert(pos, day);
-        }
-        // The FIRST row of a day CREATES that day's file: the cached day list
-        // (normally rebuilt only at rollover) must see the new key, or a
-        // lookup before the next rollover would miss the day entirely (caught
-        // by access_journal_smoke's U-line scenario).
-        //
-        // MEMBERSHIP, not a tail comparison. The list is sorted, but `current_day`
-        // is not necessarily its newest key - a directory can already hold a
-        // LATER day (a clock that went backwards, or a backfill). In that case
-        // `last() != Some(&day)` is true on EVERY append for `current_day`, and
-        // each one pushes another copy: the list grows without bound and the
-        // binary search that reads it starts returning whichever duplicate it
-        // lands on. `binary_search` answers membership directly, so the push is
-        // a one-time event per day.
-        if let Err(pos) = guard.sop_owner_days.binary_search(&day) {
-            guard.sop_owner_days.insert(pos, day);
         }
 
         Ok(())
@@ -398,8 +435,13 @@ impl ShadowTier {
         // or on first use. Old days are immutable, so their snapshots stay
         // valid.
         let cur_day = *guard.index.current_day();
-        if guard.sop_owner_days_for != Some(cur_day) {
-            guard.sop_owner_days = list_sop_owner_days(&self.idx_dir);
+        if guard.sop_owner_days_for != Some(cur_day)
+            && let Some(days) = list_sop_owner_days(&self.idx_dir)
+        {
+            // Only a COMPLETE scan becomes the cache: marking a failed scan
+            // current would make every later lookup skip the directory, and
+            // the historical days would stay invisible until a restart.
+            guard.sop_owner_days = days;
             guard.sop_owner_days_for = Some(cur_day);
         }
 
@@ -481,8 +523,12 @@ impl ShadowTier {
         // COLD: rebuild the day list on first use / rollover (same policy as
         // the sop_owner day list).
         let cur_day = *guard.index.current_day();
-        if guard.series_owner_days_for != Some(cur_day) {
-            guard.series_owner_days = list_series_owner_days(&self.idx_dir);
+        if guard.series_owner_days_for != Some(cur_day)
+            && let Some(days) = list_series_owner_days(&self.idx_dir)
+        {
+            // Same contract as the sop_owner day list: a failed scan is not
+            // an empty directory.
+            guard.series_owner_days = days;
             guard.series_owner_days_for = Some(cur_day);
         }
 
@@ -546,46 +592,77 @@ impl ShadowTier {
 
 /// A5: scan the `sop_owner` directory once and return the sorted day keys
 /// (the `read_dir` + sort tax moved out of the per-lookup path).
-fn list_sop_owner_days(idx_dir: &Path) -> Vec<DayKey> {
+///
+/// `None` means the directory could not be enumerated. That is NOT an empty
+/// list: caching it as current would make every later same-day lookup skip the
+/// directory, and once the failure clears only a NEW day re-enters the cache -
+/// the historical days would stay missing from every answer until the process
+/// restarts. An absent directory is a genuinely empty one (first run).
+fn list_sop_owner_days(idx_dir: &Path) -> Option<Vec<DayKey>> {
     let sop_owner_dir = idx_dir.join("sop_owner");
     let mut days: Vec<DayKey> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&sop_owner_dir) {
-        for ent in rd.flatten() {
-            let name = ent.file_name();
-            let name = name.to_string_lossy();
-            // `YYYYMMDD.idx` (12 chars). Guard the slice to keep the
-            // compiler happy about the `[..8]` prefix split.
-            if name.ends_with(".idx")
-                && name.len() == 12
-                && let Ok(bytes) = name.as_bytes()[..8].try_into()
-            {
-                days.push(bytes);
+    match std::fs::read_dir(&sop_owner_dir) {
+        Ok(rd) => {
+            for ent in rd {
+                let ent = ent.ok()?;
+                let name = ent.file_name();
+                let name = name.to_string_lossy();
+                // `YYYYMMDD.idx` (12 chars). Guard the slice to keep the
+                // compiler happy about the `[..8]` prefix split.
+                if name.ends_with(".idx")
+                    && name.len() == 12
+                    && let Ok(bytes) = name.as_bytes()[..8].try_into()
+                {
+                    days.push(bytes);
+                }
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(e) => {
+            crate::clog_warn!(
+                error = %e,
+                dir = %sop_owner_dir.display(),
+                "sop_owner day scan failed; keeping the previous day list"
+            );
+            return None;
         }
     }
     days.sort_unstable();
-    days
+    Some(days)
 }
 
 /// A5: scan the `series_owner` directory once and return the sorted day keys
-/// (same `read_dir` + sort tax moved out of the per-lookup path).
-fn list_series_owner_days(idx_dir: &Path) -> Vec<DayKey> {
+/// (same `read_dir` + sort tax moved out of the per-lookup path). Same
+/// fallibility contract as [`list_sop_owner_days`].
+fn list_series_owner_days(idx_dir: &Path) -> Option<Vec<DayKey>> {
     let series_owner_dir = idx_dir.join("series_owner");
     let mut days: Vec<DayKey> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&series_owner_dir) {
-        for ent in rd.flatten() {
-            let name = ent.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".idx")
-                && name.len() == 12
-                && let Ok(bytes) = name.as_bytes()[..8].try_into()
-            {
-                days.push(bytes);
+    match std::fs::read_dir(&series_owner_dir) {
+        Ok(rd) => {
+            for ent in rd {
+                let ent = ent.ok()?;
+                let name = ent.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".idx")
+                    && name.len() == 12
+                    && let Ok(bytes) = name.as_bytes()[..8].try_into()
+                {
+                    days.push(bytes);
+                }
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(e) => {
+            crate::clog_warn!(
+                error = %e,
+                dir = %series_owner_dir.display(),
+                "series_owner day scan failed; keeping the previous day list"
+            );
+            return None;
         }
     }
     days.sort_unstable();
-    days
+    Some(days)
 }
 
 /// Compute the BLAKE3 digest of the stored DICOM bytes (the date-index key).
@@ -674,5 +751,131 @@ mod tests {
             "the list must stay sorted without duplicates: {:?}",
             guard.sop_owner_days
         );
+    }
+
+    /// A day scan that FAILS must be distinguishable from an empty directory.
+    ///
+    /// The lookup used to cache the result of any scan, including one that
+    /// could not enumerate the directory. The empty list then looked current,
+    /// so every later same-day lookup skipped a directory that already held
+    /// rows - and only a new day would ever re-enter the cache.
+    #[test]
+    fn a_failed_day_scan_is_not_reported_as_an_empty_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // No directory at all: genuinely empty, and the first run's shape.
+        assert_eq!(
+            list_sop_owner_days(dir.path()),
+            Some(Vec::new()),
+            "a missing directory is an empty one"
+        );
+
+        // A path that cannot be ENUMERATED: a regular FILE where the day
+        // directory belongs. `read_dir` then fails with ENOTDIR on every
+        // platform, which is the condition under test - unlike `chmod 0300`,
+        // which a privileged (root/CI) runner ignores and the test then failed
+        // on a perfectly valid day list.
+        let blocked = dir.path().join("sop_owner");
+        std::fs::write(&blocked, b"not a directory").expect("occupy the path");
+        assert_eq!(
+            list_sop_owner_days(dir.path()),
+            None,
+            "a directory that cannot be enumerated must not answer with a day list"
+        );
+    }
+
+    /// The sop_owner day membership is published before the fallible
+    /// series-owner append.
+    ///
+    /// The SOP row is already on disk when that block runs, so a series-owner
+    /// failure must not leave today unreachable from the cached day list: the
+    /// append returns an error, and a later same-day lookup still has to find
+    /// the persisted SOP row.
+    #[test]
+    fn a_failed_series_owner_append_leaves_the_sop_day_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tier = ShadowTier::new(dir.path().to_path_buf());
+        let day = *tier.inner.lock().unwrap().index.current_day();
+
+        // Occupy the series-owner day segment with a DIRECTORY, so the
+        // appender cannot be opened for it.
+        let seg = dir.path().join("series_owner").join(format!(
+            "{}.idx",
+            std::str::from_utf8(&day).expect("ascii day")
+        ));
+        std::fs::create_dir_all(&seg).expect("occupy the day segment");
+
+        let err = tier
+            .dual_write(
+                [7u8; 32],
+                "CT",
+                "1.2.840.9.10",
+                "1.2.840.9.10.1",
+                "1.2.840.9.10.0.1",
+            )
+            .expect_err("the series-owner append must fail");
+        assert!(
+            matches!(err, ShadowError::SeriesOwner(_)),
+            "expected the series-owner stage, got {err:?}"
+        );
+
+        let guard = tier.inner.lock().unwrap();
+        assert!(
+            guard.sop_owner_days.contains(&day),
+            "the SOP row is on disk, so the day must stay reachable: {:?}",
+            guard.sop_owner_days
+        );
+    }
+
+    /// A POISONED series-owner appender must be replaced, not reused.
+    ///
+    /// The handle lives until the day changes, so selecting it again left the
+    /// index unwritable for the rest of the day - even after the disk
+    /// recovered - and every later upload silently lost its series-owner row.
+    /// The recovery must also drop the cached snapshot and length, which
+    /// described a segment that is about to be repaired.
+    #[test]
+    fn a_poisoned_series_owner_appender_is_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tier = ShadowTier::new(dir.path().to_path_buf());
+        let day = *tier.inner.lock().unwrap().index.current_day();
+
+        // First upload: a healthy appender is created and a row lands.
+        tier.dual_write(
+            [1u8; 32],
+            "CT",
+            "1.2.840.9.11",
+            "1.2.840.9.11.1",
+            "1.2.840.9.11.0.1",
+        )
+        .expect("first upload");
+
+        // Simulate the failed `write_all` that poisons the handle.
+        {
+            let mut guard = tier.inner.lock().unwrap();
+            let (_, writer) = guard
+                .series_owner_writer
+                .as_mut()
+                .expect("an appender was opened");
+            writer.poison_for_test();
+        }
+
+        // The next upload must reopen and repair, not fail on the dead handle.
+        tier.dual_write(
+            [2u8; 32],
+            "CT",
+            "1.2.840.9.12",
+            "1.2.840.9.12.1",
+            "1.2.840.9.12.0.1",
+        )
+        .expect("a poisoned appender must be replaced, not reused");
+
+        let guard = tier.inner.lock().unwrap();
+        let (d, writer) = guard
+            .series_owner_writer
+            .as_ref()
+            .expect("a fresh appender is installed");
+        assert_eq!(*d, day, "the replacement is for the same day");
+        assert!(!writer.is_poisoned(), "the replacement is healthy");
     }
 }

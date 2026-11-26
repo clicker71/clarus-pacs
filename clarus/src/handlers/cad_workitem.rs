@@ -10,10 +10,16 @@
 //! who consumes the workitem or why.
 //!
 //! # Contract
-//! - ONE workitem per study, forever. The UID is derived deterministically
-//!   from the StudyInstanceUID, so a re-STOW of the same study collides with
-//!   the existing record and the duplicate check turns the second attempt
-//!   into a no-op. Idempotency is the UID, not a lookup table.
+//! - One workitem per (study, catalog code) WHILE THE IDENTITY IS RETAINED.
+//!   The UID is derived deterministically from the StudyInstanceUID together
+//!   with the catalog code, so a re-STOW of the same study collides with the
+//!   existing record and the duplicate check turns the second attempt into a
+//!   no-op. Idempotency is the UID, not a lookup table - and that is why the
+//!   promise is bounded: once the record is DELETED (by UPS Delete or the
+//!   retention sweep) the UID is free again, and the next eligible STOW
+//!   inserts a fresh workitem under it. Lifetime deduplication would need a
+//!   completion marker that survives deletion, which this module does not
+//!   keep.
 //! - Fire-and-forget. A creation failure is logged and counted; it NEVER
 //!   fails the STOW and never changes its response bytes.
 //! - Strictly after the durable sync point. The caller invokes this after
@@ -31,6 +37,9 @@ use std::sync::atomic::Ordering;
 use clarus_core::ups::{StoreError, WorkItemRecord, WorkItemStore};
 
 use crate::state::AppState;
+// The event publishers live on the `EventSink` trait, not inherent on the
+// sink: importing it is what makes `notify_created` resolve.
+use crate::handlers::ups_pure::EventSink as _;
 /// Root of the derived workitem UID (`2.25` = the ISO/ITU-T joint root used
 /// by the UUID-derived identifiers elsewhere in the product).
 const CAD_UID_ROOT: &str = "2.25.";
@@ -352,6 +361,10 @@ pub fn build_record_for_entry(
         // concurrency counter starts at 0 - the value `cas_update` treats as
         // "this caller read nothing yet".
         revision: 0,
+        // This builder IS the readiness producer, so the marker is what makes
+        // the record identifiable as ours when the debounce sweeps the study
+        // later: a requester's workitem on the same study carries `None`.
+        minted_by: Some(clarus_core::ups::MINTED_BY_READINESS.to_string()),
     }
 }
 
@@ -447,15 +460,26 @@ fn log_empty_selection(state: &AppState, study_uid: &str, modalities: &[String])
 /// performer woken by the READY announcement would claim an input the sender
 /// has since extended.
 ///
-/// Deliberately SILENT: nothing is published on this flip. An INCOMPLETE
-/// regression is not an offer, and the performer's own guard (AIW-I
-/// 4.82.4.1.1) already refuses a claim while the input is INCOMPLETE - which
-/// is the standard's arrangement, not a gap. The later promotion publishes
-/// through the one existing path, exactly as it does for a fresh study.
+/// REPORTED, not silent: PS3.4 CC.2.4.3 requires the SCP to report a created
+/// workitem AND every change of its Input Readiness State, each report
+/// carrying the readiness the record now holds. A performer woken earlier and
+/// still deciding whether to claim needs to see the input fall back, otherwise
+/// its view says READY while the record says INCOMPLETE.
+///
+/// The report is not an offer: it carries INCOMPLETE, which a performer
+/// refuses to claim (PS3.4 CC.2.4). Only the later `promote` sends READY.
 ///
 /// A workitem that is not SCHEDULED is left ALONE, the same rule `promote`
 /// follows: it has been claimed, cancelled or completed, and rewriting its
 /// readiness would change what that claim was about after the fact.
+///
+/// Returns `true` when the record is left in the state the caller expects:
+/// already INCOMPLETE/unset (nothing to revise), not SCHEDULED (left alone),
+/// or the regression write committed. Returns `false` when the write FAILED.
+///
+/// Reporting that failure matters: the record is still READY, so a performer
+/// could claim a study whose input has just been extended. The caller must not
+/// treat the workitem as settled, and the failure is counted for retry.
 ///
 /// `pub` rather than private so the ap101 allocation gate in
 /// `tests/ap101_readiness.rs` can call it: an integration test is a separate
@@ -463,17 +487,18 @@ fn log_empty_selection(state: &AppState, study_uid: &str, modalities: &[String])
 /// other gate-measured builders in this module carry
 /// ([`workitem_uid_for_study`], [`build_record`]).
 pub fn regress_readiness_on_new_instances(
+    state: &AppState,
     store: &WorkItemStore,
     existing: clarus_core::ups::WorkItemRecord,
-) {
+) -> bool {
     if existing.workflow_state != STATE_SCHEDULED {
-        return;
+        return true;
     }
     if existing.input_readiness.as_deref() != Some(super::readiness::READINESS_READY) {
         // Already INCOMPLETE (the ordinary mid-upload case) or unset: nothing
         // to revise, and re-writing the same value would only churn the
         // record's `updated_at`.
-        return;
+        return true;
     }
 
     let workitem_uid = existing.workitem_uid.clone();
@@ -483,17 +508,29 @@ pub fn regress_readiness_on_new_instances(
     // `None` for the expected transaction UID, the same shape `promote` uses:
     // this is a readiness revision, not a state transition, and the workitem
     // is still SCHEDULED, which is what no-performer-held means.
-    if let Err(error) = store.cas_update(&record, None, None) {
-        crate::clog_warn!(
-            workitem_uid = %workitem_uid,
-            error = %error,
-            "CAD workitem: cannot write the INCOMPLETE regression after a re-STOW"
-        );
-    } else {
-        crate::clog_info!(
-            workitem_uid = %workitem_uid,
-            "CAD workitem input is INCOMPLETE again; the study received more instances"
-        );
+    match store.cas_update(&record, None, None) {
+        Ok(()) => {
+            crate::clog_info!(
+                workitem_uid = %workitem_uid,
+                "CAD workitem input is INCOMPLETE again; the study received more instances"
+            );
+            // Published only AFTER the write committed: a report must not
+            // describe a state the record does not hold (PS3.4 CC.2.4.3).
+            state.ups_events.notify_readiness_change(
+                &workitem_uid,
+                super::readiness::READINESS_READY,
+                super::readiness::READINESS_INCOMPLETE,
+                crate::handlers::ups::event_bus::FilterRouting::from_record(&record),
+            );
+            true
+        }
+        Err(error) => {
+            // The record still says READY. Counted so the failure is visible
+            // and retried, and reported to the caller so it does NOT treat the
+            // workitem as settled.
+            record_failure(&error, &workitem_uid, "readiness regression");
+            false
+        }
     }
 }
 
@@ -546,7 +583,7 @@ pub fn create_for_study_with_identity(
         // the patient identity and the readiness arm below, and differ in the
         // code, its label, its trigger modality and the station they are
         // addressed to.
-        if !create_one(&store, study_instance_uid, patient_id, issuer, entry) {
+        if !create_one(state, &store, study_instance_uid, patient_id, issuer, entry) {
             all_ok = false;
         }
     }
@@ -566,6 +603,7 @@ pub fn create_for_study_with_identity(
 /// Split from the loop so the per-entry branch - duplicate versus fresh - is
 /// read once rather than inferred from the loop body.
 fn create_one(
+    state: &AppState,
     store: &WorkItemStore,
     study_instance_uid: &str,
     patient_id: Option<&str>,
@@ -590,8 +628,11 @@ fn create_one(
             // this - it only moves the deadline - so the flip is written here.
             // It applies to EVERY entry of the study, because the new instance
             // extended the input all of them operate on.
-            regress_readiness_on_new_instances(store, existing);
-            return true;
+            //
+            // A FAILED regression is not success: the record still says READY,
+            // so a claim could act on the extended input. The caller is told so
+            // the task is not treated as settled and can be retried.
+            return regress_readiness_on_new_instances(state, store, existing);
         }
         Ok(None) => {}
         Err(e) => {
@@ -636,6 +677,26 @@ fn create_one(
                 code = %entry.code_value,
                 station = %entry.station_aet.as_deref().unwrap_or("<none>"),
                 "CAD workitem created INCOMPLETE for stored study"
+            );
+            // PS3.4 CC.2.4.3: the SCP reports the creation of a workitem and
+            // every change of its Input Readiness State, carrying the ACTUAL
+            // readiness. Suppressing this report entirely meant a subscriber
+            // saw only the delayed READY offer and could not tell that a
+            // workitem had been created but was not yet claimable.
+            //
+            // The report is NOT the performer offer: `notify_created` sends a
+            // SCHEDULED state report whose `input_readiness` is INCOMPLETE, so
+            // a performer reading it sees an input it must not claim (PS3.4
+            // CC.2.4 refuses a claim while the input is INCOMPLETE). The
+            // readiness.rs promotion sends the READY report later, and that is
+            // the one that invites a claim.
+            //
+            // The POST push stays suppressed here: it is the wake-up a
+            // performer acts on, and waking one for an unfinished study is the
+            // defect the whole readiness debounce exists to prevent.
+            state.ups_events.notify_created(
+                workitem_uid,
+                crate::handlers::ups::event_bus::FilterRouting::from_record(&record),
             );
             true
         }

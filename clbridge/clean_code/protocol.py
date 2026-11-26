@@ -93,22 +93,50 @@ NON_IMAGE_TS = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
 # accepted, released with no C-STORE; a probe against a live peer proved the
 # rejects). The SCP side has NO fallback mechanism - a rejected context is a
 # failed export. The bridge never decodes incoming pixels (store bytes ->
-# STOW), so the incoming list mirrors exactly what the server can ingest:
-# the transcode announceable set plus the two native uncompressed TS. The
-# SCU proposal keeps its narrower list above.
+# STOW), so this list mirrors what the SERVER CAN INGEST AS-IS, and nothing
+# else. It is deliberately BROADER than the transcode announceable set
+# (IMAGE_TS): the negotiation decides what a sender may use, and a syntax the
+# server accepts is a context the bridge must not refuse.
+#
+# The wider entries are not a claim that every one of them is common. They
+# close the "sender offers only this" case, which used to be a silent failed
+# export:
+#   - HTJ2K (4.201/.202/.203) and JPEG 2000 Part 2 (4.92/.93): the server
+#     writes header attributes into these instances and decodes them, so the
+#     bridge would be refusing bytes its own archive handles.
+#   - MPEG family (4.100-.105): the server does not decode video, exactly
+#     like 4.51 today - stored and served raw, which is what a sender holding
+#     a video object needs. This mirrors the "store+serve raw" case, not a
+#     claim of analysis support.
+#
 # Order: uncompressed first - acceptor-driven negotiation picks the first
-# supported match when a sender offers several TS per context.
+# supported match when a sender offers several TS per context - and the
+# appended syntaxes keep their ascending UID order after the existing set.
 # ---------------------------------------------------------------------------
 IMAGE_TS_INCOMING = [
     ExplicitVRLittleEndian,  # native
     ImplicitVRLittleEndian,  # native
     JPEGLS_LOSSLESS_TS,  # 4.80 JPEG-LS Lossless (server CAPS)
     "1.2.840.10008.1.2.4.70",  # 4.70 JPEG Lossless SV1 (server CAPS)
+    "1.2.840.10008.1.2.4.57",  # 4.57 JPEG Lossless P14 (server CAPS: JpegLosslessCodec)
     "1.2.840.10008.1.2.4.50",  # 4.50 JPEG Baseline (server CAPS; field US scanner)
+    "1.2.840.10008.1.2.4.51",  # 4.51 JPEG Extended (server parses; store+serve raw, no transcode)
     RLELossless,  # 4.1.2.5 RLE (server CAPS; field US)
     "1.2.840.10008.1.2.4.81",  # 4.81 JPEG-LS Near-Lossless (server CAPS)
     "1.2.840.10008.1.2.4.90",  # 4.90 JPEG 2000 Lossless (server CAPS)
     "1.2.840.10008.1.2.4.91",  # 4.91 JPEG 2000 (server CAPS)
+    # Appended 21.11 - see the "what the server can ingest as-is" note above.
+    "1.2.840.10008.1.2.4.92",  # 4.92 JPEG 2000 Part 2 Multi-component Lossless
+    "1.2.840.10008.1.2.4.93",  # 4.93 JPEG 2000 Part 2 Multi-component
+    "1.2.840.10008.1.2.4.100",  # 4.100 MPEG2 Main Profile / Main Level
+    "1.2.840.10008.1.2.4.101",  # 4.101 MPEG2 Main Profile / High Level
+    "1.2.840.10008.1.2.4.102",  # 4.102 MPEG-4 AVC/H.264 High Profile / Level 4.1
+    "1.2.840.10008.1.2.4.103",  # 4.103 MPEG-4 AVC/H.264 BD-compatible High / Level 4.1
+    "1.2.840.10008.1.2.4.104",  # 4.104 MPEG-4 AVC/H.264 High / Level 4.2 For 2D
+    "1.2.840.10008.1.2.4.105",  # 4.105 MPEG-4 AVC/H.264 High / Level 4.2 For 3D
+    "1.2.840.10008.1.2.4.201",  # 4.201 HTJ2K Lossless (server decodes)
+    "1.2.840.10008.1.2.4.202",  # 4.202 HTJ2K Lossless RPCL (server decodes)
+    "1.2.840.10008.1.2.4.203",  # 4.203 HTJ2K Lossy (server decodes)
 ]
 
 
@@ -177,6 +205,9 @@ QIDO_KEY_TO_TAG = {
     "00100040": (0x0010, 0x0040, "CS", "PatientSex"),
     "0020000D": (0x0020, 0x000D, "UI", "StudyInstanceUID"),
     "00200010": (0x0020, 0x0010, "SH", "StudyID"),
+    "00201200": (0x0020, 0x1200, "IS", "NumberOfPatientRelatedStudies"),
+    "00201202": (0x0020, 0x1202, "IS", "NumberOfPatientRelatedSeries"),
+    "00201204": (0x0020, 0x1204, "IS", "NumberOfPatientRelatedInstances"),
     "00201206": (0x0020, 0x1206, "IS", "NumberOfStudyRelatedSeries"),
     "00201208": (0x0020, 0x1208, "IS", "NumberOfStudyRelatedInstances"),
 }
@@ -191,6 +222,18 @@ _SERIES_ONLY_QIDO_PARAMS = frozenset(
         "SeriesDate",
         "SeriesTime",
         "SeriesDescription",
+    }
+)
+
+# C-FIND COMPOSITE OBJECT INSTANCE (IMAGE) level: the query keys the server
+# accepts ONLY on its instance routes. `/studies/{s}/series/{se}` answers a
+# request carrying any of them with 400 ("unsupported search keys"), so they
+# must not travel with the series hop of an IMAGE-level walk.
+_INSTANCE_ONLY_QIDO_PARAMS = frozenset(
+    {
+        "SOPInstanceUID",
+        "SOPClassUID",
+        "InstanceNumber",
     }
 )
 
@@ -234,6 +277,31 @@ _STUDY_IDENTITY_ATTRS = {
     "StudyInstanceUID": (0x0020, 0x000D),
 }
 
+# COMPOSITE OBJECT INSTANCE (IMAGE) level, PS3.4 Table C.6-4
+# (standard/ps3.4/image-level-C.6-4.json): Instance Number (0020,0013) is the
+# level's Required key, SOP Instance UID (0008,0018) its Unique key, SOP Class
+# UID (0008,0016) optional. The server's instance render carries exactly these
+# three plus the Study/Series UIDs it injects from context and
+# InstanceAvailability/RetrieveURL, so the map below needs no tag knowledge
+# the series map does not already have.
+QIDO_INSTANCE_KEY_TO_TAG = {
+    "00080016": (0x0008, 0x0016, "UI", "SOPClassUID"),
+    "00080018": (0x0008, 0x0018, "UI", "SOPInstanceUID"),
+    "00200013": (0x0020, 0x0013, "IS", "InstanceNumber"),
+}
+
+# Attributes stored in the series record that an IMAGE row carries as well:
+# PS3.4 Table C.6-4 leaves the other Series IE keys optional at this level, and
+# a viewer that walked STUDY -> SERIES -> IMAGE expects the series context on
+# the instance row. Only keys the server's series render supplies are listed.
+_INSTANCE_SERIES_CONTEXT = frozenset(
+    {
+        "00080060",  # Modality
+        "0008103E",  # SeriesDescription
+        "00200011",  # SeriesNumber
+    }
+)
+
 
 # C-FIND keyword -> QIDO query parameter.
 #
@@ -265,6 +333,12 @@ C_FIND_TO_QIDO = {
     "SeriesTime": "SeriesTime",
     "SeriesDescription": "SeriesDescription",
     "SOPInstanceUID": "SOPInstanceUID",
+    # PS3.4 Table C.6-4: the Composite Object Instance level's matching keys.
+    # SOPClassUID is optional there and InstanceNumber is its Required key, so
+    # an IMAGE-level request that names them must reach the server as a filter
+    # rather than be dropped (= match all).
+    "SOPClassUID": "SOPClassUID",
+    "InstanceNumber": "InstanceNumber",
 }
 
 
@@ -379,6 +453,40 @@ def _split_qido_params(ds):
     return study_params, series_params
 
 
+def _split_instance_qido_params(ds):
+    """Split an IMAGE-level C-FIND identifier into study/series/instance params.
+
+    Returns `(study_params, series_params, instance_params)` for the three QIDO
+    hops of an IMAGE-level query (PS3.4 C.4.1.3.1.1: match down the hierarchy
+    from the top level to the level named by QueryRetrieveLevel).
+
+    Three keys need care because the server scopes them to particular routes
+    (qido_pure.rs `parse_and_validate`):
+
+    - `Modality` is legal at the instance route but is a SERIES key in this
+      query (a C-FIND IMAGE request states it to narrow the walk, and the
+      series step applies it), so it stays on the series hop.
+    - `SeriesInstanceUID` is a series key everywhere except the instance
+      route, where it is foreign; it narrows the series hop and the instance
+      rows are already scoped to that one series.
+    - `SOPInstanceUID`, `SOPClassUID` and `InstanceNumber` are instance keys
+      the series route rejects with 400, so they never travel with the series
+      parameters.
+    """
+    all_params = _build_qido_params(ds)
+    study_params = {}
+    series_params = {}
+    instance_params = {}
+    for key, val in all_params.items():
+        if key in _INSTANCE_ONLY_QIDO_PARAMS:
+            instance_params[key] = val
+        elif key in _SERIES_ONLY_QIDO_PARAMS or key == "Modality":
+            series_params[key] = val
+        else:
+            study_params[key] = val
+    return study_params, series_params, instance_params
+
+
 # MWL (Modality Worklist) <-> UPS-RS workitem DICOMweb JSON keys.
 #
 # PS3.4 2026d Table K.6-1: the Modality Worklist Information Model is a FLAT,
@@ -475,6 +583,292 @@ MWL_TO_UPS_PARAM = {
     "ScheduledProcedureStepStartDate": "00404005",
 }
 
+# PS3.4 Table K.6-1 (standard/ps3.4/mwl-k.6-1-matching-keys.json) makes
+# Scheduled Procedure Step Start Time (0040,0003) a REQUIRED matching key of
+# the SPS item, with the rule "Single Value or Range". Omitting it turned a
+# 09:00-10:00 query into "match all": the bridge returned a 14:00 workitem
+# alongside the 09:30 one. It has no separate UPS parameter - the origin filters
+# on the combined workitem start instant (0040,4005) - so the time is folded
+# into that value together with the date.
+MWL_START_TIME_KEYWORD = "ScheduledProcedureStepStartTime"
+
+# PS3.4 Table K.6-1 lists Scheduled Performing Physician's Name (0040,0006) as
+# a matching key with the rule "Single Value or Wildcard". The UPS-RS workitem
+# search exposes no parameter for it, so it cannot be pushed to the origin -
+# but dropping it made the request match ALL workitems and a Jones procedure
+# came back for a `Smith*` query. It is carried here and applied as a local
+# wildcard filter over the response rows.
+MWL_PHYSICIAN_KEYWORD = "ScheduledPerformingPhysicianName"
+
+
+def _mwl_physician_matchers(ds):
+    """The Scheduled Performing Physician patterns the request asked for.
+
+    PS3.4 Table K.6-1 gives (0040,0006) the rule "Single Value or Wildcard",
+    where the wildcard is `*` (PS3.4 C.2.2.2.4) and `?` matches one character.
+    Each value is compiled once here, as a case-insensitive full match, and
+    shared by every candidate row.
+
+    Returns an empty tuple when the request states no physician, so the caller
+    skips the filter entirely.
+    """
+    import re as _re
+
+    patterns = []
+    for elem in _iter_mwl_request_elements(ds):
+        if elem.keyword != MWL_PHYSICIAN_KEYWORD:
+            continue
+        if elem.value is None:
+            continue
+        raw_values = (
+            elem.value
+            if isinstance(elem.value, (list, tuple, MultiValue))
+            else [elem.value]
+        )
+        for raw in raw_values:
+            pattern = str(raw or "").strip()
+            if not pattern:
+                continue
+            # `*` is any run and `?` exactly one character (PS3.4 C.2.2.2.4).
+            # Everything else is literal, so the value is quoted and only the
+            # two wildcard characters are translated - a name containing a
+            # regex metacharacter must not become a pattern.
+            translated = "".join(
+                ".*" if ch == "*" else "." if ch == "?" else _re.escape(ch)
+                for ch in pattern
+            )
+            try:
+                patterns.append(_re.compile(rf"\A{translated}\Z", _re.IGNORECASE))
+            except _re.error:
+                # An unparseable pattern cannot be honoured; keeping it would
+                # reject every row for a request the origin already answered.
+                continue
+    return tuple(patterns)
+
+
+def _mwl_physician_matches(stored, matchers):
+    """Whether a stored physician name satisfies at least one request pattern.
+
+    A row that carries no physician is KEPT: Type 2 permits an absent value,
+    and absence is not proof that the name differs from the query. A request
+    that states no physician (no matchers) keeps everything.
+    """
+    if not matchers:
+        return True
+    text = str(stored or "").strip()
+    if not text:
+        return True
+    return any(m.match(text) for m in matchers)
+
+
+def _mwl_start_datetime_bounds(ds):
+    """The SPS start DATE+TIME window the request asks for, or None.
+
+    PS3.4 Table K.6-1 defines (0040,0002) Start Date and (0040,0003) Start
+    Time as separate matching keys, but they describe ONE interval: July 5-7
+    at 10:00-18:00 includes a July 6 workitem at 22:00, because the time-of-day
+    window applies inside the date range, not on top of it. Filtering each key
+    independently dropped that workitem - the date query fetched it, then the
+    time-of-day filter discarded it because 22:00 is outside 10:00-18:00.
+
+    The combined window is expressed as an inclusive (low_dt, high_dt) pair of
+    YYYYMMDDHHMMSS strings so a stored (0040,4005) instant compares by plain
+    string ordering. A blank bound means unbounded on that side.
+
+    Returns None when the request states no date/time window at all, so the
+    caller skips local filtering entirely.
+    """
+    date_bounds = None
+    time_bounds = None
+    for elem in _iter_mwl_request_elements(ds):
+        if elem.keyword == "ScheduledProcedureStepStartDate" and date_bounds is None:
+            date_bounds = _mwl_date_bounds(elem.value)
+        elif elem.keyword == MWL_START_TIME_KEYWORD and time_bounds is None:
+            time_bounds = _mwl_time_bounds(elem.value)
+    if date_bounds is None and time_bounds is None:
+        return None
+
+    d_lo, d_hi = date_bounds if date_bounds is not None else ("", "")
+    t_lo, t_hi = time_bounds if time_bounds is not None else ("", "")
+
+    if not d_lo and not d_hi:
+        # TIME-ONLY request: the modality asked for a time of day on any
+        # date, so only the HHMMSS component is comparable. Returning
+        # date-prefixed bounds here would compare "2026..." against a bare
+        # "090000" and reject every row.
+        return ("T", t_lo, t_hi)
+
+    # Each side is built from the SAME kind of bound: a single date with a
+    # A date range with a time range is "EACH DAY in the range, WITHIN those
+    # hours" - not one continuous span from the first evening to the last.
+    # Concatenating the bounds (20260705210000..20260707230000) made a July 6
+    # workitem at 10:00 match a 21:00-23:00 request, because 10:00 on July 6
+    # lies between the two endpoints. The window is therefore carried as
+    # three parts: the date span, and the time-of-day span applied inside it.
+    if t_lo or t_hi:
+        return ("DR", d_lo, d_hi, t_lo, t_hi)
+    # Date only: the whole day, every day in the range.
+    return ("D", d_lo, d_hi, "", "")
+
+
+def _mwl_datetime_in_bounds(stored, bounds):
+    """Whether a stored (0040,4005) instant lies inside a combined window.
+
+    PS3.4 Table K.6-1 defines (0040,0002) Start Date and (0040,0003) Start
+    Time as ONE interval: the date range selects the days, and the time range
+    selects the hours WITHIN each of those days. July 5-7 at 21:00-23:00
+    therefore includes a July 6 workitem at 22:00 and excludes one at 10:00,
+    whereas comparing a single concatenated span accepted both.
+
+    A TIME-ONLY request compares the HHMMSS component alone, because its
+    bounds carry no date. A row without the attribute is kept: absence is not
+    a proven mismatch.
+    """
+    if bounds is None:
+        return True
+    text = str(stored or "").strip()
+    if len(text) < 8:
+        return True
+    # Pad the stored instant to the compared precision; a date-only stored
+    # value compares as the start of that day.
+    stamp = (text + "00000000000000")[:14]
+    kind = bounds[0]
+    if kind == "T":
+        _, low, high = bounds
+        hhmmss = stamp[8:14]
+        if low and hhmmss < low:
+            return False
+        if high and hhmmss > high:
+            return False
+        return True
+    _, d_lo, d_hi, t_lo, t_hi = bounds
+    day = stamp[:8]
+    # The DAY must be in the requested date range ...
+    if d_lo and day < d_lo:
+        return False
+    if d_hi and day > d_hi:
+        return False
+    # ... and the TIME OF DAY inside that day must be in the time range.
+    hhmmss = stamp[8:14]
+    if t_lo and hhmmss < t_lo:
+        return False
+    if t_hi and hhmmss > t_hi:
+        return False
+    return True
+
+
+def _mwl_time_bounds(value):
+    """A (0040,0003) TM match value as an inclusive ``(low, high)`` HHMMSS pair.
+
+    PS3.5 6.2 allows the short forms ``HH``, ``HHMM`` and ``HHMMSS``, and PS3.4
+    Table K.6-1 gives this key the rule "Single Value or Range". Both are
+    normalised to the six-digit form so a comparison against a stored time is
+    plain string ordering:
+
+      - ``0900``          -> ('090000', '090000')
+      - ``090000-100000`` -> ('090000', '100000')
+      - ``-100000``       -> ('', '100000')   (unbounded below)
+
+    Returns None when the value cannot be read, so the caller can decide
+    without guessing.
+    """
+
+    def _hm(part):
+        part = part.strip()
+        if not part:
+            return None
+        # PS3.5 6.2: TM is HH, HHMM or HHMMSS, each optionally followed by
+        # `.FFFFFF` fractional seconds. The fraction was rejected outright,
+        # so `093000.25-093000.75` - a legal range - yielded no bounds at all
+        # and the request ran WITHOUT a time filter, returning a 14:00
+        # workitem for a 09:30 request. The fraction is kept as its own
+        # six-digit string so the comparison stays plain string ordering
+        # against a stored instant that carries the same precision.
+        #
+        # The dot is split off FIRST: testing the whole component with
+        # `isdigit()` rejected every fractional value before the split could
+        # happen, which is the defect this branch exists to fix.
+        whole, _, frac = part.partition(".")
+        if not whole.isdigit() or len(whole) not in (2, 4, 6):
+            return None
+        if frac and not frac.isdigit():
+            return None
+        return (whole + "000000")[:6]
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "-" in text:
+        low, _, high = text.partition("-")
+        lo, hi = _hm(low), _hm(high)
+        if lo is None and hi is None:
+            return None
+        return (lo or "", hi or "")
+    single = _hm(text)
+    if single is None:
+        return None
+    return (single, single)
+
+
+def _mwl_date_bounds(value):
+    """A (0040,0002) DA match value as an inclusive ``(low, high)`` YYYYMMDD pair.
+
+    PS3.4 Table K.6-1 gives the key the rule "Single Value or Range", and
+    PS3.5 6.2 allows the ``YYYY.MM.DD`` form. Both are normalised to the
+    eight-digit dotted-free form so a comparison against a stored date is plain
+    string ordering:
+
+      - ``20260706``              -> ('20260706', '20260706')
+      - ``20260705-20260707``     -> ('20260705', '20260707')
+      - ``-20260707``             -> ('', '20260707')   (unbounded below)
+
+    Returns None when the value cannot be read, so the caller decides without
+    guessing.
+    """
+
+    def _day(part):
+        part = part.strip().replace(".", "")
+        if not part or not part.isdigit() or len(part) != 8:
+            return None
+        return part
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "-" in text:
+        low, _, high = text.partition("-")
+        lo, hi = _day(low), _day(high)
+        if lo is None and hi is None:
+            return None
+        return (lo or "", hi or "")
+    single = _day(text)
+    if single is None:
+        return None
+    return (single, single)
+
+
+def _mwl_time_in_bounds(stored, bounds):
+    """Whether a stored (0040,4005) instant satisfies an SPS start-time range.
+
+    The origin filters on the full instant; the modality expressed an interest
+    in a TIME OF DAY. This applies that part of the matching locally, before
+    the response limit, so a workitem outside the requested window never
+    consumes a Pending response.
+    """
+    if bounds is None:
+        return True
+    low, high = bounds
+    text = str(stored or "").strip()
+    if len(text) < 8:
+        return True
+    # (0040,4005) DT: YYYYMMDDHHMMSS...; the time component starts at index 8.
+    hhmmss = (text[8:14] + "000000")[:6]
+    if low and hhmmss < low:
+        return False
+    if high and hhmmss > high:
+        return False
+    return True
+
 
 def _mwl_date_to_ups_datetime(value):
     """Map a (0040,0002) DA match value onto the (0040,4005) DT grammar.
@@ -502,14 +896,44 @@ def _mwl_date_to_ups_datetime(value):
         low, _, high = text.partition("-")
         lo, hi = _day(low), _day(high)
         # Open-ended ranges keep their open end (the server treats an empty
-        # bound as unbounded).
+        # bound as unbounded). The two bounds are built INDEPENDENTLY: emitting
+        # the lower bound as a literal `000000` turned `-20261121` ("everything
+        # up to that day") into `000000-20261121235959`, which silently
+        # narrowed an unbounded window to one starting at midnight - the exact
+        # opposite of what the modality asked.
         if lo is None and hi is None:
             return text
-        return f"{lo or ''}000000-{hi or ''}235959" if (lo or hi) else text
+        lower = f"{lo}000000" if lo else ""
+        # PS3.5 6.2: DT may carry fractional seconds. `{day}235959` is the
+        # INSTANT 23:59:59, so a workitem scheduled at `{day}235959.500` sorts
+        # AFTER it and a single-day query silently omitted the last 999 ms of
+        # the day. The bound is the end of the final second, expressed with the
+        # maximum fraction so every instant inside 23:59:59 compares below it.
+        upper = f"{hi}235959.999999" if hi else ""
+        return f"{lower}-{upper}"
     day = _day(text)
     if day is None:
         return text
-    return f"{day}000000-{day}235959"
+    return f"{day}000000-{day}235959.999999"
+
+
+def _mwl_start_time_bounds(ds):
+    """The SPS start-time range the request asks for, or None.
+
+    Read from the same two levels `_build_mwl_params` reads: the top level and
+    the single item of (0040,0100). First statement wins, matching that
+    function's rule so the two cannot disagree about which value applies.
+    """
+    for elem in _iter_mwl_request_elements(ds):
+        if elem.keyword != MWL_START_TIME_KEYWORD:
+            continue
+        if elem.value is None:
+            continue
+        bounds = _mwl_time_bounds(elem.value)
+        if bounds is not None:
+            return bounds
+        return None
+    return None
 
 
 def _build_mwl_params(ds):
@@ -553,6 +977,32 @@ def _build_mwl_params(ds):
     return params
 
 
+def _json_pn_to_dimse(raw):
+    """A DICOMweb JSON Person Name back to its DIMSE `Alphabetic=Ideographic=Phonetic` form.
+
+    PS3.18 F.2.2 gives each populated component group its OWN property. Reading
+    only `Alphabetic` therefore dropped every non-alphabetic name: a PN whose
+    answer carried only `Ideographic` became the empty string, so the modality
+    received a nameless patient - and a PN with an ideographic part lost it.
+    The three groups are rejoined with the `=` separator in the order the VR
+    defines (PS3.5 6.2), preserving EMPTY leading groups so the modality can
+    still tell which group a value belongs to.
+    """
+    if not isinstance(raw, dict):
+        return str(raw)
+    groups = [
+        str(raw.get("Alphabetic", "") or ""),
+        str(raw.get("Ideographic", "") or ""),
+        str(raw.get("Phonetic", "") or ""),
+    ]
+    # Trailing empty groups are the default and carry no information, so only
+    # the populated span up to the last non-empty group is emitted. An entirely
+    # empty name stays an empty value rather than "==".
+    while groups and not groups[-1]:
+        groups.pop()
+    return "=".join(groups)
+
+
 def _safe_add_new(ds, group, elem, vr, val):
     """Add element to Dataset; fall back to direct assignment if tag exists (BR-014)."""
     try:
@@ -589,11 +1039,7 @@ def _json_add_vr(ds, group, elem, vr, raw_value):
         else:
             raw_first = items[0]
             if vr == "PN":
-                # Person Name: prefer the Alphabetic component.
-                if isinstance(raw_first, dict):
-                    val = raw_first.get("Alphabetic", "")
-                else:
-                    val = str(raw_first)
+                val = _json_pn_to_dimse(raw_first)
             elif vr == "IS":
                 val = int(raw_first)
             elif vr == "TM":
@@ -745,6 +1191,53 @@ def _json_to_dataset_series(json_obj, request_keywords, study_json=None):
             ident_elem = study_ds.get((group, elem))
             if ident_elem is not None:
                 _safe_add_new(ds, group, elem, ident_elem.VR, ident_elem.value)
+    return ds
+
+
+def _json_to_dataset_instance(
+    json_obj,
+    request_keywords,
+    study_uid,
+    series_uid,
+    study_json=None,
+    series_json=None,
+):
+    """QIDO-RS instance JSON -> an IMAGE-level pydicom Dataset.
+
+    PS3.4 Table C.6-4 / C.4.1.3.1.1 (standard/ps3.4/image-level-C.6-4.json):
+    every response Identifier carries all Unique Keys of the levels above, so
+    StudyInstanceUID and SeriesInstanceUID are injected from the walk's
+    context, and PatientName/PatientID plus the series context (Modality,
+    SeriesNumber, SeriesDescription) from the rows the walk already fetched.
+    The server's instance render carries none of those.
+
+    A row with NO SOPInstanceUID is not an IMAGE-level answer at all - it is
+    the relabelled study/series row the old fall-through produced, which the
+    SCU cannot use. The caller drops such a row before it is yielded; this
+    converter cannot invent the UID.
+    """
+    ds = _json_map_to_dataset(json_obj, QIDO_INSTANCE_KEY_TO_TAG)
+    # A missing UID on either axis would write a zero-length Unique Key, which
+    # a SCU reads as a real (empty) UID: absent is the honest form.
+    if study_uid:
+        _safe_add_new(ds, 0x0020, 0x000D, "UI", study_uid)
+    if series_uid:
+        _safe_add_new(ds, 0x0020, 0x000E, "UI", series_uid)
+    if study_json:
+        study_ds = _json_map_to_dataset(
+            study_json, {k: QIDO_KEY_TO_TAG[k] for k in PATIENT_LEVEL_KEYS}
+        )
+        for group, elem in _STUDY_IDENTITY_ATTRS.values():
+            src = study_ds.get((group, elem))
+            if src is not None:
+                _safe_add_new(ds, group, elem, src.VR, src.value)
+    if series_json:
+        series_ds = _json_map_to_dataset(series_json, QIDO_SERIES_KEY_TO_TAG)
+        for json_key in _INSTANCE_SERIES_CONTEXT:
+            group, elem, _vr, _kw = QIDO_SERIES_KEY_TO_TAG[json_key]
+            src = series_ds.get((group, elem))
+            if src is not None:
+                _safe_add_new(ds, group, elem, src.VR, src.value)
     return ds
 
 
@@ -974,11 +1467,31 @@ def _parse_n_action_rq(event):
     sop_list = []
     ref_seq = getattr(ds, "ReferencedSOPSequence", None)
     if ref_seq:
-        for item in ref_seq:
+        for number, item in enumerate(ref_seq, start=1):
             sop_class = str(getattr(item, "ReferencedSOPClassUID", ""))
             sop_uid = str(getattr(item, "ReferencedSOPInstanceUID", ""))
-            if sop_uid.strip():
-                sop_list.append((sop_class, sop_uid))
+            # PS3.4 J.3.2 makes both UIDs Type 1 in every item: an item that
+            # lacks either one does not identify an instance, so there is
+            # nothing the origin could be asked to commit.
+            #
+            # Silently skipping the item was the worst of the three options:
+            # with only that item present the parser returned an empty list and
+            # `handle_n_action` answered SUCCESS without registering any report,
+            # and in a mixed request the malformed item vanished while the SCU
+            # was told the whole set was accepted. Raising here sends the
+            # request down the existing refusal path, which is honest about a
+            # request the bridge cannot represent.
+            if not sop_class.strip():
+                raise ValueError(
+                    "N-ACTION-RQ: Referenced SOP Sequence item "
+                    f"{number} has no ReferencedSOPClassUID (0008,1150)"
+                )
+            if not sop_uid.strip():
+                raise ValueError(
+                    "N-ACTION-RQ: Referenced SOP Sequence item "
+                    f"{number} has no ReferencedSOPInstanceUID (0008,1155)"
+                )
+            sop_list.append((sop_class, sop_uid))
 
     return tx_uid, sop_list
 

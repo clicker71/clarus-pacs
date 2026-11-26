@@ -146,18 +146,26 @@ fn conn_hotpaths_are_allocation_free() {
     {
         let (server, client) = socket_pair();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        // The drain reports what it actually received. Treating any read error
+        // as EOF and discarding the join handle left a silent-failure hole: a
+        // send can queue bytes into the kernel buffer and return Ok even if the
+        // drain died on the first read, so the allocation budget below was
+        // measured against a transfer that never completed.
         let drain = std::thread::spawn(move || {
             use std::io::Read as _;
             let mut sink = [0u8; 8192];
-            // Signal readiness once the reader is positioned at its first
-            // read, so the measured send below runs against a live drain.
+            let mut total = 0usize;
             ready_tx.send(()).expect("signal");
             loop {
                 match (&client).read(&mut sink) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    // A reset after the peer dropped is the normal end.
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    Err(e) => return (total, Some(e)),
                 }
             }
+            (total, None)
         });
         ready_rx.recv().expect("receiver ready");
 
@@ -198,6 +206,16 @@ fn conn_hotpaths_are_allocation_free() {
              regression this catches)"
         );
         drop(conn);
-        let _ = drain.join();
+        // Both transfers (the warm one and the measured one) must have reached
+        // the peer. A short or failed send can still return Ok once its bytes
+        // are in the socket buffer, so the received total is the only evidence
+        // that the path under measurement actually ran.
+        let (received, err) = drain.join().expect("the drain thread must not panic");
+        assert!(err.is_none(), "the drain failed: {err:?}");
+        assert_eq!(
+            received as u64,
+            2 * LEN,
+            "the drain must receive BOTH sendfile transfers"
+        );
     }
 }

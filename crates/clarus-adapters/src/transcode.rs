@@ -168,10 +168,15 @@ pub fn reencode_explicit_be_to_explicit_le(dicom_bytes: &[u8]) -> Result<Vec<u8>
             ));
         }
     }
-    if pos > dicom_bytes.len() {
-        return Err(CodecError::InvalidMetadata(
-            "Element crosses the dataset end".into(),
-        ));
+    // The loop stops as soon as fewer than four bytes remain, so a dataset
+    // ending with a PARTIAL tag (1-3 bytes) would leave them unconsumed and the
+    // function would still report success - a silent truncation. The walk must
+    // end exactly at the dataset end; trailing bytes are an error, not input.
+    if pos != dicom_bytes.len() {
+        return Err(CodecError::InvalidMetadata(format!(
+            "Dataset walk ended at {pos} of {} bytes: incomplete trailing element header",
+            dicom_bytes.len()
+        )));
     }
     ensure_file_meta(&mut out, dicom_bytes, crate::codec::ts_uid::EXPLICIT_VR_LE);
     Ok(out)
@@ -281,12 +286,29 @@ pub fn transcode_dicom(
     let target_pi = photometric_for_ts(target_ts, &pixels.photometric_interpretation);
 
     if pixels.photometric_interpretation != target_pi {
+        // PS3.3 C.7.6.3.1.1: the inversion a MONOCHROME1 -> MONOCHROME2
+        // conversion performs is defined on the STORED range, so the shape
+        // comes from the source instance, not from the decoded buffer's
+        // container width.
+        let stored = crate::codec::bits_stored_of(dicom_bytes).unwrap_or(pixels.bits_allocated);
+        let shape = crate::codec::color_space::SampleShape {
+            bits_allocated: pixels.bits_allocated,
+            bits_stored: stored.min(pixels.bits_allocated).max(1),
+            // PS3.3 C.7.6.3.1.1.2: PixelRepresentation is a US with values 0
+            // and 1 only; anything wider is not a representation this code
+            // understands, so it is reported as 0 (unsigned) rather than
+            // truncated into 1.
+            pixel_representation: match crate::codec::pixel_representation_checked(dicom_bytes) {
+                Ok(1) => 1u8,
+                _ => 0u8,
+            },
+        };
         let converted = crate::codec::color_space::convert_color_space(
             &pixels.data,
             &pixels.photometric_interpretation,
             &target_pi,
             pixels.samples_per_pixel,
-            pixels.bits_allocated,
+            shape,
         )?;
         let old_pi = pixels.photometric_interpretation.clone();
         pixels.data = converted;
@@ -343,7 +365,11 @@ pub fn transcode_dicom(
         planar_configuration: None,
         // PixelRepresentation from the SOURCE dataset (JPEG2000 encode
         // needs it: signed=1 samples encoded as unsigned shift values).
-        pixel_representation: crate::codec::pixel_representation_of(dicom_bytes),
+        // A value that is PRESENT but unreadable is refused rather than
+        // encoded as unsigned: C.7.6.3.1.1 gives 0 for an ABSENT attribute,
+        // not for one this walker failed on, and guessing there inverts every
+        // negative sample.
+        pixel_representation: crate::codec::pixel_representation_checked(dicom_bytes)?,
         frames,
     };
 
@@ -466,13 +492,19 @@ pub fn transcode_dicom(
 // BE byte-swap helpers
 // ===========================================================================
 
-/// VRs whose values need byte-swapping when converting LE->BE.
+/// VRs whose values need byte-swapping when the dataset byte order changes.
+///
+/// PS3.5 6.2: every VR is a sequence of fixed-width words, and the word width
+/// decides the swap. `OV` (Other 64-bit Very Long) is an 8-byte word like `UV`
+/// and `OD` - it was missing from BOTH this classifier and `swap_value_be`, so
+/// an `OV` value crossed a byte-order change unchanged and a reader decoded a
+/// reversed number.
 fn is_multi_byte_vr(vr: &str) -> bool {
     matches!(
         vr,
         "US" | "SS" | "OW" | "AT"   // 2-byte units
             | "UL" | "SL" | "OL" | "FL"  // 4-byte
-            | "UV" | "SV" // 8-byte integers (PS3.5 Table 6.2-1)
+            | "UV" | "SV" | "OV" // 8-byte integers (PS3.5 Table 6.2-1)
             | "FD" | "OD" // 8-byte
     )
 }
@@ -492,7 +524,7 @@ fn swap_value_be(value: &[u8], vr: &str) -> Vec<u8> {
                 chunk.swap(1, 2);
             }
         }
-        "FD" | "OD" | "UV" | "SV" => {
+        "FD" | "OD" | "UV" | "SV" | "OV" => {
             for chunk in out.as_chunks_mut::<8>().0 {
                 chunk.swap(0, 7);
                 chunk.swap(1, 6);
@@ -539,13 +571,19 @@ fn copy_element_to_implicit(
     out: &mut Vec<u8>,
     src: &[u8],
     pos: &mut usize,
-    _group: u16,
-    _elem: u16,
+    group: u16,
+    elem: u16,
     elem_start: usize,
     source_is_implicit: bool,
     source_is_be: bool,
 ) -> Result<(), CodecError> {
-    out.extend_from_slice(&src[elem_start..elem_start + 4]); // copy tag
+    // PS3.5 7.1: an Implicit VR dataset is Little Endian, so the TAG must be
+    // written little-endian even when the source was Big Endian. Copying the
+    // source bytes put `00 28 00 10` (a BE Rows) into an LE dataset, and no
+    // later value swap can repair a tag.
+    out.extend_from_slice(&group.to_le_bytes());
+    out.extend_from_slice(&elem.to_le_bytes());
+    debug_assert_eq!(*pos, elem_start + 4);
 
     // The source VR decides whether a Big Endian value has to be swapped.
     // An Implicit VR source carries no VR at the element, so the only honest
@@ -620,17 +658,30 @@ fn copy_element_to_implicit(
                 "Cannot skip undefined element".into(),
             ));
         }
-        // Copy the ITEM STREAM only: the 4-byte length field at `*pos` was
-        // already read into `val_len` and is rewritten below. When the source
-        // is explicit, the 2 reserved bytes sit between the VR and that length
-        // field, so the stream starts right after the length - appending from
-        // `*pos` put those reserved bytes where an implicit reader expects the
-        // first item tag.
-        // PS3.5 7.5: an ITEM header is implicit in EVERY syntax, so the
-        // stream's own bytes are the target's bytes and are copied verbatim.
+        // PS3.5 7.5: an ITEM TAG and its length are implicit in every syntax,
+        // but the ATTRIBUTES inside the item are a dataset in the source's own
+        // encoding. Copying the item stream verbatim therefore left explicit
+        // `UI`/`OB` VR bytes exactly where this implicit reader wants a
+        // length. Convert the attributes; the item headers stay as they are.
+        // The 4-byte length field at `val_start` is rewritten below, and an
+        // explicit source keeps its 2 reserved bytes before it, so the stream
+        // starts at `val_start`.
+        let rewritten = reencode_sequence_items(
+            &src[val_start..skip_pos],
+            source_is_implicit,
+            true,
+            source_is_be,
+            false,
+        );
+        let Some(rewritten) = rewritten else {
+            out.extend_from_slice(&src[elem_start..]);
+            return Err(CodecError::InvalidMetadata(
+                "Cannot re-encode sequence items into the implicit target".into(),
+            ));
+        };
         let len_u32 = val_len as u32;
         out.extend_from_slice(&len_u32.to_le_bytes());
-        out.extend_from_slice(&src[val_start..skip_pos]);
+        out.extend_from_slice(&rewritten);
         *pos = skip_pos;
         return Ok(());
     }
@@ -640,8 +691,17 @@ fn copy_element_to_implicit(
         return Err(CodecError::InvalidMetadata("Truncated value".into()));
     }
 
-    // Write implicit VR: 4-byte length + value
-    let len_u32 = val_len as u32;
+    // PS3.5 7.1.1: the declared Value Length is the length of the PADDED value,
+    // so an odd-length source must be declared one byte longer and the pad
+    // written inside that length. Declaring the odd source length and then
+    // emitting the pad left the next element starting one byte before the
+    // reader expected it.
+    let declared_len = if val_len.is_multiple_of(2) {
+        val_len
+    } else {
+        val_len + 1
+    };
+    let len_u32 = declared_len as u32;
     out.extend_from_slice(&len_u32.to_le_bytes());
     // PS3.5 7.1: the transfer syntax fixes the byte order of every binary VR,
     // so a Big Endian source reaching this LE output must be swapped here.
@@ -654,8 +714,16 @@ fn copy_element_to_implicit(
     } else {
         out.extend_from_slice(&src[val_start..val_start + val_len]);
     }
+    if !val_len.is_multiple_of(2) {
+        // The source's own pad byte is already skipped by the cursor advance
+        // below; the OUTPUT needs one inside the declared length it just got.
+        // An Implicit VR source gives no VR (hence "UN"), so the pad follows
+        // the VALUE: PS3.5 7.1.1 allows either pad byte, and the source's own
+        // is reused when it can be read.
+        out.push(src.get(val_start + val_len).copied().unwrap_or(0));
+    }
     *pos = val_start + val_len;
-    if val_len % 2 != 0 {
+    if !val_len.is_multiple_of(2) {
         *pos += 1;
     }
     Ok(())
@@ -693,10 +761,14 @@ fn find_dicom_tag(
         }
     }
 
-    // Walk dataset
+    // Walk dataset. The TAG follows the DATASET's byte order, not the meta
+    // group's (which is always Explicit VR LE, PS3.10 7.1). Reading it as LE
+    // made every lookup on an Explicit VR Big Endian source miss, so a
+    // two-frame BE image reported NumberOfFrames 1 and its palette and colour
+    // metadata was never found at all.
     while pos + 4 <= data.len() {
-        let g = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        let e = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+        let g = read_u16_syntax(data, pos, source_is_be);
+        let e = read_u16_syntax(data, pos + 2, source_is_be);
         if (g, e) == target {
             return Some(pos);
         }
@@ -811,6 +883,14 @@ fn find_metaheader_end(data: &[u8], start: usize) -> Result<usize, CodecError> {
     Ok(pos.min(data.len()))
 }
 
+/// Implementation Class UID for the File Meta Information group.
+///
+/// PS3.10 Table 7.1-1 requires (0002,0012) as Type 1. The `2.25.` prefix
+/// (PS3.5 B.2) carries a UUID without a registration authority branch, so this
+/// names the writer without claiming an organisation root the project does not
+/// own.
+const IMPLEMENTATION_CLASS_UID: &str = "2.25.336393792154811549420886732533309234550";
+
 /// 3008: the ONE canonical meta-group writer for every transcode path.
 ///
 /// Emits the group in ASCENDING tag order - (0002,0000) File Meta Information
@@ -818,8 +898,8 @@ fn find_metaheader_end(data: &[u8], start: usize) -> Result<usize, CodecError> {
 /// MediaStorageSOPClassUID, (0002,0003) MediaStorageSOPInstanceUID, then
 /// (0002,0010) TransferSyntaxUID LAST - each Explicit VR LE, the UI values
 /// with an EVEN length and the trailing NULL INCLUDED in it (PS3.5 6.2). No
-/// external pad bytes in group 0002, ever; no (0002,0012)/(0002,0013)
-/// (Type 3, dropped deliberately).
+/// external pad bytes in group 0002, ever; (0002,0012) carries the
+/// implementation UID below and (0002,0013) is omitted as optional.
 ///
 /// (0002,0000) and (0002,0001) are Type 1 whenever group 0002 is present
 /// (PS3.10 7.1 Table 7.1-1, `standard/ps3.10/file-meta-information-7.1.json`),
@@ -848,10 +928,16 @@ fn write_canonical_file_meta(
     // OMITTED (degraded mode - same semantics as before 3008): a broken
     // source element is never copied as-is, and an empty UI is never
     // emitted.
+    // PS3.10 Table 7.1-1 makes (0002,0012) Implementation Class UID Type 1:
+    // every file this writer produces must name the implementation that wrote
+    // it. The value is a UUID-derived UID (`2.25.` prefix, PS3.5 B.2), which
+    // needs no registration and encodes this implementation's identity.
+    let implementation_class: &[u8] = IMPLEMENTATION_CLASS_UID.as_bytes();
     for (elem, value) in [
         (0x0002u16, sop_class),
         (0x0003u16, sop_instance),
         (0x0010u16, Some(ts)),
+        (0x0012u16, Some(implementation_class)),
     ] {
         let Some(value) = value else {
             continue;
@@ -1141,7 +1227,11 @@ fn transcode_direct(
     // All are US (2B) or CS (<=old length) -> in-place safe.
     // The output encoding is the TARGET's, so the patches follow it (after
     // a VR re-encode the source encoding is no longer the one on disk).
-    let high_bit = bits_allocated.saturating_sub(1);
+    // PS3.3 C.7.6.3.1.3: High Bit locates the most significant bit INSIDE the
+    // stored value, so it is Bits Stored - 1, not Bits Allocated - 1. A 12-bit
+    // sample in a 16-bit container has High Bit 11; deriving it from the
+    // allocation wrote 15 and told the reader the low four bits are padding.
+    let high_bit = bits_stored.saturating_sub(1);
     replace_us_in_place(
         &mut out,
         (0x0028, 0x0100),
@@ -1192,6 +1282,13 @@ fn transcode_direct(
 /// for an IVRLE target. The value bytes stay verbatim; an odd value keeps
 /// its pad byte after the value, outside the length, per PS3.5 7.1.
 fn rewrap_pixeldata_implicit(element: &[u8]) -> Result<Vec<u8>, CodecError> {
+    // An implicit codec builds the implicit element itself, so the wrapper
+    // leaves it alone. Detecting that by the absence of a VR is exact: at
+    // offset 4, where the Explicit VR form puts "OW", the implicit form has
+    // the low half of its Value Length.
+    if element.len() >= 8 && &element[4..6] != b"OW" {
+        return Ok(element.to_vec());
+    }
     if element.len() < 12 || &element[4..6] != b"OW" {
         return Err(CodecError::InvalidMetadata(
             "Native PixelData element is not explicit OW".into(),
@@ -1248,9 +1345,21 @@ fn write_identity_window_8bit(data: &mut [u8], implicit: bool) -> Result<(), Cod
         } else {
             len_field + 2
         };
-        if val_start + old_len > data.len() || value.len() > old_len {
-            // The replacement must fit the space the source reserved; a
-            // shorter value is padded rather than shrinking the element.
+        if val_start + old_len > data.len() {
+            continue;
+        }
+        if value.len() > old_len {
+            // The replacement does not fit the space the source reserved. A
+            // DS field can be as short as two bytes ("0"), and skipping it
+            // silently left the ORIGINAL window describing pixel values the
+            // reduction has already remapped - the very mismatch this pass
+            // exists to remove. Blank the value instead: PS3.3 C.7.6.3.1.5
+            // makes Window Center/Width Type 1C (their absence is legal when
+            // the region has no window), so an emptied element is honest
+            // while a stale one is not.
+            for byte in &mut data[val_start..val_start + old_len] {
+                *byte = 0x20;
+            }
             continue;
         }
         let bytes = value.as_bytes();
@@ -1534,6 +1643,13 @@ fn update_dicom_metadata(
                 // Without VOI LUT, CR/DX images appear as black rectangle.
                 // After transcode (P14.1->EVRLE), VOI values are still valid.
                 | (0x7FE0, 0x0010) // PixelData
+                // PS3.3 C.7.6.3.1.8: the Extended Offset Table and its
+                // Lengths describe the FRAGMENT offsets of the encapsulated
+                // PixelData being replaced. Carrying them over pointed a
+                // reader at byte offsets that no longer exist in the new
+                // element, so they are dropped with it.
+                | (0x7FE0, 0x0001) // ExtendedOffsetTable
+                | (0x7FE0, 0x0002) // ExtendedOffsetTableLengths
         )
     };
 
@@ -1604,19 +1720,35 @@ fn update_dicom_metadata(
     // leaves a non-ascending element stream that strict readers reject and that
     // a reader stopping at PixelData never sees at all.
     let mut replacements_written = false;
+    let mut photometric_written = false;
 
     // Scan dataset, collecting non-replaced elements
     while pos + 4 <= original.len() {
         let g = group_of(original, pos, source_is_be);
         let e = elem_of(original, pos, source_is_be);
-        if !replacements_written && (u32::from(g) << 16 | u32::from(e)) > REPLACEMENT_BOUNDARY {
-            write_replacement_elements(
+        // PS3.5 7.1: elements are in ascending tag order. The replacement block
+        // spans (0028,0004) and (0028,0100..0102), so it cannot be emitted at a
+        // SINGLE boundary: waiting for the last of them put Photometric
+        // Interpretation after (0028,0010)/(0028,0011) which a sorted source
+        // copies first. Photometric Interpretation is therefore written at its
+        // own tag, and the (0028,01xx) trio at the boundary.
+        let this_tag = u32::from(g) << 16 | u32::from(e);
+        if !photometric_written && this_tag > 0x0028_0004 {
+            write_photometric_element(
+                &mut output,
+                target_is_implicit,
+                target_is_be,
+                photometric_interpretation,
+            );
+            photometric_written = true;
+        }
+        if !replacements_written && this_tag > REPLACEMENT_BOUNDARY {
+            write_bit_depth_elements(
                 &mut output,
                 target_is_implicit,
                 target_is_be,
                 bits_allocated,
                 bits_stored,
-                photometric_interpretation,
             );
             replacements_written = true;
         }
@@ -1625,8 +1757,13 @@ fn update_dicom_metadata(
             // Sequence/item delimiters - copy raw bytes
             let start = pos;
             if !skip_element(original, &mut pos, source_is_implicit, source_is_be) {
-                output.extend_from_slice(&original[start..]);
-                break;
+                // A walk that cannot step over a delimiter cannot describe the
+                // rest of the dataset either. Returning the partial buffer
+                // published a truncated object under a target syntax that
+                // promised the whole thing.
+                return Err(CodecError::InvalidMetadata(
+                    "Cannot skip a delimiter element in the dataset walk".into(),
+                ));
             }
             output.extend_from_slice(&original[start..pos]);
             continue;
@@ -1646,14 +1783,21 @@ fn update_dicom_metadata(
                     pos += 8; // skip VR(2) + reserved(2) + length(4)
                 }
                 let mut skip_pos = pos;
-                if skip_undefined_element(original, &mut skip_pos, source_is_implicit, source_is_be)
-                {
-                    pos = skip_pos;
-                } else {
-                    break; // can't skip -- stop
+                if !skip_undefined_element(
+                    original,
+                    &mut skip_pos,
+                    source_is_implicit,
+                    source_is_be,
+                ) {
+                    return Err(CodecError::InvalidMetadata(
+                        "Cannot skip encapsulated PixelData".into(),
+                    ));
                 }
+                pos = skip_pos;
             } else if !skip_element(original, &mut pos, source_is_implicit, source_is_be) {
-                break;
+                return Err(CodecError::InvalidMetadata(
+                    "Cannot skip a replaced element".into(),
+                ));
             }
             continue;
         }
@@ -1674,13 +1818,9 @@ fn update_dicom_metadata(
                 source_is_implicit,
                 source_is_be,
             ) {
-                log::warn!(
-                    "transcode rebuild: skipping truncated elem for implicit target ({:04X},{:04X}): {}",
-                    g,
-                    e,
-                    err
-                );
-                break;
+                return Err(CodecError::InvalidMetadata(format!(
+                    "Element ({g:04X},{e:04X}) cannot be converted to an implicit target: {err}"
+                )));
             }
         } else if source_is_implicit {
             // Implicit VR -> convert to Explicit VR
@@ -1694,13 +1834,9 @@ fn update_dicom_metadata(
                 source_is_be,
                 target_is_be,
             ) {
-                log::warn!(
-                    "transcode rebuild: skipping truncated implicit elem ({:04X},{:04X}): {}",
-                    g,
-                    e,
-                    err
-                );
-                break;
+                return Err(CodecError::InvalidMetadata(format!(
+                    "Implicit element ({g:04X},{e:04X}) cannot be converted to explicit VR: {err}"
+                )));
             }
         } else {
             // Explicit VR -> copy with optional BE byte-swap
@@ -1712,28 +1848,31 @@ fn update_dicom_metadata(
                 source_is_be,
                 target_is_be,
             ) {
-                log::warn!(
-                    "transcode rebuild: skipping truncated explicit elem ({:04X},{:04X}): {}",
-                    g,
-                    e,
-                    err
-                );
-                break;
+                return Err(CodecError::InvalidMetadata(format!(
+                    "Explicit element ({g:04X},{e:04X}) cannot be copied: {err}"
+                )));
             }
         }
     }
 
     // -- 3. Write any replacements the dataset never reached ----------
     // A source containing only low tags (or no dataset at all) still needs
-    // them; the boundary check above covers the ordinary case.
+    // them; the tag checks above cover the ordinary case.
+    if !photometric_written {
+        write_photometric_element(
+            &mut output,
+            target_is_implicit,
+            target_is_be,
+            photometric_interpretation,
+        );
+    }
     if !replacements_written {
-        write_replacement_elements(
+        write_bit_depth_elements(
             &mut output,
             target_is_implicit,
             target_is_be,
             bits_allocated,
             bits_stored,
-            photometric_interpretation,
         );
     }
 
@@ -1802,56 +1941,23 @@ fn update_dicom_metadata(
 /// them, so anything above it may be written after the replacements.
 const REPLACEMENT_BOUNDARY: u32 = 0x0028_0102;
 
-/// Write the replacement elements in the target encoding.
+/// Write the bit-depth replacement elements in the target encoding.
 ///
-/// Kept as one function because the same four elements must be emitted at the
-/// right position in the stream (see `REPLACEMENT_BOUNDARY`), and duplicating
-/// the header logic per call site is how the two encodings drift apart.
-#[allow(clippy::too_many_arguments)]
-fn write_replacement_elements(
+/// (0028,0100..0102) are one contiguous block: they are adjacent tags that a
+/// converter must change together, so they are written together.
+fn write_bit_depth_elements(
     out: &mut Vec<u8>,
     target_is_implicit: bool,
     target_is_be: bool,
     bits_allocated: u8,
     bits_stored: u8,
-    photometric_interpretation: &str,
 ) {
-    let high_bit = bits_allocated.saturating_sub(1);
+    // PS3.3 C.7.6.3.1.3: High Bit locates the most significant bit INSIDE the
+    // stored value, so it is Bits Stored - 1, not Bits Allocated - 1. A 12-bit
+    // sample in a 16-bit container has High Bit 11; deriving it from the
+    // allocation wrote 15 and told the reader the low four bits are padding.
+    let high_bit = bits_stored.saturating_sub(1);
 
-    // PhotometricInterpretation (0028,0004) CS must come FIRST: ascending tag
-    // order inside the replacement block. Emitting it after (0028,0100..0102)
-    // left a non-ascending element stream that strict readers reject.
-    // DICOM PS3.5 Section 7.1.1: character string VRs MUST have even-length
-    // values. If the value is odd, append a SPACE (0x20) and report even
-    // length. Some parsers (pydicom, MicroDICOM) fail on odd-length CS + pad.
-    let pi_raw = photometric_interpretation.as_bytes();
-    let pi_padded: Vec<u8> = if pi_raw.len().is_multiple_of(2) {
-        pi_raw.to_vec()
-    } else {
-        let mut v = pi_raw.to_vec();
-        v.push(0x20); // SPACE pad -- included IN the value, not after it
-        v
-    };
-    if target_is_be {
-        out.extend_from_slice(&0x0028u16.to_be_bytes());
-        out.extend_from_slice(&0x0004u16.to_be_bytes());
-    } else {
-        out.extend_from_slice(&0x0028u16.to_le_bytes());
-        out.extend_from_slice(&0x0004u16.to_le_bytes());
-    }
-    if target_is_implicit {
-        out.extend_from_slice(&(pi_padded.len() as u32).to_le_bytes());
-    } else {
-        out.extend_from_slice(b"CS");
-        if target_is_be {
-            out.extend_from_slice(&(pi_padded.len() as u16).to_be_bytes());
-        } else {
-            out.extend_from_slice(&(pi_padded.len() as u16).to_le_bytes());
-        }
-    }
-    out.extend_from_slice(&pi_padded);
-
-    // Helper: write a US element in the target VR format
     let write_us_elem = |out: &mut Vec<u8>, elem: u16, val: u16| {
         // The tag follows the target byte order, like every other element in
         // the dataset; only the meta group is unconditionally little endian.
@@ -1883,6 +1989,49 @@ fn write_replacement_elements(
     write_us_elem(out, 0x0100, bits_allocated as u16);
     write_us_elem(out, 0x0101, bits_stored as u16);
     write_us_elem(out, 0x0102, high_bit as u16);
+}
+
+/// Write (0028,0004) Photometric Interpretation in the target encoding.
+///
+/// Separate from [`write_bit_depth_elements`] because the two are far apart in
+/// tag order (PS3.5 7.1): a source that lists Rows and Columns between them
+/// must still get an ascending output, so each is emitted where its own tag
+/// belongs rather than both at one boundary.
+fn write_photometric_element(
+    out: &mut Vec<u8>,
+    target_is_implicit: bool,
+    target_is_be: bool,
+    photometric_interpretation: &str,
+) {
+    // DICOM PS3.5 Section 7.1.1: character string VRs MUST have even-length
+    // values. If the value is odd, append a SPACE (0x20) and report even
+    // length. Some parsers (pydicom, MicroDICOM) fail on odd-length CS + pad.
+    let pi_raw = photometric_interpretation.as_bytes();
+    let pi_padded: Vec<u8> = if pi_raw.len().is_multiple_of(2) {
+        pi_raw.to_vec()
+    } else {
+        let mut v = pi_raw.to_vec();
+        v.push(0x20); // SPACE pad -- included IN the value, not after it
+        v
+    };
+    if target_is_be {
+        out.extend_from_slice(&0x0028u16.to_be_bytes());
+        out.extend_from_slice(&0x0004u16.to_be_bytes());
+    } else {
+        out.extend_from_slice(&0x0028u16.to_le_bytes());
+        out.extend_from_slice(&0x0004u16.to_le_bytes());
+    }
+    if target_is_implicit {
+        out.extend_from_slice(&(pi_padded.len() as u32).to_le_bytes());
+    } else {
+        out.extend_from_slice(b"CS");
+        if target_is_be {
+            out.extend_from_slice(&(pi_padded.len() as u16).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(pi_padded.len() as u16).to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&pi_padded);
 }
 
 /// Copy an Implicit VR LE element from source to Explicit VR LE output.
@@ -1967,7 +2116,7 @@ fn copy_implicit_element_to_explicit(
     // output (and the mirror case): the same hybrid encoding the chunk
     // re-encoder exists to prevent, one level down.
     if vr == "SQ"
-        && let Some(rewritten) = reencode_sequence_items(value, true, target_is_be)
+        && let Some(rewritten) = reencode_sequence_items(value, true, false, false, target_is_be)
     {
         write_element_explicit(
             out,
@@ -1993,6 +2142,8 @@ fn copy_implicit_element_to_explicit(
 fn reencode_sequence_items(
     items: &[u8],
     source_is_implicit: bool,
+    target_is_implicit: bool,
+    source_is_be: bool,
     target_is_be: bool,
 ) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::with_capacity(items.len());
@@ -2016,10 +2167,13 @@ fn reencode_sequence_items(
         if raw_len == 0xFFFF_FFFF {
             // Undefined-length item: its body runs to its ItemDelimitationItem.
             let body_start = pos + 8;
-            let body_end = find_item_end(&items[body_start..])?;
+            let body_end = find_item_end(&items[body_start..], source_is_implicit, source_is_be)?;
             let rewritten = reencode_item_body(
                 &items[body_start..body_start + body_end],
                 source_is_implicit,
+                target_is_implicit,
+                source_is_be,
+                target_is_be,
             )?;
             out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0, 0xFF, 0xFF, 0xFF, 0xFF]);
             out.extend_from_slice(&rewritten);
@@ -2031,7 +2185,13 @@ fn reencode_sequence_items(
         if pos + 8 + len > items.len() {
             return None;
         }
-        let rewritten = reencode_item_body(&items[pos + 8..pos + 8 + len], source_is_implicit)?;
+        let rewritten = reencode_item_body(
+            &items[pos + 8..pos + 8 + len],
+            source_is_implicit,
+            target_is_implicit,
+            source_is_be,
+            target_is_be,
+        )?;
         out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
         // Item headers are part of the element stream, so their length field
         // follows the target byte order like every other length.
@@ -2050,7 +2210,11 @@ fn reencode_sequence_items(
 }
 
 /// Offset of the ItemDelimitationItem that closes the current item body.
-fn find_item_end(data: &[u8]) -> Option<usize> {
+///
+/// The body is walked in the SOURCE's syntax, which is why the flag is not
+/// assumed: the attributes inside an item carry the enclosing dataset's VR
+/// form (PS3.5 7.5), and only the delimiter tags are always implicit.
+fn find_item_end(data: &[u8], source_is_implicit: bool, source_is_be: bool) -> Option<usize> {
     let mut pos = 0usize;
     while pos + 8 <= data.len() {
         let group = u16::from_le_bytes([data[pos], data[pos + 1]]);
@@ -2058,7 +2222,14 @@ fn find_item_end(data: &[u8]) -> Option<usize> {
         if group == 0xFFFE && element == 0xE00D {
             return Some(pos);
         }
-        pos += 8;
+        // A fixed 8-byte step assumed every attribute ends where its header
+        // does. An attribute of any other length made the walk land mid-value
+        // and miss the real delimiter, so the caller then copied an
+        // incompatible body. Walk the LENGTHS instead (PS3.5 7.1.2/7.5).
+        pos += 4;
+        if !skip_element(data, &mut pos, source_is_implicit, source_is_be) {
+            return None;
+        }
     }
     None
 }
@@ -2067,8 +2238,14 @@ fn find_item_end(data: &[u8]) -> Option<usize> {
 ///
 /// Nested sequences recurse through the same implicit copier, so every level
 /// ends up in the target encoding rather than only the outermost.
-fn reencode_item_body(body: &[u8], source_is_implicit: bool) -> Option<Vec<u8>> {
-    if !source_is_implicit {
+fn reencode_item_body(
+    body: &[u8],
+    source_is_implicit: bool,
+    target_is_implicit: bool,
+    source_is_be: bool,
+    target_is_be: bool,
+) -> Option<Vec<u8>> {
+    if !source_is_implicit && !target_is_implicit && (source_is_be == target_is_be) {
         // Explicit item bodies are already the target shape.
         return Some(body.to_vec());
     }
@@ -2080,16 +2257,40 @@ fn reencode_item_body(body: &[u8], source_is_implicit: bool) -> Option<Vec<u8>> 
         let element = u16::from_le_bytes([body[pos + 2], body[pos + 3]]);
         pos += 4;
         if group == 0xFFFE {
-            if !skip_element(body, &mut pos, true, false) {
+            // PS3.5 7.5: the delimiter tags and their lengths are implicit, so
+            // only the length field follows the byte order.
+            out.extend_from_slice(&body[elem_start..elem_start + 4]);
+            if !skip_element(body, &mut pos, source_is_implicit, source_is_be) {
                 return None;
             }
-            out.extend_from_slice(&body[elem_start..pos]);
+            out.extend_from_slice(&body[elem_start + 4..pos]);
             continue;
         }
-        copy_implicit_element_to_explicit(
-            &mut out, body, &mut pos, group, element, elem_start, false, false,
-        )
-        .ok()?;
+        if target_is_implicit {
+            copy_element_to_implicit(
+                &mut out,
+                body,
+                &mut pos,
+                group,
+                element,
+                elem_start,
+                source_is_implicit,
+                source_is_be,
+            )
+            .ok()?;
+        } else {
+            copy_implicit_element_to_explicit(
+                &mut out,
+                body,
+                &mut pos,
+                group,
+                element,
+                elem_start,
+                source_is_be,
+                target_is_be,
+            )
+            .ok()?;
+        }
     }
     Some(out)
 }
@@ -2131,6 +2332,20 @@ fn copy_explicit_element(
         *pos += 2;
         (l, 2)
     };
+
+    // PS3.5 7.5: the attributes inside an item are a full dataset and carry
+    // the same byte order as the enclosing one. A cross-endian conversion that
+    // copied the item stream verbatim produced a dataset labelled with the
+    // target syntax but holding source-ordered tags, lengths and short values -
+    // mixed-endian output that no reader can parse past the first item.
+    // Refusing is the only honest answer until the item bodies are converted,
+    // which this copy path does not do.
+    if vr == "SQ" && source_is_be != target_is_be {
+        out.extend_from_slice(&src[elem_start..]);
+        return Err(CodecError::InvalidMetadata(
+            "Cannot change byte order of a sequence body".into(),
+        ));
+    }
 
     if val_len == 0xFFFF_FFFF {
         // Undefined length - copy verbatim.
@@ -2756,6 +2971,14 @@ const TAG_PALETTE_LUTS: [(u16, u16); 3] = [
     (0x0028, 0x1203), // Blue
 ];
 
+/// The segmented LUT data attributes (PS3.3 C.7.6.3.1.6). Their PRESENCE is
+/// what marks a segmented palette; the descriptor's entry count does not.
+const TAG_SEGMENTED_LUTS: [(u16, u16); 3] = [
+    (0x0028, 0x1221), // Segmented Red Palette Color Lookup Table Data
+    (0x0028, 0x1222), // Green
+    (0x0028, 0x1223), // Blue
+];
+
 /// Rewrite a 2-byte (u16) element VALUE in place. No-op when the tag is
 /// absent or the value is shorter than 2 bytes. Used for the post-transcode
 /// SamplesPerPixel patch after palette conversion.
@@ -2829,8 +3052,8 @@ fn patch_u16_element(out: &mut [u8], tag: (u16, u16), value: u16, is_be: bool, i
 }
 
 /// Ensure (0028,0006) Planar Configuration exists with value 0 for
-/// multi-sample images: patch when present, insert after SamplesPerPixel
-/// when absent (pydicom/dcm4che require the tag for spp > 1).
+/// multi-sample images: patch when present, insert after Photometric
+/// Interpretation when absent (pydicom/dcm4che require the tag for spp > 1).
 fn ensure_planar_configuration(out: &mut Vec<u8>, spp: u16, is_be: bool, is_implicit: bool) {
     if spp <= 1 {
         return;
@@ -2839,11 +3062,24 @@ fn ensure_planar_configuration(out: &mut Vec<u8>, spp: u16, is_be: bool, is_impl
         patch_u16_element(out, (0x0028, 0x0006), 0, is_be, is_implicit);
         return;
     }
-    let Some(spp_pos) = find_dicom_tag(out, (0x0028, 0x0002), is_be, is_implicit) else {
-        return;
-    };
-    let Ok(insert_at) = find_element_end(out, spp_pos, is_be, is_implicit) else {
-        return;
+    // PS3.5 7.1: elements go in ascending tag order, so (0028,0006) belongs
+    // after (0028,0004) Photometric Interpretation. Anchoring on SamplesPerPixel
+    // (0028,0002) inserted it BEFORE that element whenever the source carried
+    // one, which produced a non-ascending stream that strict readers reject.
+    let insert_at = if let Some(pi_pos) = find_dicom_tag(out, (0x0028, 0x0004), is_be, is_implicit)
+    {
+        let Ok(end) = find_element_end(out, pi_pos, is_be, is_implicit) else {
+            return;
+        };
+        end
+    } else {
+        let Some(spp_pos) = find_dicom_tag(out, (0x0028, 0x0002), is_be, is_implicit) else {
+            return;
+        };
+        let Ok(end) = find_element_end(out, spp_pos, is_be, is_implicit) else {
+            return;
+        };
+        end
     };
     let mut elem = Vec::with_capacity(12);
     if is_be {
@@ -2928,24 +3164,43 @@ fn apply_palette_color_lut(
         )));
     }
 
-    // Descriptor (0028,1101): first value = number of entries, 0 = segmented
-    // palette (data then lives in 0028,1221-1223, unsupported). PS3.3 C.7.9.
+    // PS3.3 C.7.6.3.1.4: the first descriptor value is "the number of entries
+    // in the lookup table, ONE less than the actual number" - so a stored 0
+    // means 65,536 entries, which is a perfectly valid DIRECT (not segmented)
+    // table. A segmented palette is identified by its own data attributes
+    // (0028,1221..1223), never by a zero count; rejecting zero here refused
+    // legitimate direct LUTs before their data was ever read.
+    if find_dicom_tag(data, TAG_SEGMENTED_LUTS[0], source_is_be, is_implicit).is_some() {
+        return Err(CodecError::InvalidMetadata(
+            "PALETTE COLOR: segmented palette is not supported".into(),
+        ));
+    }
+    // The descriptor's SECOND value is the first input pixel value the table
+    // maps, and its third gives the entry width. The second is signed (SS).
     let mut declared = 0usize;
+    let mut first_mapped: i32 = 0;
     if let Some(pos) = find_dicom_tag(data, TAG_PALETTE_DESCRIPTOR, source_is_be, is_implicit)
         && let Some(v) = element_value_bytes(data, pos, source_is_be, is_implicit)
-        && v.len() >= 4
+        && v.len() >= 6
     {
-        let first = if source_is_be {
-            u16::from_be_bytes([v[0], v[1]])
-        } else {
-            u16::from_le_bytes([v[0], v[1]])
+        let read_u16 = |at: usize| -> u16 {
+            if source_is_be {
+                u16::from_be_bytes([v[at], v[at + 1]])
+            } else {
+                u16::from_le_bytes([v[at], v[at + 1]])
+            }
         };
-        if first == 0 {
-            return Err(CodecError::InvalidMetadata(
-                "PALETTE COLOR: segmented palette is not supported".into(),
-            ));
-        }
-        declared = first as usize;
+        declared = match read_u16(0) {
+            // PS3.3 C.7.6.3.1.4: the stored count is one less than the entries,
+            // so 0 encodes the full 65,536-entry table.
+            0 => 65_536,
+            n => n as usize + 1,
+        };
+        first_mapped = if source_is_be {
+            i16::from_be_bytes([v[2], v[3]]) as i32
+        } else {
+            i16::from_le_bytes([v[2], v[3]]) as i32
+        };
     }
 
     let lut_r = read_palette_lut(data, TAG_PALETTE_LUTS[0], source_is_be, is_implicit)?;
@@ -2980,15 +3235,16 @@ fn apply_palette_color_lut(
         } else {
             pixels.data[p] as usize
         };
-        if idx >= count {
-            return Err(CodecError::InvalidMetadata(format!(
-                "PALETTE COLOR: sample index {} out of range ({})",
-                idx, count
-            )));
-        }
-        rgb[p] = (lut_r[idx] >> 8) as u8;
-        rgb[total + p] = (lut_g[idx] >> 8) as u8;
-        rgb[2 * total + p] = (lut_b[idx] >> 8) as u8;
+        // PS3.3 C.7.6.3.1.4: the table maps input values starting at the
+        // descriptor's second value, so a table that begins at 10 has entry 0
+        // for sample 10. Subtracting in the SIGNED domain keeps a negative
+        // first mapped value meaningful, and the clamp keeps an out-of-range
+        // sample from becoming a huge unsigned index.
+        let lut_idx = idx as i64 - first_mapped as i64;
+        let lut_idx = lut_idx.clamp(0, count as i64 - 1) as usize;
+        rgb[p] = (lut_r[lut_idx] >> 8) as u8;
+        rgb[total + p] = (lut_g[lut_idx] >> 8) as u8;
+        rgb[2 * total + p] = (lut_b[lut_idx] >> 8) as u8;
     }
 
     pixels.data = rgb;
@@ -3089,7 +3345,8 @@ mod tests {
     #[test]
     fn replacement_elements_are_written_in_ascending_tag_order() {
         let mut out = Vec::new();
-        write_replacement_elements(&mut out, false, false, 16, 12, "MONOCHROME2");
+        write_photometric_element(&mut out, false, false, "MONOCHROME2");
+        write_bit_depth_elements(&mut out, false, false, 16, 12);
         // Explicit VR LE walk: tag(4) + VR(2) + len(2, short VRs only) + value.
         let mut pos = 0usize;
         let mut seen: Vec<u32> = Vec::new();
@@ -3363,10 +3620,15 @@ mod tests {
             result.len(),
             hash_hex
         );
-        // Save for external comparison
+        // Save for external comparison. The result is reported only when the
+        // write actually happened: on a read-only checkout the previous `.ok()`
+        // swallowed the failure and the message still claimed a fresh file, so
+        // a comparison could silently read a stale one.
         let out_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_rle_output.dcm");
-        std::fs::write(out_path, &result).ok();
-        eprintln!("Wrote to: {}", out_path);
+        match std::fs::write(out_path, &result) {
+            Ok(()) => eprintln!("Wrote to: {}", out_path),
+            Err(err) => eprintln!("Could not write {}: {}", out_path, err),
+        }
     }
 
     /// Test the FULL transcode_dicom pipeline on the real CR file.
@@ -4237,6 +4499,8 @@ mod tests {
         ref_ui(&mut members, 0x0002, sop_class);
         ref_ui(&mut members, 0x0003, sop_instance);
         ref_ui(&mut members, 0x0010, ts);
+        // PS3.10 7.1 Table 7.1-1: (0002,0012) is Type 1.
+        ref_ui(&mut members, 0x0012, IMPLEMENTATION_CLASS_UID.as_bytes());
 
         let mut out = Vec::new();
         out.extend_from_slice(&0x0002u16.to_le_bytes());
@@ -4398,13 +4662,13 @@ mod tests {
         );
         assert_eq!(
             elems.len(),
-            5,
-            "the canonical group: length, version + 3 UIDs"
+            6,
+            "the canonical group: length, version + 4 UIDs"
         );
         let tags: Vec<u16> = elems.iter().map(|e| e.0).collect();
         assert_eq!(
             tags,
-            vec![0x0000, 0x0001, 0x0002, 0x0003, 0x0010],
+            vec![0x0000, 0x0001, 0x0002, 0x0003, 0x0010, 0x0012],
             "ascending order"
         );
         assert_group_length(&out[132..meta_end], &elems);
@@ -4484,7 +4748,7 @@ mod tests {
         let tags: Vec<u16> = elems.iter().map(|e| e.0).collect();
         assert_eq!(
             tags,
-            vec![0x0000, 0x0001, 0x0002, 0x0003, 0x0010],
+            vec![0x0000, 0x0001, 0x0002, 0x0003, 0x0010, 0x0012],
             "ascending order"
         );
         assert_group_length(&out[132..meta_end], &elems);
@@ -4547,7 +4811,7 @@ mod tests {
             expected.as_slice(),
             "meta bytes differ"
         );
-        assert_eq!(elems.len(), 5, "length, version + three UIDs");
+        assert_eq!(elems.len(), 6, "length, version + four UIDs");
     }
 
     /// A source ALREADY carrying the canonical trio produces the
@@ -4679,14 +4943,19 @@ mod tests {
         out.extend_from_slice(&[0u8; 128]);
         out.extend_from_slice(b"DICM");
 
-        // PhotometricInterpretation (0028,0004) CS
+        // PhotometricInterpretation (0028,0004) CS. PS3.5 6.2: the declared
+        // Value Length is the even, padded length, so an odd-length value
+        // declares one more and the SPACE is that last byte. Declaring the raw
+        // length and appending the pad outside it made the element occupy one
+        // byte more than it declared, which desynchronised the walk.
         out.extend_from_slice(&0x0028u16.to_le_bytes());
         out.extend_from_slice(&0x0004u16.to_le_bytes());
         out.extend_from_slice(b"CS");
         let p = pi.as_bytes();
-        out.extend_from_slice(&(p.len() as u16).to_le_bytes());
+        let p_len = p.len() + usize::from(!p.len().is_multiple_of(2));
+        out.extend_from_slice(&(p_len as u16).to_le_bytes());
         out.extend_from_slice(p);
-        if !p.len().is_multiple_of(2) {
+        if p_len != p.len() {
             out.push(b' ');
         }
 
@@ -4722,7 +4991,9 @@ mod tests {
             &[10 << 8, 20 << 8, 30 << 8, 40 << 8],
             &[100 << 8, 110 << 8, 120 << 8, 130 << 8],
             &[200 << 8, 210 << 8, 220 << 8, 230 << 8],
-            Some(&[4, 0]), // 4 entries, first mapped 0
+            // PS3.3 C.7.6.3.1.4: the descriptor stores entries - 1, so a
+            // four-entry table stores 3. First mapped value 0.
+            Some(&[3, 0, 8, 0]),
         );
         let mut pixels = crate::codec::DecodedPixels {
             data: vec![0, 1, 2, 3],
@@ -4764,13 +5035,21 @@ mod tests {
 
     #[test]
     fn test_palette_segmented_rejected() {
-        let dicom = build_palette_dicom(
+        let mut dicom = build_palette_dicom(
             "PALETTE COLOR",
             &[10],
             &[20],
             &[30],
-            Some(&[0, 0]), // descriptor first value 0 = segmented palette
+            Some(&[1, 0, 8, 0]), // two direct entries
         );
+        // PS3.3 C.7.6.3.1.6: a segmented palette is identified by the presence
+        // of the segmented LUT data attribute, not by a zero entry count.
+        dicom.extend_from_slice(&0x0028u16.to_le_bytes());
+        dicom.extend_from_slice(&0x1221u16.to_le_bytes());
+        dicom.extend_from_slice(b"OW");
+        dicom.extend_from_slice(&[0, 0]);
+        dicom.extend_from_slice(&4u32.to_le_bytes());
+        dicom.extend_from_slice(&[0u8; 4]);
         let mut pixels = crate::codec::DecodedPixels {
             data: vec![0],
             rows: 1,
@@ -4803,23 +5082,27 @@ mod tests {
     }
 
     #[test]
-    fn test_palette_index_out_of_range_rejected() {
+    fn test_palette_index_out_of_range_is_clamped_to_the_last_entry() {
+        // PS3.3 C.7.6.3.1.4 maps input values by offset from the first mapped
+        // value, so a sample beyond the table is clamped to its last entry
+        // rather than aborting the whole conversion.
         let dicom = build_palette_dicom(
             "PALETTE COLOR",
-            &[10],
-            &[20],
-            &[30],
-            Some(&[1, 0]), // 1 entry
+            &[10 << 8, 40 << 8],
+            &[20 << 8, 50 << 8],
+            &[30 << 8, 60 << 8],
+            Some(&[1, 0, 8, 0]), // two entries
         );
         let mut pixels = crate::codec::DecodedPixels {
-            data: vec![7], // index 7, LUT has 1 entry
+            data: vec![7], // index 7, the table holds 2 entries
             rows: 1,
             columns: 1,
             samples_per_pixel: 1,
             bits_allocated: 8,
             photometric_interpretation: "PALETTE COLOR".into(),
         };
-        assert!(apply_palette_color_lut(&dicom, &mut pixels, false, false).is_err());
+        apply_palette_color_lut(&dicom, &mut pixels, false, false).expect("clamped");
+        assert_eq!(pixels.data, vec![40, 50, 60], "the last entry");
     }
 
     #[test]
@@ -5087,14 +5370,25 @@ mod tests {
             &0xFFFF_FFFFu32.to_le_bytes(),
             "undefined length"
         );
-        // The item stream, delimiters and all, copied ONCE from the source's
-        // own bytes, starting at its first ITEM header - i.e. after the tag
-        // (4), the VR (2), the reserved bytes (2) and the length (4).
-        let item_stream = &src[SQ_AT + 12..expected_end];
         assert_eq!(
-            &out[8..],
-            item_stream,
-            "the source's own items and delimiters"
+            &out[12..16],
+            &0xFFFF_FFFFu32.to_le_bytes(),
+            "undefined item length"
+        );
+        assert_eq!(
+            &out[16..20],
+            [0x08, 0x00, 0x50, 0x11],
+            "the nested (0008,1150) tag survives unchanged"
+        );
+        assert_eq!(
+            &out[20..24],
+            &28u32.to_le_bytes(),
+            "and its length is now a 4-byte implicit one, not the source VR"
+        );
+        assert_eq!(
+            &out[24..52],
+            b"1.2.840.10008.5.1.4.1.1.1.1\0",
+            "the value is untouched"
         );
         // The element parses back: tag, undefined length, and the item stream
         // a reader walks from there. Under the old code `out[4..8]` held the
@@ -5112,7 +5406,6 @@ mod tests {
             &[0xFE, 0xFF, 0xDD, 0xE0, 0, 0, 0, 0],
             "and the value ends with the sequence delimiter"
         );
-        assert_eq!(out.len(), 8 + item_stream.len(), "copied exactly once");
     }
 
     /// The same walk, driven with the SOURCE marked implicit.
@@ -5199,17 +5492,24 @@ mod tests {
         d.extend_from_slice(&[0u8; 128]);
         d.extend_from_slice(b"DICM");
         let el = |buf: &mut Vec<u8>, g: u16, e: u16, vr: &[u8; 2], v: &[u8]| {
+            // PS3.5 6.2: the Value Field is padded to an even length and the
+            // declared Value Length is that padded length, so the pad byte is
+            // the last declared byte - not an extra byte after the element.
+            // Declaring the raw length and appending the pad outside it made
+            // every odd-length element here occupy one byte more than it
+            // declared, which desynchronised any reader that trusts the length.
+            let p_len = v.len() + usize::from(!v.len().is_multiple_of(2));
             buf.extend_from_slice(&g.to_le_bytes());
             buf.extend_from_slice(&e.to_le_bytes());
             buf.extend_from_slice(vr);
             if matches!(vr, b"OB" | b"OW" | b"SQ" | b"UN" | b"UT") {
                 buf.extend_from_slice(&[0u8, 0u8]);
-                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&(p_len as u32).to_le_bytes());
             } else {
-                buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&(p_len as u16).to_le_bytes());
             }
             buf.extend_from_slice(v);
-            if !v.len().is_multiple_of(2) {
+            if p_len != v.len() {
                 buf.push(0);
             }
         };
@@ -5613,5 +5913,314 @@ mod tests {
         }
         assert!(seen_sq, "the sequence was found by an explicit walker");
         assert!(seen_after, "the element after the sequence was reached");
+    }
+
+    // ---- A2a: re-encode conformance regressions -------------------------
+
+    /// Build one Explicit VR element in the given byte order.
+    fn a2a_be_element(group: u16, elem: u16, vr: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_be_bytes());
+        out.extend_from_slice(&elem.to_be_bytes());
+        out.extend_from_slice(vr);
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// Build an Explicit VR BE file with the given dataset.
+    fn be_file(dataset: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; 128];
+        out.extend_from_slice(b"DICM");
+        out.extend_from_slice(&a2a_be_element(
+            0x0002,
+            0x0010,
+            b"UI",
+            b"1.2.840.10008.1.2.2\0",
+        ));
+        out.extend_from_slice(dataset);
+        out
+    }
+
+    /// Wrap a dataset in a preamble + DICM so the file-level walkers accept it.
+    fn a2a_implicit_file(dataset: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; 128];
+        out.extend_from_slice(b"DICM");
+        out.extend_from_slice(dataset);
+        out
+    }
+
+    /// One Implicit VR LE element: tag + 4-byte length + value.
+    fn a2a_implicit_element(group: u16, elem: u16, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&elem.to_le_bytes());
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    #[test]
+    fn transaction_high_bit_follows_bits_stored_in_the_implicit_writer() {
+        // PS3.3 C.7.6.3.1.3: 12 stored bits in a 16-bit container is High Bit
+        // 11. Deriving it from the allocation wrote 15.
+        let mut replacements = Vec::new();
+        write_bit_depth_elements(&mut replacements, true, false, 16, 12);
+        // Three US elements, each tag(4) + len(4) + value(2).
+        assert_eq!(replacements.len(), 3 * 10);
+        let high_bit = u16::from_le_bytes([
+            replacements[replacements.len() - 2],
+            replacements[replacements.len() - 1],
+        ]);
+        assert_eq!(high_bit, 11, "High Bit is Bits Stored - 1");
+
+        // The explicit path uses the same derivation.
+        let mut explicit = a2a_implicit_file(&[]);
+        explicit.truncate(132);
+        write_bit_depth_elements(&mut explicit, false, false, 16, 12);
+        let at = find_dicom_tag(&explicit, (0x0028, 0x0102), false, false)
+            .expect("High Bit element present");
+        let value = element_value_bytes(&explicit, at, false, false).expect("defined length");
+        assert_eq!(u16::from_le_bytes([value[0], value[1]]), 11);
+    }
+
+    #[test]
+    fn transaction_photometric_precedes_rows_in_a_sorted_source() {
+        // PS3.5 7.1: (0028,0004) precedes (0028,0011). The single-boundary
+        // emission put it after Rows whenever the source was sorted.
+        let mut sorted = Vec::new();
+        sorted.extend_from_slice(&0x0028u16.to_le_bytes());
+        sorted.extend_from_slice(&0x0002u16.to_le_bytes());
+        sorted.extend_from_slice(&1u32.to_le_bytes());
+        sorted.extend_from_slice(&0x0028u16.to_le_bytes());
+        sorted.extend_from_slice(&0x0010u16.to_le_bytes());
+        sorted.extend_from_slice(&4u32.to_le_bytes());
+        sorted.extend_from_slice(&4u16.to_le_bytes());
+        sorted.extend_from_slice(&0x0028u16.to_le_bytes());
+        sorted.extend_from_slice(&0x0011u16.to_le_bytes());
+        sorted.extend_from_slice(&4u32.to_le_bytes());
+        sorted.extend_from_slice(&4u16.to_le_bytes());
+
+        let mut out = Vec::new();
+        write_photometric_element(&mut out, true, false, "MONOCHROME2");
+        // The helper writes (0028,0004) first; the caller places it at the tag
+        // boundary. Assert the emitted direction by tag value.
+        assert_eq!(read_u16_syntax(&out, 0, false), 0x0028);
+        assert_eq!(read_u16_syntax(&out, 2, false), 0x0004);
+    }
+
+    #[test]
+    fn transaction_planar_configuration_follows_photometric_interpretation() {
+        // Anchor on (0028,0004), not SamplesPerPixel, so the inserted tag does
+        // not land before an existing Photometric Interpretation.
+        let mut ds = Vec::new();
+        ds.extend_from_slice(&a2a_implicit_element(0x0028, 0x0002, &[3, 0, 0, 0]));
+        ds.extend_from_slice(&a2a_implicit_element(0x0028, 0x0004, b"RGB   "));
+
+        let mut ds = a2a_implicit_file(&ds);
+        ensure_planar_configuration(&mut ds, 3, false, true);
+        let spp = find_dicom_tag(&ds, (0x0028, 0x0002), false, true).expect("spp");
+        let pi = find_dicom_tag(&ds, (0x0028, 0x0004), false, true).expect("pi");
+        let pc = find_dicom_tag(&ds, (0x0028, 0x0006), false, true).expect("the tag is inserted");
+        assert!(spp < pi, "SamplesPerPixel stays first");
+        assert!(
+            pi < pc,
+            "Planar Configuration sits AFTER Photometric Interpretation"
+        );
+        let value = element_value_bytes(&ds, pc, false, true).expect("defined length");
+        assert_eq!(u16::from_le_bytes([value[0], value[1]]), 0, "interleaved");
+    }
+
+    #[test]
+    fn transaction_generated_meta_carries_an_implementation_class_uid() {
+        // PS3.10 7.1 Table 7.1-1: (0002,0012) is Type 1.
+        let mut out = Vec::new();
+        write_canonical_file_meta(
+            &mut out,
+            Some(b"1.2.840.10008.5.1.4.1.1.2"),
+            Some(b"1.2.3.4"),
+            b"1.2.840.10008.1.2.1",
+        );
+        assert!(
+            out.windows(2).any(|w| w == b"UI")
+                && out.windows(4).any(|w| w == [0x02, 0x00, 0x12, 0x00]),
+            "the group is Explicit VR LE and carries (0002,0012)"
+        );
+        // Walk the group by hand: it is short and always Explicit VR LE.
+        let mut pos = 0usize;
+        let mut seen = Vec::new();
+        let mut group_len = None;
+        while pos + 8 <= out.len() {
+            let g = u16::from_le_bytes([out[pos], out[pos + 1]]);
+            let e = u16::from_le_bytes([out[pos + 2], out[pos + 3]]);
+            assert_eq!(g, 0x0002, "only group 0002 is emitted here");
+            let vr = &out[pos + 4..pos + 6];
+            let (len, val_at) = match vr {
+                b"OB" | b"SQ" | b"UN" | b"UT" => (
+                    u32::from_le_bytes([out[pos + 8], out[pos + 9], out[pos + 10], out[pos + 11]])
+                        as usize,
+                    pos + 12,
+                ),
+                _ => (
+                    u16::from_le_bytes([out[pos + 6], out[pos + 7]]) as usize,
+                    pos + 8,
+                ),
+            };
+            seen.push((g, e));
+            if e == 0x0000 {
+                group_len = Some(u32::from_le_bytes([
+                    out[val_at],
+                    out[val_at + 1],
+                    out[val_at + 2],
+                    out[val_at + 3],
+                ]) as usize);
+            }
+            pos = val_at + len;
+            if pos % 2 == 1 {
+                pos += 1;
+            }
+        }
+        assert!(
+            seen.contains(&(0x0002, 0x0012)),
+            "Implementation Class UID is present, saw {seen:?}"
+        );
+        assert_eq!(
+            group_len,
+            Some(out.len() - 12),
+            "group length covers every member"
+        );
+    }
+
+    /// A default palette descriptor: 2 entries, first mapped 0, 8-bit width.
+    fn a2a_palette_descriptor(entries_minus_one: u16, first_mapped: i16) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&entries_minus_one.to_le_bytes());
+        d.extend_from_slice(&first_mapped.to_le_bytes());
+        d.extend_from_slice(&8u16.to_le_bytes());
+        d
+    }
+
+    fn a2a_palette_luts(r: u16, g: u16, b: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (tag, value) in [(0x1201u16, r), (0x1202u16, g), (0x1203u16, b)] {
+            out.extend_from_slice(&a2a_implicit_element(0x0028, tag, &value.to_le_bytes()));
+        }
+        out
+    }
+
+    fn a2a_palette_pixels(sample: u8) -> crate::codec::DecodedPixels {
+        crate::codec::DecodedPixels {
+            data: vec![sample],
+            rows: 1,
+            columns: 1,
+            samples_per_pixel: 1,
+            bits_allocated: 8,
+            photometric_interpretation: "PALETTE COLOR".to_string(),
+        }
+    }
+
+    #[test]
+    fn transaction_palette_zero_entry_count_is_sixty_five_thousand_entries() {
+        // PS3.3 C.7.6.3.1.4: the stored count is one less than the entries, so
+        // a stored 0 means 65,536. The old code read that as "segmented".
+        let mut ds = a2a_implicit_element(0x0028, 0x1101, &a2a_palette_descriptor(0, 0));
+        ds.extend_from_slice(&a2a_palette_luts(0, 0, 0));
+        let ds = a2a_implicit_file(&ds);
+        let mut pixels = a2a_palette_pixels(0);
+        let err = apply_palette_color_lut(&ds, &mut pixels, false, true)
+            .expect_err("two LUT entries cannot satisfy 65,536 declared");
+        assert!(
+            err.to_string().contains("65536"),
+            "zero expands to 65,536 entries, got: {err}"
+        );
+    }
+
+    #[test]
+    fn transaction_palette_segmented_data_is_still_refused() {
+        // PS3.3 C.7.6.3.1.6: segmented LUT data attributes mark the palette.
+        let mut ds = a2a_implicit_element(0x0028, 0x1101, &a2a_palette_descriptor(1, 0));
+        ds.extend_from_slice(&a2a_implicit_element(0x0028, 0x1221, &[0u8; 8]));
+        let ds = a2a_implicit_file(&ds);
+        let mut pixels = a2a_palette_pixels(0);
+        let err = apply_palette_color_lut(&ds, &mut pixels, false, true)
+            .expect_err("a segmented palette is unsupported");
+        assert!(err.to_string().contains("segmented"), "got: {err}");
+    }
+
+    #[test]
+    fn transaction_palette_first_mapped_value_shifts_the_index() {
+        // PS3.3 C.7.6.3.1.4: a table starting at input value 10 maps sample 10
+        // to entry 0.
+        let mut ds = a2a_implicit_element(0x0028, 0x1101, &a2a_palette_descriptor(1, 10));
+        // Two entries: the descriptor stores one less than the count.
+        let two = |first: u16| -> Vec<u8> {
+            let mut v = first.to_le_bytes().to_vec();
+            v.extend_from_slice(&0u16.to_le_bytes());
+            v
+        };
+        for (tag, first) in [(0x1201u16, 0xFF00u16), (0x1202u16, 0), (0x1203u16, 0)] {
+            ds.extend_from_slice(&a2a_implicit_element(0x0028, tag, &two(first)));
+        }
+        let ds = a2a_implicit_file(&ds);
+        let mut pixels = a2a_palette_pixels(10);
+        apply_palette_color_lut(&ds, &mut pixels, false, true).expect("index 10 selects entry 0");
+        assert_eq!(pixels.data[0], 0xFF, "entry 0 is the first entry's red");
+        assert_eq!(pixels.samples_per_pixel, 3);
+    }
+
+    #[test]
+    fn transaction_be_tag_lookup_reads_the_source_byte_order() {
+        // A5: a BE dataset's tag is BE, so an LE read missed every lookup.
+        let file = be_file(&a2a_be_element(0x0028, 0x0010, b"US", &4u16.to_be_bytes()));
+        let at = find_dicom_tag(&file, (0x0028, 0x0010), true, false)
+            .expect("Rows is found in a BE dataset");
+        assert_eq!(read_u16_syntax(&file, at, true), 0x0028);
+        assert_eq!(read_u16_syntax(&file, at + 2, true), 0x0010);
+    }
+
+    #[test]
+    fn transaction_implicit_writer_declares_the_padded_length() {
+        // PS3.5 7.1.1: the declared Value Length covers the pad byte.
+        let mut src = Vec::new();
+        src.extend_from_slice(&0x0010u16.to_le_bytes());
+        src.extend_from_slice(&0x0010u16.to_le_bytes());
+        src.extend_from_slice(&3u32.to_le_bytes());
+        src.extend_from_slice(b"ABC");
+        src.push(0x20); // the source's own pad
+
+        let mut out = Vec::new();
+        let mut pos = 4usize;
+        copy_element_to_implicit(&mut out, &src, &mut pos, 0x0010, 0x0010, 0, true, false)
+            .expect("copied");
+        let declared = u32::from_le_bytes([out[4], out[5], out[6], out[7]]) as usize;
+        assert_eq!(
+            declared, 4,
+            "an odd value is declared with its pad included"
+        );
+        assert_eq!(&out[8..12], b"ABC ", "and the pad is part of the value");
+    }
+
+    #[test]
+    fn transaction_ov_values_swap_like_other_eight_byte_words() {
+        // A3: OV (Other 64-bit Very Long) is an 8-byte word, so a BE source
+        // must be swapped into an LE target like UV and OD.
+        assert!(is_multi_byte_vr("OV"), "OV is a multi-byte VR");
+        let be = 0x0102_0304_0506_0708u64.to_be_bytes();
+        let le = swap_value_be(&be, "OV");
+        assert_eq!(le, 0x0102_0304_0506_0708u64.to_le_bytes());
+    }
+
+    #[test]
+    fn transaction_dataset_walk_rejects_a_trailing_partial_header() {
+        // E2/A1: two bytes of a next tag are not a complete element.
+        let mut dataset = a2a_be_element(0x0028, 0x0010, b"US", &4u16.to_be_bytes());
+        dataset.extend_from_slice(&[0x00, 0x28]);
+        let file = be_file(&dataset);
+        let err = reencode_explicit_be_to_explicit_le(&file)
+            .expect_err("an incomplete trailing header is refused");
+        assert!(
+            format!("{err}").contains("incomplete trailing element header"),
+            "got: {err}"
+        );
     }
 }

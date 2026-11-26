@@ -228,8 +228,30 @@ pub fn search_all_series<'a>(
     filter: &SeriesFilter,
     out: &mut Vec<GlobalSeries<'a>>,
 ) {
+    search_all_series_matching(manifests, filter, None, out)
+}
+
+/// [`search_all_series`] restricted to manifests that pass a STUDY predicate.
+///
+/// PS3.18 10.6.1.2.1 makes the Study IE search keys legal on the All Series
+/// resource, so a `/series?PatientID=...` query must narrow the archive before
+/// its series are considered. The predicate is applied per manifest here rather
+/// than by pre-filtering the caller's slice, because the returned series
+/// borrow from the manifests and a filtered `Vec<&Manifest>` cannot back a
+/// `&[Manifest]` parameter.
+pub fn search_all_series_matching<'a>(
+    manifests: &'a [Manifest],
+    filter: &SeriesFilter,
+    study: Option<&crate::query::filter::QueryFilter>,
+    out: &mut Vec<GlobalSeries<'a>>,
+) {
     out.clear();
     for manifest in manifests {
+        if let Some(study) = study
+            && !crate::query::filter::match_study_attrs(study, manifest)
+        {
+            continue;
+        }
         let study_uid =
             text_attr(&manifest.study.attrs, crate::query::tag::STUDY_INSTANCE_UID).unwrap_or("");
         for s in &manifest.series {
@@ -261,7 +283,19 @@ pub fn search_all_series<'a>(
 /// returned borrowed slice in place.
 ///
 /// Borrow-only: `out` holds `GlobalInstance` references (no UID/attr clones);
-/// matching and sorting allocate nothing at steady state.
+/// matching and sorting allocate nothing at steady state, EXCEPT the study
+/// predicate map below.
+///
+/// # Allocation contract
+///
+/// When `study_filter` is present, this function calls
+/// `QueryFilter::build_expected()` once per call, which allocates one small
+/// map for the filter's attribute keys. The map is not cached across calls and
+/// is not passed in by the caller: reusing it would mean a threaded-through
+/// buffer that every caller (there is one route) has to own and size, which
+/// buys nothing for a single map per HTTP request. Callers that later need the
+/// zero-allocation guarantee on this path must pass the map in; the signature
+/// deliberately does not anticipate that.
 pub fn search_all_instances<'a>(
     manifests: &'a [Manifest],
     filter: &InstanceFilter,
@@ -547,7 +581,7 @@ fn cmp_instance(a: &InstanceRecord, b: &InstanceRecord) -> std::cmp::Ordering {
 
 /// `(present, numeric, uid)` sort key for a series. `present=false` (absent,
 /// empty, or non-numeric SeriesNumber) sorts last.
-fn series_sort_key(s: &SeriesRecord) -> (bool, u64, &str) {
+fn series_sort_key(s: &SeriesRecord) -> (bool, i64, &str) {
     let uid = text_attr(&s.attrs, crate::query::tag::SERIES_INSTANCE_UID).unwrap_or("");
     match numeric_attr(&s.attrs, crate::query::tag::SERIES_NUMBER) {
         Some(n) => (true, n, uid),
@@ -557,7 +591,7 @@ fn series_sort_key(s: &SeriesRecord) -> (bool, u64, &str) {
 
 /// `(present, numeric, uid)` sort key for an instance. `present=false`
 /// (absent, empty, or non-numeric InstanceNumber) sorts last.
-fn instance_sort_key(i: &InstanceRecord) -> (bool, u64, &str) {
+fn instance_sort_key(i: &InstanceRecord) -> (bool, i64, &str) {
     let uid = text_attr(&i.attrs, crate::query::tag::SOP_INSTANCE_UID).unwrap_or("");
     match numeric_attr(&i.attrs, crate::query::tag::INSTANCE_NUMBER) {
         Some(n) => (true, n, uid),
@@ -565,17 +599,26 @@ fn instance_sort_key(i: &InstanceRecord) -> (bool, u64, &str) {
     }
 }
 
-/// Parse the numeric sort-key attribute `tag` (SeriesNumber / InstanceNumber)
-/// from `attrs`. `Some(n)` for a non-negative integer; `None` when absent,
+/// Parse the signed numeric sort-key attribute `tag` (SeriesNumber /
+/// InstanceNumber) from `attrs`. `Some(n)` for an integer; `None` when absent,
 /// empty, or non-numeric - such records sort last.
-fn numeric_attr(attrs: &[(u32, AttrValue)], tag: u32) -> Option<u64> {
+///
+/// IS is a SIGNED integer string (PS3.5 Table 6.2-1), and a negative value
+/// really can reach the manifest: the parser reads the attribute as `i32`
+/// (`opt_int` in the dicom_rs parser) and STOW stores it as text, so no
+/// validation rejects `-1` on the way in. Parsing as `u64` therefore pushed a
+/// negative number into the MISSING group, sorting it after every real number
+/// instead of before 0 - a wrong order, not a tolerated one. The signed key
+/// keeps every non-negative value where it was and orders negatives below
+/// them.
+fn numeric_attr(attrs: &[(u32, AttrValue)], tag: u32) -> Option<i64> {
     for (t, v) in attrs {
         if *t != tag {
             continue;
         }
         return match v {
-            AttrValue::Text(s) => s.parse::<u64>().ok(),
-            AttrValue::UInt(u) => Some(*u),
+            AttrValue::Text(s) => s.trim().parse::<i64>().ok(),
+            AttrValue::UInt(u) => i64::try_from(*u).ok(),
             _ => None,
         };
     }
@@ -851,6 +894,23 @@ mod tests {
     static ALLOC: ferrite_testkit::heap::TestAllocator =
         ferrite_testkit::heap::TestAllocator::new();
 
+    /// [`series`] with an explicit Modality (0008,0060).
+    ///
+    /// The plain fixture carries no modality, so a test that asserted on a
+    /// modality filter could not tell a working filter from an ignored key.
+    fn series_with_modality(
+        uid: &str,
+        num: Option<&str>,
+        desc: Option<&str>,
+        modality: &str,
+    ) -> SeriesRecord {
+        let mut s = series(uid, num, desc, None);
+        s.attrs
+            .push((tag::MODALITY, AttrValue::Text(modality.into())));
+        s.attrs.sort_by_key(|(t, _)| *t);
+        s
+    }
+
     fn series(
         uid: &str,
         num: Option<&str>,
@@ -963,6 +1023,54 @@ mod tests {
         assert_eq!(uids(&out), vec!["A", "C", "B", "D"]);
     }
 
+    /// IS is a SIGNED integer string (PS3.5 Table 6.2-1), so a negative
+    /// SeriesNumber sorts BELOW zero rather than into the missing group.
+    ///
+    /// A negative value is reachable: the dicom_rs parser reads (0020,0011)
+    /// with `opt_int` into an `i32`, STOW stores it as text without a range
+    /// check, and the manifest therefore carries `-1`. Parsing the sort key as
+    /// `u64` failed that string and filed it with the records that have no
+    /// number at all - so every real number sorted ahead of it, including 0,
+    /// which is not the DICOM ordering.
+    #[test]
+    fn a_negative_number_sorts_below_zero_not_into_the_missing_group() {
+        let m = manifest_with(vec![
+            series("A", Some("2"), None, None),
+            series("B", Some("-1"), None, None),
+            series("C", Some("0"), None, None),
+            series("D", None, None, None),
+        ]);
+        let mut out = Vec::new();
+        search_series(&m, &SeriesFilter::default(), &mut out);
+        assert_eq!(
+            uids(&out),
+            vec!["B", "C", "A", "D"],
+            "-1 < 0 < 2, and only the truly absent number sorts last"
+        );
+    }
+
+    /// The instance path has the same key and the same defect; it is a
+    /// sibling of the series fix, not a separate finding.
+    #[test]
+    fn a_negative_instance_number_sorts_below_zero() {
+        let mut s = series("S", None, None, None);
+        s.instances = vec![
+            instance("i-missing", None),
+            instance("i-neg", Some("-3")),
+            instance("i-zero", Some("0")),
+            instance("i-2", Some("2")),
+        ];
+        let m = manifest_with(vec![s]);
+        let mut out = Vec::new();
+        let found = search_instances(&m, "S", &InstanceFilter::default(), &mut out, false);
+        assert!(found);
+        let got: Vec<&str> = out
+            .iter()
+            .map(|i| text_attr(&i.attrs, tag::SOP_INSTANCE_UID).unwrap())
+            .collect();
+        assert_eq!(got, vec!["i-neg", "i-zero", "i-2", "i-missing"]);
+    }
+
     #[test]
     fn instance_sort_numeric_missing_last() {
         let mut s = series("S", None, None, None);
@@ -985,13 +1093,43 @@ mod tests {
     #[test]
     fn series_filters_modality_and_description_glob() {
         let m = manifest_with(vec![
-            series("S1", Some("1"), Some("Chest CT"), None),
-            series("S2", Some("2"), Some("Head"), None),
-            series("S3", Some("3"), Some("Chest MR"), None),
+            series_with_modality("S1", Some("1"), Some("Chest CT"), "CT"),
+            series_with_modality("S2", Some("2"), Some("Head"), "CT"),
+            series_with_modality("S3", Some("3"), Some("Chest MR"), "MR"),
         ]);
-        // Modality filter.
+        // Modality filter. The fixtures must DIFFER in modality, otherwise a
+        // scanner that ignored the key would answer the same three series and
+        // this assertion would pass either way - which is exactly what the
+        // previous version of this test did (default filter, output discarded).
         let mut out = Vec::new();
-        search_series(&m, &SeriesFilter::default(), &mut out);
+        search_series(
+            &m,
+            &SeriesFilter {
+                modality: Some("CT".into()),
+                series_instance_uid: None,
+                series_description: None,
+                series_date: None,
+                series_time: None,
+                manufacturer: None,
+                institutional_department_name: None,
+                operators_name: None,
+                protocol_name: None,
+                station_name: None,
+                body_part_examined: None,
+                pps_start_date: None,
+                pps_start_time: None,
+                scheduled_procedure_step_id: None,
+                requested_procedure_id: None,
+                series_number: None,
+                pn_case_insensitive: false,
+            },
+            &mut out,
+        );
+        assert_eq!(
+            uids(&out),
+            vec!["S1", "S2"],
+            "only CT series may match a CT query"
+        );
         // Description glob.
         let mut out = Vec::new();
         search_series(

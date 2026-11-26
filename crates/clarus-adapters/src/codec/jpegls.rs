@@ -60,11 +60,10 @@ impl DicomCodec for JpeglsLosslessCodec {
         meta: &DicomMeta,
     ) -> Result<Vec<u8>, CodecError> {
         let fragments = jpegls_encode_fragments(pixels, meta.frames, 0, jpegls::Profile::T87)?;
-        Ok(crate::codec::build_encapsulated_pixeldata_multi(
+        crate::codec::build_encapsulated_pixeldata_multi(
             &fragments,
             pixels.samples_per_pixel as usize,
-            false,
-        ))
+        )
     }
 }
 
@@ -107,11 +106,10 @@ impl DicomCodec for JpeglsLegacyGoCodec {
         meta: &DicomMeta,
     ) -> Result<Vec<u8>, CodecError> {
         let fragments = jpegls_encode_fragments(pixels, meta.frames, 0, jpegls::Profile::LegacyGo)?;
-        Ok(crate::codec::build_encapsulated_pixeldata_multi(
+        crate::codec::build_encapsulated_pixeldata_multi(
             &fragments,
             pixels.samples_per_pixel as usize,
-            false,
-        ))
+        )
     }
 }
 
@@ -162,11 +160,10 @@ impl DicomCodec for JpeglsNearLosslessCodec {
     ) -> Result<Vec<u8>, CodecError> {
         let fragments =
             jpegls_encode_fragments(pixels, meta.frames, self.near, jpegls::Profile::T87)?;
-        Ok(crate::codec::build_encapsulated_pixeldata_multi(
+        crate::codec::build_encapsulated_pixeldata_multi(
             &fragments,
             pixels.samples_per_pixel as usize,
-            false,
-        ))
+        )
     }
 }
 
@@ -238,14 +235,13 @@ fn jpegls_decode(dicom_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
         )));
     }
 
-    // Decode frames. Fragments are frame-major: per frame, one codestream
-    // per component (PS3.5 A.4.2). The planar output is per-plane,
-    // frame-major: all frames of plane R, then all frames of plane G...
-    let fragments = super::coalesce_single_frame_fragments(
-        fragments,
-        meta.frames.max(1) as usize,
-        num_components,
-    );
+    // Fragments are frame-major: per frame, one codestream per component
+    // (the layout `jpegls_encode_fragments` writes; see the deviation note
+    // there). They are whole streams, so joining a frame's fragments would
+    // fuse independent codestreams - the coalescing helper is told that
+    // explicitly rather than left to infer it from the component count.
+    let fragments =
+        super::coalesce_single_frame_fragments(fragments, meta.frames.max(1) as usize, false);
     let frames = fragments.len() / num_components;
     if frames == 0 || !fragments.len().is_multiple_of(num_components) {
         return Err(CodecError::DecodeFailed(format!(
@@ -254,7 +250,13 @@ fn jpegls_decode(dicom_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
             num_components
         )));
     }
-    if meta.frames != 1 && meta.frames as usize != frames {
+    // PS3.3 C.7.6.3.1.4: NumberOfFrames states how many frames the value holds,
+    // so a declared 1 with two frames' worth of components is a file whose own
+    // attributes contradict its contents. The guard used to skip the check
+    // whenever the declaration was 1, which is exactly the case where the
+    // mismatch is invisible: two fragments and one declared frame decoded as two
+    // frames and returned success.
+    if meta.frames.max(1) as usize != frames {
         return Err(CodecError::DecodeFailed(format!(
             "JPEG-LS: NumberOfFrames ({}) does not match fragment count ({})",
             meta.frames, frames
@@ -263,6 +265,15 @@ fn jpegls_decode(dicom_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
     let mut planar_data: Vec<u8> =
         Vec::with_capacity(pixel_count * num_components * bytes_per_sample * frames);
 
+    // `DecodedPixels` is WHOLE-IMAGE channel planes: all frames of plane R, then
+    // all frames of plane G, and so on. The fragment stream is frame-major (one
+    // codestream per component, per frame), so the decoded component belongs at
+    // `comp * frames + frame` within its plane - NOT in the order it arrives.
+    // Emitting in arrival order produced `R0 G0 B0 | R1 G1 B1`, which is what
+    // the ENCODER then read back as whole planes, so a multi-frame colour
+    // roundtrip did not return its input.
+    let frame_bytes = pixel_count * bytes_per_sample;
+    let mut plane_written = 0usize;
     for frame in 0..frames {
         for comp in 0..num_components {
             let frag = &fragments[frame * num_components + comp];
@@ -276,17 +287,37 @@ fn jpegls_decode(dicom_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
                     meta.columns, meta.rows
                 )));
             }
+            // One codestream per component: exactly one plane per frame.
+            if decoded_u16.len() != pixel_count {
+                return Err(CodecError::DecodeFailed(format!(
+                    "JPEG-LS: frame {frame} component {comp} decoded {} samples, \
+                     {} rows x {} columns need {}",
+                    decoded_u16.len(),
+                    meta.rows,
+                    meta.columns,
+                    pixel_count
+                )));
+            }
 
-            // Convert u16 -> u8 (truncating high byte for 8-bit; writing LE for 16-bit)
+            // Where this component's frame starts inside the whole-image planes.
+            let at = comp * frames * frame_bytes + frame * frame_bytes;
+            if planar_data.len() < at + frame_bytes {
+                planar_data.resize(at + frame_bytes, 0);
+            }
+            let dst = &mut planar_data[at..at + frame_bytes];
+            // Convert u16 -> u8 (truncating high byte for 8-bit; writing LE for
+            // 16-bit).
             match bytes_per_sample {
                 1 => {
-                    for px in &decoded_u16 {
-                        planar_data.push(*px as u8);
+                    for (i, px) in decoded_u16.iter().enumerate() {
+                        dst[i] = *px as u8;
                     }
                 }
                 2 => {
-                    for px in &decoded_u16 {
-                        planar_data.extend_from_slice(&px.to_le_bytes());
+                    for (i, px) in decoded_u16.iter().enumerate() {
+                        let bytes = px.to_le_bytes();
+                        dst[i * 2] = bytes[0];
+                        dst[i * 2 + 1] = bytes[1];
                     }
                 }
                 _ => {
@@ -295,8 +326,10 @@ fn jpegls_decode(dicom_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
                     )));
                 }
             }
+            plane_written += frame_bytes;
         }
     }
+    debug_assert_eq!(plane_written, planar_data.len());
 
     Ok(DecodedPixels {
         data: planar_data,
@@ -350,6 +383,13 @@ fn jpegls_encode_fragments(
     let component_size = frame_pixel_count * bytes_per_sample; // one frame of one plane
     let frames_usize = frames as usize;
 
+    // KNOWN DEVIATION from PS3.5 A.4.2: one codestream per COMPONENT, not one
+    // codestream per frame carrying all components interleaved. `pure_jpegls`
+    // 2.0.0 writes SOF55 with a hard-wired single component
+    // (`encode.rs:145` "for a single-component image") and rejects
+    // `pixels.len() != width * height`, so a three-component codestream cannot
+    // be produced without changing the dependency. Interleaving here and
+    // letting that check fail would turn every colour encode into an error.
     let mut fragments: Vec<Vec<u8>> = Vec::with_capacity(num_components * frames_usize);
     for frame in 0..frames_usize {
         for comp in 0..num_components {
@@ -428,6 +468,43 @@ fn jpegls_encode(
 ///
 /// Handles both Explicit VR (OB/OW with Reserved bytes) and implicit
 /// encapsulated format (undefined length, sequence of Items).
+/// Read the Basic Offset Table of an encapsulated Pixel Data value.
+///
+/// PS3.5 A.4: the first Item of an encapsulated value carries one 32-bit
+/// offset per frame, measured in bytes from the first byte of the first
+/// fragment's Item tag. An empty value means "no frame boundaries declared",
+/// which is different from "one frame at offset 0" and is returned as an
+/// empty vector.
+pub(crate) fn extract_basic_offset_table(data: &[u8]) -> Vec<u32> {
+    let Some(pix_pos) = find_tag_position(data, TAG_PIXEL_DATA) else {
+        return Vec::new();
+    };
+    let mut pos = pix_pos + 4;
+    let Some(vr_bytes) = data.get(pos..pos + 2) else {
+        return Vec::new();
+    };
+    let long = super::vr_widths::is_long_form_vr(vr_bytes);
+    pos += if long { 2 + 2 + 4 } else { 2 + 2 };
+    let Some(bot_hdr) = data.get(pos..pos + 8) else {
+        return Vec::new();
+    };
+    if u16::from_le_bytes([bot_hdr[0], bot_hdr[1]]) != 0xFFFE
+        || u16::from_le_bytes([bot_hdr[2], bot_hdr[3]]) != 0xE000
+    {
+        return Vec::new();
+    }
+    let len = u32::from_le_bytes([bot_hdr[4], bot_hdr[5], bot_hdr[6], bot_hdr[7]]) as usize;
+    if len == 0 || !len.is_multiple_of(4) {
+        return Vec::new();
+    }
+    let Some(raw) = data.get(pos + 8..pos + 8 + len) else {
+        return Vec::new();
+    };
+    raw.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 pub(crate) fn extract_encapsulated_fragments(data: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
     let pix_pos = find_tag_position(data, TAG_PIXEL_DATA)
         .ok_or_else(|| CodecError::DecodeFailed("PixelData (7FE0,0010) not found".into()))?;
@@ -478,6 +555,10 @@ pub(crate) fn extract_encapsulated_fragments(data: &[u8]) -> Result<Vec<Vec<u8>>
     // The FIRST item of an encapsulated value is the Basic Offset Table
     // (PS3.5 A.4), so nothing about its content has to be guessed.
     let mut is_first_item = true;
+    // PS3.5 A.4: the value ends at (FFFE,E0DD). Without it the value is
+    // incomplete, and returning the fragments collected so far decodes a
+    // truncated image as if it were whole.
+    let mut terminated = false;
 
     while pos + 8 <= end {
         let tag_group = u16::from_le_bytes([data[pos], data[pos + 1]]);
@@ -505,16 +586,26 @@ pub(crate) fn extract_encapsulated_fragments(data: &[u8]) -> Result<Vec<Vec<u8>>
                     // fragment.
                     is_first_item = false;
                     if item_len == 0xFFFF_FFFF {
-                        // Undefined length is not a legal table item, but the
-                        // walk must not consume the whole stream either.
-                        continue;
+                        // A Basic Offset Table is a run of 32-bit offsets, so
+                        // its length is defined and a multiple of four. An
+                        // undefined length is not a table; `continue` without
+                        // moving `pos` re-read the same header forever.
+                        return Err(CodecError::DecodeFailed(
+                            "JPEG-LS: undefined-length Basic Offset Table".into(),
+                        ));
                     }
                     pos = pos.saturating_add(item_len); // skip the offsets
                     continue; // BOT -- not a data fragment
                 }
                 if item_len == 0xFFFF_FFFF {
-                    // Undefined length item - skip
-                    continue;
+                    // PS3.5 A.4: a Fragment Item carries a defined length - the
+                    // value is a piece of a codestream and has a size. An
+                    // undefined-length Item here is malformed, and `continue`
+                    // left `pos` where it was, so the walk re-read the same
+                    // header forever. Refuse it.
+                    return Err(CodecError::DecodeFailed(
+                        "JPEG-LS: undefined-length Item in an encapsulated value".into(),
+                    ));
                 }
                 if item_len == 0 {
                     // Empty item - skip
@@ -528,9 +619,17 @@ pub(crate) fn extract_encapsulated_fragments(data: &[u8]) -> Result<Vec<Vec<u8>>
                 fragments.push(data[pos..pos + item_len].to_vec());
                 pos += item_len;
             }
-            // Sequence Delimiter (FFFE,E0DD) or Item Delimiter (FFFE,E00D)
-            (0xFFFE, 0xE0DD) | (0xFFFE, 0xE00D) => {
+            // PS3.5 7.5.1: only (FFFE,E0DD) closes the encapsulated value.
+            // A bare Item Delimitation Item inside it does not - treating it
+            // as the end dropped every fragment after it.
+            (0xFFFE, 0xE0DD) => {
+                terminated = true;
                 break;
+            }
+            (0xFFFE, 0xE00D) => {
+                // An Item Delimitation closes an item, not the value; this
+                // walk never enters an item, so step over it.
+                continue;
             }
             _ => {
                 // Unknown - stop
@@ -539,6 +638,11 @@ pub(crate) fn extract_encapsulated_fragments(data: &[u8]) -> Result<Vec<Vec<u8>>
         }
     }
 
+    if !terminated {
+        return Err(CodecError::DecodeFailed(
+            "JPEG-LS: encapsulated PixelData has no Sequence Delimitation Item".into(),
+        ));
+    }
     Ok(fragments)
 }
 
@@ -567,12 +671,32 @@ pub(crate) fn parse_jpegls_meta(data: &[u8]) -> Result<DicomMeta, CodecError> {
         .ok_or_else(|| CodecError::InvalidMetadata("Missing Rows (0028,0010)".into()))?;
     let columns = find_tag_u16(data, TAG_COLUMNS)
         .ok_or_else(|| CodecError::InvalidMetadata("Missing Columns (0028,0011)".into()))?;
-    let samples_per_pixel: u8 = find_tag_u16(data, TAG_SAMPLES_PER_PIXEL)
-        .map(|v| v as u8)
-        .unwrap_or(1);
-    let bits_allocated: u8 = find_tag_u16(data, TAG_BITS_ALLOCATED)
-        .map(|v| v as u8)
-        .unwrap_or(8);
+    // PS3.3 C.7.6.3.1.1: SamplesPerPixel is 1 (grayscale) or 3 (colour).
+    // Reading it as `u16 as u8` truncated before it was ever checked, so a
+    // declared 259 narrowed to 3 and decoded as a colour image instead of
+    // being refused.
+    let samples_per_pixel: u8 = match find_tag_u16(data, TAG_SAMPLES_PER_PIXEL) {
+        None => 1,
+        Some(1) => 1,
+        Some(3) => 3,
+        Some(other) => {
+            return Err(CodecError::InvalidMetadata(format!(
+                "JPEG-LS: SamplesPerPixel must be 1 or 3, got {other}"
+            )));
+        }
+    };
+    let bits_allocated: u8 = match find_tag_u16(data, TAG_BITS_ALLOCATED) {
+        None => 8,
+        // PS3.5 8.1.1 Table 8.1-2: BitsAllocated is 1 or a multiple of 8 for
+        // the sample widths this codec handles; anything above 16 is not a
+        // JPEG-LS sample width and must not wrap.
+        Some(v @ 8..=16) if v.is_multiple_of(8) => v as u8,
+        Some(other) => {
+            return Err(CodecError::InvalidMetadata(format!(
+                "JPEG-LS: unsupported BitsAllocated {other}"
+            )));
+        }
+    };
     // PS3.5 8.1.1: BitsStored (0028,0101) is the count of bits that actually
     // carry signal and shall never exceed BitsAllocated (0028,0100). Reading
     // BitsAllocated here declared a 12-bit-in-16 CT as 16-bit, so the
@@ -633,33 +757,62 @@ fn find_tag_position(data: &[u8], target: (u16, u16)) -> Option<usize> {
         }
     }
 
-    // Walk dataset
+    // Walk dataset. PS3.5 7.1: every attribute this function serves (Pixel
+    // Data, Rows, Columns, Samples per Pixel, Photometric Interpretation) is
+    // TOP-LEVEL. An instance can also carry them inside a sequence - the Icon
+    // Image Sequence (0088,0200) of PS3.3 C.7.6.1.1.5 holds a complete
+    // thumbnail - so a walk that enters the item stream returns the icon's
+    // attributes as if they described the image.
+    let mut depth: usize = 0;
     while pos + 4 <= end {
         let g = u16::from_le_bytes([data[pos], data[pos + 1]]);
         let e = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
-        pos += 4;
 
-        if (g, e) == target {
-            return Some(pos - 4);
-        }
-
-        // Handle sequences
+        // PS3.5 7.5: (FFFE,E000), (FFFE,E00D) and (FFFE,E0DD) carry no VR, so
+        // the four bytes after the tag are a length.
         if g == 0xFFFE {
-            if pos + 4 > end {
+            if pos + 8 > end {
                 return None;
             }
-            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                as usize;
-            pos += 4;
-            if len == 0xFFFF_FFFF {
-                continue; // undefined length
+            let len =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            match (e, len) {
+                (0xE000, 0xFFFF_FFFF) => {
+                    depth += 1;
+                    pos += 8;
+                }
+                (0xE000, _) => pos = pos.saturating_add(8).saturating_add(len),
+                // PS3.5 7.5.1: a sequence closes on (FFFE,E0DD) and an item on
+                // (FFFE,E00D); each undefined-length item or sequence opened
+                // one level, so both close one.
+                (0xE00D | 0xE0DD, _) => {
+                    depth = depth.saturating_sub(1);
+                    pos += 8;
+                }
+                _ => pos += 8,
             }
-            pos = pos.saturating_add(len);
             continue;
         }
 
-        if !skip_explicit(data, &mut pos) {
-            return None;
+        if depth == 0 && (g, e) == target {
+            return Some(pos);
+        }
+        pos += 4;
+
+        // PS3.5 7.1.2 with 6.2 Table 6.2-1: the width class. An undefined
+        // length is not a length to step over - the walk enters the item
+        // stream below it.
+        let value = super::vr_widths::explicit_value(data, pos, false)?;
+        let header_len = value.header_len;
+        if value.len == super::vr_widths::UNDEFINED_LENGTH {
+            pos = pos.saturating_add(header_len);
+            depth += 1;
+        } else {
+            pos = pos.saturating_add(header_len).saturating_add(value.len);
+            if !value.len.is_multiple_of(2) {
+                pos = pos.saturating_add(1); // PS3.5 7.1 pad byte
+            }
         }
     }
 
@@ -667,15 +820,15 @@ fn find_tag_position(data: &[u8], target: (u16, u16)) -> Option<usize> {
 }
 
 fn skip_explicit(data: &[u8], pos: &mut usize) -> bool {
-    if *pos + 2 > data.len() {
+    let Some(vr_bytes) = data.get(*pos..*pos + 2) else {
         return false;
-    }
-    let vr_bytes = [data[*pos], data[*pos + 1]];
+    };
+    // PS3.5 6.2 Table 6.2-1 via `vr_widths`, the one table that states the
+    // width class - a list copied per file drifts.
+    let long = super::vr_widths::is_long_form_vr(vr_bytes);
     *pos += 2;
-    let vr = std::str::from_utf8(&vr_bytes).unwrap_or("  ");
-    match vr {
-        "OB" | "OD" | "OF" | "OL" | "OV" | "OW" | "SQ" | "SV" | "UC" | "UN" | "UR" | "UT"
-        | "UV" => {
+    match long {
+        true => {
             if *pos + 6 > data.len() {
                 return false;
             }
@@ -693,7 +846,7 @@ fn skip_explicit(data: &[u8], pos: &mut usize) -> bool {
             }
             true
         }
-        _ => {
+        false => {
             if *pos + 2 > data.len() {
                 return false;
             }
@@ -745,75 +898,64 @@ fn find_tag_bytes(data: &[u8], target: (u16, u16)) -> Option<Vec<u8>> {
         }
     }
 
-    // Walk dataset
+    // Walk dataset. PS3.5 7.1: the attributes this function serves are
+    // TOP-LEVEL, and an Icon Image Sequence (PS3.3 C.7.6.1.1.5) carries its
+    // own copy of them, so the walk must not enter the item stream.
+    let mut depth: usize = 0;
     while pos + 4 <= end {
         let g = u16::from_le_bytes([data[pos], data[pos + 1]]);
         let e = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
-        pos += 4;
 
-        if (g, e) == target {
-            // Found - extract value
-            if pos + 2 > end {
-                return None;
-            }
-            let vr_bytes = [data[pos], data[pos + 1]];
-            pos += 2;
-            let vr = std::str::from_utf8(&vr_bytes).unwrap_or("  ");
-            match vr {
-                "OB" | "OD" | "OF" | "OL" | "OV" | "OW" | "SQ" | "SV" | "UC" | "UN" | "UR"
-                | "UT" | "UV" => {
-                    if pos + 6 > end {
-                        return None;
-                    }
-                    pos += 2;
-                    let len = u32::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                    ]) as usize;
-                    pos += 4;
-                    if len == 0xFFFF_FFFF {
-                        return Some(Vec::new()); // undefined -- return empty
-                    }
-                    if pos + len > end {
-                        return None;
-                    }
-                    let val = data[pos..pos + len].to_vec();
-                    return Some(val);
-                }
-                _ => {
-                    if pos + 2 > end {
-                        return None;
-                    }
-                    let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                    pos += 2;
-                    if pos + len > end {
-                        return None;
-                    }
-                    let val = data[pos..pos + len].to_vec();
-                    return Some(val);
-                }
-            }
-        }
-
-        // Handle FFFE group
+        // PS3.5 7.5: group FFFE carries no VR, so the four bytes after the tag
+        // are a length.
         if g == 0xFFFE {
-            if pos + 4 > end {
+            if pos + 8 > end {
                 return None;
             }
-            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                as usize;
-            pos += 4;
-            if len == 0xFFFF_FFFF {
-                continue;
+            let len =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            match (e, len) {
+                (0xE000, 0xFFFF_FFFF) => {
+                    depth += 1;
+                    pos += 8;
+                }
+                (0xE000, _) => pos = pos.saturating_add(8).saturating_add(len),
+                (0xE00D | 0xE0DD, _) => {
+                    depth = depth.saturating_sub(1);
+                    pos += 8;
+                }
+                _ => pos += 8,
             }
-            pos = pos.saturating_add(len);
             continue;
         }
 
-        if !skip_explicit(data, &mut pos) {
-            return None;
+        pos += 4;
+
+        if depth == 0 && (g, e) == target {
+            // PS3.5 6.2 Table 6.2-1 via `vr_widths`.
+            let value = super::vr_widths::explicit_value(data, pos, false)?;
+            if value.len == super::vr_widths::UNDEFINED_LENGTH {
+                return Some(Vec::new()); // encapsulated: not a value to return
+            }
+            return data
+                .get(value.start..value.start + value.len)
+                .map(<[u8]>::to_vec);
+        }
+
+        // PS3.5 7.1.2 with 6.2 Table 6.2-1: the width class decides the
+        // header shape, and an undefined length is not a length to step over.
+        let value = super::vr_widths::explicit_value(data, pos, false)?;
+        if value.len == super::vr_widths::UNDEFINED_LENGTH {
+            pos = pos.saturating_add(value.header_len);
+            depth += 1;
+        } else {
+            pos = pos
+                .saturating_add(value.header_len)
+                .saturating_add(value.len);
+            if !value.len.is_multiple_of(2) {
+                pos = pos.saturating_add(1); // PS3.5 7.1 pad byte
+            }
         }
     }
 
@@ -1541,8 +1683,11 @@ mod tests {
             }
         };
         let entries: Vec<_> = match std::fs::read_dir(&dir) {
+            // An entry that cannot be read is not an entry that is absent: the
+            // gate reports how many files it actually checked, and swallowing
+            // the error silently shrank the corpus it claims to have passed.
             Ok(rd) => rd
-                .filter_map(|e| e.ok())
+                .map(|e| e.unwrap_or_else(|err| panic!("cannot read corpus entry in {dir}: {err}")))
                 .filter(|e| e.path().extension().map(|x| x == "dcm").unwrap_or(false))
                 .collect(),
             Err(e) => panic!("cannot read corpus dir {dir}: {e}"),
@@ -1826,6 +1971,40 @@ mod tests {
         assert_eq!(back_px.columns, 8);
     }
 
+    /// PS3.3 C.7.6.3.1.4: NumberOfFrames states how many frames the value holds.
+    ///
+    /// A declared 1 with two frames' worth of components is a file whose own
+    /// attributes contradict its contents. The guard skipped the check whenever
+    /// the declaration was 1, so this is exactly the case it never looked at: two
+    /// fragments and one declared frame decoded as TWO frames and returned
+    /// success.
+    #[test]
+    fn a_declared_single_frame_with_two_frames_of_data_is_refused() {
+        // Encode a legitimate 2-frame instance, then REWRITE NumberOfFrames to
+        // "1" in the ENCODED value, so the attribute contradicts the two
+        // codestreams that are actually there.
+        let src = build_multiframe_evrle(2, 8, 8);
+        let registry = crate::codec::CodecRegistry::default();
+        let mut jls = crate::transcode::transcode_dicom(&src, TS_JPEGLS_LOSSLESS, &registry)
+            .expect("a legitimate 2-frame source encodes");
+
+        let pos = jls
+            .windows(4)
+            .position(|w| w == [0x28, 0x00, 0x08, 0x00])
+            .expect("NumberOfFrames tag");
+        let value_at = pos + 8;
+        assert_eq!(&jls[value_at..value_at + 2], b"2 ", "the encoded value");
+        jls[value_at] = b'1';
+
+        let err = crate::codec::jpegls::JpeglsLosslessCodec
+            .decode(&jls)
+            .expect_err("2 frames of data behind a declared 1 is a contradiction");
+        assert!(
+            err.to_string().contains("does not match fragment count"),
+            "got: {err}"
+        );
+    }
+
     /// E2a: RGB EVRLE source -> 4.80: PI=RGB, SPP=3, pixels equal.
     #[test]
     fn jpegls_color_rgb_source_pi_rgb_spp3_pixels_equal() {
@@ -1892,5 +2071,187 @@ mod tests {
             out_px.data, src_px.data,
             "pixels equal to the baseline decode"
         );
+    }
+
+    /// A colour roundtrip returns the encoder's own planarity.
+    ///
+    /// The planar layout is per-plane, frame-major (R plane, G plane, B
+    /// plane). Emitting decoded samples in interleaved order produced
+    /// R0,G0,B0,R1,G1,B1 instead, so a roundtrip through this codec did not
+    /// return its input even for one frame.
+    #[test]
+    fn a_colour_roundtrip_keeps_the_planar_layout() {
+        let (w, h) = (4u16, 3u16);
+        let pc = w as usize * h as usize;
+        let mut data = Vec::with_capacity(pc * 3);
+        for i in 0..pc {
+            data.push((10 + i) as u8); // R plane
+        }
+        for i in 0..pc {
+            data.push((100 + i) as u8); // G plane
+        }
+        for i in 0..pc {
+            data.push((200 - i) as u8); // B plane
+        }
+
+        let pixels = DecodedPixels {
+            data: data.clone(),
+            rows: h,
+            columns: w,
+            samples_per_pixel: 3,
+            bits_allocated: 8,
+            photometric_interpretation: "RGB".into(),
+        };
+        let _meta = DicomMeta {
+            rows: h,
+            columns: w,
+            samples_per_pixel: 3,
+            bits_allocated: 8,
+            bits_stored: 8,
+            photometric_interpretation: "RGB".into(),
+            planar_configuration: None,
+            pixel_representation: 0,
+            frames: 1,
+        };
+
+        let fragments =
+            jpegls_encode_fragments(&pixels, 1, 0, jpegls::Profile::T87).expect("encode fragments");
+        // PS3.5 A.4.2 layout this codec writes: one codestream per component.
+        assert_eq!(fragments.len(), 3, "one codestream per component");
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 128]);
+        out.extend_from_slice(b"DICM");
+        append_dicom_tag_str(&mut out, (0x0002, 0x0010), "UI", TS_JPEGLS_LOSSLESS);
+        append_dicom_tag_u16(&mut out, TAG_ROWS, h);
+        append_dicom_tag_u16(&mut out, TAG_COLUMNS, w);
+        append_dicom_tag_u16(&mut out, TAG_SAMPLES_PER_PIXEL, 3);
+        append_dicom_tag_u16(&mut out, TAG_BITS_ALLOCATED, 8);
+        append_dicom_tag_str(&mut out, TAG_PHOTOMETRIC_INTERPRETATION, "CS", "RGB");
+        out.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(b"OB");
+        out.extend_from_slice(&[0x00, 0x00]);
+        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]); // empty BOT
+        out.extend_from_slice(&0u32.to_le_bytes());
+        // PS3.5 A.4: an Item value is even-length. The pad byte is part of the
+        // Item VALUE (the declared length includes it), not a byte after it.
+        for frag in &fragments {
+            let mut value = frag.clone();
+            if !value.len().is_multiple_of(2) {
+                value.push(0);
+            }
+            out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(&value);
+        }
+        out.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+
+        let decoded = JpeglsLosslessCodec.decode(&out).expect("decode");
+        assert_eq!(decoded.data, data, "planes survive the roundtrip");
+    }
+
+    /// PS3.3 C.7.6.1.1.5: the Icon Image Sequence holds a complete image. Its
+    /// Rows/Columns describe the thumbnail, and a walk that enters the items
+    /// returns them as the image geometry.
+    #[test]
+    fn the_icon_image_sequence_does_not_supply_the_geometry() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 128]);
+        data.extend_from_slice(b"DICM");
+        // (0088,0200) SQ, defined length, one item holding (0028,0010)/(0011).
+        let mut item = Vec::new();
+        for (tag, value) in [((0x0028u16, 0x0010u16), 2u16), ((0x0028, 0x0011), 2)] {
+            item.extend_from_slice(&tag.0.to_le_bytes());
+            item.extend_from_slice(&tag.1.to_le_bytes());
+            item.extend_from_slice(b"US");
+            item.extend_from_slice(&2u16.to_le_bytes());
+            item.extend_from_slice(&value.to_le_bytes());
+        }
+        // PS3.5 7.5.1: an UNDEFINED-length sequence is what makes the walk
+        // enter the item stream. A defined-length one is skipped by its
+        // length, so it cannot show whether the depth gate works at all.
+        data.extend_from_slice(&0x0088u16.to_le_bytes());
+        data.extend_from_slice(&0x0200u16.to_le_bytes());
+        data.extend_from_slice(b"SQ");
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // PS3.5 7.5.1: an UNDEFINED-length item is what forces the walk
+        // inside the item's dataset - a defined-length one is stepped over by
+        // its length, so it cannot show whether the depth gate works.
+        data.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        data.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        data.extend_from_slice(&item);
+        data.extend_from_slice(&[0xFE, 0xFF, 0x0D, 0xE0]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        // The real geometry.
+        for (tag, value) in [((0x0028u16, 0x0010u16), 64u16), ((0x0028, 0x0011), 48)] {
+            data.extend_from_slice(&tag.0.to_le_bytes());
+            data.extend_from_slice(&tag.1.to_le_bytes());
+            data.extend_from_slice(b"US");
+            data.extend_from_slice(&2u16.to_le_bytes());
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+
+        assert_eq!(find_tag_u16(&data, TAG_ROWS), Some(64));
+        assert_eq!(find_tag_u16(&data, TAG_COLUMNS), Some(48));
+    }
+
+    /// PS3.3 C.7.6.3.1.1: SamplesPerPixel is 1 or 3. Narrowing the declared
+    /// u16 to u8 before validating mapped 259 onto 3 and decoded a crafted
+    /// file as a colour image.
+    #[test]
+    fn a_declared_sample_count_above_a_byte_is_refused_not_wrapped() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 128]);
+        data.extend_from_slice(b"DICM");
+        for (tag, value) in [
+            ((0x0028u16, 0x0010u16), 4u16),
+            ((0x0028, 0x0011), 4),
+            ((0x0028, 0x0002), 259),
+        ] {
+            data.extend_from_slice(&tag.0.to_le_bytes());
+            data.extend_from_slice(&tag.1.to_le_bytes());
+            data.extend_from_slice(b"US");
+            data.extend_from_slice(&2u16.to_le_bytes());
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let err = parse_jpegls_meta(&data).expect_err("259 is not a sample count");
+        let CodecError::InvalidMetadata(msg) = err else {
+            panic!("expected InvalidMetadata");
+        };
+        assert!(msg.contains("259"), "{msg}");
+    }
+
+    /// PS3.5 A.4: the encapsulated value ends at (FFFE,E0DD). Without it the
+    /// fragments collected so far describe a truncated image, so the value is
+    /// incomplete rather than short.
+    #[test]
+    fn an_encapsulated_value_without_its_delimiter_is_refused() {
+        let frag = vec![0xFF, 0xD8, 0xFF, 0xF7, 0x00, 0x0B];
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 128]);
+        data.extend_from_slice(b"DICM");
+        data.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        data.extend_from_slice(&0x0010u16.to_le_bytes());
+        data.extend_from_slice(b"OB");
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        data.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        data.extend_from_slice(&(frag.len() as u32).to_le_bytes());
+        data.extend_from_slice(&frag);
+
+        let err = extract_encapsulated_fragments(&data)
+            .expect_err("the value is not closed by a delimiter");
+        let CodecError::DecodeFailed(msg) = err else {
+            panic!("expected DecodeFailed");
+        };
+        assert!(msg.contains("Sequence Delimitation"), "{msg}");
     }
 }

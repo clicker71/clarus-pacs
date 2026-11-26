@@ -186,8 +186,60 @@ fn expose_rejected_for(client_ip: &[u8], cidrs: &[crate::config::CidrNet]) -> bo
 /// A thin dispatcher handler.
 pub type HandlerFn = fn(&mut RequestContext<'_>) -> io::Result<()>;
 
+/// Why a request body could not be used, and therefore which status answers it.
+///
+/// These used to be one opaque `io::Error` that every caller mapped to 413, so
+/// a read TIMEOUT and a size breach were indistinguishable to the client. RFC
+/// 9110 15.5.14 reserves 413 for a request the server refuses because the body
+/// is too large; a client whose body is already below the limit received 413
+/// and learned nothing, because shortening the body cannot fix it.
+#[derive(Debug)]
+pub enum BodyError {
+    /// The announced or accumulated body exceeds the configured limit. 413.
+    TooLarge,
+    /// The framing itself is broken: bad chunk syntax, a premature EOF, or a
+    /// body that does not match its announced length. 400 - the request could
+    /// not be parsed (RFC 9110 15.5.1).
+    Malformed,
+    /// The transport failed before the body arrived (timeout, reset). 408 -
+    /// the client is expected to retry (RFC 9110 15.5.7).
+    Timeout,
+    /// An I/O failure with no better classification. Not a client error.
+    Io(io::Error),
+}
+
+impl BodyError {
+    /// The status line that answers this failure (RFC 9110 15.5).
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::TooLarge => 413,
+            Self::Malformed => 400,
+            Self::Timeout => 408,
+            Self::Io(_) => 500,
+        }
+    }
+}
+
+/// Classify a body-read failure by the error kind the body reader produced.
+///
+/// `UnexpectedEof` is a short body and `InvalidData` is bad chunk syntax; both
+/// are the client's framing (RFC 9110 15.5.1). The timeout kinds are the
+/// transport's (RFC 9110 15.5.9).
+fn body_error(e: io::Error) -> BodyError {
+    match e.kind() {
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData => BodyError::Malformed,
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => BodyError::Timeout,
+        _ => BodyError::Io(e),
+    }
+}
+
 /// Read a Content-Length or chunked body into memory, capped at `max`.
-fn read_body_limited(conn: &mut Conn, head: &RequestHead<'_>, max: usize) -> io::Result<Vec<u8>> {
+fn read_body_limited(
+    conn: &mut Conn,
+    head: &RequestHead<'_>,
+    max: usize,
+) -> Result<Vec<u8>, BodyError> {
     // A small body often arrives in the same TCP segment as the request head;
     // `read_head` stashed those trailing bytes into `Conn::prefetched`. Feed
     // them to the body reader first via PrefixedReader (falls through to the
@@ -199,13 +251,14 @@ fn read_body_limited(conn: &mut Conn, head: &RequestHead<'_>, max: usize) -> io:
             if n > max as u64 {
                 // Refusing before the first byte leaves all `n` bytes on the
                 // socket; the serve loop sees the shortfall and closes.
-                return Err(io::Error::other("413 body too large"));
+                return Err(BodyError::TooLarge);
             }
             let mut out = Vec::with_capacity(n as usize);
             clarus_core::http::body::read_length(&mut reader, n, &mut |chunk| {
                 out.extend_from_slice(chunk);
                 Ok(())
-            })?;
+            })
+            .map_err(body_error)?;
             conn.add_body_drained(out.len() as u64);
             Ok(out)
         }
@@ -214,7 +267,7 @@ fn read_body_limited(conn: &mut Conn, head: &RequestHead<'_>, max: usize) -> io:
             let mut cr = clarus_core::http::body::ChunkedReader::new(reader);
             let mut buf = [0u8; 8192];
             loop {
-                let n = cr.read(&mut buf)?;
+                let n = cr.read(&mut buf).map_err(body_error)?;
                 if n == 0 {
                     break;
                 }
@@ -223,7 +276,7 @@ fn read_body_limited(conn: &mut Conn, head: &RequestHead<'_>, max: usize) -> io:
                     // are still on the socket, and no length was announced for
                     // the serve loop to compare against, so say so directly.
                     conn.mark_unread_body();
-                    return Err(io::Error::other("413 body too large"));
+                    return Err(BodyError::TooLarge);
                 }
                 out.extend_from_slice(&buf[..n]);
             }
@@ -708,7 +761,7 @@ fn h_commitment_commit(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             crate::metrics::record_commitment(true, status);
             render_commitment(ctx, r)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -780,7 +833,7 @@ fn h_ups_create(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             );
             render_ups(ctx, r)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -799,6 +852,7 @@ fn h_ups_update_attributes(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         Ok(body) => {
             let r = crate::handlers::ups_pure::ups_update_attributes(
                 ctx.state,
+                &ctx.state.ups_events,
                 ctx.uid(0),
                 &body,
                 transaction_uid.as_deref(),
@@ -806,7 +860,7 @@ fn h_ups_update_attributes(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             );
             render_ups(ctx, r)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -822,7 +876,7 @@ fn h_ups_update(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             );
             render_ups(ctx, r)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -847,7 +901,7 @@ fn h_ups_cancelrequest(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             );
             render_ups(ctx, r)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -887,7 +941,7 @@ fn h_ups_subscribe(
             let ka = ctx.keep_alive == KeepAlive::On;
             write_resp(ctx.conn, r.status, JSON_CT, &r.body, ka)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -920,7 +974,7 @@ fn h_ups_subscribe_workitem(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             let ka = ctx.keep_alive == KeepAlive::On;
             write_resp(ctx.conn, r.status, JSON_CT, &r.body, ka)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -1000,7 +1054,7 @@ fn h_mpps_create_or_update(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             };
             render_workflow(ctx, r)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -1100,7 +1154,7 @@ fn h_ups_search_post(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             );
             render_ups(ctx, r)
         }
-        Err(_) => error_413(ctx),
+        Err(e) => error_body(ctx, e),
     }
 }
 
@@ -1139,8 +1193,8 @@ fn admin_json_body(ctx: &mut RequestContext<'_>) -> io::Result<Option<Vec<u8>>> 
     let body = match read_body_limited(ctx.conn, ctx.head, ctx.state.config.max_json_body as usize)
     {
         Ok(body) => body,
-        Err(_) => {
-            error_413(ctx)?;
+        Err(e) => {
+            error_body(ctx, e)?;
             return Ok(None);
         }
     };
@@ -1443,14 +1497,37 @@ fn parse_dry_run(ctx: &RequestContext<'_>) -> Result<bool, String> {
     // `query_value` cannot see it: it skips a pair whose value is empty, which
     // makes a valueless flag look absent. Presence is therefore checked on the
     // raw query, and only a value that is actually present is parsed.
-    let Some(raw) = ctx.query_str() else {
-        return Ok(false);
-    };
-    let Some(value) = raw.split('&').find_map(|pair| match pair.split_once('=') {
-        Some(("dry_run", v)) => Some(v),
-        None if pair == "dry_run" => Some(""),
-        _ => None,
-    }) else {
+    match ctx.query_str() {
+        Some(raw) => dry_run_from_query(raw),
+        None => Ok(false),
+    }
+}
+
+/// The PURE part of [`parse_dry_run`]: decide from the raw query string alone.
+///
+/// The NAME is decoded before it is compared. RFC 3986 2.3 lets a client
+/// percent-encode an unreserved character, and `_` is unreserved, so
+/// `dry%5Frun=true` is the same parameter as `dry_run=true`. Comparing the raw
+/// name missed it, the caller saw no flag, and the "no flag" default is a LIVE
+/// run - the destructive direction this function exists to prevent.
+fn dry_run_from_query(raw: &str) -> Result<bool, String> {
+    let mut found: Option<&str> = None;
+    for pair in raw.split('&') {
+        let name = match pair.split_once('=') {
+            Some((name, _)) => name,
+            None => pair,
+        };
+        if crate::handlers::wado::types::url_decode(name) != "dry_run" {
+            continue;
+        }
+        // A repeated flag is ambiguous, and picking one of the values is the
+        // same guessing the decoded-name comparison exists to remove.
+        if found.is_some() {
+            return Err("dry_run is given more than once".to_string());
+        }
+        found = Some(pair.split_once('=').map(|(_, v)| v).unwrap_or(""));
+    }
+    let Some(value) = found else {
         return Ok(false);
     };
     if value.is_empty() {
@@ -1621,6 +1698,24 @@ fn h_admin_recovery_rebuild_status(ctx: &mut RequestContext<'_>) -> io::Result<(
 
 fn h_wado_metadata(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     let ka = ctx.keep_alive == KeepAlive::On;
+    // Accept negotiation (PS3.18 10.4.4): XML is Required, JSON the Default.
+    //
+    // A client that excludes both representations gets 406 (RFC 9110 15.5.7,
+    // PS3.18 10.4.3.1). Returning XML or JSON anyway answered a request the
+    // client had explicitly refused - `Accept: image/png` used to receive a
+    // DICOM JSON body it could not use.
+    //
+    // Negotiating FIRST is what makes the verdict a property of the request
+    // alone: a client whose `Accept` cannot be satisfied learns so without the
+    // server resolving the object, and the 404/406 split cannot be used to
+    // probe which instances exist.
+    let representation = match crate::handlers::qido_pure::negotiate_representation(ctx.accept()) {
+        Some(r) => r,
+        None => {
+            let body = err_body(406, "Not Acceptable");
+            return write_resp(ctx.conn, 406, JSON_CT, &body, ka);
+        }
+    };
     // Resolve the instance from the manifest (locate_object) + read the CAS
     // `.dcm`, then render metadata natively (no SQLite metadata_blob). 404 if
     // absent or invalid. The series UID is not needed for lookup, so `None`.
@@ -1672,10 +1767,7 @@ fn h_wado_metadata(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             return write_resp(ctx.conn, 500, JSON_CT, &body, ka);
         }
     };
-    // Accept negotiation (PS3.18 10.4.4): XML is Required, JSON the Default.
-    if crate::handlers::qido_pure::negotiate(ctx.accept())
-        == crate::handlers::DICOM_XML_CONTENT_TYPE
-    {
+    if representation == crate::handlers::qido_pure::Representation::Xml {
         // Re-render the DICOMweb JSON as DICOM XML (PS3.19, byte-parity with
         // the qido_xml oracle) and return a buffered multipart/related with a
         // single `application/dicom+xml` part. Render failure -> 500 (like the
@@ -1723,15 +1815,34 @@ fn h_wado_metadata(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     ctx.conn.write_all_configured(&resp.body)
 }
 
-fn error_413(ctx: &mut RequestContext<'_>) -> io::Result<()> {
-    let body = err_body(413, "Payload Too Large");
-    write_resp(
-        ctx.conn,
-        413,
-        JSON_CT,
-        &body,
-        ctx.keep_alive == KeepAlive::On,
-    )
+/// Answer a body the request could not deliver, with the status its CAUSE
+/// implies.
+///
+/// RFC 9110 15.5.14 gives 413 one meaning - the server refuses to process the
+/// request because the body is too large - so it must not be the answer to a
+/// timeout or to malformed framing; those are 408 (15.5.9) and 400 (15.5.1).
+/// The handler never runs on any of them, which is the second half of the
+/// rule: a handler fed a partial body would answer as if it had the whole one.
+///
+/// The connection is closed on every branch: the body is unread or incomplete,
+/// and the next `read_head` would parse its remaining bytes as a request line
+/// (PS3.18 8.1 request framing).
+fn error_body(ctx: &mut RequestContext<'_>, e: BodyError) -> io::Result<()> {
+    let status = e.status();
+    // Marked here rather than at each refusal so the close decision stays in
+    // one place: `may_keep_alive` reads `body_pending`, and a partial body is
+    // exactly the case where reuse would desync the next request.
+    ctx.conn.mark_unread_body();
+    let text = match e {
+        BodyError::TooLarge => "Payload Too Large",
+        BodyError::Malformed => "Bad Request",
+        BodyError::Timeout => "Request Timeout",
+        // The body reader only reports transport failures here, and none of
+        // them says anything a client could act on.
+        BodyError::Io(_) => "Internal Server Error",
+    };
+    let body = err_body(status, text);
+    write_resp(ctx.conn, status, JSON_CT, &body, false)
 }
 
 // -------------------------------------------------------------------------
@@ -1850,6 +1961,7 @@ pub fn table_len() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::dry_run_from_query;
     use super::expose_rejected_for;
     use crate::config::parse_cidr;
 
@@ -1857,6 +1969,94 @@ mod tests {
         spec.iter()
             .map(|s| parse_cidr(s).expect("valid cidr"))
             .collect()
+    }
+
+    /// A body failure is answered with the status its CAUSE implies.
+    ///
+    /// RFC 9110 15.5.14 reserves 413 for a body that is too large. Every body
+    /// failure used to reach that one branch, so a read timeout arrived at the
+    /// client as 413: the body was already below `max_json_body`, and there
+    /// was nothing the client could shorten to make the request succeed.
+    #[test]
+    fn a_body_failure_is_classified_by_cause_not_by_one_status() {
+        use super::BodyError;
+        use std::io::ErrorKind;
+
+        let cases = [
+            (BodyError::TooLarge, 413),
+            (BodyError::Malformed, 400),
+            (BodyError::Timeout, 408),
+            (BodyError::Io(std::io::Error::other("x")), 500),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.status(), want, "{err:?}");
+        }
+
+        // The kinds the DICOMweb body readers actually produce map onto those
+        // classes: `read_length` reports a short body as UnexpectedEof, the
+        // chunked decoder reports bad framing as InvalidData, and a socket
+        // read timeout arrives as TimedOut (RFC 9110 15.5.1 / 15.5.9).
+        let classify = super::body_error;
+        assert_eq!(
+            classify(std::io::Error::from(ErrorKind::UnexpectedEof)).status(),
+            400
+        );
+        assert_eq!(
+            classify(std::io::Error::from(ErrorKind::InvalidData)).status(),
+            400
+        );
+        assert_eq!(
+            classify(std::io::Error::from(ErrorKind::TimedOut)).status(),
+            408
+        );
+        assert_eq!(
+            classify(std::io::Error::from(ErrorKind::ConnectionReset)).status(),
+            500
+        );
+    }
+
+    /// A percent-encoded parameter NAME still names the parameter.
+    ///
+    /// RFC 3986 2.3 makes `_` unreserved, so `dry%5Frun` is `dry_run`. The
+    /// pre-fix comparison ran on the RAW name, saw nothing, and the "no flag"
+    /// default is a LIVE run: the client asked to stay safe and the server did
+    /// the destructive thing instead.
+    #[test]
+    fn an_encoded_dry_run_name_is_still_a_dry_run() {
+        assert_eq!(dry_run_from_query("dry%5Frun=true"), Ok(true));
+        assert_eq!(dry_run_from_query("%64ry_run=true"), Ok(true));
+        // The encoded name must not become the OTHER value either: a client
+        // asking for a dry run must never be silently promoted to live.
+        assert_eq!(dry_run_from_query("dry%5Frun=false"), Ok(false));
+        // The value side was already decoded; keep that working.
+        assert_eq!(dry_run_from_query("dry_run=%74rue"), Ok(true));
+    }
+
+    /// Every spelling the admin surface documents, plus the refusals.
+    #[test]
+    fn dry_run_accepts_the_documented_spellings_and_refuses_the_rest() {
+        // Absent -> false (the historical default).
+        assert_eq!(dry_run_from_query(""), Ok(false));
+        assert_eq!(dry_run_from_query("other=1"), Ok(false));
+        // A bare flag is true.
+        assert_eq!(dry_run_from_query("dry_run"), Ok(true));
+        assert_eq!(dry_run_from_query("dry_run="), Ok(true));
+        // Both spellings of each value, case-insensitively.
+        for (q, want) in [
+            ("dry_run=true", true),
+            ("dry_run=TRUE", true),
+            ("dry_run=1", true),
+            ("dry_run=false", false),
+            ("dry_run=FALSE", false),
+            ("dry_run=0", false),
+        ] {
+            assert_eq!(dry_run_from_query(q), Ok(want), "query {q}");
+        }
+        // Unrecognised values are refused rather than guessed.
+        assert!(dry_run_from_query("dry_run=no").is_err());
+        assert!(dry_run_from_query("dry_run=y").is_err());
+        // A repeated flag is ambiguous and refused.
+        assert!(dry_run_from_query("dry_run=true&dry_run=false").is_err());
     }
 
     #[test]

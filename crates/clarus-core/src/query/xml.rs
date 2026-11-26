@@ -166,17 +166,33 @@ fn push_hms6(buf: &mut [u8; 6], v: u64) -> Result<(), UnrepresentableDate> {
 /// NOT replaced with U+FFFD: a replacement fabricates a glyph that was never
 /// in the source and is indistinguishable from a genuinely-present U+FFFD.
 fn esc_into(out: &mut Sink<'_>, s: &str) -> Result<(), StreamOverflow> {
-    for &b in s.as_bytes() {
-        match b {
-            b'&' => out.extend(b"&amp;")?,
-            b'<' => out.extend(b"&lt;")?,
-            b'>' => out.extend(b"&gt;")?,
-            b'"' => out.extend(b"&quot;")?,
-            b'\'' => out.extend(b"&apos;")?,
+    for ch in s.chars() {
+        match ch {
+            '&' => out.extend(b"&amp;")?,
+            '<' => out.extend(b"&lt;")?,
+            '>' => out.extend(b"&gt;")?,
+            '"' => out.extend(b"&quot;")?,
+            '\'' => out.extend(b"&apos;")?,
+            // XML 1.0 production [2] Char excludes the noncharacters U+FFFE
+            // and U+FFFF at every level, so a value containing either makes
+            // the WHOLE document unparseable. They are dropped on the same
+            // rule as the forbidden C0 controls rather than passed through.
+            '\u{FFFE}' | '\u{FFFF}' => {}
+            // A raw CR is normalized to LF by every conforming XML parser
+            // BEFORE the element content is delivered (XML 1.0 2.11), so
+            // writing it literally changed the value. A character reference
+            // survives that normalization, which is the only way a CR reaches
+            // the application unchanged.
+            '\r' => out.extend(b"&#xD;")?,
             // XML 1.0 [2]: only TAB (0x09), LF (0x0A) and CR (0x0D) are legal
-            // C0 characters; every other C0 control is dropped.
-            0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F => {}
-            _ => out.push(b)?,
+            // C0 characters; every other C0 control is dropped. The CR arm
+            // above handles 0x0D, so what remains here is 0x00-0x08 and
+            // 0x0B/0x0C/0x0E-0x1F.
+            '\u{0000}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}' => {}
+            _ => {
+                let mut buf = [0u8; 4];
+                out.extend(ch.encode_utf8(&mut buf).as_bytes())?;
+            }
         }
     }
     Ok(())
@@ -191,96 +207,92 @@ fn esc_into(out: &mut Sink<'_>, s: &str) -> Result<(), StreamOverflow> {
 /// the first `=`, Ideographic between `=`, Phonetic after) - identical to the
 /// legacy Value-based converter.
 fn write_person_name(out: &mut Sink<'_>, raw: &str) -> Result<(), StreamOverflow> {
-    let groups: Vec<&str> = raw.split('=').collect();
-    // `number` is REQUIRED on PersonName (PS3.19 Table A.1.5-2: "order within
-    // the Value Field, monotonically increasing from 1"). Omitting it produced
-    // a document a conforming reader may reject - and it is the sibling of the
-    // `Value` element, whose `number` this writer already emits.
+    // Groups and components are split by iterators, not collected: the writer
+    // holds no heap memory (PS3.19 A.1.3 wants one document per data set, and
+    // the same rule keeps this callable from a fixed buffer).
     out.extend(b"<PersonName number=\"1\">")?;
-
-    // Helper: write one name group.
-    fn write_name_group(
-        out: &mut Sink<'_>,
-        group_name: &str,
-        value: &str,
-    ) -> Result<(), StreamOverflow> {
-        let parts: Vec<&str> = value.split('^').collect();
-        out.push(b'<')?;
-        out.extend(group_name.as_bytes())?;
-        out.push(b'>')?;
-
-        let write_part = |out: &mut Sink<'_>, elem: &str, v: &str| -> Result<(), StreamOverflow> {
-            out.push(b'<')?;
-            out.extend(elem.as_bytes())?;
-            out.push(b'>')?;
-            esc_into(out, v)?;
-            out.extend(b"</")?;
-            out.extend(elem.as_bytes())?;
-            out.push(b'>')?;
-            Ok(())
+    for (gi, group) in raw.split('=').enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let name = match gi {
+            0 => "Alphabetic",
+            1 => "Ideographic",
+            2 => "Phonetic",
+            _ => continue,
         };
-
-        if let Some(f) = parts.first()
-            && !f.is_empty()
-        {
-            write_part(out, "FamilyName", f)?;
-        }
-        if let Some(g) = parts.get(1)
-            && !g.is_empty()
-        {
-            write_part(out, "GivenName", g)?;
-        }
-        if let Some(m) = parts.get(2)
-            && !m.is_empty()
-        {
-            write_part(out, "MiddleName", m)?;
-        }
-        // PS3.19 Table 10.2-1 names these NamePrefix/NameSuffix; a bare
-        // <Prefix>/<Suffix> is not an element the NativeDICOM schema defines,
-        // so a validating reader rejects the document (the twin of
-        // handlers/ups/xml.rs, which already emits the schema names).
-        // PS3.19 Table 10.2-1 names these NamePrefix/NameSuffix; a bare
-        // <Prefix>/<Suffix> is not an element the NativeDICOM schema defines,
-        // so a validating reader rejects the document (the twin of
-        // handlers/ups/xml.rs, which already emits the schema names).
-        if let Some(p) = parts.get(3)
-            && !p.is_empty()
-        {
-            write_part(out, "NamePrefix", p)?;
-        }
-        if let Some(s) = parts.get(4)
-            && !s.is_empty()
-        {
-            write_part(out, "NameSuffix", s)?;
-        }
-
-        out.extend(b"</")?;
-        out.extend(group_name.as_bytes())?;
-        out.push(b'>')?;
-        Ok(())
+        write_name_group(out, name, group)?;
     }
-
-    if let Some(alphabetic) = groups.first()
-        && !alphabetic.is_empty()
-    {
-        write_name_group(out, "Alphabetic", alphabetic)?;
-    }
-    if let Some(ideographic) = groups.get(1)
-        && !ideographic.is_empty()
-    {
-        write_name_group(out, "Ideographic", ideographic)?;
-    }
-    if let Some(phonetic) = groups.get(2)
-        && !phonetic.is_empty()
-    {
-        write_name_group(out, "Phonetic", phonetic)?;
-    }
-
     out.extend(b"</PersonName>")?;
     Ok(())
 }
 
+/// Write one PersonName group (`Alphabetic`/`Ideographic`/`Phonetic`).
+///
+/// The five components map to the schema element names in order; a component
+/// past the fifth has no element in PS3.19 Table 10.2-1 and is dropped, as the
+/// legacy converter did.
+fn write_name_group(
+    out: &mut Sink<'_>,
+    group_name: &str,
+    value: &str,
+) -> Result<(), StreamOverflow> {
+    const COMPONENTS: [&str; 5] = [
+        "FamilyName",
+        "GivenName",
+        "MiddleName",
+        "NamePrefix",
+        "NameSuffix",
+    ];
+    out.push(b'<')?;
+    out.extend(group_name.as_bytes())?;
+    out.push(b'>')?;
+    for (i, part) in value.split('^').enumerate() {
+        let Some(elem) = COMPONENTS.get(i) else {
+            break;
+        };
+        if part.is_empty() {
+            continue;
+        }
+        out.push(b'<')?;
+        out.extend(elem.as_bytes())?;
+        out.push(b'>')?;
+        esc_into(out, part)?;
+        out.extend(b"</")?;
+        out.extend(elem.as_bytes())?;
+        out.push(b'>')?;
+    }
+    out.extend(b"</")?;
+    out.extend(group_name.as_bytes())?;
+    out.push(b'>')?;
+    Ok(())
+}
+
 // -- Attribute writer ------------------------------------------------------
+
+/// A borrowed attribute value for [`write_attr_elem`].
+///
+/// [`AttrValue`] owns its text, so passing one forced a `to_string()` per
+/// attribute - one allocation per element on a path that is otherwise purely
+/// stack-and-sink. Borrowing the payload instead keeps the writer
+/// allocation-free without changing the manifest representation.
+enum AttrRef<'a> {
+    UInt(u64),
+    Text(&'a str),
+}
+
+impl<'a> From<&'a AttrValue> for AttrRef<'a> {
+    fn from(v: &'a AttrValue) -> Self {
+        match v {
+            AttrValue::UInt(u) => AttrRef::UInt(*u),
+            AttrValue::Text(s) => AttrRef::Text(s),
+            // Bytes/Array are not part of the study/series/instance QIDO
+            // subset; the caller filters them before reaching the writer, and
+            // a stray one renders as an empty value rather than a panic.
+            AttrValue::Bytes(_) | AttrValue::Array(_) => AttrRef::Text(""),
+        }
+    }
+}
 
 /// Append one `<DicomAttribute>` element for a scalar value.
 ///
@@ -295,20 +307,20 @@ fn write_person_name(out: &mut Sink<'_>, raw: &str) -> Result<(), StreamOverflow
 fn write_attr_elem(
     out: &mut Sink<'_>,
     tag: u32,
-    value: &AttrValue,
+    value: AttrRef<'_>,
     vr: &str,
 ) -> Result<(), StreamOverflow> {
     // Render the fixed-width DA/TM body BEFORE opening the element so a value
     // that has no rendering fails with nothing written.
-    let fixed: Option<([u8; 8], usize)> = match (value, vr) {
-        (AttrValue::UInt(u), "DA") => {
+    let fixed: Option<([u8; 8], usize)> = match (&value, vr) {
+        (AttrRef::UInt(u), "DA") => {
             let mut dbuf = [0u8; 8];
             match push_date8(&mut dbuf, *u) {
                 Ok(()) => Some((dbuf, 8)),
                 Err(e) => return Err(e.into()),
             }
         }
-        (AttrValue::UInt(u), "TM") => {
+        (AttrRef::UInt(u), "TM") => {
             let mut tbuf = [0u8; 6];
             match push_hms6(&mut tbuf, *u) {
                 Ok(()) => {
@@ -326,10 +338,16 @@ fn write_attr_elem(
     push_hex8(out, tag)?;
     out.extend(b"\" vr=\"")?;
     out.extend(vr.as_bytes())?;
-    out.extend(b"\" keyword=\"\">")?;
+    // PS3.19 Table A.1.5-2: `keyword` is Required unless the element is
+    // unknown to the host. An empty value claims exactly that, so a known tag
+    // must name its PS3.6 keyword (from standard/ps3.6/
+    // qido-response-attributes.json, via the shared includefield table).
+    out.extend(b"\" keyword=\"")?;
+    out.extend(crate::query::json::keyword_for_tag(tag).as_bytes())?;
+    out.extend(b"\">")?;
 
     match value {
-        AttrValue::Text(s) => {
+        AttrRef::Text(s) => {
             if vr == "PN" {
                 write_person_name(out, s)?;
             } else {
@@ -338,7 +356,7 @@ fn write_attr_elem(
                 out.extend(b"</Value>")?;
             }
         }
-        AttrValue::UInt(u) => {
+        AttrRef::UInt(u) => {
             out.extend(b"<Value number=\"1\">")?;
             // DA/TM are canonical fixed-width strings on the wire (DA 8-digit
             // YYYYMMDD, TM 6-digit HHMMSS, PS3.5 6.2). A bare decimal render
@@ -347,13 +365,10 @@ fn write_attr_elem(
             if let Some((buf, len)) = fixed {
                 out.extend(&buf[..len])?;
             } else {
-                push_dec(out, *u)?;
+                push_dec(out, u)?;
             }
             out.extend(b"</Value>")?;
         }
-        // Bytes (encapsulated) and Array (multi-valued) are not in the
-        // study/series/instance subset - omitted, mirroring the JSON path.
-        AttrValue::Bytes(_) | AttrValue::Array(_) => {}
     }
 
     out.extend(b"</DicomAttribute>")?;
@@ -378,7 +393,9 @@ fn write_attr_csv_elem(
     push_hex8(out, tag)?;
     out.extend(b"\" vr=\"")?;
     out.extend(vr.as_bytes())?;
-    out.extend(b"\" keyword=\"\">")?;
+    out.extend(b"\" keyword=\"")?;
+    out.extend(crate::query::json::keyword_for_tag(tag).as_bytes())?;
+    out.extend(b"\">")?;
     for (i, part) in csv.split(',').enumerate() {
         out.extend(b"<Value number=\"")?;
         push_dec(out, (i + 1) as u64)?;
@@ -448,6 +465,12 @@ impl TagFilter {
             if let Some(v) = v
                 && v != 0
                 && f.len < TagFilter::MAX_TAGS
+                // The cap bounds DISTINCT tags. Appending a repeat consumed a
+                // slot that a later, genuinely different attribute needed: 64
+                // repetitions of `0020000D` filled the filter even though the
+                // tag is already in the study baseline, so a following
+                // `InstitutionName` was dropped.
+                && !f.contains(v)
             {
                 f.tags[f.len] = v;
                 f.len += 1;
@@ -496,12 +519,41 @@ fn series_text(attrs: &[(u32, AttrValue)], tag: u32) -> Option<&str> {
     }
 }
 
-fn series_number(attrs: &[(u32, AttrValue)], tag: u32) -> Option<u64> {
+fn series_number(attrs: &[(u32, AttrValue)], tag: u32) -> Option<i64> {
     match series_attr(attrs, tag) {
-        Some(AttrValue::Text(s)) => s.parse::<u64>().ok(),
-        Some(AttrValue::UInt(u)) => Some(*u),
+        // IS is a signed integer string (PS3.5 Table 6.2-1): a negative
+        // SeriesNumber is unusual but valid, and `u64` parsing turned it into
+        // "not present" instead of a value.
+        Some(AttrValue::Text(s)) => s.trim().parse::<i64>().ok(),
+        Some(AttrValue::UInt(u)) => i64::try_from(*u).ok(),
         _ => None,
     }
+}
+
+/// Render a signed integer as the IS text body (PS3.5 6.2: IS is a decimal
+/// string, sign included). The `UInt` variant of [`AttrValue`] has no negative
+/// representation, so a signed number must travel as text.
+///
+/// The digits are formatted into this stack buffer: a `String` here cost one
+/// allocation per signed attribute, which is exactly what the ap101 gate
+/// (tests/ap101_qido_xml.rs) forbids.
+fn signed_decimal(out: &mut [u8; 24], n: i64) -> &str {
+    let mut i = out.len();
+    let negative = n < 0;
+    let mut v = n.unsigned_abs();
+    loop {
+        i -= 1;
+        out[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if negative {
+        i -= 1;
+        out[i] = b'-';
+    }
+    std::str::from_utf8(&out[i..]).expect("decimal digits are ASCII")
 }
 
 fn instance_text(attrs: &[(u32, AttrValue)], tag: u32) -> Option<&str> {
@@ -526,7 +578,11 @@ pub fn write_xml_doc_start(out: &mut Vec<u8>) {
     out.extend_from_slice(br#"<?xml version="1.0" encoding="UTF-8"?>"#);
     out.extend_from_slice(b"\n<NativeDicomModel xmlns=\"");
     out.extend_from_slice(DICOM_XML_NS.as_bytes());
-    out.extend_from_slice(b"\">\n");
+    // PS3.19 Table A.1.5-1 makes xml:space="preserve" required on the root:
+    // without it a reader is free to strip the leading and trailing spaces
+    // that DICOM values may carry, so `" PATIENT"` and `"PATIENT"` became the
+    // same string in the parsed document.
+    out.extend_from_slice(b"\" xml:space=\"preserve\">\n");
 }
 
 /// Append the closing `</NativeDicomModel>` root.
@@ -555,7 +611,12 @@ fn copy_slice(buf: &mut [u8], src: &[u8], start: usize) -> Option<usize> {
 /// stays in canonical ascending tag order (PS3.19). Split from `RetrieveURL`
 /// because the two C attrs sort at DIFFERENT anchors per level.
 fn emit_xml_ia(out: &mut Sink<'_>) -> Result<(), StreamOverflow> {
-    write_attr_elem(out, 0x0008_0056, &AttrValue::Text("ONLINE".into()), "CS")
+    write_attr_elem(
+        out,
+        0x0008_0056,
+        AttrRef::Text("ONLINE"),
+        crate::query::json::vr_for_tag(0x0008_0056),
+    )
 }
 
 /// Emit the always-on `SpecificCharacterSet` (0008,0005, CS "ISO_IR 192") as a
@@ -569,8 +630,8 @@ fn emit_xml_scs(out: &mut Sink<'_>) -> Result<(), StreamOverflow> {
     write_attr_elem(
         out,
         0x0008_0005,
-        &AttrValue::Text("ISO_IR 192".into()),
-        "CS",
+        AttrRef::Text("ISO_IR 192"),
+        crate::query::json::vr_for_tag(0x0008_0005),
     )
 }
 
@@ -598,7 +659,12 @@ fn emit_xml_ur(
         n = copy_slice(&mut url, path.as_bytes(), n).ok_or(StreamOverflow)?;
         n = copy_slice(&mut url, uid.as_bytes(), n).ok_or(StreamOverflow)?;
         let s = std::str::from_utf8(&url[..n]).expect("URL is ASCII");
-        write_attr_elem(out, 0x0008_1190, &AttrValue::Text(s.to_string()), "UR")?;
+        write_attr_elem(
+            out,
+            0x0008_1190,
+            AttrRef::Text(s),
+            crate::query::json::vr_for_tag(0x0008_1190),
+        )?;
     }
     Ok(())
 }
@@ -667,7 +733,7 @@ pub fn write_study_attrs(
             write_attr_elem(
                 &mut out,
                 0x0020_1206,
-                &AttrValue::UInt(study.series_count),
+                AttrRef::UInt(study.series_count),
                 "IS",
             )?;
             continue;
@@ -676,7 +742,7 @@ pub fn write_study_attrs(
             write_attr_elem(
                 &mut out,
                 0x0020_1208,
-                &AttrValue::UInt(study.instance_count),
+                AttrRef::UInt(study.instance_count),
                 "IS",
             )?;
             continue;
@@ -699,22 +765,23 @@ pub fn write_study_attrs(
             if matches!(v, AttrValue::Array(_)) {
                 continue;
             }
-            write_attr_elem(&mut out, *t, v, crate::query::json::vr_for_tag(*t))?;
+            write_attr_elem(&mut out, *t, v.into(), crate::query::json::vr_for_tag(*t))?;
             break;
         }
     }
     Ok(out.len)
 }
 
-/// Write one patient's two DICOM-tag attributes of the QIDO-RS `/patients`
-/// list into `buf` as `<DicomAttribute>` siblings (no document wrapper),
-/// returning bytes written.
+/// Write one patient's DICOM-tag attributes of the QIDO-RS `/patients` list
+/// into `buf` as `<DicomAttribute>` siblings (no document wrapper), returning
+/// bytes written.
 ///
 /// Byte-exact with the legacy `dicomweb_json_to_xml` per-patient fragment:
-/// the two DICOM-tag attributes (0010,0010 PN / 0010,0020 LO) back-to-back.
-/// The non-DICOM patient keys (`arrived_at`, `study_count`, `patient_id`)
-/// are not DICOM attributes and are dropped, matching the legacy converter.
-/// The caller wraps the siblings in a `<NativeDicomModel>` document.
+/// the three DICOM-tag attributes (0010,0010 PN / 0010,0020 LO / 0020,1200 IS)
+/// back-to-back. The non-DICOM patient keys (`arrived_at`, `study_count`,
+/// `patient_id`) are not DICOM attributes and are dropped, matching the
+/// legacy converter. The caller wraps the siblings in a `<NativeDicomModel>`
+/// document.
 pub fn write_patient_xml(
     buf: &mut [u8],
     p: &crate::query::json::PatientQido,
@@ -725,13 +792,33 @@ pub fn write_patient_xml(
     // sibling (before 0010,0010) to keep canonical ascending tag order.
     emit_xml_scs(&mut out)?;
     // (0010,0010) PatientName - PN, PersonName decomposition.
-    out.extend(b"<DicomAttribute tag=\"00100010\" vr=\"PN\" keyword=\"\">")?;
+    out.extend(b"<DicomAttribute tag=\"00100010\" vr=\"")?;
+    out.extend(crate::query::json::vr_for_tag(0x0010_0010).as_bytes())?;
+    out.extend(b"\" keyword=\"")?;
+    out.extend(crate::query::json::keyword_for_tag(0x0010_0010).as_bytes())?;
+    out.extend(b"\">")?;
     write_person_name(&mut out, &p.patient_name)?;
     out.extend(b"</DicomAttribute>")?;
     // (0010,0020) PatientID - LO, single Value.
-    out.extend(b"<DicomAttribute tag=\"00100020\" vr=\"LO\" keyword=\"\">")?;
+    out.extend(b"<DicomAttribute tag=\"00100020\" vr=\"")?;
+    out.extend(crate::query::json::vr_for_tag(0x0010_0020).as_bytes())?;
+    out.extend(b"\" keyword=\"")?;
+    out.extend(crate::query::json::keyword_for_tag(0x0010_0020).as_bytes())?;
+    out.extend(b"\">")?;
     out.extend(b"<Value number=\"1\">")?;
     esc_into(&mut out, &p.patient_uid)?;
+    out.extend(b"</Value></DicomAttribute>")?;
+    // (0020,1200) NumberOfPatientRelatedStudies - IS, the DICOM name of the
+    // study_count the patient scan computed. Ascends after (0010,0020); the
+    // non-DICOM keys are dropped by this writer.
+    out.extend(
+        b"<DicomAttribute tag=\"00201200\" vr=\"IS\" keyword=\"NumberOfPatientRelatedStudies\">",
+    )?;
+    out.extend(b"<Value number=\"1\">")?;
+    push_dec(
+        &mut out,
+        u64::try_from(p.study_count).map_err(|_| StreamOverflow)?,
+    )?;
     out.extend(b"</Value></DicomAttribute>")?;
     Ok(out.len)
 }
@@ -747,16 +834,30 @@ pub fn write_patient_xml(
 /// long name or a long identifier was silently MISSING from the XML patient
 /// list, which reads as "not in the archive". Growing the buffer costs one
 /// allocation for that row and is visible, which is the honest trade.
-pub fn write_patient_xml_into(out: &mut Vec<u8>, p: &crate::query::json::PatientQido) {
-    let mut buf = [0u8; 512];
+pub fn write_patient_xml_into(
+    out: &mut Vec<u8>,
+    p: &crate::query::json::PatientQido,
+) -> Result<(), StreamOverflow> {
+    // 768 covers the fixed per-row markup (SpecificCharacterSet, the PersonName
+    // decomposition, the PatientID wrapper and the 00201200 derived count) plus
+    // a short identifier and name; a longer row grows the owned buffer below.
+    let mut buf = [0u8; 768];
     if let Ok(n) = write_patient_xml(&mut buf, p) {
         out.extend_from_slice(&buf[..n]);
-        return;
+        return Ok(());
     }
-    let mut grown = vec![0u8; 8192];
-    if let Ok(n) = write_patient_xml(&mut grown, p) {
-        out.extend_from_slice(&grown[..n]);
-    }
+    // One retry with an owned buffer, sized for the row the caller actually
+    // holds rather than a magic constant: a 9000-byte PatientID overflows both
+    // the stack buffer and an 8192-byte one, and the old code then returned
+    // NORMALLY with the row omitted - the caller could not tell an omitted
+    // patient from a successful write. Growth is bounded by the input, and a
+    // still-unrepresentable row is reported instead of dropped. The 768 headroom
+    // covers the same fixed markup as the stack buffer (now including 00201200).
+    let need = p.patient_uid.len() + p.patient_name.len() + 768;
+    let mut grown = vec![0u8; need];
+    let n = write_patient_xml(&mut grown, p)?;
+    out.extend_from_slice(&grown[..n]);
+    Ok(())
 }
 
 /// Write one series' XML attributes into `buf`, returning bytes written.
@@ -784,13 +885,13 @@ pub fn write_series_attrs(
     if let Some(d) = series_attr(&series.attrs, crate::query::tag::SERIES_DATE)
         && tag_pass(&filt, 0x0008_0021)
     {
-        write_attr_elem(&mut out, 0x0008_0021, d, "DA")?;
+        write_attr_elem(&mut out, 0x0008_0021, d.into(), "DA")?;
     }
     // (0008,0031) SeriesTime - TM.
     if let Some(s) = series_text(&series.attrs, crate::query::tag::SERIES_TIME)
         && tag_pass(&filt, 0x0008_0031)
     {
-        write_attr_elem(&mut out, 0x0008_0031, &AttrValue::Text(s.to_string()), "TM")?;
+        write_attr_elem(&mut out, 0x0008_0031, AttrRef::Text(s), "TM")?;
     }
     // C attribute InstanceAvailability (0008,0056) - always-on serving
     // attr, ascends after (0008,0031) and before (0008,0060).
@@ -799,25 +900,25 @@ pub fn write_series_attrs(
     if let Some(s) = series_text(&series.attrs, crate::query::tag::MODALITY)
         && tag_pass(&filt, 0x0008_0060)
     {
-        write_attr_elem(&mut out, 0x0008_0060, &AttrValue::Text(s.to_string()), "CS")?;
+        write_attr_elem(&mut out, 0x0008_0060, AttrRef::Text(s), "CS")?;
     }
     // (0008,0070) Manufacturer - LO (08.09 extension, includefield-gated).
     if let Some(s) = series_text(&series.attrs, crate::query::tag::MANUFACTURER)
         && tag_pass(&filt, 0x0008_0070)
     {
-        write_attr_elem(&mut out, 0x0008_0070, &AttrValue::Text(s.to_string()), "LO")?;
+        write_attr_elem(&mut out, 0x0008_0070, AttrRef::Text(s), "LO")?;
     }
     // (0008,1010) StationName - SH.
     if let Some(s) = series_text(&series.attrs, crate::query::tag::STATION_NAME)
         && tag_pass(&filt, 0x0008_1010)
     {
-        write_attr_elem(&mut out, 0x0008_1010, &AttrValue::Text(s.to_string()), "SH")?;
+        write_attr_elem(&mut out, 0x0008_1010, AttrRef::Text(s), "SH")?;
     }
     // (0008,103E) SeriesDescription - LO.
     if let Some(s) = series_text(&series.attrs, crate::query::tag::SERIES_DESCRIPTION)
         && tag_pass(&filt, 0x0008_103E)
     {
-        write_attr_elem(&mut out, 0x0008_103E, &AttrValue::Text(s.to_string()), "LO")?;
+        write_attr_elem(&mut out, 0x0008_103E, AttrRef::Text(s), "LO")?;
     }
     // (0008,1040) InstitutionalDepartmentName - LO (08.09 extension).
     if let Some(s) = series_text(
@@ -825,14 +926,14 @@ pub fn write_series_attrs(
         crate::query::tag::INSTITUTIONAL_DEPARTMENT_NAME,
     ) && tag_pass(&filt, 0x0008_1040)
     {
-        write_attr_elem(&mut out, 0x0008_1040, &AttrValue::Text(s.to_string()), "LO")?;
+        write_attr_elem(&mut out, 0x0008_1040, AttrRef::Text(s), "LO")?;
     }
     // (0008,1070) OperatorsName - PN (08.09 extension). PersonName
     // decomposition via write_attr_elem, mirroring the study PN keys.
     if let Some(s) = series_text(&series.attrs, crate::query::tag::OPERATORS_NAME)
         && tag_pass(&filt, 0x0008_1070)
     {
-        write_attr_elem(&mut out, 0x0008_1070, &AttrValue::Text(s.to_string()), "PN")?;
+        write_attr_elem(&mut out, 0x0008_1070, AttrRef::Text(s), "PN")?;
     }
     // C attribute RetrieveURL (0008,1190) - conditional serving attr,
     // ascends after the whole (0008,xxxx) block and before (0018,0015).
@@ -844,8 +945,17 @@ pub fn write_series_attrs(
     let series_uid = series_text(&series.attrs, crate::query::tag::SERIES_INSTANCE_UID);
     if let Some(st) = study_uid {
         if let Some(se) = series_uid {
-            let uid = format!("{st}/series/{se}");
-            emit_xml_ur(&mut out, retrieve_base, "/dicomweb/studies/", Some(&uid))?;
+            // The study-scoped form needs both UIDs joined. Building the pair
+            // in a stack buffer keeps the writer allocation-free; a pair that
+            // does not fit is refused rather than cut, because a truncated UID
+            // still parses and names a different series.
+            let mut pair = [0u8; 132];
+            let mut n = 0usize;
+            n = copy_slice(&mut pair, st.as_bytes(), n).ok_or(StreamOverflow)?;
+            n = copy_slice(&mut pair, b"/series/", n).ok_or(StreamOverflow)?;
+            n = copy_slice(&mut pair, se.as_bytes(), n).ok_or(StreamOverflow)?;
+            let uid = std::str::from_utf8(&pair[..n]).map_err(|_| StreamOverflow)?;
+            emit_xml_ur(&mut out, retrieve_base, "/dicomweb/studies/", Some(uid))?;
         }
     } else {
         emit_xml_ur(&mut out, retrieve_base, "/dicomweb/series/", series_uid)?;
@@ -854,13 +964,13 @@ pub fn write_series_attrs(
     if let Some(s) = series_text(&series.attrs, crate::query::tag::BODY_PART_EXAMINED)
         && tag_pass(&filt, 0x0018_0015)
     {
-        write_attr_elem(&mut out, 0x0018_0015, &AttrValue::Text(s.to_string()), "CS")?;
+        write_attr_elem(&mut out, 0x0018_0015, AttrRef::Text(s), "CS")?;
     }
     // (0018,1030) ProtocolName - LO (08.09 extension, includefield-gated).
     if let Some(s) = series_text(&series.attrs, crate::query::tag::PROTOCOL_NAME)
         && tag_pass(&filt, 0x0018_1030)
     {
-        write_attr_elem(&mut out, 0x0018_1030, &AttrValue::Text(s.to_string()), "LO")?;
+        write_attr_elem(&mut out, 0x0018_1030, AttrRef::Text(s), "LO")?;
     }
     // (0020,000D) StudyInstanceUID - UI, injected from the study context (see
     // write_series_json). Always-on serving attr, not in MANDATORY_SERIES.
@@ -870,7 +980,7 @@ pub fn write_series_attrs(
         write_attr_elem(
             &mut out,
             0x0020_000D,
-            &AttrValue::Text(st.to_string()),
+            AttrRef::Text(st),
             crate::query::json::vr_for_tag(crate::query::tag::STUDY_INSTANCE_UID),
         )?;
     }
@@ -878,26 +988,32 @@ pub fn write_series_attrs(
     if let Some(s) = series_text(&series.attrs, crate::query::tag::SERIES_INSTANCE_UID)
         && tag_pass(&filt, 0x0020_000E)
     {
-        write_attr_elem(&mut out, 0x0020_000E, &AttrValue::Text(s.to_string()), "UI")?;
+        write_attr_elem(&mut out, 0x0020_000E, AttrRef::Text(s), "UI")?;
     }
     // (0020,0011) SeriesNumber - IS.
     if let Some(n) = series_number(&series.attrs, crate::query::tag::SERIES_NUMBER)
         && tag_pass(&filt, 0x0020_0011)
     {
-        write_attr_elem(&mut out, 0x0020_0011, &AttrValue::UInt(n), "IS")?;
+        let mut dec = [0u8; 24];
+        write_attr_elem(
+            &mut out,
+            0x0020_0011,
+            AttrRef::Text(signed_decimal(&mut dec, n)),
+            "IS",
+        )?;
     }
     // (0020,0060) Laterality - CS.
     if let Some(s) = series_text(&series.attrs, crate::query::tag::LATERALITY)
         && tag_pass(&filt, 0x0020_0060)
     {
-        write_attr_elem(&mut out, 0x0020_0060, &AttrValue::Text(s.to_string()), "CS")?;
+        write_attr_elem(&mut out, 0x0020_0060, AttrRef::Text(s), "CS")?;
     }
     // (0020,1209) NumberOfSeriesRelatedInstances - IS.
     if tag_pass(&filt, 0x0020_1209) {
         write_attr_elem(
             &mut out,
             0x0020_1209,
-            &AttrValue::UInt(series.instances.len() as u64),
+            AttrRef::UInt(series.instances.len() as u64),
             "IS",
         )?;
     }
@@ -908,26 +1024,26 @@ pub fn write_series_attrs(
         crate::query::tag::SCHEDULED_PROCEDURE_STEP_ID,
     ) && tag_pass(&filt, 0x0040_0009)
     {
-        write_attr_elem(&mut out, 0x0040_0009, &AttrValue::Text(s.to_string()), "SH")?;
+        write_attr_elem(&mut out, 0x0040_0009, AttrRef::Text(s), "SH")?;
     }
     // (0040,0244) PerformedProcedureStepStartDate - DA, canonical 8-digit.
     if let Some(d) = series_attr(&series.attrs, crate::query::tag::PPS_START_DATE)
         && tag_pass(&filt, 0x0040_0244)
     {
-        write_attr_elem(&mut out, 0x0040_0244, d, "DA")?;
+        write_attr_elem(&mut out, 0x0040_0244, d.into(), "DA")?;
     }
     // (0040,0245) PerformedProcedureStepStartTime - TM.
     if let Some(s) = series_text(&series.attrs, crate::query::tag::PPS_START_TIME)
         && tag_pass(&filt, 0x0040_0245)
     {
-        write_attr_elem(&mut out, 0x0040_0245, &AttrValue::Text(s.to_string()), "TM")?;
+        write_attr_elem(&mut out, 0x0040_0245, AttrRef::Text(s), "TM")?;
     }
     // (0040,1001) RequestedProcedureID - SH, the second scalar of the same
     // sequence.
     if let Some(s) = series_text(&series.attrs, crate::query::tag::REQUESTED_PROCEDURE_ID)
         && tag_pass(&filt, 0x0040_1001)
     {
-        write_attr_elem(&mut out, 0x0040_1001, &AttrValue::Text(s.to_string()), "SH")?;
+        write_attr_elem(&mut out, 0x0040_1001, AttrRef::Text(s), "SH")?;
     }
 
     Ok(out.len)
@@ -952,13 +1068,23 @@ pub fn write_instance_attrs(
     if let Some(s) = instance_text(&instance.attrs, crate::query::tag::SOP_CLASS_UID)
         && tag_pass(&filt, 0x0008_0016)
     {
-        write_attr_elem(&mut out, 0x0008_0016, &AttrValue::Text(s.to_string()), "UI")?;
+        write_attr_elem(
+            &mut out,
+            0x0008_0016,
+            AttrRef::Text(s),
+            crate::query::json::vr_for_tag(0x0008_0016),
+        )?;
     }
     // (0008,0018) SOPInstanceUID - UI (always present).
     if let Some(s) = instance_text(&instance.attrs, crate::query::tag::SOP_INSTANCE_UID)
         && tag_pass(&filt, 0x0008_0018)
     {
-        write_attr_elem(&mut out, 0x0008_0018, &AttrValue::Text(s.to_string()), "UI")?;
+        write_attr_elem(
+            &mut out,
+            0x0008_0018,
+            AttrRef::Text(s),
+            crate::query::json::vr_for_tag(0x0008_0018),
+        )?;
     }
     // C attributes: InstanceAvailability (0008,0056) always, then
     // RetrieveURL (0008,1190) conditional with the full
@@ -987,15 +1113,20 @@ pub fn write_instance_attrs(
             n = copy_slice(&mut url, part, n).ok_or(StreamOverflow)?;
         }
         let s = std::str::from_utf8(&url[..n]).expect("URL is ASCII");
-        write_attr_elem(&mut out, 0x0008_1190, &AttrValue::Text(s.to_string()), "UR")?;
+        write_attr_elem(
+            &mut out,
+            0x0008_1190,
+            AttrRef::Text(s),
+            crate::query::json::vr_for_tag(0x0008_1190),
+        )?;
     }
     // (0020,000D) StudyInstanceUID - UI, injected from context.
     if !study_uid.is_empty() && tag_pass(&filt, 0x0020_000D) {
         write_attr_elem(
             &mut out,
             0x0020_000D,
-            &AttrValue::Text(study_uid.to_string()),
-            "UI",
+            AttrRef::Text(study_uid),
+            crate::query::json::vr_for_tag(0x0020_000D),
         )?;
     }
     // (0020,000E) SeriesInstanceUID - UI, injected from context.
@@ -1003,15 +1134,21 @@ pub fn write_instance_attrs(
         write_attr_elem(
             &mut out,
             0x0020_000E,
-            &AttrValue::Text(series_uid.to_string()),
-            "UI",
+            AttrRef::Text(series_uid),
+            crate::query::json::vr_for_tag(0x0020_000E),
         )?;
     }
     // (0020,0013) InstanceNumber - IS.
     if let Some(n) = series_number(&instance.attrs, crate::query::tag::INSTANCE_NUMBER)
         && tag_pass(&filt, 0x0020_0013)
     {
-        write_attr_elem(&mut out, 0x0020_0013, &AttrValue::UInt(n), "IS")?;
+        let mut dec = [0u8; 24];
+        write_attr_elem(
+            &mut out,
+            0x0020_0013,
+            AttrRef::Text(signed_decimal(&mut dec, n)),
+            "IS",
+        )?;
     }
 
     Ok(out.len)
@@ -1028,6 +1165,30 @@ mod tests {
             attrs,
             ..Default::default()
         }
+    }
+
+    /// IS is a signed integer string (PS3.5 Table 6.2-1), so a negative
+    /// SeriesNumber or InstanceNumber is a value, not a missing attribute.
+    #[test]
+    fn a_negative_is_value_is_rendered_with_its_sign() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![
+                (0x0020_0011, AttrValue::Text("-7".into())),
+                (0x0020_000E, AttrValue::Text("1.2.3".into())),
+            ],
+            instances: Vec::new(),
+        };
+        let mut buf = [0u8; 1024];
+        let n = write_series_attrs(&mut buf, &series, None, None, Some("1.2")).expect("fits");
+        let got = std::str::from_utf8(&buf[..n]).expect("ASCII");
+        assert!(
+            got.contains("<Value number=\"1\">-7</Value>"),
+            "a signed IS keeps its sign: {got}"
+        );
+        assert!(
+            !got.contains("<Value number=\"1\">7</Value>"),
+            "the sign must not be dropped: {got}"
+        );
     }
 
     /// The four PPS/Request scalars are emitted by the XML mirror too, with
@@ -1090,7 +1251,7 @@ mod tests {
         let n = write_study_attrs(&mut buf, &s, None, None).expect("fits");
         let got = String::from_utf8(buf[..n].to_vec()).unwrap();
         assert!(got.contains(
-            "<DicomAttribute tag=\"00080020\" vr=\"DA\" keyword=\"\"><Value number=\"1\">20260802</Value></DicomAttribute>"
+            "<DicomAttribute tag=\"00080020\" vr=\"DA\" keyword=\"StudyDate\"><Value number=\"1\">20260802</Value></DicomAttribute>"
         ));
         assert!(got.contains("vr=\"CS\""));
         // PN is decomposed.
@@ -1124,7 +1285,7 @@ mod tests {
         let mut buf = [0u8; 256];
         let n = {
             let mut out = Sink::new(&mut buf);
-            write_attr_elem(&mut out, 0x0008_0020, &AttrValue::UInt(60802), "DA").expect("fits");
+            write_attr_elem(&mut out, 0x0008_0020, AttrRef::UInt(60802), "DA").expect("fits");
             out.len
         };
         let got = String::from_utf8(buf[..n].to_vec()).unwrap();
@@ -1133,7 +1294,7 @@ mod tests {
         let mut buf = [0u8; 256];
         let n = {
             let mut out = Sink::new(&mut buf);
-            write_attr_elem(&mut out, 0x0008_0030, &AttrValue::UInt(83000), "TM").expect("fits");
+            write_attr_elem(&mut out, 0x0008_0030, AttrRef::UInt(83000), "TM").expect("fits");
             out.len
         };
         let got = String::from_utf8(buf[..n].to_vec()).unwrap();
@@ -1151,14 +1312,14 @@ mod tests {
         let got = String::from_utf8(buf[..n].to_vec()).unwrap();
         // Derived counts render as IS elements.
         assert!(got.contains(
-            "<DicomAttribute tag=\"00201206\" vr=\"IS\" keyword=\"\"><Value number=\"1\">2</Value></DicomAttribute>"
+            "<DicomAttribute tag=\"00201206\" vr=\"IS\" keyword=\"NumberOfStudyRelatedSeries\"><Value number=\"1\">2</Value></DicomAttribute>"
         ));
         assert!(got.contains(
-            "<DicomAttribute tag=\"00201208\" vr=\"IS\" keyword=\"\"><Value number=\"1\">42</Value></DicomAttribute>"
+            "<DicomAttribute tag=\"00201208\" vr=\"IS\" keyword=\"NumberOfStudyRelatedInstances\"><Value number=\"1\">42</Value></DicomAttribute>"
         ));
         // ModalitiesInStudy renders one Value per comma component, in order.
         assert!(got.contains(
-            "<DicomAttribute tag=\"00080061\" vr=\"CS\" keyword=\"\"><Value number=\"1\">CT</Value><Value number=\"2\">MR</Value></DicomAttribute>"
+            "<DicomAttribute tag=\"00080061\" vr=\"CS\" keyword=\"ModalitiesInStudy\"><Value number=\"1\">CT</Value><Value number=\"2\">MR</Value></DicomAttribute>"
         ));
         // ORDER: 00080061 stays in its group-8 slot; the counts come after
         // StudyID and before SeriesInstanceUID (the json.rs:177-178 slot).
@@ -1246,14 +1407,14 @@ mod tests {
     #[test]
     fn study_attrs_always_emits_charset_no_series_uid() {
         let s = study(vec![(0x0020_000D, AttrValue::Text("1.2.840.1.1".into()))]);
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 1024];
         let n = write_study_attrs(&mut buf, &s, None, None).expect("fits");
         let got = String::from_utf8(buf[..n].to_vec()).unwrap();
         // (0008,0005) SpecificCharacterSet is ALWAYS emitted first as the
         // study writer's lowest tag.
         assert!(
             got.contains(
-                "<DicomAttribute tag=\"00080005\" vr=\"CS\" keyword=\"\"><Value number=\"1\">ISO_IR 192</Value></DicomAttribute>"
+                "<DicomAttribute tag=\"00080005\" vr=\"CS\" keyword=\"SpecificCharacterSet\"><Value number=\"1\">ISO_IR 192</Value></DicomAttribute>"
             ),
             "charset must be emitted first: {got}"
         );
@@ -1398,11 +1559,12 @@ mod tests {
         let mut buf = [0u8; 1024];
         let n = write_patient_xml(&mut buf, &p).expect("fits");
         // Patient XML now leads with the always-on SpecificCharacterSet
-        // (0008,0005) sibling, then the two DICOM-tag attributes
-        // back-to-back; non-DICOM keys dropped.
+        // (0008,0005) sibling, then the DICOM-tag attributes back-to-back
+        // (0010,0010 PN / 0010,0020 LO / 0020,1200 IS); non-DICOM keys
+        // dropped.
         assert_eq!(
             &buf[..n],
-            b"<DicomAttribute tag=\"00080005\" vr=\"CS\" keyword=\"\"><Value number=\"1\">ISO_IR 192</Value></DicomAttribute><DicomAttribute tag=\"00100010\" vr=\"PN\" keyword=\"\"><PersonName number=\"1\"><Alphabetic><FamilyName>SMIRNOV</FamilyName><GivenName>IVAN</GivenName></Alphabetic></PersonName></DicomAttribute><DicomAttribute tag=\"00100020\" vr=\"LO\" keyword=\"\"><Value number=\"1\">PT-UID-9</Value></DicomAttribute>"
+            b"<DicomAttribute tag=\"00080005\" vr=\"CS\" keyword=\"SpecificCharacterSet\"><Value number=\"1\">ISO_IR 192</Value></DicomAttribute><DicomAttribute tag=\"00100010\" vr=\"PN\" keyword=\"PatientName\"><PersonName number=\"1\"><Alphabetic><FamilyName>SMIRNOV</FamilyName><GivenName>IVAN</GivenName></Alphabetic></PersonName></DicomAttribute><DicomAttribute tag=\"00100020\" vr=\"LO\" keyword=\"PatientID\"><Value number=\"1\">PT-UID-9</Value></DicomAttribute><DicomAttribute tag=\"00201200\" vr=\"IS\" keyword=\"NumberOfPatientRelatedStudies\"><Value number=\"1\">2</Value></DicomAttribute>"
         );
     }
 
@@ -1430,14 +1592,151 @@ mod tests {
         let mut body = Vec::new();
         write_xml_doc_start(&mut body);
         let s = study(vec![(0x0020_000D, AttrValue::Text("1.2.840.1.1".into()))]);
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 1024];
         let n = write_study_attrs(&mut buf, &s, None, None).expect("fits");
         body.extend_from_slice(&buf[..n]);
         write_xml_doc_end(&mut body);
         let got = String::from_utf8(body).unwrap();
-        assert!(got.starts_with(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NativeDicomModel xmlns=\"http://dicom.nema.org/PS3.19/models/NativeDICOM\">\n"
-        ));
+        // PS3.19 Table A.1.5-1: the root carries xml:space="preserve", so a
+        // reader cannot strip the spaces a DICOM value may legitimately carry.
+        assert!(
+            got.starts_with(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NativeDicomModel xmlns=\"http://dicom.nema.org/PS3.19/models/NativeDICOM\" xml:space=\"preserve\">\n"
+            ),
+            "root must declare the namespace and preserve whitespace: {got}"
+        );
         assert!(got.ends_with("\n</NativeDicomModel>\n"));
+    }
+
+    /// XML 1.0 [2] excludes U+FFFE and U+FFFF at every level, so passing one
+    /// through made the whole document unparseable.
+    #[test]
+    fn a_noncharacter_never_reaches_the_document() {
+        let mut buf = [0u8; 1024];
+        let s = study(vec![(
+            0x0008_1030,
+            AttrValue::Text("bad\u{FFFE}value\u{FFFF}".into()),
+        )]);
+        let n = write_study_attrs(&mut buf, &s, None, None).expect("fits");
+        let got = String::from_utf8(buf[..n].to_vec()).unwrap();
+        assert!(!got.contains('\u{FFFE}'), "U+FFFE must be dropped: {got}");
+        assert!(!got.contains('\u{FFFF}'), "U+FFFF must be dropped: {got}");
+        assert!(
+            got.contains("badvalue"),
+            "the rest of the value must survive: {got}"
+        );
+    }
+
+    /// XML 1.0 2.11 normalizes a literal CR to LF before the element content
+    /// is delivered, so only a character reference preserves the value.
+    #[test]
+    fn a_carriage_return_is_escaped_as_a_character_reference() {
+        let mut buf = [0u8; 1024];
+        let s = study(vec![(0x0008_1030, AttrValue::Text("a\rb".into()))]);
+        let n = write_study_attrs(&mut buf, &s, None, None).expect("fits");
+        let got = String::from_utf8(buf[..n].to_vec()).unwrap();
+        assert!(
+            got.contains("a&#xD;b"),
+            "a CR must be a character reference: {got}"
+        );
+        assert!(!got.contains("a\rb"), "a raw CR must not be emitted: {got}");
+    }
+
+    /// PS3.19 Table A.1.5-2: `keyword` is Required unless the element is
+    /// unknown to the host, so a known tag must name its PS3.6 keyword.
+    #[test]
+    fn a_known_attribute_carries_its_ps36_keyword() {
+        let mut buf = [0u8; 1024];
+        let s = study(vec![
+            (0x0008_0020, AttrValue::UInt(20_260_802)),
+            (0x0010_0010, AttrValue::Text("IVANOV^IVAN".into())),
+        ]);
+        let n = write_study_attrs(&mut buf, &s, None, None).expect("fits");
+        let got = String::from_utf8(buf[..n].to_vec()).unwrap();
+        assert!(
+            got.contains("tag=\"00080020\" vr=\"DA\" keyword=\"StudyDate\""),
+            "StudyDate must carry its keyword: {got}"
+        );
+        assert!(
+            got.contains("tag=\"00100010\" vr=\"PN\" keyword=\"PatientName\""),
+            "PatientName must carry its keyword: {got}"
+        );
+        // An unknown tag keeps the empty value: the host genuinely does not
+        // know the element, which is exactly what an empty keyword states.
+        assert_eq!(crate::query::json::keyword_for_tag(0x7777_0001), "");
+    }
+
+    /// PS3.19 Table A.1.5-2 `vr` must be the PS3.5 VR of the element. The
+    /// specialised emitters wrote their VR as a literal, so a registry change
+    /// left them silently disagreeing with the generic writer.
+    #[test]
+    fn every_emitted_attribute_uses_its_registry_vr() {
+        let p = crate::query::json::PatientQido {
+            patient_uid: "PT-1".into(),
+            patient_name: "IVANOV^IVAN".into(),
+            last_arrival: None,
+            study_count: 1,
+            patient_id: 1,
+        };
+        let mut buf = [0u8; 1024];
+        let n = write_patient_xml(&mut buf, &p).expect("fits");
+        let got = String::from_utf8(buf[..n].to_vec()).unwrap();
+        for (tag, vr) in [
+            (0x0008_0005u32, "CS"),
+            (0x0010_0010, "PN"),
+            (0x0010_0020, "LO"),
+            (0x0020_1200, "IS"),
+        ] {
+            let hex = format!("{tag:08X}");
+            let want = format!("tag=\"{hex}\" vr=\"{vr}\"");
+            assert!(
+                got.contains(&want),
+                "{hex} must carry the registry VR {vr}: {got}"
+            );
+        }
+        let mut sbuf = [0u8; 1024];
+        let s = study(vec![(0x0008_0005, AttrValue::Text("ISO_IR 192".into()))]);
+        let sn = write_study_attrs(&mut sbuf, &s, None, None).expect("fits");
+        let sgot = String::from_utf8(sbuf[..sn].to_vec()).unwrap();
+        assert!(
+            sgot.contains("tag=\"00080005\" vr=\"CS\""),
+            "SpecificCharacterSet is CS (PS3.6), not UN: {sgot}"
+        );
+    }
+
+    /// A repeated includefield member must not consume a cap slot.
+    #[test]
+    fn a_repeated_includefield_member_does_not_consume_the_xml_cap() {
+        let mut req = String::new();
+        for _ in 0..64 {
+            req.push_str("0020000D,");
+        }
+        req.push_str("InstitutionName");
+        let baseline = crate::query::json::MANDATORY_STUDY;
+        let f = TagFilter::from_request(&baseline, Some(&req)).expect("a filter");
+        assert!(
+            f.contains(0x0008_0080),
+            "InstitutionName must survive 64 repeats of a baseline tag"
+        );
+    }
+
+    /// A patient row wider than the stack buffer must either render or be
+    /// REPORTED - never omitted silently.
+    #[test]
+    fn a_long_patient_row_is_rendered_not_dropped() {
+        let p = crate::query::json::PatientQido {
+            patient_id: 1,
+            patient_uid: "9".repeat(9_000),
+            patient_name: "LONG^NAME".into(),
+            last_arrival: Some(1),
+            study_count: 1,
+        };
+        let mut out = Vec::new();
+        write_patient_xml_into(&mut out, &p).expect("a sized buffer must fit the row");
+        let got = String::from_utf8(out).unwrap();
+        assert!(
+            got.contains(&"9".repeat(9_000)),
+            "the whole identifier must be present"
+        );
     }
 }

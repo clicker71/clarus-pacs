@@ -216,7 +216,9 @@ def test_commit_reads_failure_reason_as_a_number():
                 ],
             )
         )
-        _c, failed, _s = _stc_commit_request(origin.url, "1.2.3", [])
+        _c, failed, _s = _stc_commit_request(
+            origin.url, "1.2.3", [(SOP_CLASS, SOP_A), (SOP_CLASS, SOP_B)]
+        )
         assert (SOP_CLASS, SOP_A, 0x0110) in failed
         assert (SOP_CLASS, SOP_B, 0x0213) in failed
     finally:
@@ -238,7 +240,9 @@ def test_a_string_failure_reason_is_also_understood():
                 ],
             )
         )
-        _c, failed, _s = _stc_commit_request(origin.url, "1.2.3", [])
+        _c, failed, _s = _stc_commit_request(
+            origin.url, "1.2.3", [(SOP_CLASS, SOP_A), (SOP_CLASS, SOP_B)]
+        )
         assert (SOP_CLASS, SOP_A, 0x0110) in failed
         assert (SOP_CLASS, SOP_B, 0x0213) in failed
     finally:
@@ -252,7 +256,7 @@ def test_an_unenumerated_reason_is_reported_as_processing_failure():
         origin.script(
             body=_verdict_body(committed=[], failed=[(SOP_CLASS, SOP_A, "C2FF")])
         )
-        _c, failed, _s = _stc_commit_request(origin.url, "1.2.3", [])
+        _c, failed, _s = _stc_commit_request(origin.url, "1.2.3", [(SOP_CLASS, SOP_A)])
         assert failed == [(SOP_CLASS, SOP_A, 0x0110)]
     finally:
         origin.close()

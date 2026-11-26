@@ -313,12 +313,9 @@ mod tests {
             model: "m".into(),
             result: RuleResult {
                 kind: ResultKind::Pr,
-                color: Some("#fff".into()),
                 profile_version: 1,
                 series_description: None,
                 label: LabelProfile::default(),
-                sr: None,
-                measurements: None,
             },
             index: 0,
         }
@@ -338,12 +335,9 @@ mod tests {
             model: "m".into(),
             result: RuleResult {
                 kind: ResultKind::Pr,
-                color: Some("#fff".into()),
                 profile_version: 1,
                 series_description: None,
                 label: LabelProfile::default(),
-                sr: None,
-                measurements: None,
             },
             index: 0,
         }
@@ -506,12 +500,9 @@ mod tests {
             model: "m".into(),
             result: RuleResult {
                 kind: ResultKind::Pr,
-                color: Some("#fff".into()),
                 profile_version: 1,
                 series_description: None,
                 label: LabelProfile::default(),
-                sr: None,
-                measurements: None,
             },
             index: 0,
         }

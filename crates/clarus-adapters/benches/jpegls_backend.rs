@@ -89,20 +89,22 @@ fn build_minimal_dicom_wrapper(pixel_data: &[u8], w: u16, h: u16, bits: u8) -> V
         out.extend_from_slice(&2u16.to_le_bytes());
         out.extend_from_slice(&val.to_le_bytes());
     }
-    // (0028,0004) PhotometricInterpretation = MONOCHROME2
-    let photo = b"MONOCHROME2";
+    // (0028,0004) PhotometricInterpretation = MONOCHROME2.
+    // PS3.5 6.2: the EVEN-sized Value Field is what the Value Length declares,
+    // so the pad character counts - a CS value is padded with a space and the
+    // padded length is written. Declaring 11 for the 12-byte value put every
+    // reader that advances by the declared length on the pad instead of the
+    // next tag, and a benchmark of a non-conforming wrapper measures the
+    // decoder's tolerance rather than its throughput.
+    let mut photo = b"MONOCHROME2".to_vec();
+    if !photo.len().is_multiple_of(2) {
+        photo.push(0x20); // space, the CS pad character
+    }
     out.extend_from_slice(&0x0028u16.to_le_bytes());
     out.extend_from_slice(&0x0004u16.to_le_bytes());
     out.extend_from_slice(b"CS");
     out.extend_from_slice(&(photo.len() as u16).to_le_bytes());
-    out.extend_from_slice(photo);
-    // PS3.5 6.2: an odd-length value is padded to even, and the pad byte is
-    // NOT part of the value length. MONOCHROME2 is 11 bytes, so without the
-    // pad every element after it is read one byte early and the bench measures
-    // a decoder fed a malformed dataset.
-    if !photo.len().is_multiple_of(2) {
-        out.push(0x20); // space, the CS pad character
-    }
+    out.extend_from_slice(&photo);
     // (7FE0,0010) PixelData, OB, undefined length + BOT + one fragment + delim
     out.extend_from_slice(&0x7FE0u16.to_le_bytes());
     out.extend_from_slice(&0x0010u16.to_le_bytes());
@@ -111,9 +113,15 @@ fn build_minimal_dicom_wrapper(pixel_data: &[u8], w: u16, h: u16, bits: u8) -> V
     out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
     out.extend_from_slice(&0u32.to_le_bytes());
+    // PS3.5 A.4: an Item value is even-length, and the pad is part of the
+    // value the Item Length declares.
+    let mut fragment = pixel_data.to_vec();
+    if !fragment.len().is_multiple_of(2) {
+        fragment.push(0);
+    }
     out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
-    out.extend_from_slice(&(pixel_data.len() as u32).to_le_bytes());
-    out.extend_from_slice(pixel_data);
+    out.extend_from_slice(&(fragment.len() as u32).to_le_bytes());
+    out.extend_from_slice(&fragment);
     out.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
     out.extend_from_slice(&0u32.to_le_bytes());
     out
@@ -235,7 +243,10 @@ fn roundtrip_4_80(c: &mut Criterion) {
     // Decode source is the T.87 fixture for BOTH arms (the stored bytes
     // are LegacyGo).
     let (_, t87_bytes, _, _, meta) = setup_f776();
-    let mut group = c.benchmark_group("e2e_roundtrip_jpegls_4_80_f776");
+    // CODEC time, not transcode time: the closure decodes a JPEG-LS fragment
+    // and encodes one back. It never assembles PixelData or rebuilds the
+    // dataset, so the name must not claim an end-to-end transcode.
+    let mut group = c.benchmark_group("codec_decode_encode_jpegls_f776");
 
     group.bench_function("pure_jpegls", |b| {
         b.iter(|| {

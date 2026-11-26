@@ -57,10 +57,19 @@ pub fn vr_for_tag(tag: u32) -> &'static str {
         0x0020_0013 => "IS", // InstanceNumber
         0x0020_1206 => "IS", // NumberOfStudyRelatedSeries
         0x0020_1208 => "IS", // NumberOfStudyRelatedInstances
+        0x0020_1209 => "IS", // NumberOfSeriesRelatedInstances
         0x0020_0060 => "CS", // Laterality
         0x0028_0008 => "IS", // NumberOfFrames
+        // Image geometry emitted on the instance level (PS3.18 Table
+        // 10.6.3-5, C "shall be present if known").
+        0x0028_0010 => "US", // Rows
+        0x0028_0011 => "US", // Columns
+        0x0028_0100 => "US", // BitsAllocated
         0x0032_1032 => "PN", // RequestingPhysician
         0x0032_1060 => "LO", // RequestedProcedureDescription
+        0x0008_0005 => "CS", // SpecificCharacterSet
+        0x0008_0056 => "CS", // InstanceAvailability
+        0x0008_1190 => "UR", // RetrieveURL
         _ => "UN",
     }
 }
@@ -154,6 +163,8 @@ pub(crate) const MANDATORY_INSTANCE: [u32; 5] = [
 /// anything else is skipped by the filter parser (pre-existing semantics).
 /// Shared by the XML mirror (like MANDATORY_*).
 pub(crate) const KEYWORD_TO_TAG: &[(&str, u32)] = &[
+    ("SpecificCharacterSet", 0x0008_0005),
+    ("InstanceAvailability", 0x0008_0056),
     ("StudyDate", 0x0008_0020),
     ("StudyTime", 0x0008_0030),
     ("AccessionNumber", 0x0008_0050),
@@ -177,6 +188,7 @@ pub(crate) const KEYWORD_TO_TAG: &[(&str, u32)] = &[
     ("ProtocolName", 0x0018_1030),
     ("StudyInstanceUID", 0x0020_000D),
     ("StudyID", 0x0020_0010),
+    ("Laterality", 0x0020_0060),
     ("RequestingPhysician", 0x0032_1032),
     ("RequestedProcedureDescription", 0x0032_1060),
     ("NumberOfStudyRelatedSeries", 0x0020_1206),
@@ -207,6 +219,23 @@ pub(crate) fn keyword_tag(field: &str) -> Option<u32> {
         .iter()
         .find(|(kw, _)| kw.eq_ignore_ascii_case(field))
         .map(|(_, t)| *t)
+}
+
+/// The PS3.6 keyword for `tag`, or `""` when the registry does not know it.
+///
+/// PS3.19 Table A.1.5-2 makes `keyword` Required on every DicomAttribute
+/// element unless the Data Element is unknown to the host. The XML writer
+/// emitted `keyword=""` for EVERY attribute, StudyDate and PatientID included,
+/// which states "this host does not know the element" for elements it clearly
+/// does. Resolved from the same [`KEYWORD_TO_TAG`] table the includefield
+/// parser uses, so the two cannot drift (source:
+/// standard/ps3.6/qido-response-attributes.json).
+pub fn keyword_for_tag(tag: u32) -> &'static str {
+    KEYWORD_TO_TAG
+        .iter()
+        .find(|(_, t)| *t == tag)
+        .map(|(kw, _)| *kw)
+        .unwrap_or("")
 }
 
 /// Stream one study object (the 14 key attributes the QIDO response uses) as
@@ -285,9 +314,17 @@ pub fn write_study_json(
         if !tag_pass(&filt, want) {
             continue;
         }
-        // Derived study counts (RAM-only fields, never in attrs).
+        // Derived study counts (RAM-only fields, never in attrs). The counts
+        // are non-negative by construction; the emitter is signed because the
+        // IS attributes that share it are.
         if want == 0x0020_1206 {
-            emit_written_num(&mut out, &mut wrote, 0x0020_1206, "IS", study.series_count)?;
+            emit_written_num(
+                &mut out,
+                &mut wrote,
+                0x0020_1206,
+                "IS",
+                i64::try_from(study.series_count).unwrap_or(i64::MAX),
+            )?;
             continue;
         }
         if want == 0x0020_1208 {
@@ -296,7 +333,7 @@ pub fn write_study_json(
                 &mut wrote,
                 0x0020_1208,
                 "IS",
-                study.instance_count,
+                i64::try_from(study.instance_count).unwrap_or(i64::MAX),
             )?;
             continue;
         }
@@ -394,6 +431,14 @@ fn emit_ur(
     uid: Option<&str>,
 ) -> Result<(), StreamOverflow> {
     if let (Some(base), Some(uid)) = (retrieve_base, uid) {
+        // An empty UID cannot name a resource: the URL would carry an empty
+        // path segment (`/series//instances/...`), which is not the address of
+        // anything, while the attribute it describes is dropped from the row
+        // for being empty. Emitting a URL that resolves to some OTHER
+        // resource is worse than emitting none, so neither is emitted.
+        if uid.is_empty() {
+            return Ok(());
+        }
         // Build the absolute URL on a fixed stack buffer (no heap): base is a
         // borrow (<=256) + path + UID; the row's UIDs are <=64 bytes so the
         // buffer never overflows a real Host/scheme.
@@ -486,6 +531,12 @@ impl TagFilter {
             if let Some(v) = v
                 && v != 0
                 && f.len < TagFilter::MAX_TAGS
+                // The cap bounds DISTINCT tags. Appending a repeat consumed a
+                // slot that a later, genuinely different attribute needed: 51
+                // repetitions of `PatientID` filled every remaining slot, so a
+                // following `StudyDescription` was dropped from a request that
+                // selects two distinct tags.
+                && !f.contains(v)
             {
                 f.tags[f.len] = v;
                 f.len += 1;
@@ -555,7 +606,9 @@ pub fn write_series_json(
         match d {
             AttrValue::UInt(u) => {
                 let mut dbuf = [0u8; 8];
-                push_date8(&mut dbuf, *u);
+                // A value wider than YYYYMMDD cannot be rendered; the response
+                // fails rather than reporting a different date.
+                push_date8(&mut dbuf, *u).ok_or(StreamOverflow)?;
                 emit_written_str(&mut out, &mut wrote, 0x0008_0021, "DA", bytes_to_str(&dbuf))?;
             }
             AttrValue::Text(s) => {
@@ -592,9 +645,13 @@ pub fn write_series_json(
         emit_written_str(&mut out, &mut wrote, 0x0008_1010, "SH", s)?;
     }
     // (0008,103E) SeriesDescription - LO.
-    if let Some(s) = series_text(&series.attrs, tag::SERIES_DESCRIPTION)
-        && tag_pass(&filt, 0x0008_103E)
-    {
+    //
+    // PS3.18 Table 10.6.3-4 marks this C: "shall be present if known". A
+    // `tag_pass` gate made a KNOWN description disappear whenever the request
+    // carried a restrictive includefield, which turns a C attribute into an
+    // optional one. The value is emitted when the series has it and skipped
+    // when it does not, which is the whole of the requirement.
+    if let Some(s) = series_text(&series.attrs, tag::SERIES_DESCRIPTION) {
         emit_written_str(&mut out, &mut wrote, 0x0008_103E, "LO", s)?;
     }
     // (0008,1040) InstitutionalDepartmentName - LO (08.09 extension).
@@ -697,24 +754,47 @@ pub fn write_series_json(
             &mut wrote,
             0x0020_1209,
             "IS",
-            series.instances.len() as u64,
+            i64::try_from(series.instances.len()).unwrap_or(i64::MAX),
         )?;
     }
-    // (0040,0009) ScheduledProcedureStepID - SH, the scalar read out of
-    // RequestAttributesSequence (0040,0275) and stored under its own tag.
-    if let Some(s) = series_text(&series.attrs, tag::SCHEDULED_PROCEDURE_STEP_ID)
-        && tag_pass(&filt, 0x0040_0009)
-    {
-        emit_written_str(&mut out, &mut wrote, 0x0040_0009, "SH", s)?;
+    // (0040,0275) RequestAttributesSequence - SQ, a C return key of Table
+    // 10.6.3-4.
+    //
+    // ScheduledProcedureStepID (0040,0009) and RequestedProcedureID
+    // (0040,1001) are ATTRIBUTES OF THE SEQUENCE ITEM, not Series attributes
+    // (PS3.3 C.4.10), so a client looking for them inside (0040,0275) found
+    // nothing while the writer had emitted them at the root. The manifest
+    // stores the two scalars flat under their own tags and supports one item,
+    // so the item is reconstructed here; item boundaries beyond the first are
+    // not represented in storage and are not invented.
+    let sps_id =
+        series_text(&series.attrs, tag::SCHEDULED_PROCEDURE_STEP_ID).filter(|s| !s.is_empty());
+    let req_id = series_text(&series.attrs, tag::REQUESTED_PROCEDURE_ID).filter(|s| !s.is_empty());
+    if (sps_id.is_some() || req_id.is_some()) && tag_pass(&filt, 0x0040_0275) {
+        if wrote {
+            out.push(b',')?;
+        }
+        wrote = true;
+        out.extend(b"\"00400275\":{\"Value\":[{")?;
+        let mut item_wrote = false;
+        if let Some(s) = sps_id {
+            emit_written_str(&mut out, &mut item_wrote, 0x0040_0009, "SH", s)?;
+        }
+        if let Some(s) = req_id {
+            emit_written_str(&mut out, &mut item_wrote, 0x0040_1001, "SH", s)?;
+        }
+        out.extend(b"}],\"vr\":\"SQ\"}")?;
     }
     // (0040,0244) PerformedProcedureStepStartDate - DA, canonical 8-digit.
-    if let Some(d) = series_attr(&series.attrs, tag::PPS_START_DATE)
-        && tag_pass(&filt, 0x0040_0244)
-    {
+    // C in Table 10.6.3-4 ("shall be present if known"), so a restrictive
+    // includefield must not hide it.
+    if let Some(d) = series_attr(&series.attrs, tag::PPS_START_DATE) {
         match d {
             AttrValue::UInt(u) => {
                 let mut dbuf = [0u8; 8];
-                push_date8(&mut dbuf, *u);
+                // A value wider than YYYYMMDD cannot be rendered; the response
+                // fails rather than reporting a different date.
+                push_date8(&mut dbuf, *u).ok_or(StreamOverflow)?;
                 emit_written_str(&mut out, &mut wrote, 0x0040_0244, "DA", bytes_to_str(&dbuf))?;
             }
             AttrValue::Text(s) => {
@@ -723,18 +803,9 @@ pub fn write_series_json(
             _ => {}
         }
     }
-    // (0040,0245) PerformedProcedureStepStartTime - TM.
-    if let Some(s) = series_text(&series.attrs, tag::PPS_START_TIME)
-        && tag_pass(&filt, 0x0040_0245)
-    {
+    // (0040,0245) PerformedProcedureStepStartTime - TM. C, same rule.
+    if let Some(s) = series_text(&series.attrs, tag::PPS_START_TIME) {
         emit_written_str(&mut out, &mut wrote, 0x0040_0245, "TM", s)?;
-    }
-    // (0040,1001) RequestedProcedureID - SH, the second scalar of the same
-    // sequence.
-    if let Some(s) = series_text(&series.attrs, tag::REQUESTED_PROCEDURE_ID)
-        && tag_pass(&filt, 0x0040_1001)
-    {
-        emit_written_str(&mut out, &mut wrote, 0x0040_1001, "SH", s)?;
     }
 
     out.push(b'}')?;
@@ -777,7 +848,14 @@ pub fn write_instance_json(
     // group, ascending after SOPInstanceUID (0008,0018) and before the
     // (0020,000D) StudyInstanceUID block.
     emit_ia(&mut out, &mut wrote)?;
-    if let (Some(base), Some(sop)) = (retrieve_base, sop_uid_of(instance)) {
+    // An empty study or series UID would put an empty segment in the path
+    // (`/studies//series/...`), which addresses nothing; the row omits those
+    // UIDs for the same reason, and a URL is emitted only for a complete
+    // identity.
+    if let (Some(base), Some(sop)) = (retrieve_base, sop_uid_of(instance))
+        && !study_uid.is_empty()
+        && !series_uid.is_empty()
+    {
         // {base}/dicomweb/studies/{study}/series/{series}/instances/{sop}
         let mut url = [0u8; MAX_URL_LEN];
         let mut n = 0usize;
@@ -815,6 +893,30 @@ pub fn write_instance_json(
     if let Some(n) = instance_number(&instance.attrs, tag::NUMBER_OF_FRAMES) {
         emit_written_num(&mut out, &mut wrote, 0x0028_0008, "IS", n)?;
     }
+    // (0028,0010) Rows, (0028,0011) Columns, (0028,0100) BitsAllocated - US,
+    // all C in Table 10.6.3-5 ("shall be present if known"). The manifest
+    // stores them, but the writer had no path for any of them, so a client
+    // asking includefield=all for a known 512x512 instance got neither
+    // dimension. VR comes from standard/ps3.6/qido-response-attributes.json.
+    for t in [0x0028_0010u32, 0x0028_0011, 0x0028_0100] {
+        if let Some(v) = instance_attr(&instance.attrs, t) {
+            match v {
+                AttrValue::UInt(u) => {
+                    emit_written_num(
+                        &mut out,
+                        &mut wrote,
+                        t,
+                        "US",
+                        i64::try_from(*u).unwrap_or(i64::MAX),
+                    )?;
+                }
+                AttrValue::Text(s) if !s.is_empty() => {
+                    emit_written_str(&mut out, &mut wrote, t, "US", s)?;
+                }
+                _ => {}
+            }
+        }
+    }
 
     out.push(b'}')?;
     Ok(out.len)
@@ -840,9 +942,10 @@ pub struct PatientQido {
 
 /// Stream one patient of the QIDO-RS `/patients` list into `buf`.
 ///
-/// Byte-exact with the frozen serde-era render: outer keys in alphabetical
-/// order (`00100010`, `00100020`, `arrived_at`, `patient_id`, `study_count`),
-/// each DICOM-attribute object emitting `"Value"` before `"vr"` (serde
+/// Byte-exact with the frozen serde-era render: DICOM-tag keys in ascending
+/// tag order (`00080005`, `00100010`, `00100020`, `00201200`), then the
+/// non-DICOM keys (`arrived_at`, `patient_id`, `study_count`), each
+/// DICOM-attribute object emitting `"Value"` before `"vr"` (serde
 /// `BTreeMap` order, 0x56 `Value` < 0x76 `vr`). PN uses the
 /// `{"Alphabetic":...}` object form; `arrived_at: None` renders `null`.
 pub fn write_patient_json(buf: &mut [u8], p: &PatientQido) -> Result<usize, StreamOverflow> {
@@ -861,6 +964,12 @@ pub fn write_patient_json(buf: &mut [u8], p: &PatientQido) -> Result<usize, Stre
     out.extend(b"\"00100020\":{\"Value\":[")?;
     write_json_string(&mut out, &p.patient_uid)?;
     out.extend(b"],\"vr\":\"LO\"},")?;
+    // (0020,1200) NumberOfPatientRelatedStudies - IS, the DICOM name of the
+    // study_count `find_recent_patients` already computed for this patient.
+    // Ascends after (0010,0020) and before the non-DICOM keys.
+    out.extend(b"\"00201200\":{\"Value\":[")?;
+    push_dec_i64(&mut out, p.study_count)?;
+    out.extend(b"],\"vr\":\"IS\"},")?;
     // arrived_at - number or null.
     out.extend(b"\"arrived_at\":")?;
     match p.last_arrival {
@@ -890,12 +999,17 @@ fn series_text(attrs: &[(u32, AttrValue)], tag: u32) -> Option<&str> {
     }
 }
 
-/// The numeric value of `tag` (a non-negative integer), parsed from a `Text`
-/// or read from a `UInt`. `None` when absent, empty, or non-numeric.
-fn series_number(attrs: &[(u32, AttrValue)], tag: u32) -> Option<u64> {
+/// The numeric value of `tag`, parsed from a `Text` or read from a `UInt`.
+///
+/// IS is a SIGNED integer string (PS3.5 Table 6.2-1, recorded in
+/// standard/ps3.6/qido-response-attributes.json), and DICOM permits leading
+/// and trailing spaces in a value, so `"-1"` and `" 7 "` are both legal
+/// SeriesNumber values. Parsing them as `u64` rejected the sign and the
+/// padding, and the writer then omitted an attribute the archive holds.
+fn series_number(attrs: &[(u32, AttrValue)], tag: u32) -> Option<i64> {
     match series_attr(attrs, tag) {
-        Some(AttrValue::Text(s)) => s.parse::<u64>().ok(),
-        Some(AttrValue::UInt(u)) => Some(*u),
+        Some(AttrValue::Text(s)) => s.trim().parse::<i64>().ok(),
+        Some(AttrValue::UInt(u)) => i64::try_from(*u).ok(),
         _ => None,
     }
 }
@@ -905,8 +1019,13 @@ fn instance_text(attrs: &[(u32, AttrValue)], tag: u32) -> Option<&str> {
     series_text(attrs, tag)
 }
 
+/// The raw value of `tag` for an instance (any `AttrValue` variant).
+fn instance_attr(attrs: &[(u32, AttrValue)], tag: u32) -> Option<&AttrValue> {
+    series_attr(attrs, tag)
+}
+
 /// The numeric value of `tag` for an instance (see [`series_number`]).
-fn instance_number(attrs: &[(u32, AttrValue)], tag: u32) -> Option<u64> {
+fn instance_number(attrs: &[(u32, AttrValue)], tag: u32) -> Option<i64> {
     series_number(attrs, tag)
 }
 
@@ -929,6 +1048,17 @@ fn emit_written_str(
     *wrote = true;
     out.push(b'"')?;
     push_hex8(out, tag)?;
+    // PS3.18 F.2.5: a present-but-empty attribute carries NO Value member.
+    // Without this an empty stored SeriesDescription emitted `"Value":[""]`,
+    // which states a one-item value list holding an empty string - a different
+    // claim from "present and empty". Same rule `write_attr` applies at the
+    // study level.
+    if s.is_empty() {
+        out.extend(b"\":{\"vr\":\"")?;
+        out.extend(vr.as_bytes())?;
+        out.extend(b"\"}")?;
+        return Ok(());
+    }
     out.extend(b"\":{\"Value\":[")?;
     write_json_string(out, s)?;
     out.extend(b"],\"vr\":\"")?;
@@ -989,6 +1119,13 @@ fn emit_written_pn(
     *wrote = true;
     out.push(b'"')?;
     push_hex8(out, tag)?;
+    // PS3.18 F.2.5 again: an empty OperatorsName used to render as
+    // `"Value":[{}]` - a one-item list holding an object with no components.
+    // It is present and empty, so it carries no Value member at all.
+    if s.is_empty() {
+        out.extend(b"\":{\"vr\":\"PN\"}")?;
+        return Ok(());
+    }
     out.extend(b"\":{\"Value\":[")?;
     write_pn_object(out, s)?;
     out.extend(b"],\"vr\":\"PN\"}")?;
@@ -996,12 +1133,16 @@ fn emit_written_pn(
 }
 
 /// Emit `"TAG":{"Value":[n],"vr":"VR"}` with a leading comma when `wrote`.
+///
+/// `n` is signed because IS is (PS3.5 Table 6.2-1): a negative SeriesNumber or
+/// InstanceNumber is a legal value, and PS3.18 F.2.3 renders a numeric VR as a
+/// JSON number, so the sign belongs in the token rather than in a string.
 fn emit_written_num(
     out: &mut Sink<'_>,
     wrote: &mut bool,
     tag: u32,
     vr: &'static str,
-    n: u64,
+    n: i64,
 ) -> Result<(), StreamOverflow> {
     if *wrote {
         out.push(b',')?;
@@ -1010,7 +1151,7 @@ fn emit_written_num(
     out.push(b'"')?;
     push_hex8(out, tag)?;
     out.extend(b"\":{\"Value\":[")?;
-    push_dec(out, n)?;
+    push_dec_i64(out, n)?;
     out.extend(b"],\"vr\":\"")?;
     out.extend(vr.as_bytes())?;
     out.extend(b"\"}")?;
@@ -1051,7 +1192,12 @@ fn emit_written_csv(
 
 /// Write a `YYYYMMDD` integer as zero-padded 8 decimal ASCII digits into
 /// `buf` (allocation-free).
-fn push_date8(buf: &mut [u8; 8], v: u64) {
+///
+/// `None` when the value needs more than 8 digits. The loop used to stop when
+/// the padding was full and DISCARD the remaining digits, so `120260802`
+/// rendered as `"20260802"` - a different date, reported as success. A value
+/// that cannot be represented must be reported, not truncated.
+fn push_date8(buf: &mut [u8; 8], v: u64) -> Option<()> {
     for b in buf.iter_mut() {
         *b = b'0';
     }
@@ -1062,14 +1208,18 @@ fn push_date8(buf: &mut [u8; 8], v: u64) {
         buf[i] = b'0' + (rem % 10) as u8;
         rem /= 10;
         if rem == 0 {
-            break;
+            return Some(());
         }
     }
+    // Digits remained after the buffer filled: the value does not fit.
+    None
 }
 
 /// Write a `HHMMSS` integer as zero-padded 6 decimal ASCII digits into
-/// `buf` (allocation-free).
-fn push_hms6(buf: &mut [u8; 6], v: u64) {
+/// `buf` (allocation-free). `None` when the value needs more than 6 digits -
+/// `10103000` used to render as `"103000"`, a different time reported as
+/// success.
+fn push_hms6(buf: &mut [u8; 6], v: u64) -> Option<()> {
     for b in buf.iter_mut() {
         *b = b'0';
     }
@@ -1080,9 +1230,10 @@ fn push_hms6(buf: &mut [u8; 6], v: u64) {
         buf[i] = b'0' + (rem % 10) as u8;
         rem /= 10;
         if rem == 0 {
-            break;
+            return Some(());
         }
     }
+    None
 }
 
 /// Interpret an ASCII-digit byte slice as a `&str` (always ASCII digits, so
@@ -1139,11 +1290,11 @@ fn write_attr(
             // TM: 6-digit HHMMSS. Same shape write_series_json emits.
             if vr == "DA" {
                 let mut dbuf = [0u8; 8];
-                push_date8(&mut dbuf, *u);
+                push_date8(&mut dbuf, *u).ok_or(StreamOverflow)?;
                 write_json_string(out, bytes_to_str(&dbuf))?;
             } else if vr == "TM" {
                 let mut tbuf = [0u8; 6];
-                push_hms6(&mut tbuf, *u);
+                push_hms6(&mut tbuf, *u).ok_or(StreamOverflow)?;
                 write_json_string(out, bytes_to_str(&tbuf))?;
             } else {
                 push_dec(out, *u)?;
@@ -1409,12 +1560,12 @@ mod tests {
         let n = write_patient_json(&mut out, &patient_some()).expect("fits");
         assert_eq!(
             &out[..n],
-            b"{\"00080005\":{\"Value\":[\"ISO_IR 192\"],\"vr\":\"CS\"},\"00100010\":{\"Value\":[{\"Alphabetic\":\"SMIRNOV^IVAN\"}],\"vr\":\"PN\"},\"00100020\":{\"Value\":[\"PT-UID-9\"],\"vr\":\"LO\"},\"arrived_at\":500,\"patient_id\":7,\"study_count\":2}"
+            b"{\"00080005\":{\"Value\":[\"ISO_IR 192\"],\"vr\":\"CS\"},\"00100010\":{\"Value\":[{\"Alphabetic\":\"SMIRNOV^IVAN\"}],\"vr\":\"PN\"},\"00100020\":{\"Value\":[\"PT-UID-9\"],\"vr\":\"LO\"},\"00201200\":{\"Value\":[2],\"vr\":\"IS\"},\"arrived_at\":500,\"patient_id\":7,\"study_count\":2}"
         );
         let n2 = write_patient_json(&mut out, &patient_none()).expect("fits");
         assert_eq!(
             &out[..n2],
-            b"{\"00080005\":{\"Value\":[\"ISO_IR 192\"],\"vr\":\"CS\"},\"00100010\":{\"Value\":[{\"Alphabetic\":\"Na\\\"me\\\\^X\"}],\"vr\":\"PN\"},\"00100020\":{\"Value\":[\"U\"],\"vr\":\"LO\"},\"arrived_at\":null,\"patient_id\":42,\"study_count\":0}"
+            b"{\"00080005\":{\"Value\":[\"ISO_IR 192\"],\"vr\":\"CS\"},\"00100010\":{\"Value\":[{\"Alphabetic\":\"Na\\\"me\\\\^X\"}],\"vr\":\"PN\"},\"00100020\":{\"Value\":[\"U\"],\"vr\":\"LO\"},\"00201200\":{\"Value\":[0],\"vr\":\"IS\"},\"arrived_at\":null,\"patient_id\":42,\"study_count\":0}"
         );
     }
 
@@ -1710,10 +1861,11 @@ mod tests {
         assert!(got.starts_with('{') && got.ends_with('}'));
     }
 
-    // The four PPS/Request scalars captured from RequestAttributesSequence are
-    // matching keys (PS3.18 Table 10.6.1-5), NOT baseline: emitted only when
-    // captured AND requested (or includefield=all / None), at their ascending
-    // tag positions after (0020,1209).
+    // The PPS/Request attributes are matching keys (PS3.18 Table 10.6.1-5)
+    // AND conditional return keys of Table 10.6.3-4. The two PPS scalars are C
+    // ("shall be present if known"), so a restrictive includefield must NOT
+    // hide them; the two request IDs live inside (0040,0275), whose presence
+    // is what the filter can gate.
     #[test]
     fn series_json_emits_captured_pps_request_scalars() {
         let series = crate::manifest::SeriesRecord {
@@ -1727,34 +1879,39 @@ mod tests {
             instances: Vec::new(),
         };
 
-        // 1. Not named -> not emitted (matching keys are not baseline).
+        // 1. A restrictive includefield cannot hide the CONDITIONAL attributes.
         let mut out = [0u8; 1024];
         let n = write_series_json(&mut out, &series, Some("0008103E"), None, None).expect("fits");
         let got = String::from_utf8(out[..n].to_vec()).unwrap();
-        assert!(!got.contains("00400009"), "not named -> omitted: {got}");
-        assert!(!got.contains("00400244"), "not named -> omitted: {got}");
-        assert!(!got.contains("00400245"), "not named -> omitted: {got}");
-        assert!(!got.contains("00401001"), "not named -> omitted: {got}");
+        assert!(
+            got.contains("\"00400244\":{\"Value\":[\"20260802\"],\"vr\":\"DA\"}"),
+            "a C return key must not be filtered out: {got}"
+        );
+        assert!(
+            got.contains("\"00400245\":{\"Value\":[\"083000\"],\"vr\":\"TM\"}"),
+            "a C return key must not be filtered out: {got}"
+        );
 
-        // 2. includefield=all emits all four with canonical DA/TM rendering.
+        // 2. includefield=all emits everything, with the request IDs INSIDE
+        //    RequestAttributesSequence (0040,0275) where PS3.3 C.4.10 puts
+        //    them - not at the Series root.
         let n2 = write_series_json(&mut out, &series, Some("all"), None, None).expect("fits");
         let got2 = String::from_utf8(out[..n2].to_vec()).unwrap();
-        assert!(got2.contains("\"00400009\":{\"Value\":[\"SPID-1\"],\"vr\":\"SH\"}"));
-        assert!(got2.contains("\"00400244\":{\"Value\":[\"20260802\"],\"vr\":\"DA\"}"));
-        assert!(got2.contains("\"00400245\":{\"Value\":[\"083000\"],\"vr\":\"TM\"}"));
-        assert!(got2.contains("\"00401001\":{\"Value\":[\"RPID-1\"],\"vr\":\"SH\"}"));
+        assert!(
+            got2.contains("\"00400275\":{\"Value\":[{\"00400009\":{\"Value\":[\"SPID-1\"],\"vr\":\"SH\"},\"00401001\":{\"Value\":[\"RPID-1\"],\"vr\":\"SH\"}}],\"vr\":\"SQ\"}"),
+            "the two IDs belong to the sequence item: {got2}"
+        );
 
-        // 3. The keyword form resolves to the tag and emits the matching key.
-        let n3 = write_series_json(
-            &mut out,
-            &series,
-            Some("PerformedProcedureStepStartDate"),
-            None,
-            None,
-        )
-        .expect("fits");
+        // 3. Asking for the sequence by tag yields it, and the members appear
+        //    only AFTER the sequence opens - never as Series-level siblings.
+        let n3 = write_series_json(&mut out, &series, Some("00400275"), None, None).expect("fits");
         let got3 = String::from_utf8(out[..n3].to_vec()).unwrap();
-        assert!(got3.contains("\"00400244\":{\"Value\":[\"20260802\"],\"vr\":\"DA\"}"));
+        let seq_at = got3.find("\"00400275\"").expect("sequence present");
+        let id_at = got3.find("\"00400009\"").expect("id inside the item");
+        assert!(
+            id_at > seq_at,
+            "the ID must be nested, not a Series-level sibling: {got3}"
+        );
     }
 
     #[test]
@@ -2132,7 +2289,7 @@ mod tests {
         let got = String::from_utf8(out[..n].to_vec()).unwrap();
         assert!(
             got.contains(
-                "<DicomAttribute tag=\"0020000D\" vr=\"UI\" keyword=\"\"><Value number=\"1\">1.2.840.1.1</Value></DicomAttribute>"
+                "<DicomAttribute tag=\"0020000D\" vr=\"UI\" keyword=\"StudyInstanceUID\"><Value number=\"1\">1.2.840.1.1</Value></DicomAttribute>"
             ),
             "XML must emit the complete StudyInstanceUID element: {got}"
         );
@@ -2199,6 +2356,212 @@ mod tests {
         assert!(
             s.contains(&want),
             "the full retrieve URL must be emitted intact, got {s}"
+        );
+    }
+
+    /// An instance record carrying only `attrs`, for the writer tests.
+    fn inst(attrs: Vec<(u32, AttrValue)>) -> crate::manifest::InstanceRecord {
+        crate::manifest::InstanceRecord {
+            blake3: [0u8; 32],
+            attrs,
+            transfer_syntax: String::new(),
+            storage_tier: 0,
+            rejection_reason: 0,
+            file_size: 0,
+            frames: Vec::new(),
+        }
+    }
+
+    /// The includefield cap bounds DISTINCT tags: a repeated entry must not
+    /// consume a slot that a later, different attribute needs.
+    #[test]
+    fn a_repeated_includefield_member_does_not_consume_the_cap() {
+        let mut req = String::new();
+        for _ in 0..51 {
+            req.push_str("PatientID,");
+        }
+        req.push_str("StudyDescription");
+        let filt = TagFilter::from_request(&MANDATORY_STUDY, Some(&req)).expect("a filter");
+        assert!(
+            filt.contains(0x0008_1030),
+            "StudyDescription must survive 51 repeats of a tag already in the baseline"
+        );
+        assert!(filt.len <= TagFilter::MAX_TAGS);
+        assert_eq!(
+            filt.tags[..filt.len]
+                .iter()
+                .filter(|t| **t == 0x0010_0020)
+                .count(),
+            1,
+            "a repeated tag is stored once"
+        );
+    }
+
+    /// PS3.18 F.2.5: a present-but-empty attribute carries no Value member.
+    #[test]
+    fn a_present_but_empty_series_attribute_has_no_value_member() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![
+                (0x0008_103E, AttrValue::Text(String::new())),
+                (0x0010_0010, AttrValue::Text(String::new())),
+                (0x0020_000E, AttrValue::Text("1.2.3".into())),
+            ],
+            instances: Vec::new(),
+        };
+        let mut out = [0u8; 1024];
+        let n = write_series_json(&mut out, &series, Some("all"), None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            got.contains("\"0008103E\":{\"vr\":\"LO\"}"),
+            "an empty LO must be VR-only: {got}"
+        );
+        assert!(
+            !got.contains("\"Value\":[\"\"]"),
+            "no empty-string value list: {got}"
+        );
+    }
+
+    /// An empty UID component must not produce a URL that names nothing.
+    #[test]
+    fn an_empty_uid_segment_produces_no_retrieve_url() {
+        let instance = inst(vec![
+            (
+                0x0008_0016,
+                AttrValue::Text("1.2.840.10008.5.1.4.1.1.2".into()),
+            ),
+            (0x0008_0018, AttrValue::Text("1.2.3.4".into())),
+        ]);
+        let mut out = [0u8; 1024];
+        let n = write_instance_json(
+            &mut out,
+            &instance,
+            "1.2.3",
+            "",
+            Some("all"),
+            Some("http://h/dicomweb"),
+        )
+        .expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            !got.contains("00081190"),
+            "no RetrieveURL when a UID segment is empty: {got}"
+        );
+        assert!(
+            !got.contains("/series//instances/"),
+            "no double slash in a URL: {got}"
+        );
+    }
+
+    /// PS3.5 Table 6.2-1: IS is signed and permits padding spaces.
+    #[test]
+    fn a_signed_or_padded_is_value_survives_to_the_response() {
+        let series = crate::manifest::SeriesRecord {
+            attrs: vec![
+                (0x0020_000E, AttrValue::Text("1.2.9".into())),
+                (0x0020_0011, AttrValue::Text("-1".into())),
+            ],
+            instances: Vec::new(),
+        };
+        let mut out = [0u8; 1024];
+        let n = write_series_json(&mut out, &series, Some("all"), None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            got.contains("\"00200011\":{\"Value\":[-1],\"vr\":\"IS\"}"),
+            "a negative SeriesNumber is legal and must be rendered signed: {got}"
+        );
+
+        // Padded text parses too.
+        let padded = crate::manifest::SeriesRecord {
+            attrs: vec![
+                (0x0020_000E, AttrValue::Text("1.2.9".into())),
+                (0x0020_0011, AttrValue::Text(" 7 ".into())),
+            ],
+            instances: Vec::new(),
+        };
+        let n2 = write_series_json(&mut out, &padded, Some("all"), None, None).expect("fits");
+        let got2 = String::from_utf8(out[..n2].to_vec()).unwrap();
+        assert!(
+            got2.contains("\"00200011\":{\"Value\":[7],\"vr\":\"IS\"}"),
+            "a space-padded IS value is legal: {got2}"
+        );
+    }
+
+    /// Laterality must resolve in the keyword form as well as the tag form.
+    #[test]
+    fn laterality_resolves_by_keyword() {
+        assert_eq!(keyword_tag("Laterality"), Some(0x0020_0060));
+        assert_eq!(keyword_tag("laterality"), Some(0x0020_0060));
+    }
+
+    /// PS3.6 says (0020,1209) is IS; the series writer already emitted it as
+    /// IS, so the public dictionary disagreed with itself.
+    #[test]
+    fn the_response_dictionary_agrees_with_the_registry() {
+        assert_eq!(vr_for_tag(0x0020_1209), "IS");
+        assert_eq!(vr_for_tag(0x0028_0010), "US");
+        assert_eq!(vr_for_tag(0x0028_0100), "US");
+    }
+
+    /// A DA value wider than its canonical form must fail, not render a
+    /// different date.
+    #[test]
+    fn a_date_wider_than_its_form_is_rejected() {
+        let bad = crate::manifest::SeriesRecord {
+            attrs: vec![
+                (0x0008_0021, AttrValue::UInt(120_260_802)),
+                (0x0020_000E, AttrValue::Text("1.2.9".into())),
+            ],
+            instances: Vec::new(),
+        };
+        let mut out = [0u8; 1024];
+        assert_eq!(
+            write_series_json(&mut out, &bad, Some("all"), None, None).err(),
+            Some(StreamOverflow),
+            "an unrepresentable date must be an error"
+        );
+
+        // A value that fits still renders with the existing zero padding.
+        let ok = crate::manifest::SeriesRecord {
+            attrs: vec![
+                (0x0008_0021, AttrValue::UInt(20_260_802)),
+                (0x0020_000E, AttrValue::Text("1.2.9".into())),
+            ],
+            instances: Vec::new(),
+        };
+        let n = write_series_json(&mut out, &ok, Some("all"), None, None).expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(got.contains("\"00080021\":{\"Value\":[\"20260802\"],\"vr\":\"DA\"}"));
+    }
+
+    /// Table 10.6.3-5 marks Rows/Columns/BitsAllocated as C; the writer had no
+    /// path for any of them.
+    #[test]
+    fn a_known_image_geometry_reaches_the_instance_row() {
+        let instance = inst(vec![
+            (
+                0x0008_0016,
+                AttrValue::Text("1.2.840.10008.5.1.4.1.1.2".into()),
+            ),
+            (0x0008_0018, AttrValue::Text("1.2.3.4".into())),
+            (0x0028_0010, AttrValue::UInt(512)),
+            (0x0028_0011, AttrValue::UInt(256)),
+            (0x0028_0100, AttrValue::UInt(16)),
+        ]);
+        let mut out = [0u8; 1024];
+        let n = write_instance_json(&mut out, &instance, "1.2.3", "1.2.4", Some("all"), None)
+            .expect("fits");
+        let got = String::from_utf8(out[..n].to_vec()).unwrap();
+        assert!(
+            got.contains("\"00280010\":{\"Value\":[512],\"vr\":\"US\"}"),
+            "{got}"
+        );
+        assert!(
+            got.contains("\"00280011\":{\"Value\":[256],\"vr\":\"US\"}"),
+            "{got}"
+        );
+        assert!(
+            got.contains("\"00280100\":{\"Value\":[16],\"vr\":\"US\"}"),
+            "{got}"
         );
     }
 }

@@ -43,6 +43,9 @@ impl DicomCodec for RleCodec {
             return Err(CodecError::DecodeFailed("RLE pixel data is empty".into()));
         }
 
+        // `parse_rle_meta` already refuses a present 0, so this cannot mask a
+        // malformed value; the `.max(1)` only guards the shape for the
+        // compiler rather than changing an accepted answer.
         let frames = meta.frames.max(1) as usize;
         let spp = meta.samples_per_pixel as usize;
         let bytes_per_sample = (meta.bits_allocated as usize) >> 3;
@@ -82,6 +85,22 @@ impl DicomCodec for RleCodec {
             .ok_or_else(|| {
                 CodecError::InvalidMetadata("RLE: decoded size overflows usize".into())
             })?;
+        // PS3.5 Annex G: PackBits expands at most 128 bytes per input byte, so
+        // a small malformed stream can legitimately claim a huge output. The
+        // frame-count guard above bounds the number of HEADERS, not the size
+        // of a frame: Rows x Columns x samples in one 64-byte header is
+        // unbounded, and a 200-byte upload could ask for gigabytes and be
+        // killed by the allocator before the first segment was checked. The
+        // limit is a decode-output budget; the segments are still validated as
+        // they are read.
+        const MAX_DECODED_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
+        if out_len > MAX_DECODED_BYTES {
+            return Err(CodecError::InvalidMetadata(format!(
+                "RLE: decoded size {out_len} exceeds the {MAX_DECODED_BYTES}-byte limit \
+                 ({}x{}x{}x{} frames)",
+                meta.rows, meta.columns, spp, frames
+            )));
+        }
         let mut decoded = vec![0u8; out_len];
 
         // Walk the stream frame by frame: each frame starts with its own
@@ -205,11 +224,7 @@ impl DicomCodec for RleCodec {
         // One fragment per frame (PS3.5 A.4): every fragment carries its own
         // 64-byte RLE header + segments, so decoders can split frames.
         let frame_blobs = encode_frames(pixels, meta)?;
-        Ok(crate::codec::build_encapsulated_pixeldata_multi(
-            &frame_blobs,
-            1,
-            false,
-        ))
+        crate::codec::build_encapsulated_pixeldata_multi(&frame_blobs, 1)
     }
 }
 
@@ -260,11 +275,32 @@ fn encode_frames(pixels: &DecodedPixels, meta: &DicomMeta) -> Result<Vec<Vec<u8>
                 let base = channel * frames * pixel_count * bytes_per_sample
                     + frame * pixel_count * bytes_per_sample
                     + plane_lsb;
+                // PS3.5 Annex G.3: a PackBits run may not cross a row
+                // boundary, so each row is encoded on its own and the encoded
+                // rows are concatenated within the segment. Encoding the whole
+                // plane as one run produced a literal run spanning two rows,
+                // which Annex G.3.1 prohibits.
+                let rows = pixels.rows as usize;
+                let cols = pixels.columns as usize;
+                let mut row = Vec::with_capacity(cols);
                 let mut segment = Vec::with_capacity(pixel_count);
-                for p in 0..pixel_count {
-                    segment.push(pixels.data[base + p * bytes_per_sample]);
+                for r in 0..rows {
+                    row.clear();
+                    let row_base = base + r * cols * bytes_per_sample;
+                    for c in 0..cols {
+                        row.push(pixels.data[row_base + c * bytes_per_sample]);
+                    }
+                    segment.extend_from_slice(&packbits_encode(&row));
                 }
-                segs.push(packbits_encode(&segment));
+                // PS3.5 Annex G: each segment starts on an even offset, so an
+                // odd-length segment is padded before the NEXT segment's offset
+                // is computed. Padding only the fragment left the interior
+                // offsets odd and every following segment started one byte
+                // early.
+                if !segment.len().is_multiple_of(2) {
+                    segment.push(0x00);
+                }
+                segs.push(segment);
             }
         }
 
@@ -338,9 +374,30 @@ fn packbits_decode_consumed(
         }
     }
 
+    // PS3.5 Annex G: a segment decodes to exactly one byte plane of one frame,
+    // i.e. exactly `rows * columns` samples. Completing a short result with
+    // zeros and truncating a long one both produced pixels the file never
+    // contained, silently. Trailing pad bytes after the last packet are legal
+    // (the segment is padded to an even length), so "fewer than expected" is
+    // an error while "at least expected" is not.
     if output.len() < expected_len {
-        output.resize(expected_len, 0);
-    } else if output.len() > expected_len {
+        return Err(CodecError::DecodeFailed(format!(
+            "RLE segment decoded {} samples, expected {expected_len}",
+            output.len()
+        )));
+    }
+    if output.len() > expected_len {
+        // An over-long packet group is the mirror error: the encoder wrote
+        // more than one plane's worth into a segment. Only the padding that
+        // the standard allows is tolerated, so the excess must be zero bytes
+        // of a single trailing no-op.
+        let excess = output.len() - expected_len;
+        if excess > 1 {
+            return Err(CodecError::DecodeFailed(format!(
+                "RLE segment decoded {} samples, expected {expected_len}",
+                output.len()
+            )));
+        }
         output.truncate(expected_len);
     }
 
@@ -411,9 +468,29 @@ fn parse_rle_meta(data: &[u8]) -> Result<DicomMeta, CodecError> {
     let planar_configuration = find_tag_u16(data, TAG_PLANAR_CONFIGURATION);
     // NumberOfFrames (0028,0008) is IS - a decimal string, not a binary
     // US value (field fact 01.09: "10" as bytes 0x31 0x30).
-    let frames: u32 = find_tag_str(data, TAG_NUMBER_OF_FRAMES)
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(1);
+    // PS3.3 C.7.6.3.1.4: NumberOfFrames is IS (a decimal string). Its ABSENCE
+    // means one frame, but a PRESENT value that will not parse is a malformed
+    // file, and turning that into "1" made the decoder return the first frame
+    // of a multi-frame instance as a successful single-frame decode.
+    let frames: u32 = match find_tag_str(data, TAG_NUMBER_OF_FRAMES) {
+        Some(text) => text.trim().parse().map_err(|_| {
+            CodecError::InvalidMetadata(format!(
+                "RLE: NumberOfFrames (0028,0008) is not a number: {text:?}"
+            ))
+        })?,
+        None => 1,
+    };
+    // PS3.3 C.7.6.3.1.4: a PRESENT NumberOfFrames states how many frames the
+    // value holds, and the standard's own minimum is 1. A present 0 therefore
+    // describes nothing and is a malformed file, not "one frame": the earlier
+    // `meta.frames.max(1)` promoted it and returned the first frame of a
+    // multi-frame instance as a successful single-frame decode. Absence still
+    // defaults to 1, which is the documented meaning of an absent attribute.
+    if frames == 0 {
+        return Err(CodecError::InvalidMetadata(
+            "RLE: NumberOfFrames (0028,0008) is present but 0".into(),
+        ));
+    }
 
     Ok(DicomMeta {
         rows,
@@ -538,10 +615,12 @@ fn read_explicit_val(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
     }
     let vr = std::str::from_utf8(&data[*pos..*pos + 2]).ok()?;
     *pos += 2;
-    let extended = matches!(
-        vr,
-        "OB" | "OD" | "OF" | "OL" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT"
-    );
+    // PS3.5 6.2 Table 6.2-1: the width class comes from the shared table, not
+    // from a list kept here. This one was missing OV and SV, so an Extended
+    // Offset Table (7FE0,0001) OV before PixelData read its two reserved bytes
+    // as a zero length and the next iteration took the real length for a tag -
+    // a valid RLE instance that never reached its pixels.
+    let extended = super::vr_widths::is_long_form_vr(vr.as_bytes());
     let len: usize = if extended {
         if *pos + 6 > data.len() {
             return None;
@@ -578,7 +657,14 @@ fn read_explicit_val(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
 /// BOT rule (same as the JPEG path): an item whose payload is a multiple of
 /// 4 and starts with a zero u32 is a Basic Offset Table, not RLE data.
 fn read_encapsulated_rle_stream(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
+    // PS3.5 A.4: the value is a Basic Offset Table Item, then one Item per
+    // frame, then the Sequence Delimitation Item. Each RLE frame is a complete
+    // [64-byte header + segments] blob inside its OWN fragment, so the items
+    // are collected separately and never concatenated: joining them let a
+    // truncated frame read the next item's tag as PackBits data and decode
+    // garbage as pixels. `validate_frames` below re-checks the count.
+    let mut frames: Vec<&[u8]> = Vec::new();
+    let mut saw_delimiter = false;
     loop {
         if *pos + 8 > data.len() {
             break;
@@ -587,10 +673,14 @@ fn read_encapsulated_rle_stream(data: &[u8], pos: &mut usize) -> Option<Vec<u8>>
         if tag == (0xFFFE, 0xE0DD) {
             // Sequence Delimiter - end of encapsulated value.
             *pos += 8;
+            saw_delimiter = true;
             break;
         }
         if tag != (0xFFFE, 0xE000) {
-            break; // unexpected tag -- stop
+            // A tag that is neither an Item nor the delimiter means the value
+            // ended without closing. That is a truncated file, not a complete
+            // one with fewer frames.
+            return None;
         }
         let len = u32_from_slice(&data[*pos + 4..*pos + 8]) as usize;
         *pos += 8;
@@ -601,14 +691,34 @@ fn read_encapsulated_rle_stream(data: &[u8], pos: &mut usize) -> Option<Vec<u8>>
             return None;
         }
         let payload = &data[*pos..*pos + len];
-        let is_bot =
-            len.is_multiple_of(4) && payload.len() >= 4 && u32_from_slice(&payload[0..4]) == 0;
+        // PS3.5 A.4: the FIRST item is the Basic Offset Table and is not frame
+        // data. A defined-length zero at its head is the empty table this
+        // encoder writes; anything else is a table of offsets.
+        let is_bot = frames.is_empty()
+            && (len == 0
+                || (len.is_multiple_of(4)
+                    && payload.len() >= 4
+                    && u32_from_slice(&payload[0..4]) == 0));
         if !is_bot {
-            out.extend_from_slice(payload);
+            frames.push(payload);
         }
         *pos += len;
     }
-    if out.is_empty() { None } else { Some(out) }
+    // PS3.5 7.5.1: an undefined-length value MUST end with its delimiter. A
+    // buffer that stops after the last frame is truncated, and accepting it
+    // returned a short decode as if it were whole.
+    if !saw_delimiter {
+        return None;
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    let total: usize = frames.iter().map(|f| f.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for frame in frames {
+        out.extend_from_slice(frame);
+    }
+    Some(out)
 }
 
 fn skip_explicit(data: &[u8], pos: &mut usize) -> bool {
@@ -620,10 +730,9 @@ fn skip_explicit(data: &[u8], pos: &mut usize) -> bool {
         Err(_) => return false,
     };
     *pos += 2;
-    let extended = matches!(
-        vr,
-        "OB" | "OD" | "OF" | "OL" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT"
-    );
+    // Same table as `read_explicit_val`: an OV/SV element skipped with the
+    // short form makes every following element land four bytes early.
+    let extended = super::vr_widths::is_long_form_vr(vr.as_bytes());
     let len: usize = if extended {
         if *pos + 6 > data.len() {
             return false;
@@ -834,9 +943,42 @@ mod tests {
         // n = -128 (0x80) is a no-op.
         // After skipping the no-op, n=1 -> 2 literal bytes [2, 3].
         let encoded = vec![0x80u8, 1, 2, 3];
-        let decoded = packbits_decode(&encoded, 3).unwrap();
-        // 0x80 skipped, then 2 literals [2,3], padded to 3 bytes -> [2, 3, 0]
-        assert_eq!(decoded, vec![2, 3, 0]);
+        let decoded = packbits_decode(&encoded, 2).expect("two samples, as declared");
+        assert_eq!(decoded, vec![2, 3]);
+    }
+
+    /// A segment that decodes short of the plane is an error, not zero-fill.
+    ///
+    /// PS3.5 Annex G: one segment carries one byte plane of one frame, so it
+    /// decodes to exactly `rows * columns` samples. Completing the shortfall
+    /// with zeroes invented pixels the file never contained, and the caller had
+    /// no way to tell that from a correctly decoded image.
+    #[test]
+    fn test_packbits_short_segment_is_rejected_not_padded() {
+        // Two literal bytes for a three-sample plane.
+        let encoded = vec![0x80u8, 1, 2, 3];
+        let err = packbits_decode(&encoded, 3).expect_err("short segment");
+        assert!(
+            err.to_string().contains("decoded 2 samples, expected 3"),
+            "got: {err}"
+        );
+    }
+
+    /// A segment that decodes LONG is an error, unless one trailing pad byte
+    /// accounts for the difference (PS3.5 Annex G's even-length padding).
+    #[test]
+    fn test_packbits_long_segment_is_rejected_beyond_one_pad_byte() {
+        // Three literal bytes for a two-sample plane: one byte of smoothing,
+        // which a decoder may treat as padding.
+        let one_over = vec![2u8, 1, 2, 3];
+        assert_eq!(
+            packbits_decode(&one_over, 2).expect("one pad byte"),
+            vec![1, 2]
+        );
+        // Four literal bytes for a two-sample plane: two over, which no pad
+        // rule can explain.
+        let two_over = vec![3u8, 1, 2, 3, 4];
+        assert!(packbits_decode(&two_over, 2).is_err());
     }
 
     #[test]
@@ -1023,10 +1165,13 @@ mod tests {
         // in items - a Basic Offset Table item + one Item per frame.
         let frame0 = [10u8, 20, 30, 40];
         let frame1 = [50u8, 60, 70, 80];
-        let f0 = rle_frame_blob(&frame0);
-        // Real-world tolerance: field frames may carry a dead trailing byte
-        // (literal-run header with its data missing) - decode must skip it.
-        let f1 = [rle_frame_blob(&frame1), vec![0x00]].concat();
+        // Real-world tolerance: a frame may carry a dead trailing byte
+        // (literal-run header with its data missing), which the decoder skips
+        // BETWEEN frames. The byte must therefore sit on the FIRST frame: on
+        // the last one there is no following frame, so the skip never runs and
+        // deleting it would leave this test green - a vacuous regression test.
+        let f0 = [rle_frame_blob(&frame0), vec![0x00]].concat();
+        let f1 = rle_frame_blob(&frame1);
 
         // BOT: 2 frame offsets. Offsets count from the first byte of the
         // first Item after the BOT item (PS3.5 F.2.1), i.e. item headers
@@ -1039,7 +1184,7 @@ mod tests {
         encapsulated.extend_from_slice(&rle_item(&f1));
 
         let dicom = build_rle_test_dicom(&encapsulated, 2, 2, 1, 8, 2, true);
-        let pixels = RleCodec.decode(&dicom).unwrap();
+        let pixels = RleCodec.decode(&dicom).expect("the pad byte is skipped");
         assert_eq!(pixels.data, vec![10, 20, 30, 40, 50, 60, 70, 80]);
         assert_eq!(pixels.rows, 2);
         assert_eq!(pixels.columns, 2);
@@ -1111,5 +1256,260 @@ mod tests {
         let dicom = build_rle_test_dicom(&encoded, 1, 2, 1, 16, 1, false);
         let decoded = RleCodec.decode(&dicom).unwrap();
         assert_eq!(decoded.data, pixels.data);
+    }
+
+    // ---- A2b: Annex G conformance --------------------------------------
+
+    /// PS3.5 Annex G.3.1: a PackBits run may not cross a row boundary.
+    ///
+    /// A 2x2 plane whose four samples are distinct used to come back as ONE
+    /// literal run spanning both rows.
+    #[test]
+    fn the_encoder_restarts_packbits_at_every_row() {
+        // 2 rows x 2 columns, all distinct so a single run would be a literal
+        // of four bytes.
+        let pixels = DecodedPixels {
+            data: vec![1, 2, 3, 4],
+            rows: 2,
+            columns: 2,
+            samples_per_pixel: 1,
+            bits_allocated: 8,
+            photometric_interpretation: "MONOCHROME2".into(),
+        };
+        let meta = DicomMeta {
+            rows: 2,
+            columns: 2,
+            samples_per_pixel: 1,
+            bits_allocated: 8,
+            bits_stored: 8,
+            photometric_interpretation: "MONOCHROME2".into(),
+            planar_configuration: None,
+            pixel_representation: 0,
+            frames: 1,
+        };
+        let blobs = encode_frames(&pixels, &meta).expect("encoded");
+        let segment = &blobs[0][64..];
+        // Per row: a literal packet of two bytes = header + 2 data bytes.
+        assert_eq!(
+            segment,
+            &[0x01u8, 1, 2, 0x01, 3, 4],
+            "two independent row runs, not one four-byte run"
+        );
+    }
+
+    /// PS3.5 Annex G: every segment starts on an even offset.
+    ///
+    /// An odd-length segment must be padded before the NEXT segment's offset is
+    /// computed; padding only the fragment left the interior offsets odd.
+    #[test]
+    fn an_odd_length_segment_is_padded_before_the_next_offset() {
+        // 16-bit, 1x2: two byte planes per sample. Plane 0 (MSB) is all zero,
+        // plane 1 (LSB) holds two distinct bytes, so the second segment's
+        // PackBits is a 3-byte literal run of 2 samples (1 header + 2 data).
+        let pixels = DecodedPixels {
+            data: vec![0x00, 0x11, 0x00, 0x22],
+            rows: 1,
+            columns: 2,
+            samples_per_pixel: 1,
+            bits_allocated: 16,
+            photometric_interpretation: "MONOCHROME2".into(),
+        };
+        let meta = DicomMeta {
+            rows: 1,
+            columns: 2,
+            samples_per_pixel: 1,
+            bits_allocated: 16,
+            bits_stored: 16,
+            photometric_interpretation: "MONOCHROME2".into(),
+            planar_configuration: None,
+            pixel_representation: 0,
+            frames: 1,
+        };
+        let blobs = encode_frames(&pixels, &meta).expect("encoded");
+        let blob = &blobs[0];
+        let seg0 = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+        let seg1 = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]) as usize;
+        assert_eq!(seg0, 64, "the first segment follows the header");
+        // Each segment is even-length, so the second offset is even.
+        assert_eq!(seg1 % 2, 0, "the next segment starts on an even offset");
+        // And the whole blob is even, because every interior offset was padded.
+        assert_eq!(blob.len() % 2, 0, "the blob stays even");
+    }
+
+    /// PS3.5 7.5.1: an undefined-length value must end with its delimiter.
+    #[test]
+    fn an_encapsulated_value_without_its_delimiter_is_refused() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0011u16.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0002u16.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0100u16.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&8u16.to_le_bytes());
+        // PixelData OB, undefined length, one frame item, NO delimiter.
+        buf.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"OB");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // empty BOT
+        let frame = rle_frame_blob(&[7]);
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&frame);
+
+        let err = RleCodec.decode(&buf).expect_err("the value never closed");
+        assert!(
+            err.to_string().contains("RLE pixel data not found"),
+            "the missing delimiter is reported, got: {err}"
+        );
+    }
+
+    /// PS3.3 C.7.6.3.1.4: an unparseable NumberOfFrames is malformed, not 1.
+    #[test]
+    fn an_invalid_frame_count_is_refused_not_defaulted_to_one() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        for (tag, value) in [
+            (0x0010u16, 1u16),
+            (0x0011u16, 1u16),
+            (0x0002u16, 1u16),
+            (0x0100u16, 8u16),
+        ] {
+            buf.extend_from_slice(&0x0028u16.to_le_bytes());
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(b"US");
+            buf.extend_from_slice(&2u16.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        // NumberOfFrames IS "many" - not a number.
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0008u16.to_le_bytes());
+        buf.extend_from_slice(b"IS");
+        buf.extend_from_slice(&4u16.to_le_bytes());
+        buf.extend_from_slice(b"many");
+        // PixelData, defined length, one frame blob.
+        let frame = rle_frame_blob(&[5]);
+        buf.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"OB");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&frame);
+
+        let err = RleCodec
+            .decode(&buf)
+            .expect_err("a bad frame count is an error");
+        assert!(
+            err.to_string().contains("not a number"),
+            "the invalid value is reported, got: {err}"
+        );
+    }
+
+    /// A PRESENT NumberOfFrames of "0" describes no frames at all.
+    ///
+    /// PS3.3 C.7.6.3.1.4 makes NumberOfFrames a count with a minimum of one, so
+    /// zero is malformed rather than "default to one". The old code parsed it
+    /// successfully and then promoted it with `.max(1)`, returning the first
+    /// frame of a multi-frame instance as a successful single-frame decode.
+    #[test]
+    fn a_present_zero_frame_count_is_refused_not_promoted() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        for (tag, value) in [
+            (0x0010u16, 1u16),
+            (0x0011u16, 1u16),
+            (0x0002u16, 1u16),
+            (0x0100u16, 8u16),
+        ] {
+            buf.extend_from_slice(&0x0028u16.to_le_bytes());
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(b"US");
+            buf.extend_from_slice(&2u16.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        // NumberOfFrames IS "0" - parses, but names no frames.
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0008u16.to_le_bytes());
+        buf.extend_from_slice(b"IS");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(b"0 ");
+        let frame = rle_frame_blob(&[5]);
+        buf.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"OB");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&frame);
+
+        let err = RleCodec.decode(&buf).expect_err("zero frames is malformed");
+        assert!(
+            err.to_string().contains("present but 0"),
+            "the reason names the zero, got: {err}"
+        );
+    }
+
+    /// PS3.5 Annex G: one segment decodes to exactly one byte plane.
+    ///
+    /// A segment whose packets produce too few samples was zero-filled and one
+    /// that produced too many was truncated, so the caller could not tell a
+    /// correct decode from a wrong one.
+    #[test]
+    fn a_segment_with_the_wrong_sample_count_is_refused() {
+        // 2x2 image = 4 samples per plane, but the segment encodes three.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        for (tag, value) in [
+            (0x0010u16, 2u16),
+            (0x0011u16, 2u16),
+            (0x0002u16, 1u16),
+            (0x0100u16, 8u16),
+        ] {
+            buf.extend_from_slice(&0x0028u16.to_le_bytes());
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(b"US");
+            buf.extend_from_slice(&2u16.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        // A frame whose single segment is a 3-byte literal run.
+        let mut frame = vec![0u8; 64];
+        frame[0..4].copy_from_slice(&1u32.to_le_bytes());
+        frame[4..8].copy_from_slice(&64u32.to_le_bytes());
+        frame.push(0x02); // literal run of 3
+        frame.extend_from_slice(&[1, 2, 3]);
+        buf.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"OB");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&frame);
+
+        let err = RleCodec
+            .decode(&buf)
+            .expect_err("3 samples for a 4-sample plane");
+        assert!(
+            err.to_string().contains("decoded 3 samples, expected 4"),
+            "got: {err}"
+        );
     }
 }

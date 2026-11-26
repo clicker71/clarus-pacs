@@ -64,7 +64,19 @@ pub fn read_length<R: Read, F: FnMut(&[u8]) -> io::Result<()>>(
         // still arriving. The buffer length is a small constant, so the
         // narrowed value is always in range.
         let want = n.min(buf.len() as u64) as usize;
-        let got = r.read(&mut buf[..want])?;
+        // `Interrupted` means the syscall was woken by a signal before it
+        // delivered anything - the body is not broken and nothing was
+        // consumed, so the read is simply retried. Propagating it with `?`
+        // abandoned the remaining count: a source that returns `ab`, then
+        // `Interrupted`, then `cd` for a four-byte body delivered only `ab`
+        // and reported success, and the caller had no way to resume because
+        // `read_length` owns the count. The chunked reader already retried;
+        // this is the same rule on the other framing.
+        let got = match r.read(&mut buf[..want]) {
+            Ok(got) => got,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if got == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -226,6 +238,9 @@ pub struct ChunkedReader<R: Read> {
     /// `\r\n\r\n` terminator.
     trailer_line_len: usize,
     trailer_prev: u8,
+    /// Whether the current trailer line has carried a field-name colon, so a
+    /// line with no field name is rejected instead of discarded.
+    trailer_line_has_colon: bool,
     /// An error that arose AFTER payload bytes were already handed to the
     /// caller.
     ///
@@ -262,6 +277,7 @@ impl<R: Read> ChunkedReader<R> {
             crlf_len: 0,
             trailer_line_len: 0,
             trailer_prev: 0,
+            trailer_line_has_colon: false,
             pending_err: None,
         }
     }
@@ -465,7 +481,24 @@ impl<R: Read> Read for ChunkedReader<R> {
                                 self.state = ChunkState::Done;
                                 return Ok(0); // message complete
                             }
+                            // RFC 9112 7.1.2: the trailer section is a list of
+                            // field lines, so every line must end CRLF and name
+                            // a field. Discarding the bytes unread meant a
+                            // malformed trailer (`no-colon-here`) was silently
+                            // swallowed and the message reported complete -
+                            // a truncated or injected trailer read as success.
+                            if self.trailer_line_len < 2 || self.trailer_prev != b'\r' {
+                                return Err(invalid("trailer line: missing CRLF"));
+                            }
+                            if !self.trailer_line_has_colon {
+                                return Err(invalid("trailer line: missing field name"));
+                            }
                             self.trailer_line_len = 0;
+                            self.trailer_line_has_colon = false;
+                        } else if b == b':' && self.trailer_line_len > 1 {
+                            // A colon names the field; one at position 1 means
+                            // the name is empty, which the check above rejects.
+                            self.trailer_line_has_colon = true;
                         }
                         // Remember this byte for the next iteration's CR test.
                         // Must stay INSIDE the loop: the terminator check above
@@ -718,6 +751,72 @@ mod tests {
         assert_eq!(cr.read(&mut [0u8; 16]).expect("complete"), 0);
         assert!(cr.is_message_complete());
         assert_eq!(cr.read(&mut [0u8; 16]).expect("done no-op"), 0);
+    }
+
+    /// RFC 9112 7.1.2: the trailer section is a list of FIELD lines. A line
+    /// with no field name used to be discarded unread and the message reported
+    /// complete, so an injected or truncated trailer read as success.
+    #[test]
+    fn a_malformed_trailer_line_is_rejected_not_discarded() {
+        // No colon at all: not a field line.
+        let mut cr = ChunkedReader::new(ByteReader(b"0\r\nno-colon-here\r\n\r\n"));
+        let mut out = Vec::new();
+        assert!(
+            std::io::Read::read_to_end(&mut cr, &mut out).is_err(),
+            "a colonless trailer line is malformed"
+        );
+        assert!(!cr.is_message_complete());
+
+        // An empty field name (`:` first) is malformed too.
+        let mut cr = ChunkedReader::new(ByteReader(b"0\r\n: v\r\n\r\n"));
+        let mut out = Vec::new();
+        assert!(std::io::Read::read_to_end(&mut cr, &mut out).is_err());
+
+        // A valid trailer still completes.
+        let mut cr = ChunkedReader::new(ByteReader(b"0\r\nX: y\r\n\r\n"));
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut cr, &mut out).expect("a valid trailer completes");
+        assert!(cr.is_message_complete());
+    }
+
+    /// `read_length` must RETRY `Interrupted` in place.
+    ///
+    /// It owns the remaining count, so returning the error to the caller
+    /// abandons bytes that will never be read again: a four-byte body whose
+    /// source answers `ab`, then `Interrupted`, then `cd` delivered only `ab`
+    /// and reported success.
+    #[test]
+    fn read_length_retries_an_interrupted_read() {
+        struct Flaky {
+            steps: Vec<Option<&'static [u8]>>,
+            i: usize,
+        }
+        impl std::io::Read for Flaky {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let step = self.steps.get(self.i).copied().flatten();
+                self.i += 1;
+                match step {
+                    None => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                    Some(bytes) => {
+                        let n = bytes.len().min(out.len());
+                        out[..n].copy_from_slice(&bytes[..n]);
+                        Ok(n)
+                    }
+                }
+            }
+        }
+
+        let mut src = Flaky {
+            steps: vec![Some(b"ab"), None, Some(b"cd")],
+            i: 0,
+        };
+        let mut got = Vec::new();
+        read_length(&mut src, 4, &mut |chunk: &[u8]| {
+            got.extend_from_slice(chunk);
+            Ok(())
+        })
+        .expect("an interrupted read is retried, not propagated");
+        assert_eq!(got, b"abcd", "all four bytes must arrive");
     }
 
     /// F5: the read bound must be computed in u64, not narrowed first.

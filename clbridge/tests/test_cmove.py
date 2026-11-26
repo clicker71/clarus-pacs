@@ -45,13 +45,13 @@ class TestParseCMoveRq:
         ds.StudyInstanceUID = "1.2.3.4.5.6"
         ds.MoveDestination = "DEST_AET"
         event = FakeEvent(ds)
-        study_uids, dest, level, series_uid, sop_uid = _parse_c_move_rq(event)
+        study_uids, dest, level, series_uids, sop_uids = _parse_c_move_rq(event)
         assert study_uids == ["1.2.3.4.5.6"]
         assert dest == "DEST_AET"
         # Absent QueryRetrieveLevel means STUDY scope (the historical meaning).
         assert level == ""
-        assert series_uid == ""
-        assert sop_uid == ""
+        assert series_uids == []
+        assert sop_uids == []
 
     def test_series_level_carries_the_series_scope(self):
         """PS3.4 C.4.2.1.2: a SERIES-level C-MOVE names SeriesInstanceUID."""
@@ -60,8 +60,8 @@ class TestParseCMoveRq:
         ds.StudyInstanceUID = "1.2.3"
         ds.SeriesInstanceUID = "1.2.3.4"
         ds.MoveDestination = "DEST_AET"
-        _study, _dest, level, series_uid, sop_uid = _parse_c_move_rq(FakeEvent(ds))
-        assert (level, series_uid, sop_uid) == ("SERIES", "1.2.3.4", "")
+        _study, _dest, level, series_uids, sop_uids = _parse_c_move_rq(FakeEvent(ds))
+        assert (level, series_uids, sop_uids) == ("SERIES", ["1.2.3.4"], [])
 
     def test_image_level_carries_series_and_instance(self):
         ds = Dataset()
@@ -70,8 +70,8 @@ class TestParseCMoveRq:
         ds.SeriesInstanceUID = "1.2.3.4"
         ds.SOPInstanceUID = "1.2.3.4.5"
         ds.MoveDestination = "DEST_AET"
-        _study, _dest, level, series_uid, sop_uid = _parse_c_move_rq(FakeEvent(ds))
-        assert (level, series_uid, sop_uid) == ("IMAGE", "1.2.3.4", "1.2.3.4.5")
+        _study, _dest, level, series_uids, sop_uids = _parse_c_move_rq(FakeEvent(ds))
+        assert (level, series_uids, sop_uids) == ("IMAGE", ["1.2.3.4"], ["1.2.3.4.5"])
 
     def test_series_level_without_a_series_uid_is_refused(self):
         """Refuse rather than fall back to whole-study retrieval: the SCU

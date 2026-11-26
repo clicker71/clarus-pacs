@@ -1,0 +1,53 @@
+# Contours: ROI polygons as an RT Structure Set, from raw CT pixels.
+#
+# DISABLED by default. To enable: install numpy and opencv-python
+# (`pip install numpy opencv-python`). No model, no weights - the script
+# thresholds the RAW pixels, so its HU windows assume RescaleSlope 1 and 0;
+# edit them in YOUR copy for your own data.
+
+enabled: false
+
+title: "Threshold contours"
+description: "Outer contours of a thresholded axial CT, stored as an RT Structure Set."
+
+provider:
+  name: "RTSTRUCT-contours"
+  vendor: "Clarus"
+  version: "1.0"
+
+input_requirements:
+  modalities: [CT]
+  anatomy:
+    - system: "http://snomed.info/sct"
+      code: "80891009"
+      meaning: "Heart structure"
+
+output_capabilities:
+  sop_classes: ["1.2.840.10008.5.1.4.1.1.481.3"]
+
+parameters:
+  - code: BONE_MIN
+    type: decimal
+    text: "Bone window lower bound"
+    default: 300.0
+  - code: BONE_MAX
+    type: decimal
+    text: "Bone window upper bound"
+    default: 1100.0
+  - code: TEETH_MIN
+    type: decimal
+    text: "Teeth window lower bound"
+    default: 1100.0
+
+match:
+  modality: [CT]
+
+runtime:
+  script: "../abi/RTSTRUCT-contours.py"
+  interpreter: "python3"
+  timeout_secs: 1800
+
+outputs:
+  - kind: rtstruct
+    series_description: "AI Structures"
+    profile_version: 1

@@ -159,6 +159,25 @@ impl StudyScanner {
         &self,
         filter: &QueryFilter,
     ) -> Result<(Vec<StudySearchResult>, usize), StudySearchError> {
+        let (results, matches, _skipped) = self.search_with_skips(filter)?;
+        Ok((results, matches))
+    }
+
+    /// [`search`](Self::search) that also reports how many candidates could
+    /// not be read.
+    ///
+    /// A candidate whose manifest is absent or undecodable is skipped rather
+    /// than failing the page (one damaged file must not make every healthy
+    /// study unanswerable). That skip is deliberate, but a persistent read
+    /// failure - a permission error, an I/O error under a file that still
+    /// exists - reaches the same branch and is indistinguishable from it. The
+    /// query cannot fail on it, so the count is handed back for a diagnostic
+    /// sink: the page stays correct and the operator still learns that the
+    /// answer was short.
+    pub fn search_with_skips(
+        &self,
+        filter: &QueryFilter,
+    ) -> Result<(Vec<StudySearchResult>, usize, usize), StudySearchError> {
         // 1) Candidate set.
         let candidates = self.candidate_study_uids(filter)?;
 
@@ -168,9 +187,12 @@ impl StudyScanner {
 
         // 2) Resolve each candidate: mmap manifest, shallow-decode, filter.
         let mut out = Vec::new();
+        let mut skipped = 0usize;
         for uid in &candidates {
-            if let Some(res) = self.load_if_matches(uid, filter, &expected)? {
-                out.push(res);
+            match self.load_if_matches(uid, filter, &expected)? {
+                LoadOutcome::Hit(res) => out.push(res),
+                LoadOutcome::NoMatch => {}
+                LoadOutcome::Unreadable => skipped += 1,
             }
         }
 
@@ -191,10 +213,14 @@ impl StudyScanner {
         let matches = out.len();
         let offset = filter.offset.unwrap_or(0) as usize;
         if offset >= matches {
-            return Ok((Vec::new(), matches));
+            return Ok((Vec::new(), matches, skipped));
         }
         let limit = filter.limit.map(|l| l as usize).unwrap_or(matches - offset);
-        Ok((out.into_iter().skip(offset).take(limit).collect(), matches))
+        Ok((
+            out.into_iter().skip(offset).take(limit).collect(),
+            matches,
+            skipped,
+        ))
     }
 
     /// Series-level QIDO over one study manifest.
@@ -259,8 +285,20 @@ impl StudyScanner {
                     continue;
                 }
                 // Only a candidate if the manifest actually exists.
-                if !self.manifests_dir.join(format!("{uid}.manifest")).is_file() {
-                    continue;
+                //
+                // `is_file()` answers false for BOTH "absent" and "cannot
+                // stat" (EACCES, ENOENT on a parent component), so it cannot
+                // tell an erased study from a lookup that failed. The two need
+                // different answers: an absent manifest is a legitimate
+                // no-candidate, while a failed lookup would silently drop a
+                // study the caller can still read. Skipping stays the choice
+                // for NotFound, as before; any other error surfaces.
+                let path = self.manifests_dir.join(format!("{uid}.manifest"));
+                match std::fs::metadata(&path) {
+                    Ok(m) if m.is_file() => {}
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(StudySearchError::Io(e)),
                 }
                 // A repeated member is ONE candidate. Pushing it twice made the
                 // loader return the same study twice, so `limit=2` could spend
@@ -295,11 +333,44 @@ impl StudyScanner {
         {
             return Ok(index.all_uids());
         }
-        if !self.manifests_dir.is_dir() {
-            return Ok(Vec::new());
-        }
+        // `is_dir()` answers false both for an absent root and for a root that
+        // cannot be inspected, and this branch used to read the second as an
+        // empty archive - a permission error on `manifests/` became "no
+        // studies". `read_dir` is called directly so the error kinds separate:
+        // a MISSING root really is an empty archive (a fresh install answers
+        // QIDO with an empty result set), while a root that exists but cannot
+        // be read is an I/O error the caller must see.
         let mut out = Vec::new();
-        for entry in std::fs::read_dir(&self.manifests_dir).map_err(StudySearchError::Io)? {
+        let entries = match std::fs::read_dir(&self.manifests_dir) {
+            Ok(entries) => entries,
+            // Windows reports a path component that is a regular file as
+            // NotFound, so the bare kind check is not enough: re-asking with
+            // `metadata` separates "the root does not exist" (empty archive)
+            // from "the root cannot be a directory" (an error). Unix already
+            // answers the second case with NotADirectory.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Windows also reports a path COMPONENT that is a regular file
+                // as NotFound, so the kind alone cannot separate "the root does
+                // not exist" (an empty archive) from "the root cannot be a
+                // directory" (an error). The nearest existing ancestor decides:
+                // if it exists and is not a directory, the root is unreachable
+                // for a reason the caller must see.
+                let mut probe = self.manifests_dir.as_path();
+                while let Some(parent) = probe.parent() {
+                    if parent.as_os_str().is_empty() {
+                        break;
+                    }
+                    match std::fs::metadata(parent) {
+                        Ok(m) if m.is_dir() => break,
+                        Ok(_) => return Err(StudySearchError::Io(e)),
+                        Err(_) => probe = parent,
+                    }
+                }
+                return Ok(out);
+            }
+            Err(e) => return Err(StudySearchError::Io(e)),
+        };
+        for entry in entries {
             let entry = entry.map_err(StudySearchError::Io)?;
             let fname = entry.file_name().to_string_lossy().into_owned();
             if let Some(stem) = fname.strip_suffix(".manifest") {
@@ -323,11 +394,14 @@ impl StudyScanner {
         uid: &str,
         filter: &QueryFilter,
         expected: &std::collections::HashMap<u32, crate::query::Predicate<'_>>,
-    ) -> Result<Option<StudySearchResult>, StudySearchError> {
+    ) -> Result<LoadOutcome, StudySearchError> {
         if let Some(index) = self.index.as_ref()
             && index.ready()
         {
-            return Ok(load_if_matches_index(index, uid, filter, expected));
+            return Ok(match load_if_matches_index(index, uid, filter, expected) {
+                Some(res) => LoadOutcome::Hit(res),
+                None => LoadOutcome::NoMatch,
+            });
         }
         // QIDO only needs study-level QIDO attributes - skip expensive
         // series/instance/frame decode via decode_study_only (shallow read).
@@ -344,22 +418,39 @@ impl StudyScanner {
         // must not be the channel that surfaces it.
         let Some(published) = crate::manifest::PublishedManifest::new(&self.manifests_dir, uid)
         else {
-            return Ok(None);
+            return Ok(LoadOutcome::NoMatch);
         };
         let manifest = match crate::manifest::read_manifest_study_only_published(&published) {
             Ok(m) => m,
-            Err(_) => return Ok(None),
+            // A decode failure is not a filter miss: the study is present and
+            // unreadable, so it is reported as such instead of vanishing into
+            // the same branch as a study that simply did not match.
+            Err(_) => return Ok(LoadOutcome::Unreadable),
         };
         if !crate::query::match_study_attrs_prebuilt(filter, &manifest, expected) {
-            return Ok(None);
+            return Ok(LoadOutcome::NoMatch);
         }
         // JSON streaming is delegated to `json.rs` (C-009); here we hand the
         // caller the study attributes so it can emit without re-parsing.
-        Ok(Some(StudySearchResult {
+        Ok(LoadOutcome::Hit(StudySearchResult {
             study_uid: uid.to_string(),
             qido: manifest.study,
         }))
     }
+}
+
+/// Resolution outcome for one candidate, before pagination.
+///
+/// `NoMatch` and `Unreadable` used to be the same `None`, so a study that
+/// could not be read was counted as one that did not match. They need
+/// different accounting: only the second one means the answer is short.
+enum LoadOutcome {
+    /// The manifest decoded and the study matched the filter.
+    Hit(StudySearchResult),
+    /// The manifest decoded (or is absent) and the study did not match.
+    NoMatch,
+    /// The manifest exists but could not be decoded.
+    Unreadable,
 }
 
 /// resolve `uid` from the RAM index and filter it. Returns `None` when
@@ -399,6 +490,22 @@ mod tests {
 
     /// Write a minimal manifest for `study_uid` into `manifests_dir`.
     fn seed_manifest(manifests_dir: &Path, study_uid: &str, name: &str, date: u64) {
+        seed_manifest_modality(manifests_dir, study_uid, name, date, "CT");
+    }
+
+    /// [`seed_manifest`] with an explicit modality.
+    ///
+    /// The fixed `CT` made every modality test vacuous: the scanner matched
+    /// regardless of modality, so a broken matcher would still have answered
+    /// the same set. Tests that assert on modality must seed at least one
+    /// value that does NOT match.
+    fn seed_manifest_modality(
+        manifests_dir: &Path,
+        study_uid: &str,
+        name: &str,
+        date: u64,
+        modality: &str,
+    ) {
         let m = Manifest {
             sys: SysHeader {
                 version: 1,
@@ -409,7 +516,7 @@ mod tests {
             study: StudyQido {
                 attrs: vec![
                     (0x0008_0020, AttrValue::UInt(date)),
-                    (0x0008_0060, AttrValue::Text("CT".into())),
+                    (0x0008_0060, AttrValue::Text(modality.to_string())),
                     (0x0010_0010, AttrValue::Text(name.to_string())),
                     (0x0020_000D, AttrValue::Text(study_uid.to_string())),
                 ],
@@ -607,56 +714,16 @@ mod tests {
     /// produce). A non-empty accelerator set used to be returned as the whole
     /// answer, so `?Modality=CT` silently omitted `1.2.2`.
     #[test]
-    fn modality_idx_accelerates_and_filters() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let manifests = dir.path().join("manifests");
-        std::fs::create_dir_all(&manifests).expect("mkdir");
-        seed_manifest(&manifests, "1.2.1", "alice", 20260101);
-        seed_manifest(&manifests, "1.2.2", "bob", 20260202);
-
-        // Build the modality accelerator for "CT" on day 20260101 with uid 1.2.1.
-        let idx = dir.path().join("idx");
-        let mut set = DailyIndexSet::new(idx.clone(), *b"20260101");
-        let mut row = [0u8; 128];
-        let filled = crate::idx::modality::format_row("1.2.1", &mut row);
-        set.modality_writer("CT")
-            .expect("mod")
-            .append(filled)
-            .expect("row");
-
-        let scanner = StudyScanner::new(manifests.clone(), idx);
-        let f = QueryFilter {
-            modality: Some("CT".into()),
-            ..Default::default()
-        };
-        let (res, _) = scanner.search(&f).expect("search");
-        // BOTH studies carry the CT modality. `1.2.1` comes from the idx row
-        // and `1.2.2` from the manifests-only fallback, so the answer is the
-        // same either way - which is the property that matters. The previous
-        // assertion of `len == 1` pinned the bug: it accepted an answer that
-        // omitted an unindexed CT study.
-        let uids: Vec<&str> = res.iter().map(|r| r.study_uid.as_str()).collect();
-        assert_eq!(
-            uids,
-            vec!["1.2.1", "1.2.2"],
-            "every CT study must answer, indexed or not"
-        );
-    }
-
-    /// A study the accelerator has no row for is still a candidate.
-    ///
-    /// This is the C2 defect stated directly: the idx is a performance
-    /// structure, not the source of truth, so narrowing to it must never lose
-    /// a study the archive holds. `1.2.2` carries the CT modality and has no
-    /// idx row.
-    #[test]
     fn an_unindexed_study_still_matches_a_modality_query() {
         let dir = tempfile::tempdir().expect("tempdir");
         let manifests = dir.path().join("manifests");
         std::fs::create_dir_all(&manifests).expect("mkdir");
-        // Both are CT studies in the manifests.
-        seed_manifest(&manifests, "1.2.1", "alice", 20260101);
-        seed_manifest(&manifests, "1.2.2", "bob", 20260202);
+        // Two matching CT studies and one that must NOT be returned: without a
+        // non-matching control the assertion held even when the modality key
+        // was ignored entirely.
+        seed_manifest_modality(&manifests, "1.2.1", "alice", 20260101, "CT");
+        seed_manifest_modality(&manifests, "1.2.2", "bob", 20260202, "CT");
+        seed_manifest_modality(&manifests, "1.2.3", "carol", 20260303, "MR");
 
         // The accelerator knows only 1.2.1 (a partially written day).
         let idx = dir.path().join("idx");
@@ -675,9 +742,10 @@ mod tests {
         };
         let (res, _) = scanner.search(&f).expect("search");
         let uids: Vec<&str> = res.iter().map(|r| r.study_uid.as_str()).collect();
-        assert!(
-            uids.contains(&"1.2.2"),
-            "a study with no idx row must still be a candidate: {uids:?}"
+        assert_eq!(
+            uids,
+            vec!["1.2.1", "1.2.2"],
+            "both CT studies must answer and the MR study must not"
         );
     }
 
@@ -1210,5 +1278,90 @@ mod tests {
             vec!["1.2.1", "1.2.2"],
             "a space after the comma must not drop the member"
         );
+    }
+
+    /// A manifests root that is ABSENT is an empty archive, and one that
+    /// cannot be read is an error. `is_dir()` answered false for both and the
+    /// cold path read the second as "no studies", so a permission failure on
+    /// the directory produced a well-formed empty QIDO answer.
+    #[test]
+    fn an_absent_manifests_root_is_empty_but_a_failed_scan_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Absent root: an empty tier, not a failure.
+        let absent = StudyScanner::new(dir.path().join("nope"), dir.path().join("idx"));
+        let (res, matches) = absent.search(&QueryFilter::default()).expect("search");
+        assert!(res.is_empty());
+        assert_eq!(matches, 0);
+
+        // Present-but-unreadable needs a real permission failure, which only
+        // exists on Unix for a non-root process; the injectable form is a path
+        // whose parent is a regular FILE, which fails with ENOTDIR on every
+        // platform and is reported rather than swallowed.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write");
+        let broken = StudyScanner::new(blocker.join("manifests"), dir.path().join("idx"));
+        match broken.search(&QueryFilter::default()) {
+            Err(StudySearchError::Io(e)) => {
+                // Windows surfaces a path component that is a regular file as
+                // NotFound; Unix as NotADirectory. Both mean "the root cannot
+                // be a directory", which is the property under test.
+                assert!(
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::NotFound
+                    ),
+                    "unexpected error kind: {:?}",
+                    e.kind()
+                );
+            }
+            other => panic!("an unreadable root must be an error, got {other:?}"),
+        }
+    }
+
+    /// A manifest that cannot be decoded is reported as a SKIP, not silently
+    /// counted as a study that did not match.
+    #[test]
+    fn an_undecodable_manifest_is_counted_as_a_skip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        seed_manifest(&manifests, "1.2.2", "healthy", 20260202);
+        // A manifest stem that is a valid UID but whose bytes are not a
+        // manifest - the shape a torn write leaves behind.
+        std::fs::write(manifests.join("1.2.1.manifest"), b"not a manifest").expect("write");
+
+        let scanner = StudyScanner::new(manifests, dir.path().join("idx"));
+        let (res, matches, skipped) = scanner
+            .search_with_skips(&QueryFilter::default())
+            .expect("search");
+        assert_eq!(res.len(), 1, "the healthy study still answers");
+        assert_eq!(matches, 1);
+        assert_eq!(
+            skipped, 1,
+            "the undecodable candidate must be reported, not absorbed"
+        );
+    }
+
+    /// A same-SOP-era control: a decoded manifest that merely fails the filter
+    /// is NOT a skip. Without this the counter above would be satisfied by any
+    /// non-matching study.
+    #[test]
+    fn a_filtered_out_study_is_not_counted_as_a_skip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+        seed_manifest_modality(&manifests, "1.2.1", "alice", 20260101, "CT");
+        seed_manifest_modality(&manifests, "1.2.2", "bob", 20260202, "MR");
+
+        let scanner = StudyScanner::new(manifests, dir.path().join("idx"));
+        let f = QueryFilter {
+            modality: Some("CT".into()),
+            ..Default::default()
+        };
+        let (res, matches, skipped) = scanner.search_with_skips(&f).expect("search");
+        assert_eq!(res.len(), 1);
+        assert_eq!(matches, 1);
+        assert_eq!(skipped, 0, "a non-matching study is not an unreadable one");
     }
 }

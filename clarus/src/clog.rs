@@ -280,7 +280,12 @@ fn maybe_line(
 fn render(level: Level, msg: &str, tag: Option<(&str, &str)>) -> String {
     // wall-clock "now" + render via clarus-core::time (libc),
     // byte-identical %Y/%m/%d %H:%M:%S to the previous chrono format.
-    let now = clarus_core::time::local_now().fmt_datetime();
+    // A conversion failure is marked, never rendered as the epoch: 1970 would
+    // read as a genuine timestamp in the log.
+    let now = match clarus_core::time::local_now() {
+        Ok(t) => t.fmt_datetime(),
+        Err(_) => "<no-local-time>".to_string(),
+    };
     let mut out = format!("{now} [{}] ", level.tag());
     if let Some((t, payload)) = tag {
         out.push_str(t);
@@ -357,7 +362,20 @@ macro_rules! clog_keep_fields {
         let _ = &$name;
         $crate::clog_keep_fields!([$($out)* $name] $($rest)*)
     };
+    // `?` is the Debug sigil, symmetric with `%`. Without these arms the sigil
+    // is peeled as its own token and the expression behind it is left in a
+    // position no rule matches, so every `field = ?value` call site fails to
+    // compile - the macro accepted only `%`, which the call sites do not
+    // consistently use.
+    ([$($out:tt)*] ? $name:ident , $($rest:tt)*) => {
+        let _ = &$name;
+        $crate::clog_keep_fields!([$($out)* $name] $($rest)*)
+    };
     ([$($out:tt)*] $name:ident = % $value:expr , $($rest:tt)*) => {
+        let _ = &$value;
+        $crate::clog_keep_fields!([$($out)* $value] $($rest)*)
+    };
+    ([$($out:tt)*] $name:ident = ? $value:expr , $($rest:tt)*) => {
         let _ = &$value;
         $crate::clog_keep_fields!([$($out)* $value] $($rest)*)
     };
@@ -571,5 +589,57 @@ mod drop_tests {
         record_drop();
         let after = crate::metrics::CLARUS_LOG_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(after - before, 2, "two record_drop() calls -> +2");
+    }
+}
+
+#[cfg(test)]
+mod field_sigil_tests {
+    /// Both structured-field sigils must reach a value in every shape a call
+    /// site uses.
+    ///
+    /// The field peeler consumed `%` but had no `?` arm, so `field = ?value`
+    /// peeled the sigil as its own token and left the expression behind it in a
+    /// position no rule matched. That is a COMPILE error, not a runtime one, so
+    /// it is only observable by expanding the macro - hence a compile-time test
+    /// rather than an assertion.
+    #[test]
+    fn both_field_sigils_compile_on_a_plain_name() {
+        let e = 7;
+        let s = "text";
+        clog_keep_fields!([] error = %e, detail = ?s,);
+        clog_keep_fields!([] % e, ?s,);
+        clog_keep_fields!([] bare = e,);
+    }
+
+    /// A `?` value that is a multi-token expression or a grouped literal: the
+    /// inner comma of `(1, 2)` must not be read as a field separator.
+    #[test]
+    fn a_debug_field_accepts_grouped_and_multitoken_values() {
+        clog_keep_fields!([] pair = ?(1, 2),);
+        clog_keep_fields!([] owned = ?String::from("x"),);
+    }
+
+    /// The accumulator must not be re-emitted as code: keeping a field marks it
+    /// used, and nothing else. A field value is NOT evaluated for formatting
+    /// here, so a value whose `Display` would panic (none here) cannot fire.
+    #[test]
+    fn keeping_a_field_does_not_evaluate_formatting() {
+        // Build a value whose Debug impl counts evaluations.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        struct Noisy;
+        impl std::fmt::Debug for Noisy {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                COUNT.fetch_add(1, Ordering::Relaxed);
+                f.write_str("noisy")
+            }
+        }
+        let n = Noisy;
+        clog_keep_fields!([] value = ?n,);
+        assert_eq!(
+            COUNT.load(Ordering::Relaxed),
+            0,
+            "keeping a field must take a reference, never format it"
+        );
     }
 }

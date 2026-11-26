@@ -93,6 +93,18 @@ const K_OUTPUT_STUDY_UID: u64 = 36;
 /// state. This counter can: every successful write bumps it, and a caller can
 /// hand back the value it observed.
 const K_REVISION: u64 = 37;
+/// Provenance of the workitem (key 38), append-only as above.
+///
+/// PS3.4 CC.2.4 has readiness driven by the SCP that owns the input study, so
+/// a readiness sweep must only ever flip workitems whose readiness THIS
+/// service is responsible for. A requester can mint a workitem for the same
+/// study through N-CREATE with readiness UNAVAILABLE and a workflow state of
+/// its own choosing; finding workitems by input study alone would sweep that
+/// one up and announce it READY - a claim an input nobody here assessed.
+///
+/// The marker is what the mint wrote, not a display label: labels are free
+/// text a requester also controls.
+const K_MINTED_BY: u64 = 38;
 
 /// A single UPS workitem, as persisted in `workitems/{uid}.cbor`.
 ///
@@ -284,7 +296,22 @@ pub struct WorkItemRecord {
     /// bumping this counter instead makes the second writer's stale read
     /// visible as a conflict.
     pub revision: u64,
+    /// Provenance marker (key 38): set to [`MINTED_BY_READINESS`] only by the
+    /// readiness producer in this service, `None` for every workitem that
+    /// arrived over the wire.
+    ///
+    /// Persisted rather than derived, because the only other signal - the
+    /// workitem UID - is derived from the catalog and therefore reproducible
+    /// by anyone who can read the config.
+    pub minted_by: Option<String>,
 }
+
+/// Value of [`WorkItemRecord::minted_by`] for a workitem the readiness
+/// producer created.
+///
+/// A short stable token rather than a description: it is compared for
+/// equality, never displayed, so it must not drift with wording.
+pub const MINTED_BY_READINESS: &str = "readiness";
 
 /// One item of (0040,4033) Output Information Sequence.
 ///
@@ -385,6 +412,7 @@ impl WorkItemRecord {
             self.performed_procedure_information.is_some(),
             self.worklist_label.is_some(),
             self.output_study_uid.is_some(),
+            self.minted_by.is_some(),
         ]
         .iter()
         .filter(|p| **p)
@@ -568,6 +596,8 @@ impl WorkItemRecord {
         // Keys 35 and 36 close the set, LAST so the map keys stay ascending.
         write_opt_str(writer, K_WORKLIST_LABEL, self.worklist_label.as_deref())?;
         write_opt_str(writer, K_OUTPUT_STUDY_UID, self.output_study_uid.as_deref())?;
+        // Key 38 closes the set, LAST so the map keys stay ascending.
+        write_opt_str(writer, K_MINTED_BY, self.minted_by.as_deref())?;
         // The revision is written only when non-zero, so a record that was
         // never updated keeps the exact bytes it had before the counter
         // existed - the format stays append-only.
@@ -728,6 +758,7 @@ impl WorkItemRecord {
                 K_OUTPUT_STUDY_UID => {
                     rec.output_study_uid = Some(read_text(&mut reader, "output_study_uid")?)
                 }
+                K_MINTED_BY => rec.minted_by = Some(read_text(&mut reader, "minted_by")?),
                 K_REVISION => {
                     let CborToken::UInt(v) = reader.next()? else {
                         return Err(WorkItemError::Malformed("revision is not an integer"));
@@ -753,14 +784,32 @@ impl WorkItemRecord {
                         // The COUNT, not the emptiness of a field, tells them apart: a
                         // current record legitimately carries an empty study or series
                         // when the performer named none.
+                        //
+                        // Any other count is a reference this reader cannot
+                        // place, and the two ways of pretending otherwise both
+                        // lose data: a one-field entry produced a reference with
+                        // four empty strings, and a five-field entry matched the
+                        // two-field arm and took its SECOND field as the SOP
+                        // Instance UID. Rejecting keeps the record honest - the
+                        // stored bytes are corrupt, not "no outputs".
                         let (class, study, series, instance) = match parts.as_slice() {
                             [class, study, series, instance] => {
                                 (*class, *study, *series, *instance)
                             }
                             [class, series, instance] => (*class, "", *series, *instance),
-                            [class, instance, ..] => (*class, "", "", *instance),
-                            _ => ("", "", "", ""),
+                            [class, instance] => (*class, "", "", *instance),
+                            _ => {
+                                return Err(WorkItemError::Malformed(
+                                    "output_information entry has an unsupported field count",
+                                ));
+                            }
                         };
+                        // A reference with no SOP Instance UID names nothing.
+                        if instance.is_empty() {
+                            return Err(WorkItemError::Malformed(
+                                "output_information entry has no SOP Instance UID",
+                            ));
+                        }
                         outputs.push(OutputReference {
                             sop_class_uid: class.to_string(),
                             study_instance_uid: study.to_string(),
@@ -1033,5 +1082,81 @@ mod tests {
             rec.encode(),
             Err(WorkItemError::UnexpectedValue(_))
         ));
+    }
+
+    /// Build a minimal valid record whose output_information (key 17) is a
+    /// single text value built from `fields` joined with the field separator.
+    ///
+    /// The encoder refuses a separator inside a component, so corrupt on-disk
+    /// shapes can only be produced by hand - which is exactly the input the
+    /// decoder has to survive.
+    fn encoded_with_output_fields(fields: &[&str]) -> Vec<u8> {
+        let joined = fields.join("\u{1f}");
+        let mut out = Vec::new();
+        out.push(0xa3); // map(3)
+        // key 2: workitem_uid "1.2.3.4" (7 bytes)
+        out.push(0x02);
+        out.push(0x67);
+        out.extend_from_slice(b"1.2.3.4");
+        // key 3: workflow_state "SCHEDULED" (9 bytes)
+        out.push(0x03);
+        out.push(0x69);
+        out.extend_from_slice(b"SCHEDULED");
+        // key 25: output_information (one-byte uint 25 needs the 0x18 extension)
+        out.push(0x18);
+        out.push(0x19);
+        // Text string, major type 3: 0..23 inline, then the 1-byte form.
+        let n = joined.len();
+        if n < 24 {
+            out.push(0x60 | n as u8);
+        } else {
+            assert!(n < 256, "test values stay in the one-byte length form");
+            out.push(0x78);
+            out.push(n as u8);
+        }
+        out.extend_from_slice(joined.as_bytes());
+        out
+    }
+
+    /// A one-field output entry is a corrupt reference, not an empty one.
+    ///
+    /// The old arm fell through to `("", "", "", "")`, producing a reference
+    /// with four empty strings - a record that decodes "successfully" and
+    /// names nothing. The stored bytes are the problem, so the decoder says so.
+    #[test]
+    fn rejects_a_one_field_output_reference() {
+        let bytes = encoded_with_output_fields(&["1.2.3"]);
+        let r = WorkItemRecord::decode(&bytes);
+        assert!(
+            matches!(r, Err(WorkItemError::Malformed(m)) if m.contains("field count")),
+            "got {r:?}"
+        );
+    }
+
+    /// A five-field output entry must not be read as the two-field form.
+    ///
+    /// `[class, instance, ..]` matched any five-field entry and took its
+    /// SECOND field as the SOP Instance UID, silently substituting one UID for
+    /// another. The count is exact, so an unsupported one is rejected.
+    #[test]
+    fn rejects_a_five_field_output_reference() {
+        let bytes =
+            encoded_with_output_fields(&["1.2.3", "1.2.3.4", "1.2.3.4.5", "1.2.3.4.5.6", "x"]);
+        let r = WorkItemRecord::decode(&bytes);
+        assert!(
+            matches!(r, Err(WorkItemError::Malformed(m)) if m.contains("field count")),
+            "got {r:?}"
+        );
+    }
+
+    /// A reference with no SOP Instance UID names nothing, so it is rejected.
+    #[test]
+    fn rejects_an_output_reference_without_an_instance_uid() {
+        let bytes = encoded_with_output_fields(&["1.2.3", "1.2.3.4", "1.2.3.4.5", ""]);
+        let r = WorkItemRecord::decode(&bytes);
+        assert!(
+            matches!(r, Err(WorkItemError::Malformed(m)) if m.contains("SOP Instance UID")),
+            "got {r:?}"
+        );
     }
 }

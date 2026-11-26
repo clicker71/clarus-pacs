@@ -69,8 +69,6 @@ const STOW_WRITE_BUF: usize = 1024 * 1024;
 /// value. What it still does is pin the SPELLING of the media type against
 /// `ts_uid::EXPLICIT_VR_LE`: [`dicom_media_type`] builds that string at run
 /// time from the manifest's UID, and the test below keeps the format honest.
-#[cfg(test)]
-const DICOM_EVRLE_CT: &str = "application/dicom; transfer-syntax=1.2.840.10008.1.2.1";
 /// SSE content type.
 const SSE_CT: &[u8] = b"text/event-stream";
 
@@ -348,16 +346,12 @@ fn resolve_file(
             continue;
         };
         if let Ok(f) = std::fs::File::open(cas.root_dir().join(rel)) {
-            // 0210: storage read throughput. `metadata()` here is one stat on
-            // the fd we already opened - the alternative (counting the bytes
-            // from the transfer loop) would mean touching the sendfile/copy
-            // path the ap101 gates pin, for a rate() that only needs a
-            // counter. The length of the file handed to the writer IS the
-            // bytes read.
-            if let Ok(md) = f.metadata() {
-                crate::metrics::STORAGE_READ_BYTES
-                    .fetch_add(md.len(), std::sync::atomic::Ordering::Relaxed);
-            }
+            // 0210 storage-read throughput is accounted by the READERS
+            // (`read_cas_head`, `read_cas_bytes`, `read_cas_range`, and the
+            // streaming send loop), not here. Charging `md.len()` at open time
+            // booked the WHOLE object for a bounded prefix read: a 4 MiB
+            // metadata head of a 4 GiB instance added 4 GiB to the counter,
+            // and a later budget refusal had already been counted as traffic.
             return Ok(f);
         }
     }
@@ -412,16 +406,66 @@ fn resolve_path(
 
 /// Read a stored object fully into memory (buffered paths: thumbnail, frame
 /// extraction, metadata blob, bulkdata).
+///
+/// The read is bounded by `config.max_frame_bytes`: the pixel budget on the
+/// `/rendered` path is derived from Rows/Columns, which the instance itself
+/// declares, so a crafted header can pass it while the stored blob is far
+/// larger. The size comes from `metadata()`, which is the archive's own file,
+/// and is checked BEFORE the allocation - an over-budget object costs zero
+/// bytes of buffer. A caller that deliberately reads a whole blob (the
+/// transcode path) states its own bound at the call site.
 pub(crate) fn read_cas_bytes(
     state: &crate::state::AppState,
     blake3: &str,
     tier: StorageTier,
 ) -> io::Result<Vec<u8>> {
-    let mut file = resolve_file(state, blake3, tier)?;
+    let file = resolve_file(state, blake3, tier)?;
+    let len = file.metadata()?.len();
+    let budget = state
+        .config
+        .max_frame_bytes
+        .saturating_mul(WHOLESALE_READ_PARTS);
+    if len > budget {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let cap = usize::try_from(len).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "object does not fit in memory")
+    })?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    buf.try_reserve_exact(cap)
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    file.take(budget).read_to_end(&mut buf)?;
+    crate::metrics::count_storage_read(buf.len() as u64);
     Ok(buf)
 }
+
+/// Map a buffered-read failure to the WADO error the client should see.
+///
+/// A budget refusal is `InvalidInput`, which the wire answers as 413: the
+/// object exists and the archive will not buffer it, and reporting 404 would
+/// claim the instance is missing. Every other failure keeps the existing
+/// FileNotFound mapping.
+pub(crate) fn buffered_read_error(
+    e: &io::Error,
+    blake3: &str,
+) -> crate::handlers::wado::error::WadoError {
+    if e.kind() == io::ErrorKind::InvalidInput {
+        crate::handlers::wado::error::WadoError::PayloadTooLarge(
+            "the stored object is larger than the archive's buffered-read budget".to_string(),
+        )
+    } else {
+        crate::handlers::wado::error::WadoError::FileNotFound(blake3.to_string())
+    }
+}
+
+/// How many `max_frame_bytes` a whole-blob read may span.
+///
+/// A whole-object read exists for renderers and transcoders, which hold the
+/// decoded image anyway, and the frame budget is a TILE bound, so the two are
+/// not the same quantity. Sixteen times the tile budget keeps a genuine
+/// multi-frame instance readable while refusing the pathological shapes: at
+/// the 64 MiB default that is a 1 GiB ceiling on any single buffered read.
+const WHOLESALE_READ_PARTS: u64 = 16;
 
 /// Read at most `max` bytes from the START of a stored object (0310 F3).
 ///
@@ -444,6 +488,7 @@ pub fn read_cas_head(
     let read_len = max.min(file_len) as usize;
     let mut buf = vec![0u8; read_len];
     file.read_exact(&mut buf)?;
+    crate::metrics::count_storage_read(read_len as u64);
     Ok(buf)
 }
 
@@ -498,6 +543,9 @@ pub fn read_cas_range(
     }
     file.seek(io::SeekFrom::Start(offset))?;
     file.read_exact(&mut buf)?;
+    // The RANGE length, not the object length: this is a bounded frame read
+    // and the object may be orders of magnitude larger.
+    crate::metrics::count_storage_read(cap as u64);
     Ok(buf)
 }
 
@@ -578,7 +626,7 @@ fn serve_single_object(
     {
         let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
             Ok(b) => b,
-            Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+            Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
         };
         let (out, out_ts) = match crate::handlers::wado_pure::maybe_transcode(
             bytes,
@@ -602,9 +650,9 @@ fn serve_single_object(
                 ),
             );
         }
-        let range_header = ctx.head.range.and_then(|v| std::str::from_utf8(v).ok());
         let total = out.len() as u64;
-        return serve_instance_buffer(ctx, out, &out_ts, range_header, total);
+        let range = request_range(ctx, total);
+        return serve_instance_buffer(ctx, out, &out_ts, range, total);
     }
 
     let file = match resolve_file(ctx.state, &oref.sha256, oref.storage_tier) {
@@ -632,26 +680,24 @@ fn serve_single_object(
     // only the requested span. The whole-file head declared 200 and the whole
     // length, so a client asking for a slice received the full object under a
     // status that promised exactly the object.
-    let range_header = ctx.head.range.and_then(|v| std::str::from_utf8(v).ok());
-    let (status, reason, span) =
-        match crate::handlers::wado_range::parse_range_header_str(range_header, real_size) {
-            crate::handlers::wado_range::RangeResult::Partial(range) => {
-                (206u16, "Partial Content", range)
-            }
-            crate::handlers::wado_range::RangeResult::NotSatisfiable => {
-                return wado_err_response(ctx, WadoError::RangeNotSatisfiable);
-            }
-            // `InvalidIgnored` is the RFC 9110 14.2 "unsatisfiable syntax is
-            // ignored" case: the full representation is the legal answer.
-            _ => (
-                200u16,
-                "OK",
-                crate::handlers::wado_range::ByteRange {
-                    start: 0,
-                    end: real_size.saturating_sub(1),
-                },
-            ),
-        };
+    let (status, reason, span) = match request_range(ctx, real_size) {
+        crate::handlers::wado_range::RangeResult::Partial(range) => {
+            (206u16, "Partial Content", range)
+        }
+        crate::handlers::wado_range::RangeResult::NotSatisfiable => {
+            return wado_err_response(ctx, WadoError::RangeNotSatisfiable);
+        }
+        // `InvalidIgnored` is the RFC 9110 14.2 "unsatisfiable syntax is
+        // ignored" case: the full representation is the legal answer.
+        _ => (
+            200u16,
+            "OK",
+            crate::handlers::wado_range::ByteRange {
+                start: 0,
+                end: real_size.saturating_sub(1),
+            },
+        ),
+    };
     let content_len = if real_size == 0 { 0 } else { span.len() };
     let mut extra: Vec<(&[u8], Vec<u8>)> = Vec::with_capacity(2);
     extra.push((b"Accept-Ranges", b"bytes".to_vec()));
@@ -714,6 +760,31 @@ fn serve_single_object(
 fn dicom_media_type(transfer_syntax_uid: &str) -> String {
     format!("application/dicom; transfer-syntax={transfer_syntax_uid}")
 }
+/// The `Range` header to HONOUR for this request, or `None`.
+///
+/// RFC 9110 14.2 defines Range as a modifier of GET: "A server MUST ignore a
+/// Range header field received with a request method that is unrecognized or
+/// for which range handling is not defined." The only defined method is GET, so
+/// a HEAD carrying `Range: bytes=0-9` must be answered as the full
+/// representation - its headers must describe what the corresponding GET would
+/// return for the request the client actually sent. Ignoring the header here is
+/// what keeps `HEAD` honest: the pre-fix behaviour answered 206 to `HEAD` +
+/// Range, a status RFC 9110 never allows for that method.
+///
+/// `ctx.conn.suppress_body()` is the serve loop's own HEAD predicate (it is set
+/// from the method of every request), so this reuses one definition of "HEAD"
+/// instead of inventing a second.
+///
+/// The parsed RANGE is returned rather than the header text, so the borrow on
+/// `ctx` ends here and the caller stays free to use the connection mutably.
+fn request_range(ctx: &RequestContext<'_>, total: u64) -> crate::handlers::wado_range::RangeResult {
+    let header = if ctx.conn.suppress_body() {
+        None
+    } else {
+        ctx.head.range.and_then(|v| std::str::from_utf8(v).ok())
+    };
+    crate::handlers::wado_range::parse_range_header_str(header, total)
+}
 
 /// Serve an already-transcoded single-instance buffer, applying an RFC 7233
 /// Range if present.
@@ -728,10 +799,10 @@ fn serve_instance_buffer(
     ctx: &mut RequestContext<'_>,
     out: Vec<u8>,
     out_ts: &str,
-    range_header: Option<&str>,
+    range: crate::handlers::wado_range::RangeResult,
     total: u64,
 ) -> io::Result<()> {
-    use crate::handlers::wado_range::{RangeResult, content_range_header, parse_range_header_str};
+    use crate::handlers::wado_range::{RangeResult, content_range_header};
     // The body is the OUTPUT of `maybe_transcode`, which may be the stored
     // bytes (any syntax), a re-encoded Explicit VR dataset, a transcoded one,
     // or the ORIGINAL bytes after a transient decoder failure. The parameter
@@ -739,7 +810,7 @@ fn serve_instance_buffer(
     // Explicit VR LE label was wrong on three of those four paths, and a client
     // that picks its decoder from the header decoded the wrong thing.
     let content_type = dicom_media_type(out_ts);
-    match parse_range_header_str(range_header, total) {
+    match range {
         RangeResult::FullFile | RangeResult::InvalidIgnored => {
             // Written directly rather than through `WadoResp`: that struct
             // carries `content_type: &'static str`, and the media type here is
@@ -836,14 +907,19 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         };
         let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
             Ok(b) => b,
-            Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+            Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
         };
+        // The instance endpoint takes no `viewport` (PS3.18 8.3.5.1.3 scopes
+        // the rendering parameters to the Rendered Resource), so the fit box is
+        // the native size - which is also what "no downscale" has to mean here.
+        let (cols, rows) = native_pixel_size(&bytes);
         let resp = match crate::handlers::wado_pure::render_full_from_bytes(
             &bytes,
             ctx.uid(2),
             &ctx.state.codec_registry,
             &ctx.state.transcode_pool,
             ctx.state.config.transcode.max_megapixels,
+            (cols, rows),
         ) {
             Ok(r) => r,
             Err(e) => return wado_err_response(ctx, e), // Busy -> 503; PayloadTooLarge -> 413
@@ -875,7 +951,7 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         ctx.wado_series_expected = expected.or(ctx.wado_series_expected);
         let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
             Ok(b) => b,
-            Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+            Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
         };
         let (out, out_ts) = match crate::handlers::wado_pure::maybe_transcode(
             bytes,
@@ -889,9 +965,9 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             Ok(v) => v,
             Err(e) => return wado_err_response(ctx, e),
         };
-        let range_header = ctx.head.range.and_then(|v| std::str::from_utf8(v).ok());
         let total = out.len() as u64;
-        return serve_instance_buffer(ctx, out, &out_ts, range_header, total);
+        let range = request_range(ctx, total);
+        return serve_instance_buffer(ctx, out, &out_ts, range, total);
     }
 
     // DICOMweb viewers (Weasis, OHIF) request `multipart/related` even for a
@@ -926,7 +1002,7 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     {
         let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
             Ok(b) => b,
-            Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+            Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
         };
         let (out, out_ts) = match crate::handlers::wado_pure::maybe_transcode(
             bytes,
@@ -965,10 +1041,15 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
             &[],
         );
         let mut wire = std::mem::take(&mut ctx.conn.header);
-        wire.append(&mut head);
+        // RFC 9110 9.3.2: a HEAD response carries the header fields a GET would
+        // send and NO body. The MIME opening delimiter and part header are body
+        // bytes, so they must not follow the header terminator - on a reused
+        // connection the next response parser would read them as a status line.
+        // The GET `Content-Length` above still describes the full multipart body.
         let res = if ctx.conn.suppress_body() {
             ctx.conn.stream().write_all(&wire)
         } else {
+            wire.append(&mut head);
             ctx.conn.write_all_configured(&wire).and_then(|_| {
                 ctx.conn.write_all_configured(&out).and_then(|_| {
                     ctx.conn
@@ -1018,14 +1099,24 @@ pub(crate) fn h_wado_instance(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         &[],
     );
     let mut head = std::mem::take(&mut ctx.conn.header);
-    head.extend_from_slice(open.as_bytes());
+    // RFC 9110 9.3.2: HEAD sends the header fields only. The opening delimiter
+    // and part header are BODY bytes and must not be written after the header
+    // terminator; the GET `Content-Length` above still describes the whole
+    // multipart body, which is exactly what a HEAD response promises.
     let res = if ctx.conn.suppress_body() {
-        // HEAD: the response head (with the GET Content-Length) goes out, the
-        // file bytes and the closing boundary do not.
         ctx.conn.stream().write_all(&head)
     } else {
-        clarus_core::http::response::sendfile_response(ctx.conn.stream(), &head, &file, real_size)
-            .and_then(|_| ctx.conn.write_all_configured(close.as_bytes()))
+        head.extend_from_slice(open.as_bytes());
+        let sent = clarus_core::http::response::sendfile_response(
+            ctx.conn.stream(),
+            &head,
+            &file,
+            real_size,
+        );
+        if sent.is_ok() {
+            crate::metrics::count_storage_read(real_size);
+        }
+        sent.and_then(|_| ctx.conn.write_all_configured(close.as_bytes()))
     };
     ctx.conn.header = head;
     res
@@ -1124,6 +1215,10 @@ fn serve_multipart_chunked(
     // terminator is flushed after the loop. Tracks a successfully-written
     // previous part so a skipped (missing/transcode-failed) part emits nothing.
     let mut pending_trailer = false;
+    // Parts the plan named that could not be delivered. PS3.18 10.4 makes the
+    // retrieve a promise of ALL target representations, so a 200 that carries
+    // fewer of them is a lie the client cannot detect; see the abort below.
+    let mut skipped = 0usize;
     for (i, plan) in plans.iter().enumerate() {
         let is_first = i == 0;
         let kind = crate::handlers::wado_pure::resolve_part_kind(
@@ -1137,6 +1232,7 @@ fn serve_multipart_chunked(
             Ok(f) => f,
             Err(_) => {
                 crate::clog_warn!(sha256 = %plan.sha256, "Multipart part missing on disk; skipping");
+                skipped += 1;
                 continue;
             }
         };
@@ -1185,6 +1281,7 @@ fn serve_multipart_chunked(
                             error = %e,
                             "Multipart part stat failed; skipping"
                         );
+                        skipped += 1;
                         continue;
                     }
                 };
@@ -1197,6 +1294,7 @@ fn serve_multipart_chunked(
                     Ok(b) => b,
                     Err(_) => {
                         crate::clog_warn!(sha256 = %plan.sha256, "Multipart transcode read failed; skipping");
+                        skipped += 1;
                         continue;
                     }
                 };
@@ -1217,10 +1315,12 @@ fn serve_multipart_chunked(
                     // wire carries no error here.
                     Err(WadoError::Busy) => {
                         crate::clog_warn!(sop_uid = %plan.sop_uid, "Multipart transcode: global pool busy; skipping part");
+                        skipped += 1;
                         continue;
                     }
                     Err(e) => {
                         crate::clog_warn!(error = %e, "Multipart transcode failed; skipping");
+                        skipped += 1;
                         continue;
                     }
                 };
@@ -1268,6 +1368,7 @@ fn serve_multipart_chunked(
                 // the access log `bytes=` (head + body) is honest for
                 // streamed multipart parts.
                 ctx.conn.add_response_bytes(size);
+                crate::metrics::count_storage_read(size);
             }
             BodyMode::Bytes(bytes) => {
                 ctx.conn.write_all_configured(&bytes)?;
@@ -1276,6 +1377,24 @@ fn serve_multipart_chunked(
         // This part is now written; its chunk terminator is folded into the
         // next part's prefix (or flushed after the loop).
         pending_trailer = true;
+    }
+
+    // A part was dropped after the head was on the wire, so no status can be
+    // revised any more. The only honest remaining option is to NOT signal
+    // completion: the closing delimiter and the zero-length chunk are what tell
+    // the client the representation set is complete (RFC 9112 7.1), and
+    // emitting them would deliver a 200 that silently holds fewer instances
+    // than the retrieve named. Ending the connection mid-body makes the client
+    // see a truncated response, which is what happened.
+    if skipped > 0 {
+        crate::clog_warn!(
+            skipped,
+            "Multipart retrieve incomplete; aborting the response instead of finishing it"
+        );
+        ctx.conn.mark_unread_body();
+        return Err(io::Error::other(
+            "multipart retrieve incomplete: a planned part could not be delivered",
+        ));
     }
 
     // The final part's chunk terminator (not folded forward).
@@ -1314,6 +1433,12 @@ pub(crate) fn h_wado_study(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         RetrieveWanted::Wado => {}
     }
     let target_ts = crate::handlers::wado_pure::resolve_target_ts(&wado_query(ctx), ctx.accept());
+    if let Some(err) = target_ts
+        .as_deref()
+        .and_then(crate::handlers::wado_pure::banned_target_error)
+    {
+        return wado_err_response(ctx, err);
+    }
     let plans =
         match crate::handlers::wado_pure::plan_study_multipart(ctx.state, ctx.uid(0), ctx.route.qa)
         {
@@ -1334,6 +1459,12 @@ pub(crate) fn h_wado_series(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         RetrieveWanted::Wado => {}
     }
     let target_ts = crate::handlers::wado_pure::resolve_target_ts(&wado_query(ctx), ctx.accept());
+    if let Some(err) = target_ts
+        .as_deref()
+        .and_then(crate::handlers::wado_pure::banned_target_error)
+    {
+        return wado_err_response(ctx, err);
+    }
     let plans = match crate::handlers::wado_pure::plan_series_multipart(
         ctx.state,
         ctx.uid(0),
@@ -1589,39 +1720,91 @@ pub enum RetrieveWanted {
 
 /// Classify the Accept header for an overloaded retrieve resource.
 ///
-/// Deliberately a simple ordered preference check over the comma-separated
-/// ranges - media parameters are dropped, so `dicom+json;q=0.9` counts as a
-/// preference for JSON. Full RFC 9110 negotiation (q-value ordering, wildcard
-/// specificity) is not implemented and is not needed for these two choices.
+/// PS3.18 8.7 and 10.4 put both transactions on one path and the Accept header
+/// is the only distinguisher, so it is read here and nowhere else. RFC 9110
+/// 12.5.1 makes each range a case-insensitive type with its own weight: a
+/// `q=0` range is a REFUSAL, so `application/dicom+json; q=0,
+/// multipart/related` must be WADO-RS, and the highest weight decides the
+/// preference rather than the order of the ranges.
 ///
 /// A wildcard (`*/*`, `application/*`) or an absent header is "no
 /// preference": this server answers WADO-RS by default, which is what every
 /// deployed viewer already gets, so it must stay byte-identical.
 ///
-/// Runs on every retrieve GET, so it compares the ranges in place without
-/// allocating (pinned by the ap101 gate in tests/ap101_accept_negotiation.rs).
+/// Runs on every retrieve GET, so it uses the stack-only [`AcceptList`] parse
+/// and allocates nothing (pinned by the ap101 gate in
+/// tests/ap101_accept_negotiation.rs).
 pub fn classify_retrieve_accept(accept: Option<&str>) -> RetrieveWanted {
     let Some(accept) = accept else {
         return RetrieveWanted::Wado;
     };
-
-    let wants_json = accept_media_type_present_ci(accept, DICOM_JSON_MEDIA_TYPE);
-    let wants_wado = accept_media_type_present_ci(accept, "multipart/related")
-        || accept_media_type_present_ci(accept, "application/dicom");
-    if wants_json {
-        return RetrieveWanted::Json;
-    }
-    if wants_wado {
+    let list = crate::handlers::accept::AcceptList::parse(Some(accept));
+    if list.is_empty() {
+        // Only malformed ranges: nothing was asked for, so keep the default.
         return RetrieveWanted::Wado;
     }
-    // No usable type named. A wildcard asks for "whatever you have", which is
-    // the WADO-RS default; anything else is a type this resource cannot serve.
-    let wildcard = accept_media_type_present_ci(accept, "*/*")
-        || accept_media_type_present_ci(accept, "application/*");
-    if wildcard {
-        RetrieveWanted::Wado
-    } else {
-        RetrieveWanted::Unacceptable
+
+    // The WADO offer is `application/dicom`, which a `multipart/related;
+    // type="application/dicom"` range also names through its `type` parameter.
+    // Take the better of the two spellings for each offer.
+    //
+    // RFC 9110 12.5.1: `q=0` means "not acceptable" and a wildcard only says
+    // "whatever you have". Neither is a preference for a NAMED representation,
+    // so both are dropped here and the wildcard case is handled below.
+    let usable = |p: (Option<u16>, bool)| matches!(p, (Some(w), true) if w > 0);
+    let json_named = usable(list.preference(DICOM_JSON_MEDIA_TYPE));
+    let wado_named = usable(better_of(
+        list.preference("multipart/related"),
+        list.preference("application/dicom"),
+    ));
+    match (json_named, wado_named) {
+        // Both named: the higher weight wins, and a tie keeps JSON because
+        // that is the range every deployed QIDO client sends explicitly.
+        (true, true) => {
+            let jw = list.preference(DICOM_JSON_MEDIA_TYPE).0.unwrap_or(0);
+            let ww = better_of(
+                list.preference("multipart/related"),
+                list.preference("application/dicom"),
+            )
+            .0
+            .unwrap_or(0);
+            if jw >= ww {
+                RetrieveWanted::Json
+            } else {
+                RetrieveWanted::Wado
+            }
+        }
+        (true, false) => RetrieveWanted::Json,
+        (false, true) => RetrieveWanted::Wado,
+        (false, false) => {
+            // No named type. A wildcard asks for "whatever you have", which is
+            // the WADO-RS default; anything else is a type this resource
+            // cannot serve.
+            if list.wildcard_weight().is_some_and(|w| w > 0) {
+                RetrieveWanted::Wado
+            } else {
+                RetrieveWanted::Unacceptable
+            }
+        }
+    }
+}
+
+/// The more specific of two preferences, then the higher weight.
+fn better_of(a: (Option<u16>, bool), b: (Option<u16>, bool)) -> (Option<u16>, bool) {
+    match (a, b) {
+        ((Some(x), cx), (Some(y), cy)) => {
+            if cx && !cy {
+                (Some(x), true)
+            } else if cy && !cx {
+                (Some(y), true)
+            } else if y > x {
+                (Some(y), cy)
+            } else {
+                (Some(x), cx)
+            }
+        }
+        ((Some(_), _), _) => a,
+        (_, other) => other,
     }
 }
 
@@ -1664,6 +1847,59 @@ fn content_type_is(content_type: &str, media_type: &str) -> bool {
     !base.is_empty() && base.eq_ignore_ascii_case(media_type)
 }
 
+/// Whether the STOW-RS response should be rendered as DICOM XML.
+///
+/// PS3.18 10.5.1.3 lets the client choose the store-response representation
+/// with `Accept`; RFC 9110 12.5.1 makes each range a case-insensitive type
+/// with a weight, so `application/dicom+xml; q=0` is the client REFUSING XML
+/// and must not select it. An absent header keeps the JSON default.
+fn stow_wants_xml(accept: Option<&str>) -> bool {
+    matches!(
+        crate::handlers::accept::select(
+            accept,
+            &["application/dicom+json", "application/dicom+xml"]
+        ),
+        Some("application/dicom+xml")
+    )
+}
+
+/// How a study/series metadata request wants its body framed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataFraming {
+    /// `application/dicom+json`, one array for the whole resource.
+    SingleJson,
+    /// `multipart/related`, one part per instance.
+    Multipart,
+    /// The header named no framing this resource offers -> 406.
+    Unacceptable,
+}
+
+/// Choose the metadata framing from the request `Accept` header.
+///
+/// PS3.18 10.4.4 makes `multipart/related` the Required media type for a
+/// metadata resource and lets the client ask for the single `application/
+/// dicom+json` array instead. RFC 9110 12.5.1 makes each media range a
+/// case-insensitive type with its own weight, so the decision must be a parse,
+/// not a substring search: `Accept: application/dicom+json; example=
+/// "multipart/related"` names JSON with an EXAMPLE of the other form and the
+/// old `contains("multipart/related")` answered multipart anyway.
+///
+/// Multipart is offered first because PS3.18 10.4.4 makes it Required; an
+/// ABSENT header still gets the single array, which is the SQL-era behaviour
+/// the field verified (02.09 incidents) and is not negotiable without
+/// breaking OHIF's `responseType='json'` reader.
+fn metadata_framing(accept: Option<&str>) -> MetadataFraming {
+    if accept.is_none() {
+        return MetadataFraming::SingleJson;
+    }
+    match crate::handlers::accept::select(accept, &["multipart/related", "application/dicom+json"])
+    {
+        Some("multipart/related") => MetadataFraming::Multipart,
+        Some(_) => MetadataFraming::SingleJson,
+        None => MetadataFraming::Unacceptable,
+    }
+}
+
 // -------------------------------------------------------------------------
 // 3. Buffered WADO responders (thumbnail / frame / bulkdata / metadata)
 // -------------------------------------------------------------------------
@@ -1695,13 +1931,15 @@ pub(crate) fn h_wado_series_metadata(ctx: &mut RequestContext<'_>) -> io::Result
     };
     let ka = ctx.keep_alive == KeepAlive::On;
 
-    // Absent Accept OR explicit non-multipart accept (OHIF:
-    // `application/dicom+json`) -> a single JSON array body.
-    let wants_single_json = ctx
-        .accept()
-        .map(|a| !a.to_ascii_lowercase().contains("multipart/related"))
-        .unwrap_or(true);
-    if wants_single_json {
+    // Negotiated per RFC 9110 12.5.1 (see `metadata_framing`): an explicit
+    // exclusion of both forms is a 406 rather than an answer the client
+    // refused, and a parameter VALUE is never read as a media range.
+    let framing = metadata_framing(ctx.accept());
+    if framing == MetadataFraming::Unacceptable {
+        let body = error_body("", "no acceptable metadata representation");
+        return write_resp(ctx.conn, 406, JSON_CT, &body, ka);
+    }
+    if framing == MetadataFraming::SingleJson {
         let mut parts: Vec<Vec<u8>> = Vec::with_capacity(plans.len());
         for plan in &plans {
             if let Some(json) = instance_metadata_json(ctx, plan) {
@@ -1779,13 +2017,15 @@ pub(crate) fn h_wado_study_metadata(ctx: &mut RequestContext<'_>) -> io::Result<
         };
     let ka = ctx.keep_alive == KeepAlive::On;
 
-    // Absent Accept OR explicit non-multipart accept (OHIF:
-    // `application/dicom+json`) -> a single JSON array body.
-    let wants_single_json = ctx
-        .accept()
-        .map(|a| !a.to_ascii_lowercase().contains("multipart/related"))
-        .unwrap_or(true);
-    if wants_single_json {
+    // Negotiated per RFC 9110 12.5.1 (see `metadata_framing`): an explicit
+    // exclusion of both forms is a 406 rather than an answer the client
+    // refused, and a parameter VALUE is never read as a media range.
+    let framing = metadata_framing(ctx.accept());
+    if framing == MetadataFraming::Unacceptable {
+        let body = error_body("", "no acceptable metadata representation");
+        return write_resp(ctx.conn, 406, JSON_CT, &body, ka);
+    }
+    if framing == MetadataFraming::SingleJson {
         let mut parts: Vec<Vec<u8>> = Vec::with_capacity(plans.len());
         for plan in &plans {
             if let Some(json) = instance_metadata_json_at(ctx, plan) {
@@ -1956,7 +2196,7 @@ pub(crate) fn h_wado_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     }
     let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
         Ok(b) => b,
-        Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+        Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
     };
     let mut resp = match crate::handlers::wado_pure::render_thumbnail_from_bytes_any(
         &bytes,
@@ -2128,7 +2368,7 @@ pub(crate) fn h_wado_rendered(ctx: &mut RequestContext<'_>) -> io::Result<()> {
     RENDERED_FULL_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let bytes = match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
         Ok(b) => b,
-        Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+        Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
     };
 
     // STEP 6: render. The renderer re-extracts PixelData from `bytes`.
@@ -2188,6 +2428,7 @@ pub(crate) fn h_wado_rendered(ctx: &mut RequestContext<'_>) -> io::Result<()> {
                     &ctx.state.codec_registry,
                     &ctx.state.transcode_pool,
                     ctx.state.config.transcode.max_megapixels,
+                    target,
                 )
             }
             RenderedAccept::Jpeg => crate::handlers::wado_pure::render_pixels_thumbnail(
@@ -2217,33 +2458,38 @@ enum RenderedAccept {
 
 /// Negotiate the `/rendered` Accept header. `image/png` -> PNG; `image/gif` ->
 /// GIF; `image/jpeg` -> JPEG; absent / `*/*` / `image/*` -> the image/jpeg
-/// default; anything else named -> 406. The new gif test sits after the png
-/// and jpeg tests but before the wildcard test, so no existing header's
-/// outcome changes.
+/// default; anything else named -> 406.
+///
+/// The client's weights decide WHICH image format, not merely its presence
+/// (RFC 9110 12.5.1, PS3.18 10.4.3.1). `image/png; q=0, image/jpeg; q=1` asks
+/// for JPEG and excludes PNG; the pre-fix "first type found in the header wins"
+/// order answered PNG - the very format the client refused.
 fn rendered_accept(accept: Option<&str>) -> Result<RenderedAccept, WadoError> {
     let Some(accept) = accept else {
         return Ok(RenderedAccept::Jpeg);
     };
-    let wildcard = accept_media_type_present_ci(accept, "*/*")
-        || accept_media_type_present_ci(accept, "image/*");
-    let png = accept_media_type_present_ci(accept, "image/png");
-    let gif = accept_media_type_present_ci(accept, "image/gif");
-    let jpeg = accept_media_type_present_ci(accept, "image/jpeg");
-    if png {
-        return Ok(RenderedAccept::Png);
+    // PNG first so an equal-weight header keeps the historical preference
+    // order; `select` only replaces that when a weight is actually higher.
+    match crate::handlers::accept::select(Some(accept), &["image/png", "image/gif", "image/jpeg"]) {
+        Some("image/png") => Ok(RenderedAccept::Png),
+        Some("image/gif") => Ok(RenderedAccept::Gif),
+        Some("image/jpeg") => Ok(RenderedAccept::Jpeg),
+        Some(_) => unreachable!("the offers are the three arms above"),
+        None => {
+            // A wildcard that names no concrete format (`*/*`, `image/*`)
+            // still selects the JPEG default; an excluding wildcard does not,
+            // because `select` returns `None` for it as well.
+            if accept_media_type_present_ci(accept, "*/*")
+                || accept_media_type_present_ci(accept, "image/*")
+            {
+                Ok(RenderedAccept::Jpeg)
+            } else {
+                Err(WadoError::NotAcceptable(
+                    "rendered requires Accept: image/png, image/gif or image/jpeg".to_string(),
+                ))
+            }
+        }
     }
-    if gif {
-        return Ok(RenderedAccept::Gif);
-    }
-    if jpeg {
-        return Ok(RenderedAccept::Jpeg);
-    }
-    if wildcard {
-        return Ok(RenderedAccept::Jpeg);
-    }
-    Err(WadoError::NotAcceptable(
-        "rendered requires Accept: image/png, image/gif or image/jpeg".to_string(),
-    ))
 }
 
 /// Resolve the `/rendered` render size: ABSENT viewport -> NATIVE size (Slim's
@@ -2273,6 +2519,38 @@ fn rendered_viewport(
             crate::handlers::wado::types::MAX_THUMBNAIL_VIEWPORT
         ))),
     }
+}
+
+/// Native `(columns, rows)` of a fully-read instance.
+///
+/// The `/rendered` viewport contract needs a fit box; the instance endpoint has
+/// no `viewport` parameter (PS3.18 8.3.5.1.3 scopes the rendering parameters to
+/// the Rendered Resource), so its box is the native size. A missing geometry
+/// yields `(0, 0)`, which the renderer rejects - better a 500 than a silently
+/// misdimensioned image.
+fn native_pixel_size(bytes: &[u8]) -> (u32, u32) {
+    let parser = clarus_adapters::dicom_rs::DicomRsParser;
+    let cols = parser
+        .extract_tag_value(bytes, (0x0028, 0x0011))
+        .ok()
+        .flatten()
+        .and_then(|v| match v.len() {
+            0 => None,
+            1 => Some(u32::from(v[0])),
+            _ => Some(u32::from(u16::from_le_bytes([v[0], v[1]]))),
+        })
+        .unwrap_or(0);
+    let rows = parser
+        .extract_tag_value(bytes, (0x0028, 0x0010))
+        .ok()
+        .flatten()
+        .and_then(|v| match v.len() {
+            0 => None,
+            1 => Some(u32::from(v[0])),
+            _ => Some(u32::from(u16::from_le_bytes([v[0], v[1]]))),
+        })
+        .unwrap_or(0);
+    (cols, rows)
 }
 
 /// Read a u16 tag value from a bounded header via the parser.
@@ -2339,11 +2617,19 @@ fn thumbnail_request(ctx: &RequestContext<'_>) -> Result<(u32, u32), WadoError> 
     };
 
     // Accept: image/jpeg is the only Thumbnail media type (Table 10.4.4-1).
+    //
+    // The weight matters here too: RFC 9110 12.5.1 makes `q=0` a refusal, so
+    // `image/jpeg; q=0` asks for NOTHING and is a 406, while a wildcard at a
+    // positive weight still selects the default JPEG.
     if let Some(accept) = ctx.accept() {
-        let named = accept_media_type_present_ci(accept, "image/jpeg");
-        let wildcard = accept_media_type_present_ci(accept, "*/*")
-            || accept_media_type_present_ci(accept, "image/*");
-        if !named && !wildcard {
+        let acceptable = match crate::handlers::accept::select(Some(accept), &["image/jpeg"]) {
+            Some(_) => true,
+            None => {
+                accept_media_type_present_ci(accept, "*/*")
+                    || accept_media_type_present_ci(accept, "image/*")
+            }
+        };
+        if !acceptable {
             return Err(WadoError::NotAcceptable(
                 "thumbnail requires Accept: image/jpeg".to_string(),
             ));
@@ -2527,7 +2813,7 @@ pub(crate) fn h_wado_frame_thumbnail(ctx: &mut RequestContext<'_>) -> io::Result
             }
             match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
                 Ok(b) => b,
-                Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+                Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
             }
         }
     };
@@ -2624,7 +2910,7 @@ pub(crate) fn h_wado_frame_rendered(ctx: &mut RequestContext<'_>) -> io::Result<
             }
             match read_cas_bytes(ctx.state, &oref.sha256, oref.storage_tier) {
                 Ok(b) => b,
-                Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+                Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
             }
         }
     };
@@ -3074,9 +3360,21 @@ fn serve_frame_list(
             }
         }
     } else {
+        // A frame record can EXIST and still be undeliverable: its stored
+        // length may exceed `max_frame_bytes` (the bound `read_cas_range`
+        // enforces before it allocates), or the whole blob may be too large
+        // for the bounded fallback. Both are decidable from the manifest
+        // alone, so they are decided NOW - before the head - instead of being
+        // discovered by the write loop, which can only abort a 200 that has
+        // already announced the frame list (PS3.18 10.4.3.1: the payload
+        // holds representations for ALL of the target resources).
+        let max_frame_bytes = ctx.state.config.max_frame_bytes;
         for n in &frames {
-            if !oref.frames.iter().any(|f| f.number == *n) {
+            let Some(rec) = oref.frames.iter().find(|f| f.number == *n) else {
                 return wado_err_response(ctx, WadoError::NotFound(spec.to_string()));
+            };
+            if rec.compressed_len > max_frame_bytes || oref.file_size > max_frame_bytes {
+                return wado_err_response(ctx, WadoError::RangeNotSatisfiable);
             }
         }
     }
@@ -3097,9 +3395,13 @@ fn serve_frame_list(
                 // away mid-response. Close the body honestly by ending the
                 // chunked stream - the client sees a short (invalid) part
                 // rather than a hang.
+                // No terminating zero chunk: a client that trusts the
+                // terminator would accept the truncated part list as complete
+                // (PS3.18 8.7 - a multipart body is the resource). Dropping the
+                // connection is the only honest signal left once the 200 head
+                // is on the wire.
                 crate::clog_warn!(frame = %n, error = %e, "Frame list aborted mid-body");
-                ctx.conn.chunked_end()?;
-                return Ok(());
+                return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
             }
         };
         let media = frame_part_media_type(&declared_ts);
@@ -3115,31 +3417,49 @@ fn serve_frame_list(
     ctx.conn.chunked_end()
 }
 
-/// PS3.18 frame media type for a stored transfer syntax (the table that
-/// dicomweb-client 0.10.4 `api.js` `supportedMediaTypes` mirrors). Returned
-/// by [`h_wado_frame`] to label a pixel part; the caller ALWAYS appends
-/// `; transfer-syntax=<uid>` regardless of the returned media.
+/// PS3.18 frame media type for a stored transfer syntax.
+///
+/// Grounded in `standard/ps3.18/compressed-bulk-data-media-types-8.7.3.3.2.json`
+/// (Table 8.7.3-5). The table maps a transfer syntax to its media type for the
+/// Single Frame Image and Multi-frame Image resource categories, which are
+/// identical, so one match serves both. Returned by [`h_wado_frame`] to label
+/// a pixel part; the caller ALWAYS appends `; transfer-syntax=<uid>`
+/// regardless of the returned media.
+///
+/// The earlier table emitted `image/x-dicom-rle`, `image/x-jls` and
+/// `image/jhc`, and let JPEG XL Lossless fall through to
+/// `application/octet-stream`. PS3.18 8.7.3.3.2 states those x- forms "have
+/// been replaced with the standard Media Types image/dicom-rle and image/jls",
+/// and Table 8.7.3-5 names `image/jphc` and `image/jxl` for the HTJ2K and JPEG
+/// XL families. A client that selects its decoder by media type rejects a part
+/// labelled with a type it does not recognize.
 fn frame_part_media_type(ts: &str) -> &'static str {
     match ts {
-        // JPEG Baseline / Extended / Lossless / JPEG-LS (lossless) -> image/jpeg.
+        // image/jpeg - four JPEG transfer syntaxes share the media type.
         "1.2.840.10008.1.2.4.50"
         | "1.2.840.10008.1.2.4.51"
         | "1.2.840.10008.1.2.4.57"
         | "1.2.840.10008.1.2.4.70" => "image/jpeg",
-        // RLE Lossless.
-        "1.2.840.10008.1.2.5" => "image/x-dicom-rle",
-        // JPEG-LS (near-lossless / lossless).
-        "1.2.840.10008.1.2.4.80" | "1.2.840.10008.1.2.4.81" => "image/x-jls",
-        // JPEG 2000 (lossless / lossy).
+        // image/dicom-rle - RLE Lossless.
+        "1.2.840.10008.1.2.5" => "image/dicom-rle",
+        // image/jls - JPEG-LS (lossless / near-lossless).
+        "1.2.840.10008.1.2.4.80" | "1.2.840.10008.1.2.4.81" => "image/jls",
+        // image/jp2 - JPEG 2000 (lossless-only / lossy).
         "1.2.840.10008.1.2.4.90" | "1.2.840.10008.1.2.4.91" => "image/jp2",
-        // HTJ2K / HTJ2K Lossless / HTJ2K Multicomponent (+ JPEG XL HTJ2K).
-        "1.2.840.10008.1.2.4.201"
-        | "1.2.840.10008.1.2.4.202"
-        | "1.2.840.10008.1.2.4.203"
-        | "3.2.840.10008.1.2.4.96" => "image/jhc",
-        // Uncompressed (Implicit/Explicit LE, Explicit BE, Deflated) and
-        // unrecognized syntaxes -> generic. The transfer-syntax= parameter is
-        // always present, so the loader can still pick a codec.
+        // image/jpx - JPEG 2000 Part 2 multi-component.
+        "1.2.840.10008.1.2.4.92" | "1.2.840.10008.1.2.4.93" => "image/jpx",
+        // image/jphc - HTJ2K lossless, HTJ2K with RPCL options, HTJ2K.
+        "1.2.840.10008.1.2.4.201" | "1.2.840.10008.1.2.4.202" | "1.2.840.10008.1.2.4.203" => {
+            "image/jphc"
+        }
+        // image/jxl - JPEG XL Lossless / JPEG recompression / JPEG XL.
+        "1.2.840.10008.1.2.4.110" | "1.2.840.10008.1.2.4.111" | "1.2.840.10008.1.2.4.112" => {
+            "image/jxl"
+        }
+        // Uncompressed (Implicit/Explicit LE, Explicit BE, Deflated EVRLE) and
+        // any unrecognized syntax -> the Required bulk-data media type. The
+        // transfer-syntax parameter is always present, so the loader can still
+        // pick a codec.
         _ => "application/octet-stream",
     }
 }
@@ -3258,7 +3578,7 @@ pub(crate) fn h_wado_bulkdata(ctx: &mut RequestContext<'_>) -> io::Result<()> {
         ctx.state.config.max_part_header,
     ) {
         Ok(b) => b,
-        Err(_) => return wado_err_response(ctx, WadoError::FileNotFound(oref.sha256)),
+        Err(e) => return wado_err_response(ctx, buffered_read_error(&e, &oref.sha256)),
     };
     let in_head = parser.extract_tag_value(&head, (group, element));
     let body = match in_head {
@@ -3536,6 +3856,9 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
                     sop_class_uid: None,
                     sop_instance_uid: None,
                     reason: reason.clone(),
+                    // The part could not be ingested as DICOM, which is a
+                    // property of the payload the client sent.
+                    class: clarus_ports::stow_response::FailureClass::InvalidInput,
                 };
                 accum.record(
                     &failed,
@@ -3548,7 +3871,8 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
         // instance whose study manifest could not be written is not
         // retrievable, so it is reported as failed (reason 272) instead of
         // counted as stored.
-        let mut manifest_failed = crate::handlers::stow_pure::commit_manifests(ctx.state, &batch);
+        let mut manifest_failed =
+            crate::handlers::stow_pure::commit_manifests(ctx.state, &mut batch);
         manifest_failed.extend(batch.take_manifest_failed());
         for (sop_class_uid, sop_instance_uid) in &manifest_failed {
             let reason = "Failed to write the study manifest for this instance".to_string();
@@ -3576,8 +3900,11 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
         // F1: the studies are durable at this point, so the CAD workitems may
         // be created. Fire-and-forget - a failure is counted, never echoed.
         crate::handlers::cad_workitem::after_durable_stow(ctx.state, &batch);
-        let wants_xml =
-            accept_media_type_present_ci(ctx.accept().unwrap_or(""), "application/dicom+xml");
+        // PS3.18 10.5.1.3: the STOW-RS response representation is negotiated
+        // through `Accept`, and RFC 9110 12.5.1 makes `q=0` a refusal, so the
+        // body must be parsed rather than substring-scanned. An absent header
+        // keeps the JSON default this server has always sent.
+        let wants_xml = stow_wants_xml(ctx.accept());
         let (status, ct, resp_body, warning) =
             crate::handlers::stow_response::build_stow_response(&accum, wants_xml);
         let user = std::str::from_utf8(ctx.user).ok();
@@ -3837,6 +4164,9 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
                     sop_class_uid: None,
                     sop_instance_uid: None,
                     reason: "Instance exceeds size limit".to_string(),
+                    // A request carrying an over-limit instance is refused by
+                    // the size policy applied to the client's payload.
+                    class: clarus_ports::stow_response::FailureClass::InvalidInput,
                 },
                 None,
                 Some(build_failed_sop_entry(
@@ -3941,6 +4271,7 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
                     sop_class_uid: None,
                     sop_instance_uid: None,
                     reason: reason.clone(),
+                    class: clarus_ports::stow_response::FailureClass::InvalidInput,
                 };
                 accum.record(
                     &failed,
@@ -3963,7 +4294,7 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
     // study manifest could not be written is not retrievable, so it moves from
     // the accepted count into FailedSOPSequence (reason 272).
     let manifest_failed = {
-        let mut all = crate::handlers::stow_pure::commit_manifests(ctx.state, &batch);
+        let mut all = crate::handlers::stow_pure::commit_manifests(ctx.state, &mut batch);
         all.extend(batch.take_manifest_failed());
         all
     };
@@ -3988,8 +4319,7 @@ fn stow_core(ctx: &mut RequestContext<'_>, scope: Option<&str>) -> io::Result<()
     // F1: the studies are durable at this point, so the CAD workitems may
     // be created. Fire-and-forget - a failure is counted, never echoed.
     crate::handlers::cad_workitem::after_durable_stow(ctx.state, &batch);
-    let wants_xml =
-        accept_media_type_present_ci(ctx.accept().unwrap_or(""), "application/dicom+xml");
+    let wants_xml = stow_wants_xml(ctx.accept());
     let (status, ct, resp_body, warning) =
         crate::handlers::stow_response::build_stow_response(&accum, wants_xml);
     let user = std::str::from_utf8(ctx.user).ok();
@@ -4034,6 +4364,7 @@ fn build_json_entries(
 ) -> (Option<String>, Option<String>) {
     use crate::handlers::stow_response::{
         build_conflict_failed_sop_entry, build_failed_sop_entry, build_referenced_sop_entry,
+        build_study_conflict_failed_sop_entry,
     };
     use clarus_ports::stow_response::InstanceOutcome;
     match outcome {
@@ -4085,10 +4416,22 @@ fn build_json_entries(
                 )),
             )
         }
+        InstanceOutcome::StudyPatientConflict {
+            sop_class_uid,
+            sop_instance_uid,
+            ..
+        } => (
+            None,
+            Some(build_study_conflict_failed_sop_entry(
+                sop_class_uid,
+                sop_instance_uid,
+            )),
+        ),
         InstanceOutcome::Failed {
             sop_class_uid,
             sop_instance_uid,
             reason,
+            ..
         } => (
             None,
             Some(build_failed_sop_entry(
@@ -4183,28 +4526,54 @@ fn emit_update_event(user: &[u8], ip: &[u8], via: &'static str, ingest: &IngestO
     }
 }
 
-/// Extract the `boundary="..."` value from a multipart Content-Type header.
+/// Extract the `boundary` parameter from a `multipart/*` Content-Type header.
+///
+/// RFC 2046 5.1.1 makes `boundary` a PARAMETER of the media type, and RFC 9110
+/// 8.3.1 defines the parameter list as `; name=value` pairs whose VALUE may be
+/// a quoted string that itself contains `;` and `=`. A search for the text
+/// `boundary=` therefore finds it in the wrong place: given
+/// `multipart/related; note="boundary=wrong"; boundary=real` the pre-fix code
+/// took `wrong` from inside `note`, and the multipart reader could not
+/// recognise the delimiter actually used by the body.
+///
+/// The parameters are walked by NAME here, honouring quoted strings, so a
+/// value can contain anything a quoted string may.
 fn extract_boundary(ct: &str) -> Option<String> {
-    let lower = ct.to_ascii_lowercase();
-    let idx = lower.find("boundary=")?;
-    let rest = &ct[idx + "boundary=".len()..];
-    let rest = rest.trim_start();
-    // Weasis (Java HttpClient) sends compact unquoted params with no space
-    // after `;` (`boundary=weasisDicomBoundary;`): an unquoted value runs to
-    // the next `;` or the end of the header. A quoted value is delimited by
-    // its closing quote, as before.
-    let b = if let Some(stripped) = rest.strip_prefix('"') {
-        let end = stripped.find('"').unwrap_or(stripped.len());
-        &stripped[..end]
-    } else {
-        let end = rest.find(';').unwrap_or(rest.len());
-        rest[..end].trim_end()
-    };
-    if b.is_empty() {
-        None
-    } else {
-        Some(b.to_string())
+    let mut rest = ct;
+    // Skip the media type itself: parameters start after the FIRST `;`.
+    let semi = rest.find(';')?;
+    rest = &rest[semi + 1..];
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches([' ', '\t', ';']);
+        if rest.is_empty() {
+            break;
+        }
+        // `name` runs to `=`; a token without one ends the walk (it is not a
+        // parameter this function can use, and the rest is unparsable).
+        let Some(eq) = rest.find('=') else { break };
+        let name = rest[..eq].trim();
+        let after = rest[eq + 1..].trim_start();
+        // A quoted value ends at the closing quote; anything else ends at the
+        // next `;` (PS3.18 clients send `boundary=weasisDicomBoundary;` with no
+        // space, so the terminator cannot be relied on to be `; `).
+        let (value, next) = if let Some(stripped) = after.strip_prefix('"') {
+            let end = stripped.find('"').unwrap_or(stripped.len());
+            let consumed = after.len() - stripped.len() + end + usize::from(end < stripped.len());
+            (&stripped[..end], &after[consumed..])
+        } else {
+            let end = after.find(';').unwrap_or(after.len());
+            (after[..end].trim_end(), &after[end..])
+        };
+        if name.eq_ignore_ascii_case("boundary") {
+            return if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        rest = next;
     }
+    None
 }
 
 // -------------------------------------------------------------------------
@@ -4457,16 +4826,22 @@ pub(crate) fn publish_event_to_channels(event: &crate::handlers::ups::event_bus:
     let values = crate::push::FilterValues::from_event(event);
 
     let json = ups_event_json(event);
-    let delivered = channels.broadcast(&json, |requester| {
+    let queued = channels.broadcast(&json, |requester| {
         crate::push::subscriptions().accepts_for_with_values(
             requester,
             &event.workitem_uid,
             &values,
         )
     });
-    if delivered > 0 {
-        crate::metrics::WS_EVENTS_DELIVERED
-            .fetch_add(delivered as u64, std::sync::atomic::Ordering::Relaxed);
+    // ENQUEUED, not delivered: `broadcast` only fills a per-channel queue, and
+    // the frame may never reach the socket (the peer can be gone before the
+    // writer picks it up). WS_EVENTS_DELIVERED is incremented exactly once per
+    // event actually written, in `ws_channel_loop`; counting the enqueue here
+    // as well made every delivered event count twice and a lost event still
+    // count as delivered.
+    if queued > 0 {
+        crate::metrics::WS_EVENTS_QUEUED
+            .fetch_add(queued as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -4582,7 +4957,23 @@ pub(crate) fn h_ups_notification_connect(ctx: &mut RequestContext<'_>) -> io::Re
         )
         .as_bytes(),
     );
-    ctx.conn.write_head()?;
+    // The registration above MUST precede the 101 (a state change must not
+    // overtake it), which means a failing write left a channel registered for a
+    // connection that never became a WebSocket. Returning here with `?` would
+    // leak it until the process restarted, and the requester's slot would stay
+    // taken. Close it before propagating, then leave the single exit path below
+    // to handle every post-101 failure.
+    if let Err(e) = ctx.conn.write_head() {
+        crate::ws_channels::channels().close(channel_id);
+        crate::metrics::WS_CHANNELS_OPENED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        crate::clog_info!(
+            requester = %requester,
+            channel_id,
+            error = %e,
+            "UPS notification connection closed before the upgrade completed"
+        );
+        return Err(e);
+    }
 
     // From here on the connection is a WebSocket: every failure path must
     // remove the channel, so they all funnel through one loop exit.
@@ -4758,15 +5149,43 @@ fn log_entry_json(entry: &crate::state::LogEntry) -> String {
 /// Public only so the ap101 allocation gate can call it from its isolated
 /// test binary (`tests/ap101_sse.rs`), where the cost of ONE event is pinned.
 pub fn ups_event_json(e: &crate::handlers::ups::event_bus::UpsEvent) -> String {
+    use clarus_core::query::tag;
     let mut b = Vec::with_capacity(220);
-    b.extend_from_slice(b"{\"00001000\":{\"vr\":\"UI\",\"Value\":[");
-    push_json_str_loose(&mut b, &e.workitem_uid);
-    b.extend_from_slice(b"]},\"00404041\":{\"vr\":\"CS\",\"Value\":[");
-    push_json_str_loose(&mut b, &e.input_readiness);
-    b.extend_from_slice(b"]},\"00741000\":{\"vr\":\"CS\",\"Value\":[");
-    push_json_str_loose(&mut b, &e.new_state);
-    b.extend_from_slice(b"]}}");
+    // Tags and VRs come from `clarus_core::query::tag`, which is grounded in
+    // `standard/ps3.4/ups-cc-2.4-3-event-report.json`. Spelling them again as
+    // JSON literals put a second tag/VR dictionary in the serializer, free to
+    // drift from the one the rest of the server uses.
+    b.push(b'{');
+    push_tag_json(
+        &mut b,
+        tag::AFFECTED_SOP_INSTANCE_UID,
+        "UI",
+        &e.workitem_uid,
+    );
+    b.push(b',');
+    push_tag_json(&mut b, tag::INPUT_READINESS_STATE, "CS", &e.input_readiness);
+    b.push(b',');
+    push_tag_json(&mut b, tag::PROCEDURE_STEP_STATE, "CS", &e.new_state);
+    b.push(b'}');
     String::from_utf8(b).expect("ups_event_json is valid UTF-8")
+}
+
+/// Append `"GGGGEEEE":{"vr":VR,"Value":["<s>"]}` for one Data Set attribute.
+///
+/// The leading `{` of the object is the caller's, so the caller also closes it.
+fn push_tag_json(out: &mut Vec<u8>, tag: u32, vr: &str, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    out.push(b'"');
+    // DICOM JSON spells the key as 8 uppercase hex digits with no separator
+    // (PS3.18 F.2.1), high group first.
+    for shift in [28u32, 24, 20, 16, 12, 8, 4, 0] {
+        out.push(HEX[((tag >> shift) & 0xF) as usize]);
+    }
+    out.extend_from_slice(b"\":{\"vr\":\"");
+    out.extend_from_slice(vr.as_bytes());
+    out.extend_from_slice(b"\",\"Value\":[");
+    push_json_str_loose(out, value);
+    out.extend_from_slice(b"]}");
 }
 
 // -------------------------------------------------------------------------
@@ -4793,14 +5212,22 @@ pub(crate) fn h_admin_logs_stream(ctx: &mut RequestContext<'_>) -> io::Result<()
     ctx.conn.chunked_start(200, "OK", SSE_CT, ka)?;
 
     // Phase 1: buffered snapshot (matches the filter), one SSE frame each.
-    let snapshot = crate::handlers::admin::pure::initial_log_snapshot(ctx.state, &filter);
+    //
+    // The cursor comes back WITH the snapshot: it was sampled after the entries
+    // had been written to the socket, so an entry appended during those writes
+    // sat below the cursor and the poll below never returned it. RFC 9110 does
+    // not apply here, but the same rule does: a stream that promises "recent
+    // then new" must not have a gap. The lock is released before the socket
+    // writes, so a slow client never blocks the log producers.
+    let (snapshot, snapshot_cursor) =
+        crate::handlers::admin::pure::initial_log_snapshot(ctx.state, &filter);
     for entry in &snapshot {
         let json = log_entry_json(entry);
         ctx.conn.chunked_data(&sse_data_frame(&json))?;
     }
 
     // Phase 2: poll every 500 ms for new entries; empty poll emits a tick.
-    let mut cursor = ctx.state.log_buffer.read().map(|b| b.len()).unwrap_or(0);
+    let mut cursor = snapshot_cursor;
     loop {
         std::thread::sleep(Duration::from_millis(500));
         let fresh = crate::handlers::admin::pure::poll_logs(ctx.state, &mut cursor, &filter);
@@ -4853,6 +5280,140 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
+
+    // -- multipart boundary parameter parsing ----------------------------
+
+    /// The `boundary` parameter is found by NAME, not by searching for text.
+    ///
+    /// RFC 9110 8.3.1: a parameter VALUE may be a quoted string, and a quoted
+    /// string may contain `;` and `=`. Searching for the literal `boundary=`
+    /// therefore finds it inside an earlier parameter's VALUE, which is what
+    /// `note="boundary=wrong"` exercises.
+    #[test]
+    fn the_boundary_parameter_is_found_by_name() {
+        assert_eq!(
+            extract_boundary("multipart/related; note=\"boundary=wrong\"; boundary=real"),
+            Some("real".to_string()),
+            "the value of `note` is not the boundary parameter"
+        );
+        // The ordinary quoted spelling, with and without padding.
+        assert_eq!(
+            extract_boundary("multipart/related; boundary=\"abc123\""),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            extract_boundary("multipart/related; type=\"application/dicom\"; boundary=\"abc123\""),
+            Some("abc123".to_string())
+        );
+        // Weasis sends compact unquoted parameters with no space after `;`.
+        assert_eq!(
+            extract_boundary("multipart/related;boundary=weasisDicomBoundary;"),
+            Some("weasisDicomBoundary".to_string())
+        );
+        // A quoted value may itself contain a `;`, which an unquoted split on
+        // `;` would have truncated.
+        assert_eq!(
+            extract_boundary("multipart/related; boundary=\"a;b\""),
+            Some("a;b".to_string())
+        );
+        // The parameter name is case-insensitive (RFC 9110 5.6.1).
+        assert_eq!(
+            extract_boundary("multipart/related; BOUNDARY=xyz"),
+            Some("xyz".to_string())
+        );
+        // Absent, empty, or a header with no parameters at all.
+        assert_eq!(extract_boundary("multipart/related"), None);
+        assert_eq!(extract_boundary("multipart/related; boundary="), None);
+        assert_eq!(extract_boundary("multipart/related; boundary=\"\""), None);
+        // `notboundary` is a different parameter and must not match.
+        assert_eq!(extract_boundary("multipart/related; notboundary=no"), None);
+    }
+
+    // -- PS3.18 8.7.3.3.2 frame media types -------------------------------
+
+    /// Every row of Table 8.7.3-5 that this server can serve maps to the
+    /// STANDARD media type.
+    ///
+    /// Pinned directly rather than only through a multipart body, because the
+    /// superseded spellings (`image/x-dicom-rle`, `image/x-jls`) and the wrong
+    /// HTJ2K type (`image/jhc`) are exactly the kind of drift a `contains`
+    /// assertion elsewhere would not notice.
+    #[test]
+    fn frame_part_media_types_match_ps3_18_table_8_7_3_5() {
+        // image/jpeg covers four transfer syntaxes.
+        for ts in [
+            "1.2.840.10008.1.2.4.50",
+            "1.2.840.10008.1.2.4.51",
+            "1.2.840.10008.1.2.4.57",
+            "1.2.840.10008.1.2.4.70",
+        ] {
+            assert_eq!(frame_part_media_type(ts), "image/jpeg", "{ts}");
+        }
+        // The two types PS3.18 8.7.3.3.2 explicitly renames from the x- forms.
+        assert_eq!(
+            frame_part_media_type("1.2.840.10008.1.2.5"),
+            "image/dicom-rle"
+        );
+        assert_eq!(frame_part_media_type("1.2.840.10008.1.2.4.80"), "image/jls");
+        assert_eq!(frame_part_media_type("1.2.840.10008.1.2.4.81"), "image/jls");
+        // JPEG 2000 and its Part 2 multi-component family.
+        assert_eq!(frame_part_media_type("1.2.840.10008.1.2.4.90"), "image/jp2");
+        assert_eq!(frame_part_media_type("1.2.840.10008.1.2.4.91"), "image/jp2");
+        assert_eq!(frame_part_media_type("1.2.840.10008.1.2.4.92"), "image/jpx");
+        assert_eq!(frame_part_media_type("1.2.840.10008.1.2.4.93"), "image/jpx");
+        // HTJ2K: jphc, not "jhc".
+        for ts in [
+            "1.2.840.10008.1.2.4.201",
+            "1.2.840.10008.1.2.4.202",
+            "1.2.840.10008.1.2.4.203",
+        ] {
+            assert_eq!(frame_part_media_type(ts), "image/jphc", "{ts}");
+        }
+        // JPEG XL lossless must NOT fall through to octet-stream.
+        for ts in [
+            "1.2.840.10008.1.2.4.110",
+            "1.2.840.10008.1.2.4.111",
+            "1.2.840.10008.1.2.4.112",
+        ] {
+            assert_eq!(frame_part_media_type(ts), "image/jxl", "{ts}");
+        }
+        // Uncompressed and unknown syntaxes take the Required bulk-data type;
+        // the transfer-syntax parameter identifies the codec.
+        for ts in [
+            "1.2.840.10008.1.2",
+            "1.2.840.10008.1.2.1",
+            "1.2.840.10008.1.2.2",
+            "1.2.840.10008.1.2.1.99",
+            "9.9.9.9",
+        ] {
+            assert_eq!(
+                frame_part_media_type(ts),
+                "application/octet-stream",
+                "{ts}"
+            );
+        }
+    }
+
+    /// No frame part is ever labelled with a superseded or invented type.
+    #[test]
+    fn no_frame_part_uses_a_superseded_media_type() {
+        for ts in [
+            "1.2.840.10008.1.2.5",
+            "1.2.840.10008.1.2.4.80",
+            "1.2.840.10008.1.2.4.81",
+            "1.2.840.10008.1.2.4.201",
+            "1.2.840.10008.1.2.4.202",
+            "1.2.840.10008.1.2.4.203",
+            "1.2.840.10008.1.2.4.110",
+        ] {
+            let media = frame_part_media_type(ts);
+            assert!(
+                !media.starts_with("image/x-"),
+                "{ts} still uses the experimental x- form: {media}"
+            );
+            assert_ne!(media, "image/jhc", "{ts} uses the wrong HTJ2K type");
+        }
+    }
 
     // -- D4: frame lists -------------------------------------------------
 
@@ -4924,23 +5485,27 @@ mod tests {
 
     // -- Group 1: sendfile (temp file + loopback; copy_loop fallback) -----
 
-    /// The media type this crate serves a transcoded body under names the
-    /// transfer syntax those bytes are actually in.
+    /// The media type the server ADVERTISES names the transfer syntax of the
+    /// bytes it is sending, and it is the PRODUCTION formatter that is tested.
     ///
-    /// `WadoResp::content_type` is a `&'static str` and `concat!` needs
-    /// literals, so the UID is written once here rather than derived. This
-    /// test is what keeps that copy honest: a drift between it and
-    /// `ts_uid::EXPLICIT_VR_LE` fails the build's tests instead of shipping a
-    /// response whose header contradicts its body.
+    /// The previous assertion compared a test-only constant with a second
+    /// fixture, so it stayed green if `dicom_media_type` stopped emitting the
+    /// `transfer-syntax` parameter altogether - a header that lies about its
+    /// body, which is exactly the regression a viewer decodes wrongly from
+    /// (cornerstone picks its codec from this parameter). Calling the function
+    /// the handlers call removes that blind spot; the constant it used is gone.
     #[test]
     fn the_served_media_type_names_the_explicit_vr_little_endian_syntax() {
         assert_eq!(
-            DICOM_EVRLE_CT,
-            format!(
-                "application/dicom; transfer-syntax={}",
-                clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE
-            ),
-            "the served media type has to name the syntax the bytes are in"
+            dicom_media_type(clarus_adapters::codec::ts_uid::EXPLICIT_VR_LE),
+            "application/dicom; transfer-syntax=1.2.840.10008.1.2.1",
+            "the advertised media type must name the syntax the bytes are in"
+        );
+        // A different stored syntax must be advertised as itself, so the
+        // parameter is driven by the argument and not hardcoded.
+        assert_eq!(
+            dicom_media_type(clarus_adapters::codec::ts_uid::RLE_LOSSLESS),
+            "application/dicom; transfer-syntax=1.2.840.10008.1.2.5"
         );
     }
 

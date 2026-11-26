@@ -24,9 +24,17 @@ pub const RESPONSIBLE_PERSON: DicomTag = (0x0010, 0x2297);
 
 // -- Character encoding ----------------------------------------------------
 
-/// SpecificCharacterSet - defines the character encoding for all
-/// string values in the dataset.
-/// DICOM PS3.5 Section 6.1.1: MUST be the first element in the dataset.
+/// SpecificCharacterSet - extends or replaces the default character repertoire.
+///
+/// PS3.5 6.1.2.2 scopes it to SEVEN text VRs - SH, LO, UC, ST, LT, UT and PN -
+/// and says the replacement "does not apply to other textual Value
+/// Representations (AE and CS)". It is not a statement about every string VR:
+/// UI, DA, TM, DT, IS, DS and AS keep their own restricted repertoires.
+///
+/// The attribute is only needed when a value actually leaves the default
+/// repertoire, and its position is ordinary tag order (PS3.5 7.1), not a
+/// special "first element" rule - so a text element can precede it.
+/// See `standard/ps3.5/specific-character-set-scope-6.1.2.2.json`.
 pub const SPECIFIC_CHARACTER_SET: DicomTag = (0x0008, 0x0005);
 
 // -- Study-level tags -----------------------------------------------------

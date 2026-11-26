@@ -116,16 +116,6 @@ server:
   identity_user: \"clinfer\"
 engine:
   cache_dir: \"./cache\"
-models:
-  m:
-    script: \"proc.py\"
-rules:
-  - match:
-      modality: [DX]
-    model: \"m\"
-    result:
-      kind: pr
-      color: \"#FF3B30\"
 default_rule: cancel
 ";
 

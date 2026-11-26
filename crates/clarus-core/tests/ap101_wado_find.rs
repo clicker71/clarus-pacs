@@ -116,7 +116,13 @@ fn find_instance_never_allocates() {
     assert_eq!(found.storage_tier, TIER_HOT);
     assert_eq!(found.file_size, 2_000_000);
 
-    // A miss is equally allocation-free.
-    let (zero_alloc, _) = allocate_env(|| manifest.find_instance("9.9.9.9"));
+    // A miss is equally allocation-free, AND must actually miss. Discarding
+    // the result let a lookup that returned the first instance for an unknown
+    // UID pass this gate.
+    let (zero_alloc, miss) = allocate_env(|| manifest.find_instance("9.9.9.9"));
     assert!(zero_alloc, "Manifest::find_instance miss must not allocate");
+    assert!(
+        miss.is_none(),
+        "an unknown SOPInstanceUID must not resolve to any instance"
+    );
 }

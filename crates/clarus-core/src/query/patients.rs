@@ -105,16 +105,36 @@ pub fn find_recent_patients(
     limit: usize,
     birth_range: Option<(Option<u64>, Option<u64>)>,
 ) -> Result<Vec<PatientRow>, String> {
+    let (rows, _skipped) = find_recent_patients_with_skips(manifests_dir, limit, birth_range)?;
+    Ok(rows)
+}
+
+/// [`find_recent_patients`] that also reports how many studies it could not
+/// read.
+///
+/// A study whose manifest will not decode is skipped so one bad file cannot
+/// fail the whole patient list. That skip is deliberate, but it is
+/// indistinguishable from "the study is not there" once the rows are returned,
+/// and a persistent read failure (a permission error, an I/O error under a
+/// file that still exists) reaches the same branch. The list stays correct and
+/// the count is handed back for a diagnostic sink, so an operator can tell a
+/// short answer from a complete one.
+pub fn find_recent_patients_with_skips(
+    manifests_dir: &std::path::Path,
+    limit: usize,
+    birth_range: Option<(Option<u64>, Option<u64>)>,
+) -> Result<(Vec<PatientRow>, usize), String> {
     // A fresh store legitimately has no manifests dir yet - an empty result,
     // not an error. Real failures (permission denied, not-a-directory, ...)
     // still propagate so the handler 500s honestly.
     let dir = match std::fs::read_dir(manifests_dir) {
         Ok(dir) => dir,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(format!("cannot read manifests dir: {e}")),
     };
 
     let mut by_patient: HashMap<String, Acc> = HashMap::new();
+    let mut skipped = 0usize;
     for entry in dir {
         let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
         let fname = entry.file_name().to_string_lossy().into_owned();
@@ -137,8 +157,12 @@ pub fn find_recent_patients(
             //
             // Silent here on purpose: `clarus-core` has no logger, and this
             // runs once per patient-list request - a `println!` would be both
-            // a format the server cannot parse and a line per row.
-            Err(_) => continue,
+            // a format the server cannot parse and a line per row. The count
+            // returned alongside the rows is the channel.
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         let pid = attr_text(&study.study.attrs, tag::PATIENT_ID);
         if pid.is_empty() {
@@ -149,7 +173,7 @@ pub fn find_recent_patients(
         let arrived = study.sys.arrived_at;
 
         let acc = by_patient.entry(pid).or_insert_with(|| Acc {
-            name: pname,
+            name: pname.clone(),
             max_arrival: 0,
             count: 0,
             birth: None,
@@ -158,6 +182,20 @@ pub fn find_recent_patients(
         // StudyDate but a newer arrived_at must still win the grouping.
         if arrived > acc.max_arrival {
             acc.max_arrival = arrived;
+        }
+        // The displayed name must not depend on directory order.
+        //
+        // `read_dir` gives no ordering guarantee, so taking the FIRST study's
+        // name meant a patient whose earliest-listed study omits (0010,0010)
+        // showed an empty name even when a later study supplied one - and two
+        // runs over the same archive could display different names. An empty
+        // name is filled from any study that has one; between two DIFFERENT
+        // non-empty names the lexicographically smaller wins, so the choice is
+        // deterministic rather than whichever file the filesystem listed first.
+        // An empty captured name is filled from any study that has one; between
+        // two DIFFERENT non-empty names the lexicographically smaller wins.
+        if !pname.is_empty() && (acc.name.is_empty() || pname < acc.name) {
+            acc.name.clone_from(&pname);
         }
         if acc.birth.is_none() {
             acc.birth = attr_birth(&study.study.attrs, tag::PATIENT_BIRTH_DATE);
@@ -193,7 +231,7 @@ pub fn find_recent_patients(
     for (i, r) in rows.iter_mut().enumerate() {
         r.patient_id = i as i64;
     }
-    Ok(rows)
+    Ok((rows, skipped))
 }
 
 #[cfg(test)]
@@ -205,9 +243,8 @@ mod tests {
     #[test]
     fn retrospective_with_old_study_date_rises_to_top() {
         // A fresh arrival with a very old StudyDate must still win by arrival.
-        let dir = std::env::temp_dir().join("clarus_ep14_retro");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
         // petrov arrived later (epoch 200) but has an older StudyDate than ivanov.
         write_test_manifest(&dir, "1.2.3.1", "ivanov", 100, "20260101");
         write_test_manifest(&dir, "1.2.3.2", "petrov", 200, "19990101");
@@ -220,9 +257,8 @@ mod tests {
 
     #[test]
     fn re_stow_updates_arrival_and_increments_count() {
-        let dir = std::env::temp_dir().join("clarus_ep14_restow");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
         write_test_manifest(&dir, "1.2.3.1", "ivanov", 100, "20260101");
         write_test_manifest(&dir, "1.2.3.2", "ivanov", 300, "20260102");
 
@@ -232,11 +268,32 @@ mod tests {
         assert_eq!(rows[0].study_count, 2);
     }
 
+    /// Re-STOWing the SAME StudyInstanceUID replaces the study in place: the
+    /// patient keeps ONE study and the newest arrival, rather than being
+    /// counted twice.
+    ///
+    /// The two-study case above is an aggregation test and does not exercise
+    /// this: with distinct UIDs a count of 2 is correct either way, so a
+    /// re-STOW that duplicated the row would pass it.
+    #[test]
+    fn a_same_uid_re_stow_replaces_the_row_and_keeps_one_study() {
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
+
+        write_test_manifest(&dir, "1.2.9.1", "ivanov", 100, "20260101");
+        // Same UID, newer arrival: the manifest is rewritten in place.
+        write_test_manifest(&dir, "1.2.9.1", "ivanov", 500, "20260101");
+
+        let rows = find_recent_patients(&dir, 10, None).unwrap();
+        assert_eq!(rows.len(), 1, "one manifest is one patient");
+        assert_eq!(rows[0].last_arrival, 500, "the re-STOW's arrival must win");
+        assert_eq!(rows[0].study_count, 1, "one study UID is one study");
+    }
+
     #[test]
     fn enforces_limit_and_binds_rank() {
-        let dir = std::env::temp_dir().join("clarus_ep14_limit");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
         write_test_manifest(&dir, "1.2.3.1", "a", 100, "20260201");
         write_test_manifest(&dir, "1.2.3.2", "b", 200, "20260202");
         let rows = find_recent_patients(&dir, 1, None).unwrap();
@@ -247,9 +304,8 @@ mod tests {
 
     #[test]
     fn empty_manifests_dir_returns_empty() {
-        let dir = std::env::temp_dir().join("clarus_ep14_empty");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
         assert!(find_recent_patients(&dir, 10, None).unwrap().is_empty());
     }
 
@@ -258,8 +314,10 @@ mod tests {
         // Fresh store: the manifests dir does not exist yet. That is a legal
         // empty state, not a server error. RED pre-fix: read_dir on the
         // missing dir returned Err -> handler 500. GREEN post-fix: Ok(empty).
-        let dir = std::env::temp_dir().join("clarus_ep14_missing");
-        let _ = std::fs::remove_dir_all(&dir); // ensure absent
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        // A child path the test never creates: the parent exists, so a
+        // NotFound can only mean the manifests dir itself is absent.
+        let dir = tmp.path().join("manifests");
         assert!(!dir.exists(), "precondition: manifests dir must be absent");
         let rows = find_recent_patients(&dir, 10, None);
         assert!(
@@ -270,9 +328,8 @@ mod tests {
 
     #[test]
     fn old_manifest_without_arrived_at_sorts_last() {
-        let dir = std::env::temp_dir().join("clarus_ep14_old");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
         // New patient with a real arrival.
         write_test_manifest(&dir, "1.2.3.1", "fresh", 500, "20260201");
         // "Old" manifest - encodes arrived_at as 0 (equivalent to a pre-S6c
@@ -289,9 +346,8 @@ mod tests {
     /// and the study_count stays the patient's total (not the matched subset).
     #[test]
     fn birth_date_range_filters_patients() {
-        let dir = std::env::temp_dir().join("clarus_ep14_birth");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
         // ivanov 19800101 (arrived 100), petrov 19900101 (arrived 200),
         // smith without a birth date (arrived 300).
         write_test_manifest_birth(&dir, "1.2.3.1", "ivanov", 100, "20260101", Some(19_800_101));
@@ -314,13 +370,113 @@ mod tests {
         let uids: Vec<&str> = rows.iter().map(|r| r.patient_uid.as_str()).collect();
         assert_eq!(uids, vec!["petrov", "ivanov"]);
 
-        // A patient with two studies (one in range) keeps its total count.
-        write_test_manifest_birth(&dir, "1.2.3.4", "ivanov", 400, "20260201", Some(19_800_101));
+        // A patient with two studies keeps its total count. The SECOND study
+        // carries NO birth date, so the count can only reach 2 when the
+        // per-study rows are aggregated BEFORE the birth filter: a regression
+        // that dropped studies first would leave ivanov with one row in range
+        // and a count of 1, and this assertion would catch it.
+        write_test_manifest_birth(&dir, "1.2.3.4", "ivanov", 400, "20260201", None);
         let rows =
             find_recent_patients(&dir, 10, Some((Some(19_800_101), Some(19_800_101)))).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].patient_uid, "ivanov");
         assert_eq!(rows[0].study_count, 2);
+        assert_eq!(
+            rows[0].last_arrival, 400,
+            "the undated study must still contribute its arrival"
+        );
+    }
+
+    /// A study that will not decode is skipped and COUNTED, so a short answer
+    /// is distinguishable from a complete one.
+    #[test]
+    fn an_undecodable_manifest_is_reported_as_a_skip_not_absorbed() {
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
+        write_test_manifest(&dir, "1.2.4.1", "ivanov", 100, "20260101");
+        // A valid study-UID stem whose bytes are not a manifest.
+        std::fs::write(dir.join("1.2.4.2.manifest"), b"not a manifest").unwrap();
+
+        let (rows, skipped) = find_recent_patients_with_skips(&dir, 10, None).unwrap();
+        assert_eq!(rows.len(), 1, "the healthy patient still lists");
+        assert_eq!(skipped, 1, "the undecodable study must be reported");
+
+        // A clean directory reports no skips, so the counter is not constant.
+        let clean_tmp = tempfile::tempdir().expect("a scratch dir");
+        let clean = clean_tmp.path().to_path_buf();
+        write_test_manifest(&clean, "1.2.4.3", "petrov", 200, "20260102");
+        let (rows, skipped) = find_recent_patients_with_skips(&clean, 10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(skipped, 0);
+    }
+
+    /// A study that omits PatientName must not mask a name captured from the
+    /// patient's other studies, and two different names must resolve the same
+    /// way regardless of directory order.
+    #[test]
+    fn an_empty_patient_name_does_not_mask_a_captured_one() {
+        let tmp = tempfile::tempdir().expect("a scratch dir");
+        let dir = tmp.path().to_path_buf();
+
+        // The OLDER arrival carries the empty name; the newer one has a name.
+        write_test_manifest_with_name(&dir, "1.2.5.1", "ivanov", "", 100, "20260101");
+        write_test_manifest_with_name(&dir, "1.2.5.2", "ivanov", "IVANOV^IVAN", 200, "20260102");
+
+        let rows = find_recent_patients(&dir, 10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].patient_name, "IVANOV^IVAN",
+            "an empty name must be filled from another study"
+        );
+
+        // Two different non-empty names: the choice is deterministic (the
+        // lexicographically smaller), not whichever the filesystem listed.
+        write_test_manifest_with_name(&dir, "1.2.5.3", "ivanov", "AAA^FIRST", 300, "20260103");
+        let rows = find_recent_patients(&dir, 10, None).unwrap();
+        assert_eq!(
+            rows[0].patient_name, "AAA^FIRST",
+            "the tie-break must not depend on read_dir order"
+        );
+
+        // A patient whose ONLY study has an empty name still lists as empty.
+        write_test_manifest_with_name(&dir, "1.2.5.4", "petrov", "", 400, "20260104");
+        let rows = find_recent_patients(&dir, 10, None).unwrap();
+        let petrov = rows
+            .iter()
+            .find(|r| r.patient_uid == "petrov")
+            .expect("petrov listed");
+        assert_eq!(petrov.patient_name, "");
+    }
+
+    fn write_test_manifest_with_name(
+        dir: &std::path::Path,
+        uid: &str,
+        pid: &str,
+        name: &str,
+        arrived_at: u64,
+        date: &str,
+    ) {
+        let m = Manifest {
+            sys: SysHeader {
+                version: 1,
+                storage_tier: TIER_HOT,
+                total_pixel_bytes: 0,
+                arrived_at,
+            },
+            study: StudyQido {
+                attrs: vec![
+                    (tag::PATIENT_ID, AttrValue::Text(pid.to_string())),
+                    (tag::PATIENT_NAME, AttrValue::Text(name.to_string())),
+                    (
+                        tag::STUDY_DATE,
+                        AttrValue::UInt(date.parse().unwrap_or_default()),
+                    ),
+                ],
+                ..Default::default()
+            },
+            series: vec![],
+        };
+        write_manifest_file(&dir.join(format!("{uid}.manifest")), &m).expect("write manifest");
     }
 
     fn write_test_manifest_birth(

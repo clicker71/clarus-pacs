@@ -19,9 +19,26 @@
 //!
 //! # Staleness metric
 //!
-//! [`reconcile_idx`] returns how many accelerator entries it added plus how
-//! many manifests it scanned. A caller sets `clarus_idx_stale_objects` to the
-//! number of *added* entries; `0` after a pass means the tier is consistent.
+//! [`reconcile_idx`] returns a [`ReconcileReport`]. A caller sets
+//! `clarus_idx_stale_objects` to
+//!
+//! ```text
+//! append_failed + corrupt_entries_needing_repair
+//! ```
+//!
+//! NOT to `entries_added`, and not to `entries_added + append_failed` either.
+//! The question that counter answers is "how much repair is still NEEDED", so
+//! an entry that this pass successfully appended is gone from it (the work was
+//! done), while an entry that was missing and whose append failed is still
+//! outstanding. Counting `entries_added` inverted the meaning: a pass that
+//! repaired everything reported the full backlog, and the next clean pass
+//! reported `0` only because there was nothing left to find - the two were
+//! indistinguishable from the number alone.
+//!
+//! `corrupt` is part of the backlog too: a manifest that cannot be decoded has
+//! not had its row rebuilt and will be re-found on every pass. It is reported
+//! separately from `append_failed` because the operator's remedy differs
+//! (fix or refetch the manifest, not the index).
 
 use crate::idx::modality;
 use crate::idx::modality::ModalityIndex;
@@ -73,12 +90,22 @@ impl From<io::Error> for ReconcileError {
     }
 }
 
+/// The `(modality, day)` pair naming one modality-index bucket.
+///
+/// Both halves are owned because the walk carries them out of `entries` while
+/// the bucket's writer is open.
+type BucketKey = (String, [u8; 8]);
+
 /// Walk `manifests/` and rebuild missing modality-index entries.
 ///
 /// For every study manifest, if its study UID is not already present in
 /// `modality/{MOD}/YYYYMMDD.idx` (where `YYYYMMDD` comes from the manifest's
 /// `StudyDate`), it is appended. Returns a [`ReconcileReport`] of what was
-/// scanned and added.
+/// scanned, added, and left needing repair.
+///
+/// The report separates work DONE (`entries_added`) from work STILL NEEDED
+/// (`append_failed`, `corrupt`); see the module docs for how a caller derives
+/// the staleness gauge from it.
 ///
 /// A missing `manifests/` directory is an error (the caller decides whether
 /// that is fatal); an empty directory yields a zero report.
@@ -86,8 +113,24 @@ pub fn reconcile_idx(
     manifests_dir: &Path,
     idx_dir: &Path,
 ) -> Result<ReconcileReport, ReconcileError> {
-    if !manifests_dir.is_dir() {
-        return Err(ReconcileError::NoManifestDir(manifests_dir.to_path_buf()));
+    // `is_dir()` folds EVERY failure into `false`, so an archive the process
+    // cannot traverse reported `NoManifestDir` - "there is nothing to
+    // reconcile" - when the truth was "this archive cannot be read". The two
+    // are opposite diagnoses for an operator. Opening the directory directly
+    // and mapping only `NotFound` keeps the absence case and surfaces the
+    // access failure.
+    match std::fs::read_dir(manifests_dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(ReconcileError::NoManifestDir(manifests_dir.to_path_buf()));
+        }
+        // A path that exists but is not a directory is also "nothing to
+        // reconcile" in the caller's sense, and `read_dir` reports it as an
+        // error of its own kind; keep the original variant for it.
+        Err(e) if e.kind() == io::ErrorKind::NotADirectory => {
+            return Err(ReconcileError::NoManifestDir(manifests_dir.to_path_buf()));
+        }
+        Err(e) => return Err(ReconcileError::Io(e)),
     }
 
     let mut report = ReconcileReport::default();
@@ -147,16 +190,12 @@ pub fn reconcile_idx(
 
     // Append each missing study once, de-duplicated.
     //
-    // The bucket is read ONCE per (modality, day) and kept in memory for the
-    // pass. Reading it per entry made reconciliation quadratic in the number
+    // The bucket is read ONCE per (modality, day), when the walk enters that
+    // group. Reading it per entry made reconciliation quadratic in the number
     // of studies in a bucket - a day's modality file with thousands of rows
     // was re-read for every study on that day, which is exactly the O(N^2)
-    // this walk exists to avoid. The memo is updated after a successful
-    // append so a second manifest naming the same UID cannot add it twice.
-    let mut buckets: std::collections::HashMap<
-        (String, [u8; 8]),
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
+    // this walk exists to avoid.
+    //
     // The single live writer: opened for one (modality, day) and dropped when
     // the bucket changes. A `DailyIndexSet` is NOT usable here: it carries a
     // single active day and treats every earlier day as immutable, so walking
@@ -167,17 +206,54 @@ pub fn reconcile_idx(
     // writer: it must reach any day it was asked about, so it opens the day
     // files directly - but, with `entries` sorted by (modality, day), it never
     // needs more than one open at a time.
-    let mut current: Option<((String, [u8; 8]), ModalityIndex)> = None;
-    for (modality_str, day, uid) in entries {
-        let key = (modality_str.clone(), day);
-        let bucket = buckets.entry(key.clone()).or_insert_with(|| {
+    let mut current: Option<(BucketKey, ModalityIndex)> = None;
+    // Only the bucket being worked on keeps its membership set. `entries` is
+    // sorted by (modality, day), so a completed group is never revisited and
+    // holding every earlier bucket's decoded UIDs only grew the map for the
+    // length of the pass - a rebuild over a large archive held one `HashSet`
+    // per day of every modality in RAM at once.
+    let mut live: Option<(BucketKey, std::collections::HashSet<String>)> = None;
+    let mut i = 0;
+    while i < entries.len() {
+        let (modality_str, day, uid) = entries[i].clone();
+        let key = (modality_str, day);
+        if live.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+            // Read the new bucket ONCE. A read failure is NOT an empty bucket:
+            // `unwrap_or_default()` made both repair paths proceed as though no
+            // UID were present, so the fixer could append a duplicate row and
+            // the batch counted writes made without checking membership. Only
+            // "the file does not exist" is a legitimate empty bucket.
             #[cfg(test)]
             BUCKET_READS.with(|c| c.set(c.get() + 1));
-            modality::read_study_uids(idx_dir, &key.0, &key.1)
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        });
+            let members: std::collections::HashSet<String> =
+                match modality::read_study_uids(idx_dir, &key.0, &key.1) {
+                    Ok(v) => v.into_iter().collect(),
+                    // A bucket file that does not exist yet is genuinely empty.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Default::default(),
+                    Err(_) => {
+                        // Every remaining study in this bucket is un-reconciled
+                        // this pass, and the caller must keep reporting the tier
+                        // stale. `entries` is sorted by (modality, day), so they
+                        // are the whole contiguous run from `i`.
+                        let mut run = 0usize;
+                        while i + run < entries.len()
+                            && entries[i + run].0 == key.0
+                            && entries[i + run].1 == key.1
+                        {
+                            run += 1;
+                        }
+                        report.append_failed += run as u64;
+                        i += run;
+                        continue;
+                    }
+                };
+            live = Some((key.clone(), members));
+        }
+        i += 1;
+        let bucket = &mut live
+            .as_mut()
+            .expect("a live bucket is loaded for this key")
+            .1;
         // Check presence to avoid duplicate rows on repeated reconciles.
         if bucket.contains(&uid) {
             continue;
@@ -204,7 +280,10 @@ pub fn reconcile_idx(
         if writer.append(filled).is_ok() {
             report.entries_added += 1;
             // Only a row that actually landed joins the membership set.
-            bucket.insert(uid);
+            live.as_mut()
+                .expect("a live bucket is loaded for this key")
+                .1
+                .insert(uid);
         } else {
             // The row is still missing: the caller must keep reporting the tier
             // as stale instead of reading `entries_added == 0` as "consistent".
@@ -229,6 +308,9 @@ thread_local! {
     static BUCKET_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 /// Format an integer `YYYYMMDD` as an 8-byte day key.
+///
+/// Callers must already have established that `d` has at most eight decimal
+/// digits; [`day_key_from_yyyymmdd`] is the checked entry point.
 fn u64_to_day_key(mut d: u64) -> [u8; 8] {
     let mut out = [b'0'; 8];
     let mut i = 8;
@@ -243,12 +325,35 @@ fn u64_to_day_key(mut d: u64) -> [u8; 8] {
     out
 }
 
-/// Public wrapper around [`u64_to_day_key`] so the server-side runtime fixer
-/// can convert a manifest's `StudyDate` (0008,0020) into the day key used by
-/// the modality-idx bucket files without re-implementing the conversion.
-pub fn day_key_from_yyyymmdd(date_yyyymmdd: u64) -> [u8; 8] {
-    u64_to_day_key(date_yyyymmdd)
+/// Convert a manifest `StudyDate` (0008,0020) into a bucket day key.
+///
+/// ERRORS on a value that is not exactly eight decimal digits. The old
+/// signature returned `[u8; 8]` unconditionally and simply kept the LOW eight
+/// digits, so `120260101` produced the key `20260101` - the same bucket as a
+/// completely different date. Reconciliation feeds stored `UInt` dates through
+/// here, so a corrupt or misencoded date silently filed a row under someone
+/// else's day and the lookups for both were then wrong.
+///
+/// A MISSING date is the caller's decision (`Option`), not this function's:
+/// callers that have no date must not call it at all.
+pub fn day_key_from_yyyymmdd(date_yyyymmdd: u64) -> Result<[u8; 8], InvalidStudyDate> {
+    if date_yyyymmdd == 0 || date_yyyymmdd > 99_999_999 {
+        return Err(InvalidStudyDate(date_yyyymmdd));
+    }
+    Ok(u64_to_day_key(date_yyyymmdd))
 }
+
+/// A `StudyDate` that cannot be a `YYYYMMDD` day key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidStudyDate(pub u64);
+
+impl std::fmt::Display for InvalidStudyDate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StudyDate {} is not an eight-digit YYYYMMDD key", self.0)
+    }
+}
+
+impl std::error::Error for InvalidStudyDate {}
 
 /// Append one study's modality-idx row if it is missing (runtime heal).
 ///
@@ -271,7 +376,16 @@ pub fn heal_modality_row_if_missing(
         // No modality -> no modality accelerator row (mirrors reconcile_idx).
         return Ok(false);
     }
-    let bucket = crate::idx::modality::read_study_uids(idx_dir, modality, &day).unwrap_or_default();
+    // A read failure is NOT an empty bucket. `unwrap_or_default()` made the
+    // fixer proceed as though no UID were present and append a duplicate row -
+    // the one thing this function exists to prevent. Only "the file does not
+    // exist yet" is a legitimate empty bucket; anything else is reported to the
+    // caller so the tier stays reported stale rather than silently duplicated.
+    let bucket = match crate::idx::modality::read_study_uids(idx_dir, modality, &day) {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
     if bucket.iter().any(|u| u == study_uid) {
         return Ok(false);
     }
@@ -340,6 +454,61 @@ mod tests {
             reconcile_idx(&missing, &dir.path().join("idx")),
             Err(ReconcileError::NoManifestDir(_))
         ));
+    }
+
+    /// An untraversable manifests directory is `Io`, not `NoManifestDir`.
+    ///
+    /// The old check was `is_dir()`, which reports `false` for a permission
+    /// failure exactly as it does for an absent path, so an archive nobody
+    /// could read was diagnosed as "there is nothing to reconcile". The two
+    /// call for opposite operator actions.
+    ///
+    /// The unreadable path must be the *parent chain*, not the manifests
+    /// directory itself: `stat` on a mode-000 directory succeeds (only its
+    /// contents are hidden), so `is_dir()` still returns `true` and the old
+    /// code reached `read_dir` and produced the same `Io` - a fixture that
+    /// left the bug untested. Making the GRANDPARENT untraversable means
+    /// `stat` itself fails, which is precisely where `is_dir()` collapses the
+    /// error into `false`.
+    ///
+    /// `chmod` does not bind for root, so the precondition is asserted rather
+    /// than assumed; the test skips loudly when it cannot be set up.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_manifest_dir_is_io_not_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = dir.path().join("inner");
+        let manifests = inner.join("manifests");
+        std::fs::create_dir_all(&manifests).expect("mkdir");
+
+        let no_access = std::fs::Permissions::from_mode(0o000);
+        let full = std::fs::Permissions::from_mode(0o755);
+
+        // Precondition: the mode must actually deny traversal to this process.
+        std::fs::set_permissions(&inner, no_access).expect("chmod");
+        let blocked = std::fs::metadata(&manifests).is_err();
+        if !blocked {
+            std::fs::set_permissions(&inner, full).expect("chmod");
+            eprintln!("skipped: process can traverse a mode-000 directory (running as root)");
+            return;
+        }
+
+        let res = reconcile_idx(&manifests, &dir.path().join("idx"));
+        // Restore before asserting so a failure does not leave an unreadable
+        // directory behind for `TempDir`'s cleanup.
+        std::fs::set_permissions(&inner, full).expect("chmod");
+
+        match res {
+            Err(ReconcileError::Io(e)) => {
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            }
+            Err(ReconcileError::NoManifestDir(p)) => {
+                panic!("an unreadable dir was reported as absent: {p:?}")
+            }
+            Ok(r) => panic!("an unreadable dir produced a report: {r:?}"),
+        }
     }
 
     /// Interleaved (modality, day) order must still place each study in its OWN
@@ -478,6 +647,122 @@ mod tests {
         assert!(
             uids.iter().any(|u| u == "1.2.torn"),
             "the torn fragment must be readable: {uids:?}"
+        );
+    }
+
+    /// A bucket that exists but cannot be READ is not an empty bucket.
+    ///
+    /// `unwrap_or_default()` mapped every read error onto "no UID present", so
+    /// an unreadable `.idx` made the pass append the row again - duplicating
+    /// every study in the bucket - and reported a clean tier. The heal must
+    /// propagate the read failure instead.
+    ///
+    /// The bucket is made unreadable by occupying its path with a DIRECTORY,
+    /// which fails `read` with a non-`NotFound` kind on every platform.
+    ///
+    /// The assertion is on error PROVENANCE, not on `is_err()` or on the kind
+    /// alone: the append path collides with the very same directory and fails
+    /// with the same `PermissionDenied` kind (on Windows) or `IsADirectory`
+    /// (on unix), so a weaker assertion passes with the guard removed - it
+    /// would be observing the append's failure, not the read's. The heal wraps
+    /// an append failure with `io::Error::other`, whose message begins
+    /// `modality index I/O error:`, while a propagated read failure is
+    /// returned bare. Asserting the message does NOT carry that prefix pins
+    /// the failure to the read.
+    #[test]
+    fn heal_reports_a_read_failure_instead_of_appending_a_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let idx = dir.path().join("idx");
+        let day = *b"20260101";
+
+        let path = modality::file_path(&idx, "CT", &day);
+        std::fs::create_dir_all(&path).expect("mkdir");
+
+        let err = heal_modality_row_if_missing(&idx, "CT", day, "1.2.1")
+            .expect_err("an unreadable bucket must be reported");
+        let msg = err.to_string();
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "an existing-but-unreadable bucket must not be reported as absent"
+        );
+        assert!(
+            !msg.contains("modality index I/O error"),
+            "the failure must come from the BUCKET READ, not from an appended \
+             duplicate hitting the same path: {msg}"
+        );
+        // Nothing was written: the path is still the directory we planted.
+        assert!(
+            path.is_dir(),
+            "the heal must not have replaced the unreadable bucket"
+        );
+        assert_eq!(
+            std::fs::read_dir(&path).expect("readdir").count(),
+            0,
+            "no row may be written into the unreadable bucket's path"
+        );
+    }
+
+    /// An absent bucket IS an empty bucket: the heal must still append.
+    ///
+    /// This is the other half of the pair above - distinguishing read failure
+    /// from absence is only useful if absence keeps working.
+    #[test]
+    fn heal_treats_an_absent_bucket_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let idx = dir.path().join("idx");
+        let day = *b"20260101";
+
+        let healed = heal_modality_row_if_missing(&idx, "CT", day, "1.2.1").expect("heal");
+        assert!(healed);
+        let uids = modality::read_study_uids(&idx, "CT", &day).expect("read");
+        assert_eq!(uids, vec!["1.2.1".to_string()]);
+
+        // Idempotent on the second call.
+        let again = heal_modality_row_if_missing(&idx, "CT", day, "1.2.1").expect("heal 2");
+        assert!(!again, "a present row must not be appended twice");
+        let uids = modality::read_study_uids(&idx, "CT", &day).expect("read 2");
+        assert_eq!(uids, vec!["1.2.1".to_string()]);
+    }
+
+    /// A day key must be exactly eight digits, not merely "the last eight".
+    ///
+    /// The old signature returned `[u8; 8]` with no error channel and kept the
+    /// low digits, so `120260101` produced the key for `20260101` - a corrupt
+    /// manifest silently filed its study under an unrelated day.
+    #[test]
+    fn day_key_rejects_over_wide_dates_instead_of_truncating() {
+        assert_eq!(
+            day_key_from_yyyymmdd(20260101).expect("valid"),
+            *b"20260101"
+        );
+        assert_eq!(
+            day_key_from_yyyymmdd(99999999).expect("valid max"),
+            *b"99999999"
+        );
+        assert_eq!(
+            day_key_from_yyyymmdd(101).expect("valid short"),
+            *b"00000101"
+        );
+
+        // `120260101` truncates to `20260101` under the old behaviour: the same
+        // key as a different, perfectly valid date. It must be refused.
+        let err = day_key_from_yyyymmdd(120260101).expect_err("over-wide must fail");
+        assert_eq!(err, InvalidStudyDate(120260101));
+        assert_ne!(
+            day_key_from_yyyymmdd(120260101),
+            day_key_from_yyyymmdd(20260101),
+            "a truncated key would collide with the valid date"
+        );
+
+        assert_eq!(
+            day_key_from_yyyymmdd(100000000).expect_err("nine digits"),
+            InvalidStudyDate(100000000)
+        );
+        assert!(day_key_from_yyyymmdd(u64::MAX).is_err());
+        assert!(
+            day_key_from_yyyymmdd(0).is_err(),
+            "no date is not a day key"
         );
     }
 }

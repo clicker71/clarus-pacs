@@ -1,9 +1,20 @@
 // Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
 
-//! Deterministic generation of empty DICOM Type 2 fields (B-007).
+//! Deterministic generation of empty DICOM identity fields (B-007).
 //!
-//! DICOM PS3.3: PatientName (0010,0010), PatientID (0010,0020), and
-//! StudyInstanceUID (0020,000D) are Type 2 - they may be present but empty.
+//! DICOM PS3.3 Table C.7-1 gives PatientName (0010,0010) and PatientID
+//! (0010,0020) Type 2 - they must be present but may be empty. StudyInstanceUID
+//! (0020,000D) is Type 1 (PS3.3 Table C.7-3, "Unique identifier for the
+//! Study"), so a conforming sender MUST supply a nonempty value, and an empty
+//! one is a non-conformant data set.
+//!
+//! This module synthesises values for all three anyway. For StudyInstanceUID
+//! that is a RECOVERY POLICY, not permission to omit the value: refusing every
+//! data set that arrives with an empty Study UID would lose studies that the
+//! archive can still serve under a derived identity, and the derived UID is
+//! deterministic, so a retry derives the same one. The policy is recorded here
+//! so nobody reads this support for the claim that Type 1 is optional.
+//!
 //! Empty values would break both SQLite's B-tree indexes and the shadow
 //! tier, so the server synthesises deterministic values:
 //!
@@ -176,16 +187,27 @@ pub fn fallback_study_uid_key(
     uuid_u128_from_digest(&digest)
 }
 
-/// Derive a 128-bit RFC 4122 UUID integer from the first 16 BLAKE3 bytes.
+/// Derive a 128-bit UUID integer from the first 16 BLAKE3 bytes.
 ///
 /// PS3.5 B.2: a `2.25.` UID is the decimal of a 128-bit UUID. A bare hash
 /// prefix is neither 128 bits nor a UUID, so the version nibble (byte 6) and
-/// the variant bits (byte 8) are set per RFC 4122 - version 4, variant 10.
+/// the variant bits (byte 8) are set.
+///
+/// The version nibble stays at 4 even though RFC 9562 defines v4 as a RANDOM
+/// or pseudorandom UUID and v8 as the custom/derived form this actually is.
+/// The value is PERSISTED: it is the StudyInstanceUID written into every
+/// manifest and every 2.25 derived UID, so changing the nibble renames every
+/// study that ever entered with an empty Study UID - the same inputs would
+/// derive a different UID and the old rows would never be found again. The
+/// nibble is therefore a compatibility constant, not a claim about how the
+/// bits were produced, and the comment says so rather than pretending v4 fits.
 fn uuid_u128_from_digest(digest: &[u8; 32]) -> u128 {
     let mut b = [0u8; 16];
     b.copy_from_slice(&digest[..16]);
-    b[6] = (b[6] & 0x0F) | 0x40; // version 4 (RFC 4122 4.1.3)
-    b[8] = (b[8] & 0x3F) | 0x80; // variant 10 (RFC 4122 4.1.1)
+    // RFC 9562 5.4 would put 0x80 here for a derived (v8) UUID. Kept at 0x40
+    // for the persisted-value reason above.
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80; // variant 10 (RFC 4122 4.1.1 / RFC 9562 4.1)
     u128::from_be_bytes(b)
 }
 
@@ -261,13 +283,44 @@ mod tests {
 
     #[test]
     fn a_separator_inside_a_component_cannot_imitate_a_boundary() {
-        // PatientID "A|B" + Accession "C" must not hash like PatientID "A" +
-        // Accession "B|C": both used to spell the same joined byte string.
-        let left = generate_study_instance_uid("A|B", Some("20240115"), None, Some("C"), "CT")
-            .expect("left");
-        let right = generate_study_instance_uid("A", Some("20240115"), None, Some("B|C"), "CT")
-            .expect("right");
+        // The two tuples are chosen so that their PLAIN `|`-joins are the same
+        // byte string, which is what makes the assertion discriminating:
+        // escaping cannot be dropped without both sides colliding.
+        //
+        //   A|20240115|120000|B + 20240116 + 130000 + C
+        //   A + 20240115 + 120000 + B|20240116|130000|C
+        //
+        // both spell `A|20240115|120000|B|20240116|130000|C`. With escaping the
+        // separator and the escape byte inside a component are marked, so the
+        // two encodings differ.
+        let left = generate_study_instance_uid(
+            "A|20240115|120000|B",
+            Some("20240116"),
+            Some("130000"),
+            Some("C"),
+            "CT",
+        )
+        .expect("left");
+        let right = generate_study_instance_uid(
+            "A",
+            Some("20240115"),
+            Some("120000"),
+            Some("B|20240116|130000|C"),
+            "CT",
+        )
+        .expect("right");
         assert_ne!(left, right, "delimiter collision merged two studies");
+
+        // Pin the premise: the plain `|`-joins really are the same byte string,
+        // so the test cannot pass by accident on two unrelated inputs. Built
+        // with `join` rather than `blake3_of`, because `blake3_of` already
+        // escapes - the point is what the UNESCAPED form would have produced.
+        let plain_left = ["A|20240115|120000|B", "20240116", "130000", "C", "CT"].join("|");
+        let plain_right = ["A", "20240115", "120000", "B|20240116|130000|C", "CT"].join("|");
+        assert_eq!(
+            plain_left, plain_right,
+            "the fixture tuples must collide under a plain join"
+        );
     }
 
     #[test]

@@ -37,9 +37,17 @@ use clarus_core::query::tag;
 use crate::state::AppState;
 
 /// Grayscale Softcopy Presentation State Storage.
+///
+/// Quoted from `standard/ps3.6/sop-class-uids.json` (PS3.6 A-1 "Grayscale
+/// Softcopy Presentation State Storage"), not from memory. The cascade table
+/// keys on this UID, so a wrong digit would silently stop presentation states
+/// from being cascaded with the images they annotate.
 pub const SOP_GSPS: &str = "1.2.840.10008.5.1.4.1.1.11.1";
 
 /// Segmentation Storage.
+///
+/// Quoted from `standard/ps3.6/sop-class-uids.json` (PS3.6 A-1 "Segmentation
+/// Storage").
 pub const SOP_SEG: &str = "1.2.840.10008.5.1.4.1.1.66.4";
 
 /// Which captured reference a derived object is matched by.
@@ -413,6 +421,35 @@ mod tests {
         assert!(class_entry(SOP_SEG).is_some());
         // An ordinary image is not a derived class and never cascades.
         assert!(class_entry("1.2.840.10008.5.1.4.1.1.7").is_none());
+    }
+
+    /// The two UIDs must be the rows PS3.6 A-1 names, checked against the
+    /// repository's own fact file rather than against a second literal.
+    ///
+    /// A cascade table keyed on a mistyped UID fails silently: the derived
+    /// objects are never matched, so they outlive the images they describe and
+    /// nothing reports it.
+    #[test]
+    fn both_uids_match_the_standard_table() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("standard")
+            .join("ps3.6")
+            .join("sop-class-uids.json");
+        let text = std::fs::read_to_string(&path).expect("the PS3.6 SOP UID table");
+        for (uid, name) in [
+            (SOP_GSPS, "Grayscale Softcopy Presentation State Storage"),
+            (SOP_SEG, "Segmentation Storage"),
+        ] {
+            // Match the exact pair, in either key order, so a UID that exists
+            // under a different name is still a failure.
+            let by_uid = format!("\"{uid}\": \"{name}\"");
+            let by_name = format!("\"{name}\": \"{uid}\"");
+            assert!(
+                text.contains(&by_uid) || text.contains(&by_name),
+                "{uid} must be PS3.6 A-1 \"{name}\""
+            );
+        }
     }
 
     #[test]

@@ -36,6 +36,30 @@ fn example_conf() -> clinfer::conf::Conf {
     clinfer::conf::load(&path).expect("the shipped example parses")
 }
 
+/// The example configuration with rule 0's MATCH replaced.
+///
+/// A rule's match is copied from the model it came from, and the model is
+/// what an administrator edits - so the test edits the model too, and the
+/// rule keeps agreeing with it. Mutating the rule alone would leave the
+/// configuration in a state no file can produce.
+fn with_first_rule_match<F: FnOnce(&mut clinfer::conf::Match)>(edit: F) -> clinfer::conf::Conf {
+    let mut conf = example_conf();
+    let model_id = conf.rules[0].model.clone();
+    let mut model = conf.model(&model_id).expect("rule 0 names a model").clone();
+    edit(&mut model.r#match);
+    conf.models
+        .iter_mut()
+        .find(|candidate| candidate.id == model_id)
+        .expect("the model is registered")
+        .r#match = model.r#match.clone();
+    for rule in &mut conf.rules {
+        if rule.model == model_id {
+            rule.r#match = model.r#match.clone();
+        }
+    }
+    conf
+}
+
 /// A dispatch topology with NO model threads.
 ///
 /// Most tests in this file drive the DECISION paths - claim, cancel,
@@ -80,7 +104,8 @@ fn origin_twin(origin: &Dicomweb) -> Dicomweb {
     Dicomweb::new(client)
 }
 
-/// A SCHEDULED workitem that names its input study.
+/// A SCHEDULED workitem that names its input study and its task code
+/// (0040,4018) - the code the shipped model is selected by.
 ///
 /// Identity is (0008,0018); the study is reachable only through (0040,4021)
 /// Input Information Sequence. The clinical attributes a rule matches on are
@@ -89,6 +114,8 @@ fn workitem_json(study_uid: &str) -> String {
     format!(
         r#"{{"00080018":{{"vr":"UI","Value":["1.2.3"]}},
              "00741000":{{"vr":"CS","Value":["SCHEDULED"]}},
+             "00404018":{{"vr":"SQ","Value":[{{"00080100":{{"vr":"SH","Value":["IMG-CLAHE"]}},
+                                                 "00080102":{{"vr":"SH","Value":["99CLARUS"]}}}}]}},
              "00404021":{{"vr":"SQ","Value":[{{"0040E020":{{"vr":"CS","Value":["DICOM"]}},
                                                 "0020000D":{{"vr":"UI","Value":["{study_uid}"]}}}}]}}}}"#
     )
@@ -161,15 +188,17 @@ fn a_put_sends_its_body_with_a_length_the_origin_can_frame() {
     );
 }
 
-/// RED FACT. Update (11.6) carries the Transaction UID in the PAYLOAD, not as
-/// a query parameter.
+/// The Update carries the Transaction UID on BOTH carriages the standard
+/// gives it: the `?TransactionUid=` query parameter (PS3.18 11.6.1.2) AND
+/// the (0008,1195) data-set attribute (CC.2.6.2).
 ///
-/// PS3.18 11.6.1.4 requires the Update payload to comply with PS3.4 CC.2.6.2,
-/// which for an IN PROGRESS workitem makes (0008,1195) an Attribute OF the
-/// data set. PS3.18 11.6.1.2 also allows the query parameter, but dcm4chee-arc
-/// reads only the data set, so the payload form is the interoperable one.
+/// The two origins in the field read different ones: Clarus routes the Update
+/// by the query string, so the parameterised form is the one whose Output
+/// Information Sequence is parsed; dcm4chee-arc reads only the data set. A
+/// client that sends one carriage and not the other breaks the matching
+/// origin, so both are asserted here.
 #[test]
-fn an_update_sends_the_transaction_uid_in_the_payload() {
+fn an_update_sends_the_transaction_uid_on_both_carriages() {
     let fake = FakeOrigin::start(vec![Answer::ok("{}")]);
     let origin = origin(&fake);
     origin
@@ -187,23 +216,18 @@ fn an_update_sends_the_transaction_uid_in_the_payload() {
 
     let recorded = fake.last().expect("a request arrived");
     assert_eq!(recorded.method, "POST");
-    // The workitem resource, with NO TransactionUid query parameter: the
-    // locking UID travels in the body.
+    // The workitem resource WITH the TransactionUid query parameter: the
+    // Clarus carriage.
     assert_eq!(
-        recorded.path, "/dicomweb/workitems/1.2.3",
-        "the TUID is not a query parameter any more"
-    );
-    assert!(
-        !recorded.path.contains("TransactionUid"),
-        "no TransactionUid in the URL: {}",
-        recorded.path
+        recorded.path, "/dicomweb/workitems/1.2.3?TransactionUid=2.25.7",
+        "the TUID rides as the 11.6.1.2 query parameter"
     );
 
     let body = json::parse(recorded.body_bytes.as_slice()).expect("parses");
     assert_eq!(
         body.attribute(clinfer::dicomweb::TAG_TRANSACTION_UID),
         Some("2.25.7"),
-        "the TUID is a payload attribute"
+        "the TUID is also a payload attribute, for the origins that read the body"
     );
     // No report was passed, so there is no (0074,1216) item and therefore no
     // place for the outputs: (0040,4033) is a child of that sequence, not a
@@ -279,7 +303,10 @@ fn an_update_without_outputs_still_carries_the_transaction_uid() {
         .expect("update");
 
     let recorded = fake.last().expect("a request arrived");
-    assert_eq!(recorded.path, "/dicomweb/workitems/1.2.3");
+    assert_eq!(
+        recorded.path,
+        "/dicomweb/workitems/1.2.3?TransactionUid=2.25.8"
+    );
     let body = json::parse(recorded.body_bytes.as_slice()).expect("parses");
     assert_eq!(
         body.attribute(clinfer::dicomweb::TAG_TRANSACTION_UID),
@@ -988,14 +1015,13 @@ fn a_completed_transition_with_outputs_but_no_report_carries_only_the_state() {
 /// modality mattering at all, and a test built on it would pass even if
 /// (0008,0061) were never read. This rule removes that escape.
 fn modality_only_conf() -> conf::Conf {
-    let mut conf = example_conf();
-    let rule = &mut conf.rules[0];
-    rule.r#match.modality = vec!["DX".to_string()];
-    rule.r#match.study_description_contains.clear();
-    rule.r#match.code_meaning_contains.clear();
-    rule.r#match.body_part_contains.clear();
-    rule.r#match.tags.clear();
-    conf
+    with_first_rule_match(|m| {
+        m.modality = vec!["DX".to_string()];
+        m.study_description_contains.clear();
+        m.code_meaning_contains.clear();
+        m.body_part_contains.clear();
+        m.tags.clear();
+    })
 }
 
 #[test]
@@ -1147,9 +1173,8 @@ fn modalities_in_study_takes_precedence_over_a_series_level_modality() {
     // CT rule and must NOT match a DX rule: the series-level value belongs
     // to a different level of the model and cannot override the study's
     // own declaration.
-    let mut conf = modality_only_conf();
+    let mut conf = with_first_rule_match(|m| m.modality = vec!["DX".to_string()]);
     conf.default_rule = conf::DefaultRule::Off;
-    conf.rules[0].r#match.modality = vec!["DX".to_string()];
     let fake = FakeOrigin::start(vec![
         Answer::ok(workitem_json("9.9.9")),
         Answer::ok(
@@ -1491,7 +1516,27 @@ fn listener_config() -> Arc<clinfer::worker::Shared> {
         std::process::id(),
         std::thread::current().id()
     ));
-    std::fs::create_dir_all(&dir).expect("scratch directory");
+    let models = dir.join("models");
+    std::fs::create_dir_all(&models).expect("scratch directory");
+    std::fs::write(
+        models.join("proc.yaml"),
+        "\
+enabled: false
+title: Process
+output_capabilities:
+  sop_classes:
+    - 1.2.840.10008.5.1.4.1.1.11.1
+match:
+  modality: [DX]
+runtime:
+  script: /bin/true
+  timeout_secs: 60
+outputs:
+  - kind: pr
+    profile_version: 3
+",
+    )
+    .expect("write the model");
     let path = dir.join("clinfer.conf");
     std::fs::write(
         &path,
@@ -1501,17 +1546,7 @@ fn listener_config() -> Arc<clinfer::worker::Shared> {
   listen: "127.0.0.1:18124"
 engine:
   cache_dir: "/tmp/clinfer-wire-cache"
-models:
-  proc:
-    script: "/bin/true"
-    timeout_secs: 60
-rules:
-  - match:
-      modality: [DX]
-    model: "proc"
-    result:
-      kind: pr
-      profile_version: 3
+models_dir: ./models
 default_rule: cancel
 "#,
     )
@@ -1676,30 +1711,39 @@ fn health_metrics_and_version_answer_on_the_same_listener() {
 }
 
 #[test]
-fn the_processors_endpoint_answers_with_the_configured_list() {
-    // Through the SOCKET, not by calling `Processors` directly: the route is
-    // what ClarityX builds its menu from, and a test that read the type
-    // would not notice a route that answered with something else.
+fn the_questionnaire_endpoint_answers_the_enabled_models_as_fhir() {
+    // Through the SOCKET, not by calling `questionnaire_route` directly: the
+    // route is what a viewer reads, and a test that called the type would not
+    // notice a route that answered with something else.
     let policy = Policy::new(&["127.0.0.1".to_string()], false).0;
     let (address, _, _, shutdown) = start_receiver(policy);
     let response = send_raw(
         &address,
-        "GET /processors HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "GET /processors/Questionnaire HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
     );
 
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(
-        response.contains("application/json"),
-        "the answer is JSON: {response}"
+        response.contains("application/fhir+json"),
+        "the answer is FHIR JSON: {response}"
     );
-    // The fixture configuration declares one processor, `proc`, whose rule
-    // produces `pr`. Both the id and the kind are asserted: a route that
-    // answered with an empty list, or with a kind taken from somewhere
-    // other than the rule, would fail here.
+    // The fixture's only model is DISABLED, so the Bundle is the empty
+    // searchset a sidecar with nothing to serve answers - not an error and
+    // not an empty body.
     assert!(
-        response.contains(r#"{"processors":[{"id":"proc","kind":"pr"}]}"#),
-        "the configured processor is listed with its rule's kind: {response}"
+        response.contains("\"resourceType\":\"Bundle\""),
+        "a searchset Bundle: {response}"
     );
+    assert!(response.contains("\"type\":\"searchset\""), "{response}");
+    assert!(response.contains("\"entry\":[]"), "{response}");
+
+    // One id that names no model is a 404, which is the FHIR answer for a
+    // read of a resource that does not exist.
+    let missing = send_raw(
+        &address,
+        "GET /processors/Questionnaire/nowhere HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
     shutdown.store(true, Ordering::Relaxed);
 }
 
@@ -1811,6 +1855,7 @@ fn the_lifecycle_agrees_with_the_matcher_on_the_reference_rule() {
     let attrs = clinfer::matcher::StudyAttrs {
         modalities: vec!["DX".into()],
         study_description: "CHEST PA".into(),
+        code: Some("IMG-CLAHE".into()),
         ..clinfer::matcher::StudyAttrs::default()
     };
     assert_eq!(

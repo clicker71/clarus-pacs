@@ -42,8 +42,24 @@ fn a_real_implicit_file_survives_the_round_trip() {
         "the fixture has a dataset after its meta group"
     );
 
+    // The file is written for the external reader the caller runs next, so an
+    // existing one is a result worth keeping, not scratch space to overwrite.
+    // `create_new` makes that an error rather than a silent replacement.
     let target = source.with_extension("evrle.dcm");
-    std::fs::write(&target, &out).expect("write the converted file");
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cannot create {}: {e} - remove the existing converter output first",
+                    target.display()
+                )
+            });
+        file.write_all(&out).expect("write the converted file");
+    }
     eprintln!("wrote {}", target.display());
 }
 

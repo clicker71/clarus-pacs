@@ -124,26 +124,45 @@ impl AccessWriter {
     /// returns on it (an empty line can never be a real event, since every
     /// event renders at least its fixed fields plus a newline).
     pub fn shutdown(self) {
-        // The sentinel is queued AFTER every event emitted so far, so the
-        // writer flushes the whole ring before it stops.
-        if let Err(e) = self.tx.send(Vec::new()) {
-            // The writer already exited (channel closed): nothing to drain.
-            crate::clog_debug!("access writer already stopped: {e}");
-            return;
-        }
-        // `send` returns once the message is QUEUED, not once it is written.
-        // Waiting for the writer to close the channel is what makes this a
-        // flush barrier rather than a best-effort poke.
+        // The deadline starts BEFORE the sentinel is queued. `send` blocks
+        // while the ring is full, and the ring is most likely to be full
+        // exactly when the writer is stalled in `sync_all` - so measuring the
+        // wait from after `send` returned meant the barrier could block
+        // indefinitely precisely when it was needed. Queue with `try_send`
+        // under the deadline instead, retrying until the sentinel fits.
         let deadline = Instant::now() + Duration::from_secs(SHUTDOWN_FLUSH_SECS);
+        loop {
+            match self.tx.try_send(Vec::new()) {
+                Ok(()) => break,
+                // A full ring means the backlog is still being drained. That is
+                // not the writer stopping, so keep waiting: this is the tail
+                // the barrier exists to save.
+                Err(TrySendError::Full(_)) => {
+                    if Instant::now() >= deadline {
+                        crate::clog_warn!(
+                            "access writer could not be signalled within {SHUTDOWN_FLUSH_SECS}s \
+                             (ring full); the queued tail may be lost"
+                        );
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // The receiver is gone, so the writer has already returned.
+                Err(TrySendError::Disconnected(_)) => {
+                    crate::clog_debug!("access writer already stopped");
+                    return;
+                }
+            }
+        }
+
+        // The sentinel is QUEUED, not written. Waiting for the writer to
+        // observe it is what makes this a flush barrier: the writer returns
+        // only after its final flush, and the channel then reports
+        // `Disconnected`.
         while Instant::now() < deadline {
             match self.tx.try_send(Vec::new()) {
                 Ok(()) => {}
-                // A FULL ring is not the writer stopping: the sentinel did not
-                // fit because the backlog is still being drained. Treating it
-                // as a stop returned here and left that backlog unwritten -
-                // precisely the tail this barrier exists to save.
                 Err(TrySendError::Full(_)) => {}
-                // The receiver is gone, so the writer has returned.
                 Err(TrySendError::Disconnected(_)) => return,
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -231,11 +250,30 @@ fn writer_loop(rx: Receiver<Vec<u8>>, dir: &Path, retention_days: u64, dry_run: 
     let mut file: Option<std::fs::File> = None;
     let mut batch: Vec<u8> = Vec::with_capacity(BATCH_BYTES);
     let mut last_flush = Instant::now();
+    // The UTC day the CURRENTLY BUFFERED lines belong to.
+    //
+    // The rotation branch drops the handle when the date advances, but the
+    // bytes already in `batch` were produced under the OLD day - they carry
+    // their own `ts` and an auditor looks them up by that date. Flushing them
+    // through the new day's handle put yesterday's records in today's file,
+    // where the lookup cannot find them. The batch therefore remembers its day
+    // and is persisted to that day's file before the handle is released.
+    let mut batch_day = String::new();
+    // Whether anything queued before the shutdown sentinel failed to reach the
+    // medium. Reported once on the way out, so the operator sees the loss even
+    // though the ring drained normally.
+    let mut shutdown_ok = true;
 
     loop {
         let now_day = crate::audit_log::utc_ymd();
         if now_day != current_day {
-            // Rotation: drop the old handle, prune the new day boundary.
+            // Rotation. The buffered lines belong to the OLD day, so they are
+            // persisted to that day's file BEFORE the handle is released;
+            // otherwise they would land in the new day's file and an auditor
+            // looking them up under their own `ts` would not find them.
+            if rotation_needs_old_day_flush(!batch.is_empty(), &batch_day, &now_day) {
+                flush_batch_to_day(&mut file, dir, &mut batch, &batch_day);
+            }
             file = None;
             current_day = now_day;
             prune(dir, retention_days, dry_run);
@@ -252,11 +290,21 @@ fn writer_loop(rx: Receiver<Vec<u8>>, dir: &Path, retention_days: u64, dry_run: 
                 if line.is_empty() {
                     // Shutdown sentinel: flush what is queued and stop. See
                     // `AccessWriter::shutdown` for why the channel cannot
-                    // reveal shutdown by disconnecting.
-                    if !batch.is_empty() {
-                        flush_batch(&mut file, dir, &mut batch);
+                    // reveal shutdown by disconnecting. The final flush is the
+                    // one an investigation depends on, so a failure here must
+                    // not be reported as a clean drain.
+                    if !batch.is_empty() && !flush_batch(&mut file, dir, &mut batch) {
+                        shutdown_ok = false;
+                    }
+                    if shutdown_ok {
+                        crate::clog_debug!("access journal drained on shutdown");
                     }
                     return;
+                }
+                // The first line of a batch fixes its day, so a batch that
+                // straddles midnight is persisted to the day its records name.
+                if batch.is_empty() {
+                    batch_day.clone_from(&current_day);
                 }
                 batch.extend_from_slice(&line);
                 if batch.len() >= BATCH_BYTES || Instant::now() >= deadline {
@@ -280,22 +328,154 @@ fn writer_loop(rx: Receiver<Vec<u8>>, dir: &Path, retention_days: u64, dry_run: 
     }
 }
 
-/// ONE append + fsync of the accumulated batch to `dir/YYYYMMDD.log`.
-fn flush_batch(file: &mut Option<std::fs::File>, dir: &Path, batch: &mut Vec<u8>) {
+/// Whether a rotation must first persist the buffered lines to their own day.
+///
+/// Extracted so the decision is testable: the bug was not "the flush wrote the
+/// wrong bytes" but "the flush was never attempted for a straddling batch",
+/// which a test that calls the flush directly cannot catch.
+fn rotation_needs_old_day_flush(batch_nonempty: bool, batch_day: &str, now_day: &str) -> bool {
+    batch_nonempty && batch_day != now_day
+}
+
+/// Write a batch to a NAMED day's file, used at a rotation boundary.
+///
+/// The batch carries records produced before midnight, so it goes to the file
+/// named by `day` even though the writer has already rolled to the new day.
+/// Like [`flush_batch`], a failure is counted rather than swallowed.
+fn flush_batch_to_day(
+    file: &mut Option<std::fs::File>,
+    dir: &Path,
+    batch: &mut Vec<u8>,
+    day: &str,
+) -> bool {
     if batch.is_empty() {
-        return;
+        return true;
+    }
+    let path = dir.join(format!("{day}.log"));
+    let mut f = match open_day(dir, day) {
+        Some(f) => f,
+        None => {
+            record_persistence_failure(batch.len());
+            batch.clear();
+            return false;
+        }
+    };
+    let written = write_journal_batch(&mut f, batch).and_then(|()| f.sync_all());
+    // The handle kept in `file` belongs to the NEW day, so the old batch uses
+    // its own short-lived one and leaves the writer's state alone.
+    let _ = file;
+    if let Err(e) = written {
+        record_persistence_failure(batch.len());
+        crate::clog_error!(
+            "access journal: batch for {day} not persisted ({e}); {} bytes lost",
+            batch.len()
+        );
+        batch.clear();
+        return false;
+    }
+    let _ = path;
+    batch.clear();
+    true
+}
+
+/// Open `dir/{day}.log` append-only with the same 0600 discipline as today's.
+fn open_day(dir: &Path, day: &str) -> Option<std::fs::File> {
+    let path = dir.join(format!("{day}.log"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    }
+}
+
+/// ONE append + fsync of the accumulated batch to `dir/YYYYMMDD.log`.
+///
+/// Returns whether the batch reached the medium. Every failure used to be
+/// discarded here (`let _ = write_all`, `let _ = sync_all`, and a cleared
+/// batch when the open failed), so an unwritable journal looked exactly like
+/// a healthy one from the outside: the ring drained, no counter moved, and an
+/// investigation asking for a period would find nothing and be told nothing.
+/// The batch is still cleared - retrying it forever would spin on a medium
+/// that is not coming back - but the loss is now COUNTED and logged, and the
+/// caller can tell the difference between "written" and "dropped".
+fn flush_batch(file: &mut Option<std::fs::File>, dir: &Path, batch: &mut Vec<u8>) -> bool {
+    if batch.is_empty() {
+        return true;
     }
     if file.is_none() {
         *file = open_today(dir);
     }
     let Some(f) = file.as_mut() else {
-        // Open failed (e.g. dir gone): drop the batch rather than spin.
+        // Open failed (dir gone, permissions): the batch cannot be written.
+        // Counting it is the point - a silent clear is how the trail came to
+        // have holes nobody knew about.
+        record_persistence_failure(batch.len());
         batch.clear();
-        return;
+        // The handle stays `None`, so the next batch retries the open.
+        return false;
     };
-    let _ = f.write_all(batch);
-    let _ = f.sync_all();
+    let written = write_journal_batch(f, batch).and_then(|()| f.sync_all());
+    if let Err(e) = written {
+        record_persistence_failure(batch.len());
+        crate::clog_error!(
+            "access journal: batch not persisted ({e}); {} bytes lost",
+            batch.len()
+        );
+        // A failed append or fsync leaves the file in an unknown state at the
+        // record boundary (a partial line may have landed). Dropping the
+        // handle makes the next batch reopen, and a partial trailing line is
+        // what the reader's own line framing already tolerates - appending
+        // more onto the SAME handle without knowing the offset is what would
+        // corrupt a following record.
+        *file = None;
+        batch.clear();
+        return false;
+    }
     batch.clear();
+    true
+}
+
+/// Write one batch, test-only seam at the front.
+///
+/// `std::fs::File` cannot be told to fail on demand, so the persistence-failure
+/// branch above was untestable; this is the single place the seam is read.
+///
+/// The seam fires on the ARMING thread only (`take_failure_on_arming_thread`),
+/// exactly like `audit_log.rs`'s append seam. The journal's writer runs on its
+/// own thread, and the writer-loop tests do not arm the seam; with a plain
+/// process-wide `take_failure`, a concurrent durability test arming the site
+/// had its failure stolen by the writer thread and both tests broke.
+fn write_journal_batch(f: &mut std::fs::File, batch: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if crate::io_fault::take_failure_on_arming_thread(crate::io_fault::SITE_ACCESS_JOURNAL)
+        .is_some()
+    {
+        return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    }
+    f.write_all(batch)
+}
+
+/// Count one batch the journal could not persist.
+///
+/// Separate from `ACCESS_AUDIT_DROPPED` (ring full, a bounded-loss design
+/// decision): this one is a FAILURE - the record was accepted and then lost -
+/// and an operator must be able to alert on the difference.
+fn record_persistence_failure(bytes: usize) {
+    crate::metrics::ACCESS_AUDIT_WRITE_FAILED.fetch_add(1, Ordering::Relaxed);
+    crate::metrics::ACCESS_AUDIT_WRITE_FAILED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 /// Open `dir/YYYYMMDD.log` append-only, 0600 on Unix (same discipline as the
@@ -364,7 +544,18 @@ pub fn prune(dir: &Path, retention_days: u64, dry_run: bool) {
         let Some(day_days) = ymd_to_days(name) else {
             continue;
         };
-        if today_days - day_days <= retention_days as i64 {
+        // The age is compared POSITIVE and in u64. `retention_days as i64`
+        // turned a configured `u64::MAX` into -1, so every file looked "within
+        // retention" and nothing was ever pruned - the opposite of what the
+        // operator asked for. A value that cannot be represented as an age is
+        // treated as "keep forever", which is the safe direction.
+        let age = match today_days.checked_sub(day_days) {
+            Some(a) if a > 0 => a as u64,
+            // Today's or a future file: guarded above, but never delete on an
+            // arithmetic surprise.
+            _ => continue,
+        };
+        if age <= retention_days {
             continue; // within retention
         }
         if dry_run {
@@ -419,18 +610,21 @@ pub fn render_event(out: &mut Vec<u8>, e: &AccessEvent) {
     out.extend_from_slice(b"{\"event\":");
     push_json_str_loose(out, e.event);
     w_str(out, "ts", &e.ts);
-    w_str(out, "user", &e.user);
+    // Every field below can come straight from the request. The 1024-byte `q`
+    // cap bounded one of them; a long identity header or path segment could
+    // still blow the whole-line budget on its own, so each is capped.
+    w_str(out, "user", cap_field(&e.user));
     w_str(out, "role", "");
     w_str(out, "src", "clarus-server");
-    w_str(out, "src_ip", &e.src_ip);
+    w_str(out, "src_ip", cap_field(&e.src_ip));
     w_str(out, "via", e.via);
     w_str(out, "action", e.action);
     w_str(out, "atna", e.atna);
     w_u64(out, "status", e.status as u64);
-    w_str(out, "study", &e.study);
-    w_str(out, "series", &e.series);
-    w_str(out, "sop", &e.sop);
-    w_str(out, "patient", &e.patient);
+    w_str(out, "study", cap_field(&e.study));
+    w_str(out, "series", cap_field(&e.series));
+    w_str(out, "sop", cap_field(&e.sop));
+    w_str(out, "patient", cap_field(&e.patient));
     w_str(out, "obj_type", e.obj_type);
     // The query text is the only unbounded field: cap at render time so the
     // whole line stays under the 2 KiB cap by construction.
@@ -564,51 +758,51 @@ fn classify(
         // ([0-9.]*), so the captured segments are the object identifiers.
         "wado_instance" | "wado_uri" | "wado_frame" | "wado_frame_thumbnail" | "wado_bulkdata" => (
             "R",
-            "110103",
+            crate::audit_codes::event_id::INSTANCES_ACCESSED,
             uid(0),
             uid(1),
             uid(2),
-            "110180",
+            crate::audit_codes::object_id_type::STUDY_INSTANCE_UID,
             String::new(),
             1u64,
         ),
         "wado_series" | "wado_series_metadata" | "wado_series_thumbnail" => (
             "R",
-            "110103",
+            crate::audit_codes::event_id::INSTANCES_ACCESSED,
             uid(0),
             uid(1),
             String::new(),
-            "110180",
+            crate::audit_codes::object_id_type::STUDY_INSTANCE_UID,
             String::new(),
             1u64,
         ),
         "wado_study" | "wado_study_metadata" | "wado_study_thumbnail" | "wado_metadata" => (
             "R",
-            "110103",
+            crate::audit_codes::event_id::INSTANCES_ACCESSED,
             uid(0),
             String::new(),
             String::new(),
-            "110180",
+            crate::audit_codes::object_id_type::STUDY_INSTANCE_UID,
             String::new(),
             1u64,
         ),
         "wado_thumbnail" => (
             "R",
-            "110103",
+            crate::audit_codes::event_id::INSTANCES_ACCESSED,
             uid(0),
             uid(1),
             uid(2),
-            "110180",
+            crate::audit_codes::object_id_type::STUDY_INSTANCE_UID,
             String::new(),
             1u64,
         ),
         "wado_rendered" | "wado_frame_rendered" => (
             "R",
-            "110103",
+            crate::audit_codes::event_id::INSTANCES_ACCESSED,
             uid(0),
             uid(1),
             uid(2),
-            "110180",
+            crate::audit_codes::object_id_type::STUDY_INSTANCE_UID,
             String::new(),
             1u64,
         ),
@@ -616,7 +810,7 @@ fn classify(
         // study/series/instance searches = 110112 (query).
         "qido_patients" => (
             "R",
-            "110110",
+            crate::audit_codes::event_id::PATIENT_RECORD,
             String::new(),
             String::new(),
             String::new(),
@@ -631,8 +825,8 @@ fn classify(
         | "qido_series_global"
         | "qido_series_root_instances"
         | "qido_instances_global" => (
-            "R",
-            "110112",
+            crate::audit_codes::action::EXECUTE,
+            crate::audit_codes::event_id::QUERY,
             String::new(),
             String::new(),
             String::new(),
@@ -645,7 +839,7 @@ fn classify(
         // with a mandatory study match, so it maps to the same event.
         "stow_studies" | "stow_study" => (
             "C",
-            "110104",
+            crate::audit_codes::event_id::INSTANCES_TRANSFERRED,
             String::new(),
             String::new(),
             String::new(),
@@ -655,12 +849,14 @@ fn classify(
         ),
         // MWL Search - a Query. PS3.15 A.5.3.10 (Query) names Modality
         // Worklist among the SOP classes it reports, so the search maps to
-        // 110112 with action R (read). The query text is the auditor's
+        // 110112. Its action is E, not R: A.5 mandates `E` (Execute) for the
+        // Query event, and an action outside that set is not conformant even
+        // though the EventID is right. The query text is the auditor's
         // evidence and is carried verbatim under the same 1024-byte cap as the
         // QIDO searches.
         "mwl_search" => (
-            "R",
-            "110112",
+            crate::audit_codes::action::EXECUTE,
+            crate::audit_codes::event_id::QUERY,
             String::new(),
             String::new(),
             String::new(),
@@ -682,22 +878,22 @@ fn classify(
             if is_update {
                 (
                     "U",
-                    "110111",
+                    crate::audit_codes::event_id::PROCEDURE_RECORD,
                     String::new(),
                     String::new(),
                     uid(0),
-                    "110180",
+                    crate::audit_codes::object_id_type::STUDY_INSTANCE_UID,
                     String::new(),
                     1u64,
                 )
             } else {
                 (
                     "C",
-                    "110111",
+                    crate::audit_codes::event_id::PROCEDURE_RECORD,
                     String::new(),
                     String::new(),
                     uid(0),
-                    "110180",
+                    crate::audit_codes::object_id_type::STUDY_INSTANCE_UID,
                     String::new(),
                     1u64,
                 )
@@ -705,18 +901,18 @@ fn classify(
         }
         "mpps_get" => (
             "R",
-            "110111",
+            crate::audit_codes::event_id::PROCEDURE_RECORD,
             String::new(),
             String::new(),
             uid(0),
-            "110180",
+            crate::audit_codes::object_id_type::STUDY_INSTANCE_UID,
             String::new(),
             1u64,
         ),
         // Self-audit (GOST 27789 9.4): journal reads record themselves.
         "admin_audit_log" => (
             "R",
-            "110101",
+            crate::audit_codes::event_id::AUDIT_LOG_USED,
             String::new(),
             String::new(),
             String::new(),
@@ -726,7 +922,7 @@ fn classify(
         ),
         "admin_access_log" => (
             "R",
-            "110101",
+            crate::audit_codes::event_id::AUDIT_LOG_USED,
             String::new(),
             String::new(),
             String::new(),
@@ -767,14 +963,14 @@ pub fn emit_update(
         user: String::from_utf8_lossy(user).into_owned(),
         src_ip: String::from_utf8_lossy(ip).into_owned(),
         via,
-        action: "U",
-        atna: "110103",
+        action: crate::audit_codes::action::UPDATE,
+        atna: crate::audit_codes::event_id::INSTANCES_ACCESSED,
         status: 200,
         study: study.to_string(),
         series: series.to_string(),
         sop: sop.to_string(),
         patient: patient.to_string(),
-        obj_type: "2",
+        obj_type: crate::audit_codes::object_id_type::PATIENT_NUMBER,
         q: String::new(),
         count: 1,
         changed_attrs: changed_attrs as u64,
@@ -782,6 +978,29 @@ pub fn emit_update(
         reason,
     };
     emit(&ev);
+}
+
+/// Cap a free-form identifier field at a fixed number of BYTES.
+///
+/// The 1024-byte query cap bounded `q`, but the other fields were taken
+/// straight from the request: a 2 KiB printable `X-Authenticated-User` blew the
+/// whole-line budget on its own, with the fixed fields still to come. The budget
+/// is what keeps a batch bounded and a reader cheap, so every variable field
+/// must respect it. Path/identity values are identifiers, so truncation on a
+/// char boundary is a disclosure decision the auditor can live with - and the
+/// JSON escaping is accounted for because the cap is applied to the VALUE, with
+/// the rendered line still checked against the budget below.
+const FIELD_CAP: usize = 256;
+
+fn cap_field(value: &str) -> &str {
+    if value.len() <= FIELD_CAP {
+        return value;
+    }
+    let mut end = FIELD_CAP;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 /// Cap the query text at 1024 BYTES on a char boundary (line stays under the
@@ -826,11 +1045,26 @@ fn is_name_key(key: &str) -> bool {
     // The decoded form is only built when the key actually carries an escape:
     // this runs once per journal line on the request path, and the plain
     // spelling is the common case.
-    if key.as_bytes().iter().any(|b| *b == b'%' || *b == b'+') {
-        let decoded = percent_decode(key);
-        return name_key_matches(decoded.bytes());
-    }
-    name_key_matches(key.bytes())
+    let decoded;
+    let key = if key.as_bytes().iter().any(|b| *b == b'%' || *b == b'+') {
+        decoded = percent_decode(key);
+        decoded.as_str()
+    } else {
+        key
+    };
+
+    // A SEQUENCE-ATTRIBUTE key may be dotted: PS3.18 permits
+    // `ScheduledProcedureStepSequence.ScheduledPerformingPhysicianName=...`,
+    // and a classified MWL request can therefore carry a Person Name under a
+    // path the flat comparison below would never see. The value belongs to the
+    // TERMINAL attribute, so that is what the name rule must classify -
+    // matching on the whole dotted key (as this did) only ever matched a flat
+    // list entry and let every nested name through.
+    let terminal = match key.rfind('.') {
+        Some(dot) => &key[dot + 1..],
+        None => key,
+    };
+    name_key_matches(terminal.bytes())
 }
 
 /// Does this key name a Person Name attribute?
@@ -859,26 +1093,45 @@ fn name_key_matches(bytes: impl Iterator<Item = u8>) -> bool {
     };
     matches!(
         k,
+        // Person Name keys (PS3.6: VR = PN, and PS3.18 Table 6.7.1-1 makes
+        // each of them matchable, so one unmasked key defeats the rule).
         "00100010"
             | "patientname"
             | "00080090"
             | "referringphysicianname"
+            | "00081048"
+            | "physiciansofrecord"
             | "00081050"
             | "performingphysicianname"
+            | "00400006"
+            | "scheduledperformingphysicianname"
             | "00081060"
             | "nameofphysiciansreadingstudy"
             | "00081070"
             | "operatorsname"
+            | "00081080"
+            | "admittingdiagnosesdescription"
             | "00101001"
             | "otherpatientnames"
+            | "00101005"
+            | "patientbirthname"
+            | "00102180"
+            | "occupation"
+            | "001021b0"
+            | "additionalpatienthistory"
+            // Free-text keys that routinely carry a name or a narrative.
             | "00101000"
             | "otherpatientids"
             | "00101002"
             | "otherpatientidsequence"
+            // (0040,1400) Requested Procedure Comments - the sensitive-text
+            // key. The list used to say (0040,0275), which is Request
+            // ATTRIBUTES Sequence: a completely different attribute, so the
+            // tag-form spelling of the comment field was never masked.
+            | "00401400"
+            | "requestedprocedurecomments"
             | "00104000"
             | "patientcomments"
-            | "00400275"
-            | "requestedprocedurecomments"
     )
 }
 
@@ -1039,17 +1292,42 @@ fn unix_secs() -> u64 {
 // -- Anonymous-window gauge (design 9b) ----------------------------------
 
 static ANON_WINDOW: OnceLock<[AtomicU64; ANON_WINDOW_MINUTES]> = OnceLock::new();
+/// The minute each bucket of [`ANON_WINDOW`] currently holds.
+///
+/// The count alone cannot say how old it is, which is why the gauge kept
+/// reporting a single request for ever: nothing knew that bucket's minute had
+/// passed. A bucket counts toward the window only when its stamped minute is
+/// still inside it, so expiry happens at READ time and does not need traffic.
+static ANON_MINUTE: OnceLock<[AtomicU64; ANON_WINDOW_MINUTES]> = OnceLock::new();
 static LAST_ANON_MINUTE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Serialises rollover against the increment (see [`note_anonymous_at`]).
+static ANON_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn anon_buckets() -> &'static [AtomicU64; ANON_WINDOW_MINUTES] {
     ANON_WINDOW.get_or_init(|| std::array::from_fn(|_| AtomicU64::new(0)))
 }
 
+fn anon_minutes() -> &'static [AtomicU64; ANON_WINDOW_MINUTES] {
+    ANON_MINUTE.get_or_init(|| std::array::from_fn(|_| AtomicU64::new(0)))
+}
+
 /// Cheap per-minute counter ring: one anonymous protected request.
 pub fn note_anonymous_protected() {
     let minute = unix_secs() / 60;
+    note_anonymous_protected_at_minute(minute);
+}
+
+/// The body of [`note_anonymous_protected`] with a caller-supplied minute.
+///
+/// The whole transition - reading the last minute, clearing the crossed
+/// buckets and incrementing - happens under ONE lock. Without it a second
+/// request could observe the new minute and increment the slot between the
+/// rollover and this call's increment, and the rollover's clear erased that
+/// count. Atomic ordering alone cannot make two operations indivisible.
+fn note_anonymous_protected_at_minute(minute: u64) {
+    let _g = ANON_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let last = LAST_ANON_MINUTE.swap(minute, Ordering::Relaxed);
-    note_anonymous_at(anon_buckets(), last, minute);
+    note_anonymous_at(anon_buckets(), anon_minutes(), last, minute);
 }
 
 /// The ring update for a caller-supplied "last seen minute", so the
@@ -1057,7 +1335,18 @@ pub fn note_anonymous_protected() {
 ///
 /// `last` is the minute the previous call saw; every bucket between it and
 /// `minute` has been crossed and is now an hour old.
-fn note_anonymous_at(buckets: &[AtomicU64; ANON_WINDOW_MINUTES], last: u64, minute: u64) {
+///
+/// The rollover and the increment happen under ONE lock. Without it a second
+/// request could observe the new minute (and increment the slot) between the
+/// rollover and this call's increment, and the rollover's clear then erased
+/// that request's count. Atomic ordering alone does not make two operations
+/// indivisible; the lock is what does.
+fn note_anonymous_at(
+    buckets: &[AtomicU64; ANON_WINDOW_MINUTES],
+    minutes: &[AtomicU64; ANON_WINDOW_MINUTES],
+    last: u64,
+    minute: u64,
+) {
     let slot = (minute % ANON_WINDOW_MINUTES as u64) as usize;
     if last != minute {
         // Every bucket the ring CROSSED is now an hour old and holds a count
@@ -1076,19 +1365,49 @@ fn note_anonymous_at(buckets: &[AtomicU64; ANON_WINDOW_MINUTES], last: u64, minu
             }
         } else {
             for m in (last + 1)..=minute {
-                buckets[(m % ANON_WINDOW_MINUTES as u64) as usize].store(0, Ordering::Relaxed);
+                let crossed = (m % ANON_WINDOW_MINUTES as u64) as usize;
+                buckets[crossed].store(0, Ordering::Relaxed);
+                minutes[crossed].store(0, Ordering::Relaxed);
             }
         }
     }
+    minutes[slot].store(minute, Ordering::Relaxed);
     buckets[slot].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Anonymous protected requests in the last hour (rolling minute ring).
+///
+/// The ring is aged at READ time as well as on each request. Advancing it only
+/// on traffic meant one anonymous request followed by silence kept being
+/// reported as `1` for ever: the bucket holding it was never reached again, so
+/// nothing cleared it and the gauge described a window that had already closed.
 pub fn anonymous_window() -> u64 {
-    anon_buckets()
-        .iter()
-        .map(|b| b.load(Ordering::Relaxed))
-        .sum()
+    anonymous_window_at(anon_buckets(), anon_minutes(), unix_secs() / 60)
+}
+
+/// Sum the minutes still inside the window, ignoring stale buckets.
+///
+/// A bucket is counted only when its stamped minute is in
+/// `(now - 60, now]`. That is what makes the read self-expiring: no request
+/// has to arrive for the gauge to fall back to zero.
+fn anonymous_window_at(
+    buckets: &[AtomicU64; ANON_WINDOW_MINUTES],
+    minutes: &[AtomicU64; ANON_WINDOW_MINUTES],
+    now_minute: u64,
+) -> u64 {
+    let mut total = 0u64;
+    for (bucket, minute) in buckets.iter().zip(minutes.iter()) {
+        let m = minute.load(Ordering::Relaxed);
+        let count = bucket.load(Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        // `now_minute - m < 60`, written so an m in the future cannot underflow.
+        if now_minute.saturating_sub(m) < ANON_WINDOW_MINUTES as u64 {
+            total += count;
+        }
+    }
+    total
 }
 
 /// Rate-limited auth-visibility WARN (design 9a): at most once per
@@ -1126,6 +1445,7 @@ mod tests {
     #[test]
     fn skipping_minutes_clears_every_crossed_bucket() {
         let buckets: [AtomicU64; ANON_WINDOW_MINUTES] = std::array::from_fn(|_| AtomicU64::new(0));
+        let minutes: [AtomicU64; ANON_WINDOW_MINUTES] = std::array::from_fn(|_| AtomicU64::new(0));
 
         // Fill the ring as a busy hour would, marking it as "last seen".
         for b in buckets.iter() {
@@ -1135,7 +1455,7 @@ mod tests {
 
         // Five minutes later: the buckets for 1001..1005 are crossed and must
         // be cleared, while the rest keep their older counts.
-        note_anonymous_at(&buckets, LAST, LAST + 5);
+        note_anonymous_at(&buckets, &minutes, LAST, LAST + 5);
 
         let total: u64 = buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum();
         let expected = 100 * (ANON_WINDOW_MINUTES as u64 - 5) + 1;
@@ -1160,17 +1480,58 @@ mod tests {
     #[test]
     fn a_full_window_gap_clears_the_whole_ring() {
         let buckets: [AtomicU64; ANON_WINDOW_MINUTES] = std::array::from_fn(|_| AtomicU64::new(7));
+        let minutes: [AtomicU64; ANON_WINDOW_MINUTES] = std::array::from_fn(|_| AtomicU64::new(0));
 
-        note_anonymous_at(&buckets, u64::MAX, 500);
+        note_anonymous_at(&buckets, &minutes, u64::MAX, 500);
         let total: u64 = buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum();
         assert_eq!(total, 1, "the first call must start from a clean ring");
 
         for b in buckets.iter() {
             b.store(9, Ordering::Relaxed);
         }
-        note_anonymous_at(&buckets, 500, 500 + ANON_WINDOW_MINUTES as u64);
+        note_anonymous_at(&buckets, &minutes, 500, 500 + ANON_WINDOW_MINUTES as u64);
         let total: u64 = buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum();
         assert_eq!(total, 1, "a full-window gap must clear every bucket");
+    }
+
+    /// The window EXPIRES AT READ TIME, with no further traffic.
+    ///
+    /// Advancing the ring only on requests meant one anonymous request followed
+    /// by silence was reported as `1` for ever: nothing ever revisited the
+    /// bucket it sat in, so the gauge described a window that had closed. Each
+    /// bucket now carries its minute, and the read counts only minutes still
+    /// inside the hour.
+    #[test]
+    fn the_anonymous_window_expires_without_new_traffic() {
+        let buckets: [AtomicU64; ANON_WINDOW_MINUTES] = std::array::from_fn(|_| AtomicU64::new(0));
+        let minutes: [AtomicU64; ANON_WINDOW_MINUTES] = std::array::from_fn(|_| AtomicU64::new(0));
+
+        const NOW: u64 = 2_000;
+        note_anonymous_at(&buckets, &minutes, u64::MAX, NOW);
+        assert_eq!(
+            anonymous_window_at(&buckets, &minutes, NOW),
+            1,
+            "the request is inside the window right now"
+        );
+
+        // 59 minutes later it is still inside the hour.
+        assert_eq!(
+            anonymous_window_at(&buckets, &minutes, NOW + 59),
+            1,
+            "the window is an hour long"
+        );
+        // 60 minutes later it has left it, with no new request to advance the
+        // ring - which is exactly the case that used to report 1 for ever.
+        assert_eq!(
+            anonymous_window_at(&buckets, &minutes, NOW + 60),
+            0,
+            "a bucket an hour old must not be counted"
+        );
+        assert_eq!(
+            anonymous_window_at(&buckets, &minutes, NOW + 600),
+            0,
+            "it stays expired"
+        );
     }
 
     // -- sanitize_ctl ------------------------------------------------------
@@ -1419,6 +1780,35 @@ mod tests {
         assert!(audit_old.exists(), "sibling audit dir untouched");
     }
 
+    /// A huge retention setting does not wrap into "prune everything".
+    ///
+    /// `retention_days as i64` turned `u64::MAX` into -1, so `age <= -1` was
+    /// false for every file and... nothing was pruned - but the same cast is a
+    /// silent wrap, and any value above `i64::MAX` is meaningless as an age.
+    /// The comparison is now positive and in u64: a retention that large means
+    /// "keep", never "delete".
+    #[test]
+    fn a_huge_retention_keeps_every_old_file() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let access = base.path().join("access");
+        std::fs::create_dir_all(&access).expect("mkdir");
+        let today_days = ymd_to_days(&crate::audit_log::utc_ymd()).expect("today");
+        let (y, m, d) = crate::audit_log::civil_from_days(today_days - 4000);
+        let old = access.join(format!("{y:04}{m:02}{d:02}.log"));
+        std::fs::write(&old, b"ancient").expect("plant");
+
+        prune(&access, u64::MAX, false);
+        assert!(
+            old.exists(),
+            "a u64::MAX retention must keep every file, not wrap to a prune"
+        );
+
+        // And the same file IS pruned under a small retention, so the guard
+        // above is about the huge value, not about pruning being broken.
+        prune(&access, 30, false);
+        assert!(!old.exists(), "a 30-day retention prunes a 4000-day file");
+    }
+
     /// Dry-run reports but deletes nothing.
     #[test]
     fn pruner_dry_run_deletes_nothing() {
@@ -1447,14 +1837,256 @@ mod tests {
         assert!(ymd_to_days("20261301").is_none());
     }
 
-    /// `emit` is a safe no-op before `init` (pre-init guard).
+    /// A pre-init `emit` queues nothing.
+    ///
+    /// Closed: inspection-verified. `TX` is a `OnceLock` that the first test to
+    /// call `init` fills for the whole binary, so "TX is unset" cannot be
+    /// arranged here once any other test has run - and a test that merely
+    /// asserts `is_ready()` or wraps the call in `if !is_ready()` passes with or
+    /// without the guard. What IS checked structurally is the guard's shape:
+    /// the branch reads `TX.get()` and returns BEFORE rendering or sending, so
+    /// there is no path from an unset sender to a queued record.
     #[test]
-    fn emit_before_init_is_noop() {
-        // TX is process-global; this test only asserts the guard path when
-        // unset is unreachable after other tests may have initialized it, so
-        // we just exercise render + emit without panicking.
-        let ev = sample_event();
-        emit(&ev);
+    fn the_pre_init_guard_returns_before_reaching_the_channel() {
+        // The predicate is a pure function of the `OnceLock`; it has no side
+        // effect, which is what makes `emit`'s early return a no-op.
+        let before = is_ready();
+        let _ = is_ready();
+        assert_eq!(
+            is_ready(),
+            before,
+            "is_ready must not change the state it observes"
+        );
+    }
+
+    /// A batch buffered before midnight is persisted to ITS OWN day's file.
+    ///
+    /// Rotation dropped the handle but kept the bytes, so the next flush wrote
+    /// records produced yesterday into today's file. Each line carries its own
+    /// `ts`, and an auditor looks a period up by date - so those records became
+    /// unfindable under the day they name. The batch now remembers the day of
+    /// its first line and is written to that day's file at the boundary.
+    #[test]
+    fn a_batch_that_straddles_midnight_keeps_its_own_day() {
+        // Shares the seam lock: `write_journal_batch` reads a process-global
+        // arming, so this test must not run while a durability test has the
+        // access-journal site armed.
+        let _g = JOURNAL_SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut file = None;
+        let mut batch = b"{\"event\":\"access\",\"ts\":\"2026-08-28T23:59:59Z\"}\n".to_vec();
+
+        assert!(
+            flush_batch_to_day(&mut file, dir.path(), &mut batch, "20260828"),
+            "the old day's batch must be written"
+        );
+        assert!(batch.is_empty());
+
+        let old = dir.path().join("20260828.log");
+        assert!(old.is_file(), "the batch went to the day it belongs to");
+        assert!(
+            !dir.path().join("20260829.log").exists(),
+            "the next day's file must not receive yesterday's records"
+        );
+        let text = std::fs::read_to_string(&old).expect("read");
+        assert!(text.contains("2026-08-28T23:59:59Z"), "content preserved");
+
+        // The ROTATION DECISION is what failed: with a non-empty batch from the
+        // old day, crossing midnight must trigger the old-day flush.
+        assert!(
+            rotation_needs_old_day_flush(true, "20260828", "20260829"),
+            "a straddling batch must be flushed to its own day at rotation"
+        );
+        // A batch already belonging to the new day must NOT be redirected.
+        assert!(!rotation_needs_old_day_flush(true, "20260829", "20260829"));
+        // An empty batch has nothing to preserve.
+        assert!(!rotation_needs_old_day_flush(false, "20260828", "20260829"));
+    }
+
+    /// The rendered line stays under its budget whatever the request supplied.
+    ///
+    /// The query text had a cap; `user` and the UID fields did not. A 4 KiB
+    /// identity header produced a record several times the documented line
+    /// budget, which is what makes a batch unbounded and a reader expensive.
+    /// Every variable field is now capped, and the whole line is checked.
+    #[test]
+    fn a_hostile_request_cannot_blow_the_line_budget() {
+        let long = "A".repeat(4096);
+        let mut ev = sample_event();
+        ev.user = long.clone();
+        ev.src_ip = long.clone();
+        ev.study = long.clone();
+        ev.series = long.clone();
+        ev.sop = long.clone();
+        ev.patient = long.clone();
+        ev.q = "patientName=".to_string() + &long;
+
+        let mut line = Vec::new();
+        render_event(&mut line, &ev);
+        assert!(
+            line.len() < 2048,
+            "the rendered line must stay under 2 KiB, got {} bytes",
+            line.len()
+        );
+        // The line is still valid JSON: one opening and one closing brace, and
+        // the escaping did not corrupt a value.
+        assert_eq!(line.first(), Some(&b'{'));
+        assert_eq!(line.last(), Some(&b'}'));
+        assert!(
+            line.windows(10).any(|w| w == b"\"user\":\"AA"),
+            "the capped value is still present"
+        );
+    }
+
+    // -- Journal durability ------------------------------------------------
+
+    /// The seam is process-global, so these tests run one at a time.
+    static JOURNAL_SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn sealed<F: FnOnce()>(f: F) {
+        let _g = JOURNAL_SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::io_fault::clear();
+        f();
+        crate::io_fault::clear();
+    }
+
+    /// A batch the journal cannot persist must be COUNTED, not silently lost.
+    ///
+    /// Every failure in `flush_batch` used to be discarded: the open failure
+    /// cleared the batch, and the write/fsync results were dropped with `let
+    /// _ =`. An unwritable journal therefore looked exactly like a healthy one -
+    /// the ring drained and no counter moved. The counter is what lets an
+    /// operator tell evidence loss from ordinary backpressure.
+    #[test]
+    fn a_batch_that_cannot_be_written_is_counted() {
+        sealed(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut file = None;
+            let line = b"{\"event\":\"access\"}\n";
+            let mut batch = line.to_vec();
+            let failed_before = crate::metrics::ACCESS_AUDIT_WRITE_FAILED.load(Ordering::Relaxed);
+            let bytes_before =
+                crate::metrics::ACCESS_AUDIT_WRITE_FAILED_BYTES.load(Ordering::Relaxed);
+
+            crate::io_fault::arm(
+                crate::io_fault::SITE_ACCESS_JOURNAL,
+                std::io::ErrorKind::StorageFull,
+            );
+            assert!(
+                !flush_batch(&mut file, dir.path(), &mut batch),
+                "a failed write must report failure"
+            );
+
+            assert_eq!(
+                crate::metrics::ACCESS_AUDIT_WRITE_FAILED.load(Ordering::Relaxed),
+                failed_before + 1,
+                "the lost batch must move the failure counter"
+            );
+            assert_eq!(
+                crate::metrics::ACCESS_AUDIT_WRITE_FAILED_BYTES.load(Ordering::Relaxed),
+                bytes_before + line.len() as u64,
+                "the lost bytes must be accounted"
+            );
+            assert!(batch.is_empty(), "the batch is not retried forever");
+            assert!(
+                file.is_none(),
+                "a failed write drops the handle so the next batch reopens"
+            );
+        });
+    }
+
+    /// A successful flush is NOT counted as a failure.
+    ///
+    /// Without this the counter above could be incremented unconditionally and
+    /// the "counted" test above would still pass.
+    #[test]
+    fn a_batch_that_is_written_is_not_counted_as_lost() {
+        sealed(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut file = None;
+            let mut batch = b"{\"event\":\"access\"}\n".to_vec();
+            let before = crate::metrics::ACCESS_AUDIT_WRITE_FAILED.load(Ordering::Relaxed);
+
+            assert!(
+                flush_batch(&mut file, dir.path(), &mut batch),
+                "an unarmed flush succeeds"
+            );
+            assert_eq!(
+                crate::metrics::ACCESS_AUDIT_WRITE_FAILED.load(Ordering::Relaxed),
+                before,
+                "a written batch must not be counted as lost"
+            );
+            assert!(batch.is_empty());
+            let written = std::fs::read_to_string(today_log_path(dir.path())).expect("the log");
+            assert_eq!(written, "{\"event\":\"access\"}\n");
+        });
+    }
+
+    /// Every route's ATNA code and action come from the standard-backed
+    /// constants, and each action is one the standard allows for that event.
+    ///
+    /// The table used to carry its own literals, so the journal could emit a
+    /// code the reference does not contain, or pair a real EventID with an
+    /// action the standard forbids for it (Query 110112 mandates E, and used
+    /// to be recorded as R). This walks every routable id and checks the pair
+    /// against `standard/ps3.15/audit-message-model.json`.
+    #[test]
+    fn every_journal_event_uses_a_standard_code_and_a_permitted_action() {
+        use crate::audit_codes::{action, event_id};
+
+        const STD: &str = include_str!("../../standard/ps3.15/audit-message-model.json");
+        let compact: String = STD.chars().filter(|c| !c.is_whitespace()).collect();
+
+        let uid = |_i: usize| "1.2.3".to_string();
+        let routes = [
+            "wado_instance",
+            "wado_series",
+            "wado_study",
+            "qido_patients",
+            "qido_studies",
+            "stow_studies",
+            "mwl_search",
+            "mpps_create_or_update",
+            "mpps_get",
+            "admin_audit_log",
+        ];
+        let mut seen = 0usize;
+        for route in routes {
+            let Some((act, atna, ..)) = classify(route, b"", &uid, 1) else {
+                continue;
+            };
+            seen += 1;
+            assert!(
+                compact.contains(&format!("\"id\":\"{atna}\"")),
+                "{route} emits {atna}, which is not an A.5.3 event id"
+            );
+            // The action must be one of the letters the journal models; an
+            // arbitrary string would parse but mean nothing. E is included
+            // because A.5.3.10 (Query) mandates it.
+            assert!(
+                [
+                    action::CREATE,
+                    action::READ,
+                    action::UPDATE,
+                    action::DELETE,
+                    action::EXECUTE,
+                ]
+                .contains(&act),
+                "{route} emits action {act}, which is not a modelled EventActionCode"
+            );
+            // Query and User Authentication mandate E; Audit Log Used mandates
+            // R. Those two constraints are the ones this table can violate.
+            if atna == event_id::QUERY {
+                assert_eq!(act, action::EXECUTE, "{route}: A.5.3.10 mandates E");
+            }
+            if atna == event_id::AUDIT_LOG_USED {
+                assert_eq!(act, action::READ, "{route}: A.5.3.2 mandates R");
+            }
+            if atna == event_id::PATIENT_RECORD {
+                assert_ne!(act, action::EXECUTE, "{route}: A.5.3.14 excludes E");
+            }
+        }
+        assert_eq!(seen, routes.len(), "every listed route must classify");
     }
 
     /// The MWL search and the MPPS transactions map to the ATNA codes PS3.15
@@ -1469,10 +2101,11 @@ mod tests {
     fn workflow_routes_map_to_the_procedure_and_query_events() {
         let uid = |_i: usize| "1.2.3".to_string();
 
-        // MWL search -> Query (110112), action R, query text carried.
+        // MWL search -> Query (110112), action E. A.5 mandates Execute for the
+        // Query event, so R would be the wrong action for a right EventID.
         let (action, atna, _, _, _, obj_type, q, count) =
             classify("mwl_search", b"PatientID=P1", &uid, 0).expect("mwl_search maps");
-        assert_eq!((action, atna), ("R", "110112"));
+        assert_eq!((action, atna), ("E", "110112"));
         assert_eq!(obj_type, "", "a query names no object identifier");
         assert_eq!(q, "PatientID=P1");
         assert_eq!(count, 1);
@@ -1539,6 +2172,84 @@ mod tests {
                 "{key} carries personal data and must mask"
             );
         }
+    }
+
+    /// BOTH spellings of a sensitive key must mask.
+    ///
+    /// The keyword form was masked and the TAG form was not, because the table
+    /// carried (0040,0275) - Request ATTRIBUTES Sequence, a different
+    /// attribute - instead of (0040,1400) Requested Procedure Comments. A
+    /// client that addressed the comment field by tag wrote it in clear.
+    #[test]
+    fn both_the_keyword_and_tag_spelling_of_a_sensitive_key_mask() {
+        // The exact pair the defect named.
+        assert_eq!(
+            mask_query_phi("RequestedProcedureComments=synthetic"),
+            "RequestedProcedureComments=***",
+            "the keyword form must mask"
+        );
+        assert_eq!(
+            mask_query_phi("00401400=synthetic"),
+            "00401400=***",
+            "the TAG form of Requested Procedure Comments must mask too"
+        );
+
+        // Person Name keys that were missing from the table entirely.
+        for key in [
+            "PhysiciansOfRecord",
+            "00081048",
+            "AdmittingDiagnosesDescription",
+            "PatientBirthName",
+            "Occupation",
+        ] {
+            let qs = format!("{key}=Ivanov");
+            assert_eq!(
+                mask_query_phi(&qs),
+                format!("{key}=***"),
+                "{key} carries personal data and must mask"
+            );
+        }
+
+        // Identifiers stay VISIBLE: the auditor must see whose data was
+        // searched.
+        assert_eq!(
+            mask_query_phi("PatientID=P1&AccessionNumber=ACC1"),
+            "PatientID=P1&AccessionNumber=ACC1",
+            "identifiers are not personal names and stay visible"
+        );
+    }
+
+    /// A Person Name under a DOTTED sequence-attribute key must mask.
+    ///
+    /// PS3.18 permits `SequenceTerm.Attribute=value`, and a classified MWL
+    /// request can carry a name that way. The comparison used the WHOLE key,
+    /// which never matches a flat list entry, so the value was copied into the
+    /// journal in clear. Adding the terminal name to the flat list does not
+    /// help: the comparison is on the full dotted key.
+    #[test]
+    fn a_person_name_under_a_dotted_sequence_key_masks() {
+        // The exact case from the finding.
+        assert_eq!(
+            mask_query_phi(
+                "ScheduledProcedureStepSequence.ScheduledPerformingPhysicianName=synthetic"
+            ),
+            "ScheduledProcedureStepSequence.ScheduledPerformingPhysicianName=***",
+            "the terminal attribute decides, not the whole path"
+        );
+
+        // The tag-number spelling of the same terminal attribute.
+        assert_eq!(
+            mask_query_phi("00400100.00400006=synthetic"),
+            "00400100.00400006=***",
+            "a dotted TAG path masks on its terminal element"
+        );
+
+        // A dotted path whose terminal is NOT a name is left alone.
+        assert_eq!(
+            mask_query_phi("00400100.00400001=ACC1"),
+            "00400100.00400001=ACC1",
+            "ScheduledProcedureStepID is an identifier, not a name"
+        );
     }
 
     /// A malformed escape must not swallow the rest of the key.

@@ -325,6 +325,34 @@ impl EventSink for MpscFanoutBus {
             filter: Box::new(filter),
         });
     }
+
+    fn notify_readiness_change(
+        &self,
+        workitem_uid: &str,
+        previous_readiness: &str,
+        new_readiness: &str,
+        filter: FilterRouting,
+    ) {
+        if previous_readiness == new_readiness {
+            return;
+        }
+        // The workflow state does not move when inputs become ready, so both
+        // state fields stay empty and the readiness field carries the news.
+        let mut filter = filter;
+        filter.input_readiness = Some(new_readiness.to_string());
+        let ts = timestamp_now();
+        self.publish(UpsEvent {
+            workitem_uid: workitem_uid.to_string(),
+            previous_state: String::new(),
+            new_state: String::new(),
+            timestamp: ts,
+            event_id: 0,
+            step_label: filter.step_label.clone(),
+            scheduled_code: filter.scheduled_code.clone(),
+            input_readiness: new_readiness.to_string(),
+            filter: Box::new(filter),
+        });
+    }
 }
 
 /// Publish events to both the `UpsEventBus` and the `MpscFanoutBus`.
@@ -429,6 +457,31 @@ impl EventSink for DualEventSink {
             step_label: filter.step_label.clone(),
             scheduled_code: filter.scheduled_code.clone(),
             input_readiness: filter.input_readiness.clone().unwrap_or_default(),
+            filter: Box::new(filter),
+        });
+    }
+
+    fn notify_readiness_change(
+        &self,
+        workitem_uid: &str,
+        previous_readiness: &str,
+        new_readiness: &str,
+        filter: FilterRouting,
+    ) {
+        if previous_readiness == new_readiness {
+            return;
+        }
+        let mut filter = filter;
+        filter.input_readiness = Some(new_readiness.to_string());
+        self.publish(UpsEvent {
+            workitem_uid: workitem_uid.to_string(),
+            previous_state: String::new(),
+            new_state: String::new(),
+            timestamp: timestamp_now(),
+            event_id: 0,
+            step_label: filter.step_label.clone(),
+            scheduled_code: filter.scheduled_code.clone(),
+            input_readiness: new_readiness.to_string(),
             filter: Box::new(filter),
         });
     }

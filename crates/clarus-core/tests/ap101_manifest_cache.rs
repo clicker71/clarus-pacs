@@ -41,9 +41,19 @@ fn a_cache_hit_never_allocates() {
     let path = dir.path().join(format!("{study}.manifest"));
     write_manifest(&path, &sample_manifest(study)).expect("write manifest");
 
-    // The test publishes its own manifest via tmp-file + rename and never
-    // truncates it in place, so it can vouch for the dir it just wrote.
-    // SAFETY: same publication invariant the server's ffi.rs voucher asserts.
+    // This fixture publishes through `write_manifest` (temp file + rename) and
+    // never truncates or rewrites the manifest in place, so the precondition
+    // carries. It is stated here because an INTEGRATION test is its own crate:
+    // the crate-internal safe voucher (`trusted_manifest_dir_for_test`) is
+    // `#[cfg(test)]` + `pub(crate)` and therefore invisible here, and the
+    // server's audited voucher (`clarus::ffi`) would make `clarus` a
+    // dev-dependency of `clarus-core` - a dependency cycle the workspace
+    // forbids. This block is the trust assertion that remains.
+    //
+    // SAFETY: `dir` is a fresh `TempDir` this test alone writes into, every
+    // manifest in it is created by `write_manifest`'s temp-file + rename, and
+    // nothing rewrites or truncates one in place for as long as the cache
+    // holds a mapping of it.
     let trusted = unsafe { TrustedManifestDir::new_unchecked(dir.path()) };
 
     // Warm the slot: the FIRST call is a miss and decodes from disk.

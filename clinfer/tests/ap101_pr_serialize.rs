@@ -129,12 +129,9 @@ fn identity() -> PrIdentity {
 fn profile() -> PrProfile {
     PrProfile::of(&clinfer::conf::RuleResult {
         kind: ResultKind::Pr,
-        color: Some("#FF3B30".to_string()),
         profile_version: 1,
         series_description: Some("AI Boxes".to_string()),
         label: clinfer::conf::LabelProfile::default(),
-        sr: None,
-        measurements: None,
     })
 }
 

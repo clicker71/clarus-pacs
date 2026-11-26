@@ -24,6 +24,8 @@
 /// DICOM-specific WADL type in PS3.18 8.7).
 pub const WADL_CONTENT_TYPE: &str = "application/vnd.sun.wadl+xml";
 
+use crate::handlers::workflow_response::HTTP_OK;
+
 // -- Pure logic - no axum, no AppState -----------------------------------
 
 /// Build the DICOMweb Capabilities Description as a WADL document
@@ -42,34 +44,34 @@ pub fn build_capabilities(base: Option<&str>) -> (u16, &'static str, Vec<u8>) {
   <resources base=""#;
     const BODY: &str = r#"/dicomweb">
     <resource path="studies">
-      <method name="GET" id="Search for Studies"/>
-      <method name="POST" id="Store Instances"/>
+      <method name="GET"><doc title="Search for Studies"/></method>
+      <method name="POST"><doc title="Store Instances"/></method>
       <resource path="{StudyInstance}">
-        <method name="GET" id="Retrieve Study"/>
-        <method name="POST" id="Store Study Instances"/>
-        <resource path="metadata"><method name="GET" id="Retrieve Study Metadata"/></resource>
-        <resource path="thumbnail"><method name="GET" id="Retrieve Study Thumbnail"/></resource>
-        <resource path="bulkdata"><method name="GET" id="Retrieve Study Bulk Data"/></resource>
+        <method name="GET"><doc title="Retrieve Study"/></method>
+        <method name="POST"><doc title="Store Study Instances"/></method>
+        <resource path="metadata"><method name="GET"><doc title="Retrieve Study Metadata"/></method></resource>
+        <resource path="thumbnail"><method name="GET"><doc title="Retrieve Study Thumbnail"/></method></resource>
+        <resource path="bulkdata"><method name="GET"><doc title="Retrieve Study Bulk Data"/></method></resource>
         <resource path="series">
-          <method name="GET" id="Search for Series"/>
+          <method name="GET"><doc title="Search for Series"/></method>
           <resource path="{SeriesInstance}">
-            <method name="GET" id="Retrieve Series"/>
-            <resource path="metadata"><method name="GET" id="Retrieve Series Metadata"/></resource>
-            <resource path="thumbnail"><method name="GET" id="Retrieve Series Thumbnail"/></resource>
-            <resource path="bulkdata"><method name="GET" id="Retrieve Series Bulk Data"/></resource>
+            <method name="GET"><doc title="Retrieve Series"/></method>
+            <resource path="metadata"><method name="GET"><doc title="Retrieve Series Metadata"/></method></resource>
+            <resource path="thumbnail"><method name="GET"><doc title="Retrieve Series Thumbnail"/></method></resource>
+            <resource path="bulkdata"><method name="GET"><doc title="Retrieve Series Bulk Data"/></method></resource>
             <resource path="instances">
-              <method name="GET" id="Search for Instances"/>
+              <method name="GET"><doc title="Search for Instances"/></method>
               <resource path="{SOPInstance}">
-                <method name="GET" id="Retrieve Instance"/>
-                <resource path="metadata"><method name="GET" id="Retrieve Instance Metadata"/></resource>
-                <resource path="rendered"><method name="GET" id="Retrieve Rendered Instance"/></resource>
-                <resource path="thumbnail"><method name="GET" id="Retrieve Instance Thumbnail"/></resource>
-                <resource path="bulkdata"><method name="GET" id="Retrieve Instance Bulk Data"/></resource>
+                <method name="GET"><doc title="Retrieve Instance"/></method>
+                <resource path="metadata"><method name="GET"><doc title="Retrieve Instance Metadata"/></method></resource>
+                <resource path="rendered"><method name="GET"><doc title="Retrieve Rendered Instance"/></method></resource>
+                <resource path="thumbnail"><method name="GET"><doc title="Retrieve Instance Thumbnail"/></method></resource>
+                <resource path="bulkdata"><method name="GET"><doc title="Retrieve Instance Bulk Data"/></method></resource>
                 <resource path="frames">
-                  <method name="GET" id="Retrieve Frames"/>
+                  <method name="GET"><doc title="Retrieve Frames"/></method>
                   <resource path="{frame}">
-                    <method name="GET" id="Retrieve Frame"/>
-                    <resource path="rendered"><method name="GET" id="Retrieve Rendered Frame"/></resource>
+                    <method name="GET"><doc title="Retrieve Frame"/></method>
+                    <resource path="rendered"><method name="GET"><doc title="Retrieve Rendered Frame"/></method></resource>
                   </resource>
                 </resource>
               </resource>
@@ -79,38 +81,38 @@ pub fn build_capabilities(base: Option<&str>) -> (u16, &'static str, Vec<u8>) {
       </resource>
     </resource>
     <resource path="workitems">
-      <method name="GET" id="Search for Workitems"/>
-      <method name="POST" id="Create Workitem"/>
+      <method name="GET"><doc title="Search for Workitems"/></method>
+      <method name="POST"><doc title="Create Workitem"/></method>
       <resource path="{workitem}">
-        <method name="GET" id="Retrieve Workitem"/>
-        <method name="POST" id="Update Workitem"/>
-        <resource path="state"><method name="PUT" id="Change Workitem State"/></resource>
-        <resource path="cancelrequest"><method name="POST" id="Request Cancellation"/></resource>
+        <method name="GET"><doc title="Retrieve Workitem"/></method>
+        <method name="POST"><doc title="Update Workitem"/></method>
+        <resource path="state"><method name="PUT"><doc title="Change Workitem State"/></method></resource>
+        <resource path="cancelrequest"><method name="POST"><doc title="Request Cancellation"/></method></resource>
         <resource path="subscribers">
-          <method name="POST" id="Create Subscription"/>
-          <resource path="{subscriber}"><method name="DELETE" id="Delete Subscription"/></resource>
+          <method name="POST"><doc title="Create Subscription"/></method>
+          <resource path="{subscriber}"><method name="DELETE"><doc title="Delete Subscription"/></method></resource>
         </resource>
       </resource>
       <resource path="{subscriptionSOPClassUID}">
         <resource path="subscribers">
-          <method name="POST" id="Create Subscription"/>
-          <resource path="{subscriber}"><method name="DELETE" id="Delete Subscription"/></resource>
+          <method name="POST"><doc title="Create Subscription"/></method>
+          <resource path="{subscriber}"><method name="DELETE"><doc title="Delete Subscription"/></method></resource>
         </resource>
       </resource>
     </resource>
     <resource path="commitment-requests">
       <resource path="{TransactionUID}">
-        <method name="POST" id="Commit"/>
-        <method name="GET" id="Check Commit Result"/>
+        <method name="POST"><doc title="Commit"/></method>
+        <method name="GET"><doc title="Check Commit Result"/></method>
       </resource>
     </resource>
     <resource path="modality-scheduled-procedure-steps">
-      <method name="GET" id="Search for Scheduled Procedure Steps"/>
+      <method name="GET"><doc title="Search for Scheduled Procedure Steps"/></method>
     </resource>
     <resource path="modality-performed-procedure-steps">
       <resource path="{mppsUID}">
-        <method name="POST" id="Create Performed Procedure Step"/>
-        <method name="GET" id="Retrieve Performed Procedure Step"/>
+        <method name="POST"><doc title="Create Performed Procedure Step"/></method>
+        <method name="GET"><doc title="Retrieve Performed Procedure Step"/></method>
       </resource>
     </resource>
   </resources>
@@ -127,7 +129,7 @@ pub fn build_capabilities(base: Option<&str>) -> (u16, &'static str, Vec<u8>) {
         push_xml_escaped(&mut body, base);
     }
     body.extend_from_slice(BODY.as_bytes());
-    (200, WADL_CONTENT_TYPE, body)
+    (HTTP_OK, WADL_CONTENT_TYPE, body)
 }
 
 /// Append `s` with the five XML predefined entities escaped.
@@ -167,6 +169,29 @@ mod tests {
         assert!(s.contains("modality-scheduled-procedure-steps"));
     }
 
+    /// WADL (Annex H) does not allow `id` on a locally embedded `method`
+    /// element. Every method carries its label in a `doc` child instead, and
+    /// the HTTP method stays in `name`, so the document validates.
+    #[test]
+    fn no_method_carries_an_id_attribute() {
+        let (_, _, body) = build_capabilities(Some("http://host:8024"));
+        let s = String::from_utf8(body).expect("wadl is utf-8");
+        assert!(
+            !s.contains("<method name=\"GET\" id=") && !s.contains("<method name=\"POST\" id="),
+            "a local method element must not carry an id: {s}"
+        );
+        assert!(
+            s.contains(r#"<method name="GET"><doc title="Search for Studies"/></method>"#),
+            "the label moved into a doc child: {s}"
+        );
+        // Every method element names its HTTP method and has a closing tag.
+        assert_eq!(
+            s.matches("<method ").count(),
+            s.matches("</method>").count(),
+            "every method element is closed: {s}"
+        );
+    }
+
     /// With no base the `base` attribute is the relative `/dicomweb`, so the
     /// document is still well-formed WADL.
     #[test]
@@ -191,19 +216,19 @@ mod tests {
         let (_, _, body) = build_capabilities(Some("http://host:8024"));
         let s = String::from_utf8(body).expect("wadl is utf-8");
         assert!(
-            !s.contains(r#"id="Retrieve Rendered Study""#),
+            !s.contains(r#"<doc title="Retrieve Rendered Study"/>"#),
             "study-level rendered is not implemented and must not be advertised"
         );
         assert!(
-            !s.contains(r#"id="Retrieve Rendered Series""#),
+            !s.contains(r#"<doc title="Retrieve Rendered Series"/>"#),
             "series-level rendered is not implemented and must not be advertised"
         );
         assert!(
-            s.contains(r#"id="Retrieve Rendered Instance""#),
+            s.contains(r#"<doc title="Retrieve Rendered Instance"/>"#),
             "instance-level rendered IS implemented and must be advertised"
         );
         assert!(
-            s.contains(r#"id="Retrieve Rendered Frame""#),
+            s.contains(r#"<doc title="Retrieve Rendered Frame"/>"#),
             "frame-level rendered IS implemented and must be advertised"
         );
         assert!(

@@ -50,6 +50,34 @@ pub enum RangeResult {
     NotSatisfiable,
 }
 
+/// A decimal range bound, distinguishing overflow from invalid syntax.
+///
+/// RFC 9110 14.1.2 defines a range bound as `1*DIGIT`, so a value of any
+/// magnitude is syntactically valid; only the FILE bounds decide whether it can
+/// be served. Collapsing "too large to represent" into "invalid" made a legal
+/// request fall back to a full 200.
+enum DecimalBound {
+    /// Fits in `u64`.
+    Value(u64),
+    /// One or more digits, but the value exceeds `u64::MAX`.
+    Overflow,
+    /// Not a nonempty run of ASCII digits (a sign, empty, trailing junk).
+    Invalid,
+}
+
+/// Parse a range bound, reporting decimal overflow separately from bad syntax.
+fn parse_decimal_clamped(s: &str) -> DecimalBound {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return DecimalBound::Invalid;
+    }
+    // A leading `+` is not a DIGIT: `u64::from_str` would accept `"+1"`, which
+    // the range grammar does not allow.
+    match s.parse::<u64>() {
+        Ok(n) => DecimalBound::Value(n),
+        Err(_) => DecimalBound::Overflow,
+    }
+}
+
 /// Parse a `Range` header value string against a file size (pure, axum-free).
 ///
 /// Only single byte ranges are supported. Multi-range requests return
@@ -65,10 +93,14 @@ pub fn parse_range_header_str(range: Option<&str>, file_size: u64) -> RangeResul
         return RangeResult::FullFile;
     };
 
-    // Only accept "bytes=" prefix.
-    let spec = match range_str.strip_prefix("bytes=") {
-        Some(s) => s.trim(),
-        None => return RangeResult::InvalidIgnored,
+    // The range unit is case-INSENSITIVE: RFC 9110 14.1 defines it as a
+    // token matched with "case-insensitive" semantics, so `Bytes=0-9` is the
+    // same request as `bytes=0-9`. A `strip_prefix("bytes=")` matched only the
+    // lowercase spelling, so a `Bytes=` header was silently ignored and the
+    // client got a full 200 where it asked for 206.
+    let spec = match range_str.split_once('=') {
+        Some((unit, rest)) if unit.trim().eq_ignore_ascii_case("bytes") => rest.trim(),
+        _ => return RangeResult::InvalidIgnored,
     };
 
     // Reject multi-range requests (comma-separated).
@@ -82,26 +114,32 @@ pub fn parse_range_header_str(range: Option<&str>, file_size: u64) -> RangeResul
         let end_str = end_str.trim();
 
         if start_str.is_empty() {
-            // Suffix range: bytes=-N -> last N bytes
-            let suffix_len: u64 = match end_str.parse() {
-                Ok(n) => n,
-                Err(_) => return RangeResult::InvalidIgnored,
+            // Suffix range: bytes=-N -> last N bytes. A suffix longer than the
+            // file is valid and means the whole file, so an unrepresentable
+            // decimal saturates rather than being rejected.
+            let suffix_len: u64 = match parse_decimal_clamped(end_str) {
+                DecimalBound::Value(n) => n,
+                DecimalBound::Overflow => u64::MAX,
+                DecimalBound::Invalid => return RangeResult::InvalidIgnored,
             };
             if suffix_len == 0 {
                 return RangeResult::NotSatisfiable;
             }
-            let start = file_size.saturating_sub(suffix_len);
-            // end is file_size - 1, checked below for empty file
             if file_size == 0 {
                 return RangeResult::NotSatisfiable;
             }
+            let start = file_size.saturating_sub(suffix_len);
             let end = file_size.saturating_sub(1);
             return RangeResult::Partial(ByteRange { start, end });
         }
 
-        let start: u64 = match start_str.parse() {
-            Ok(n) => n,
-            Err(_) => return RangeResult::InvalidIgnored,
+        // The START is NOT clamped: a first byte beyond the file is genuinely
+        // unsatisfiable (416), so an unrepresentable start means "past the
+        // end" rather than "the end".
+        let start: u64 = match parse_decimal_clamped(start_str) {
+            DecimalBound::Value(n) => n,
+            DecimalBound::Overflow => return RangeResult::NotSatisfiable,
+            DecimalBound::Invalid => return RangeResult::InvalidIgnored,
         };
 
         if end_str.is_empty() {
@@ -113,10 +151,16 @@ pub fn parse_range_header_str(range: Option<&str>, file_size: u64) -> RangeResul
             return RangeResult::Partial(ByteRange { start, end });
         }
 
-        // Explicit range: bytes=N-M
-        let end: u64 = match end_str.parse() {
-            Ok(n) => n,
-            Err(_) => return RangeResult::InvalidIgnored,
+        // Explicit range: bytes=N-M. `M` is clamped, so a decimal value above
+        // u64::MAX is NOT a syntax error - `bytes=50-18446744073709551616` on a
+        // 100-byte object means "50 through the last byte" and must be 206.
+        // Parsing it straight into `u64` rejected the whole header and planned
+        // a full 200 instead.
+        let end = match parse_decimal_clamped(end_str) {
+            DecimalBound::Value(n) => n,
+            // All digits but unrepresentable: saturate, the clamp handles it.
+            DecimalBound::Overflow => u64::MAX,
+            DecimalBound::Invalid => return RangeResult::InvalidIgnored,
         };
 
         // INV: start must not exceed end
@@ -189,6 +233,66 @@ mod tests {
                 start: 1536,
                 end: 2047
             })
+        ));
+    }
+
+    /// The range UNIT is case-insensitive (RFC 9110 14.1).
+    ///
+    /// `Bytes=0-9` used to fall through the `strip_prefix("bytes=")` check to
+    /// `InvalidIgnored`, so a 100-byte object answered a full 200 where the
+    /// lowercase spelling answered 206.
+    #[test]
+    fn the_bytes_unit_is_case_insensitive() {
+        for header in ["bytes=0-9", "Bytes=0-9", "BYTES=0-9", "bYtEs=0-9"] {
+            assert!(
+                matches!(
+                    parse_range_header_str(Some(header), 100),
+                    RangeResult::Partial(ByteRange { start: 0, end: 9 })
+                ),
+                "{header} must plan a 206"
+            );
+        }
+        // The unit must still be `bytes`: another token is ignored.
+        assert!(matches!(
+            parse_range_header_str(Some("items=0-9"), 100),
+            RangeResult::InvalidIgnored
+        ));
+    }
+
+    /// A decimal end bound above `u64::MAX` is a CLAIM, not a syntax error.
+    ///
+    /// RFC 9110 14.1.2 allows any run of digits. `bytes=50-18446744073709551616`
+    /// on a 100-byte object means bytes 50..99; parsing the end straight into
+    /// `u64` rejected the header and planned a full 200.
+    #[test]
+    fn an_end_bound_past_u64_max_is_clamped_not_rejected() {
+        assert!(
+            matches!(
+                parse_range_header_str(Some("bytes=50-18446744073709551616"), 100),
+                RangeResult::Partial(ByteRange { start: 50, end: 99 })
+            ),
+            "an oversized END must select 50..=99"
+        );
+        // Same for a suffix longer than any file: `-N` past the end is the
+        // whole file, so an unrepresentable N saturates to the same answer.
+        assert!(matches!(
+            parse_range_header_str(Some("bytes=-18446744073709551616"), 100),
+            RangeResult::Partial(ByteRange { start: 0, end: 99 })
+        ));
+        // A START past the end is genuinely unsatisfiable, not clamped to the
+        // last byte: it names a byte that does not exist.
+        assert!(matches!(
+            parse_range_header_str(Some("bytes=18446744073709551616-"), 100),
+            RangeResult::NotSatisfiable
+        ));
+        // Non-digit input is still ignored, and a leading `+` is not a DIGIT.
+        assert!(matches!(
+            parse_range_header_str(Some("bytes=0-abc"), 100),
+            RangeResult::InvalidIgnored
+        ));
+        assert!(matches!(
+            parse_range_header_str(Some("bytes=0-+9"), 100),
+            RangeResult::InvalidIgnored
         ));
     }
 

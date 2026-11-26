@@ -213,10 +213,24 @@ class TestForwardCstoreHook:
         forward = OutboxQueue(outbox_dir=str(tmp_path / "fwd"))
         return primary, forward
 
+    @staticmethod
+    def _event(sop_instance_uid=_SOP_UID):
+        """A C-STORE event that needs no coercion.
+
+        These tests are about the FORWARD channel never changing the modality
+        status, so the dataset carries the identifying attributes the bridge
+        would otherwise coerce: a coerced instance correctly answers 0xB000
+        (PS3.4 B.4), which would otherwise be mistaken for the forward hook
+        having altered the status.
+        """
+        event = make_fake_cstore_event(sop_instance_uid=sop_instance_uid)
+        event.dataset.PatientID = "PID-1"
+        return event
+
     def test_forward_success_keeps_0x0000(self, tmp_path, mock_shutdown_not_set):
         """Real forward enqueue after primary success -> 0x0000, blob mirrored."""
         primary, forward = self._queues(tmp_path)
-        event = make_fake_cstore_event(sop_instance_uid=_SOP_UID)
+        event = self._event()
         status = handle_c_store(
             event,
             URL,
@@ -241,7 +255,7 @@ class TestForwardCstoreHook:
             forward.enqueue_from_blob(seed_src, "1.2.840.10008.5.1.4.1.1.2.999") is True
         )
 
-        event = make_fake_cstore_event(sop_instance_uid=_SOP_UID)
+        event = self._event()
         status = handle_c_store(
             event,
             URL,
@@ -267,7 +281,7 @@ class TestForwardCstoreHook:
             raise RuntimeError("boom")
 
         monkeypatch.setattr(forward, "enqueue_from_blob", _boom)
-        event = make_fake_cstore_event(sop_instance_uid=_SOP_UID)
+        event = self._event()
         status = handle_c_store(
             event,
             URL,
@@ -315,7 +329,7 @@ class TestForwardCstoreHook:
         # Only the primary queue exists; assert the hook creates NO forward dir
         # and the primary survives a normal persist.
         primary = OutboxQueue(outbox_dir=str(tmp_path / "primary"))
-        event = make_fake_cstore_event(sop_instance_uid=_SOP_UID)
+        event = self._event()
         status = handle_c_store(event, URL, False, outbox=primary, forward_outbox=None)
         assert status == 0x0000
         # The primary blob is persisted; no forward tree appeared.

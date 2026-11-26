@@ -38,6 +38,7 @@ from pynetdicom.sop_class import (
 )
 
 from clean_code.http_helpers import (
+    QidoPage,
     _qido_request,
     dicomweb_base,
     service_base_url,
@@ -47,6 +48,7 @@ from clean_code.metrics import (
     associations_total,
     bytes_total,
     cstore_outbound_duration,
+    cstore_warnings,
     move_jobs_counter,
 )
 from clean_code.prefetch import PartPrefetcher
@@ -128,6 +130,27 @@ _assoc_module.LOGGER.error = _patched_assoc_error
 # ---------------------------------------------------------------------------
 # Bridge: C-MOVE  -  extract MoveDestination from C-MOVE-RQ
 # ---------------------------------------------------------------------------
+def _scoped_uid_values(ds, keyword):
+    """Every usable value of a scoped identifier key, in request order.
+
+    PS3.4 C.4.2.1.2 lists SeriesInstanceUID and SOPInstanceUID as single-value
+    keys, but a sender may still put several values in one identifier, and
+    PS3.4 Annex C.4.2 permits UID-list matching at the SERIES and IMAGE levels.
+    Narrowing such a request to its first value silently dropped the rest: the
+    bridge then answered Success for data it never sent.
+    """
+    raw = getattr(ds, keyword, None)
+    if raw is None:
+        return []
+    if isinstance(raw, (str, bytes)):
+        values = [str(raw).strip()]
+    elif hasattr(raw, "__iter__"):
+        values = [str(v).strip() for v in raw if v is not None and str(v).strip()]
+    else:
+        values = [str(raw).strip()]
+    return [v for v in values if v]
+
+
 def _parse_scoped_uid(ds, keyword, tag_text):
     """One SINGLE-VALUE scoped UID from the C-MOVE identifier.
 
@@ -136,24 +159,18 @@ def _parse_scoped_uid(ds, keyword, tag_text):
     request can still carry several values. `str()` on a pydicom MultiValue
     renders the Python list ("['1.2.3', '1.2.4']"), which then becomes a path
     segment of the WADO-RS GET - an unroutable URL, a 404 and a failed job for
-    what was a legitimate request. Only the first value is used (the level
-    scopes ONE series / ONE instance); a value list is truncated rather than
-    collapsed into a string, and an unusable value is refused.
+    what was a legitimate request.
+
+    A value LIST is no longer truncated: `_scoped_uid_values` returns every
+    value and the caller scopes one job per entry. This accessor answers the
+    single-value case (no duplicates, one entry) and refuses a rendered
+    container, which is the only remaining ambiguity.
     """
-    raw = getattr(ds, keyword, None)
-    if raw is None:
-        return ""
-    # pydicom's MultiValue is NOT a list/tuple subclass, so an isinstance test
-    # alone let it reach `str(raw)` and rendered "['1.2.3', '1.2.4']" into the
-    # URL path. Iterating on "has __iter__ and is not a str" covers both the
-    # decoded wire form and a plain container.
-    if not isinstance(raw, (str, bytes)) and hasattr(raw, "__iter__"):
-        values = [str(v).strip() for v in raw if v is not None and str(v).strip()]
-    else:
-        values = [str(raw).strip()]
-    values = [v for v in values if v]
+    values = _scoped_uid_values(ds, keyword)
     if not values:
         return ""
+    if len(values) > 1:
+        raise ValueError(f"C-MOVE-RQ: invalid {keyword} ({tag_text})")
     value = values[0]
     if "[" in value or "]" in value or "," in value:
         # A rendered container reached here (a caller stringified it before
@@ -213,15 +230,19 @@ def _parse_c_move_rq(event):
     # transferred every instance of the study to a viewer that asked for one
     # series. The identifier carries SeriesInstanceUID (0020,000E) at SERIES
     # and additionally SOPInstanceUID (0008,0018) at IMAGE.
+    #
+    # Both keys are UID-LIST matchable at these levels (PS3.4 Annex C.4.2), so
+    # the values are returned as LISTS: the caller scopes one job per value and
+    # the single-UID path is just the one-element case.
     level = str(getattr(ds, "QueryRetrieveLevel", "") or "").strip().upper()
-    series_uid = _parse_scoped_uid(ds, "SeriesInstanceUID", "0020,000E")
-    sop_instance_uid = _parse_scoped_uid(ds, "SOPInstanceUID", "0008,0018")
+    series_uids = _scoped_uid_values(ds, "SeriesInstanceUID")
+    sop_uids = _scoped_uid_values(ds, "SOPInstanceUID")
 
-    if level == "SERIES" and not series_uid:
+    if level == "SERIES" and not series_uids:
         raise ValueError(
             "C-MOVE-RQ: SERIES level without SeriesInstanceUID (0020,000E)"
         )
-    if level == "IMAGE" and not (series_uid and sop_instance_uid):
+    if level == "IMAGE" and not (series_uids and sop_uids):
         raise ValueError(
             "C-MOVE-RQ: IMAGE level without SeriesInstanceUID and "
             "SOPInstanceUID (0020,000E / 0008,0018)"
@@ -232,7 +253,59 @@ def _parse_c_move_rq(event):
         # for (PS3.4 Table C.4-2 'Unable to process').
         raise ValueError(f"C-MOVE-RQ: unsupported QueryRetrieveLevel {level!r}")
 
-    return study_uids, str(move_dest), level, series_uid, sop_instance_uid
+    # A rendered container in a value list is a malformed identifier: refuse it
+    # here rather than let "['1.2.3', '1.2.4']" reach a URL path.
+    for value in series_uids + sop_uids:
+        if any(ch in value for ch in "[]'\""):
+            raise ValueError(f"C-MOVE-RQ: invalid scoped UID {value!r}")
+
+    return study_uids, str(move_dest), level, series_uids, sop_uids
+
+
+# One C-MOVE-RQ may scope several studies (Weasis sends a list) and, at the
+# SERIES/IMAGE levels, several series or instance UIDs (PS3.4 Annex C.4.2
+# permits UID-list matching). Each becomes its own job, because a job carries
+# ONE scope and the worker no longer has the event. The cap bounds the work a
+# single request can queue on this bridge; a request over it is refused with a
+# stated reason rather than partially honoured, which would drop scopes
+# silently.
+_MAX_SCOPED_JOBS = 64
+
+
+def _scope_cardinality(level, series_uids, sop_uids):
+    """How many retrieval scopes a request names, WITHOUT expanding them.
+
+    `_request_scopes` materialises the series-by-instance product for an IMAGE
+    request, so a request naming 1000 series and 1000 instances allocated a
+    million tuples before the caller's cap could reject it. The count is
+    arithmetic on the input lengths, so the cap can be applied first and the
+    allocation only ever happens for a request that fits.
+    """
+    if level == "IMAGE":
+        return len(series_uids) * len(sop_uids)
+    if level == "SERIES":
+        return len(series_uids)
+    return 1
+
+
+def _request_scopes(level, series_uids, sop_uids):
+    """`[(series_uid, sop_uid), ...]` - one entry per retrieval scope.
+
+    STUDY scopes the whole study, so it carries neither key (the study UID
+    already scopes it). IMAGE pairs each requested instance with its series
+    and, when the sender gives several series for one instance list, every
+    combination that can be addressed. SERIES carries one entry per series.
+
+    Callers must check `_scope_cardinality` first: this function allocates the
+    full product.
+    """
+    if level == "IMAGE":
+        return [
+            (series_uid, sop_uid) for series_uid in series_uids for sop_uid in sop_uids
+        ]
+    if level == "SERIES":
+        return [(series_uid, "") for series_uid in series_uids]
+    return [("", "")]
 
 
 def _json_loads(payload):
@@ -504,7 +577,7 @@ def _preflight_study_ts_by_class(
     try:
         series_url = f"{base}/studies/{_quote(study_uid, safe='')}/series"
         series_rows = _qido_request(series_url, {}, http_timeout, limit=None, tls=tls)
-        if not isinstance(series_rows, list):
+        if not isinstance(series_rows, (list, QidoPage)):
             raise ValueError("series QIDO did not return a JSON list")
     except (_httpx.HTTPError, ValueError, KeyError, TypeError):
         logging.debug(
@@ -531,6 +604,9 @@ def _preflight_study_ts_by_class(
     result = {}
     probed = 0
     missed = 0
+    # Set when a series was probed by a SINGLE instance: the class map then
+    # samples the series rather than enumerating it (see the probe below).
+    sampled_class_coverage = False
     for suid in series_uids:
         if _over_budget():
             # Circuit breaker only. With per-instance probes a 4.0 s budget
@@ -551,7 +627,7 @@ def _preflight_study_ts_by_class(
                 f"/series/{_quote(suid, safe='')}/instances"
             )
             inst_rows = _qido_request(inst_url, {}, http_timeout, limit=None, tls=tls)
-            if not isinstance(inst_rows, list) or not inst_rows:
+            if not isinstance(inst_rows, (list, QidoPage)) or not inst_rows:
                 missed += 1
                 continue
             sop_uid = ""
@@ -566,6 +642,18 @@ def _preflight_study_ts_by_class(
                     # acquisitions, but this one already removes the whole
                     # reason the pre-flight was failing.
                     break
+            # A series can hold MORE THAN ONE SOP class (a mixed acquisition,
+            # or an SR written into an image series). One probed instance
+            # therefore proves only that ONE class is present, so the class map
+            # this study reports is a SAMPLE, not an inventory. The association
+            # then has no context for a class the probe never saw, and refetch
+            # cannot repair that: refetch can only choose among contexts the
+            # association already accepted.
+            #
+            # The probe stays single (its cost is why it exists); the flag
+            # below records that the walk's class coverage is unproven, so the
+            # registry still supplies classes the sample could not rule out.
+            sampled_class_coverage = True
             if not sop_uid:
                 missed += 1
                 continue
@@ -617,10 +705,27 @@ def _preflight_study_ts_by_class(
                 continue
             sop_class = _json_first_value(inst, "00080016")
             ts_uid = _json_first_value(inst, "00020010")
-            if sop_class and ts_uid:
-                result.setdefault(sop_class, set()).add(ts_uid)
-    # drop empty classes
-    result = {k: v for k, v in result.items() if v}
+            if not sop_class:
+                continue
+            # The class is the fact that matters: it is KNOWN to be in the
+            # study, so the proposal must carry it or the instances are
+            # undeliverable whatever the syntax says. The stored syntax only
+            # refines the proposal.
+            #
+            # Keeping the two together (the old rule: both or neither) meant a
+            # sender that omits group 0002 - which standard DICOMweb metadata
+            # MAY, PS3.18 10.4.4 only requires the dataset attributes - silently
+            # dropped its class from the map. The association then never
+            # proposed that class, so a passthrough origin could not deliver it
+            # and no transcoding could recover it either: there was no context
+            # to accept on.
+            bucket = result.setdefault(sop_class, set())
+            if ts_uid:
+                bucket.add(ts_uid)
+    # A class whose stored syntax never appeared keeps its EMPTY set: it is
+    # still known to be in the study, so `_associate_for_move` proposes its
+    # baseline pair and the per-instance refetch can find a target from the
+    # server's capability list. Dropping it here is what made the class vanish.
     n_classes = len(result)
     n_ts = sum(len(v) for v in result.values())
     logging.info(
@@ -645,11 +750,10 @@ def _preflight_study_ts_by_class(
         )
         _cache_evict(_preflight_cache, time.monotonic())
     # `partial` is what decides the registry fill-in: a walk that missed a
-    # series has an INCOMPLETE class map, so the registry supplies the classes
-    # it could not learn. A COMPLETE walk already lists the study's real class
-    # set (PS3.18 10.4.4 metadata is per-instance), and adding the registry to
-    # it only spends the 128-context budget on classes the study does not hold.
-    partial = bool(missed) or probed != len(series_uids)
+    # series, or whose per-series sample could not prove the series' class
+    # set, has an INCOMPLETE class map, so the registry supplies the classes
+    # it could not learn.
+    partial = bool(missed) or probed != len(series_uids) or sampled_class_coverage
     return result, partial
 
 
@@ -747,7 +851,7 @@ def _study_sop_uids(
     except Exception:
         return None
     series_uids = []
-    if isinstance(series_rows, list):
+    if isinstance(series_rows, (list, QidoPage)):
         for row in series_rows:
             if isinstance(row, dict):
                 s = _json_first_value(row, "0020000E")
@@ -784,7 +888,7 @@ def _study_sop_uids(
             inst_rows = _qido_request(inst_url, {}, http_timeout, limit=None, tls=tls)
         except Exception:
             return None
-        if not isinstance(inst_rows, list):
+        if not isinstance(inst_rows, (list, QidoPage)):
             return None
         for inst in inst_rows:
             if not isinstance(inst, dict):
@@ -952,15 +1056,22 @@ def handle_c_move(
             study_uids,
             move_dest_ae,
             request_level,
-            request_series_uid,
-            request_sop_uid,
+            request_series_uids,
+            request_sop_uids,
         ) = _parse_c_move_rq(event)
     except ValueError as e:
         # An unhonourable level (SERIES without a series UID, an unknown
         # level) arrives here: refusing is right, because falling back to
         # whole-study retrieval would send the viewer data it did not ask for.
+        #
+        # The refusal is 0x0110 (Processing Failure) with NO address yield.
+        # The old path yielded 0xC000 as the destination pair, which
+        # pynetdicom 3.0.4 reads as (address, port): the port was None, so it
+        # answered 0xA801 "Move Destination unknown" instead - a wrong status
+        # for a malformed request, and the honest one is only reachable by
+        # yielding the status first.
         logging.warning("[C-MOVE] Parse error: %s", e)
-        yield 0xC000, None
+        yield 0x0110, None
         return
 
     if peers_file:
@@ -983,6 +1094,14 @@ def handle_c_move(
     # destination is the calling client itself (subnet match, PS3.4 sec.C.4.2.2).
     # Without substitution _associate_for_move would get the CIDR string and
     # silently fail to associate.
+    #
+    # The REGISTRY key and the CONNECTION address are kept apart: replacing
+    # `target_host` wholesale made every later `record_scp_success/failure`
+    # name the client IP, while `scp_targets` is keyed by the configured host,
+    # so a subnet-backed peer never had its failure streak updated (an exact
+    # `(ae_title, host)` UPDATE matched no row). The client IP is used to
+    # connect; the configured key is what gets recorded.
+    registry_host = target_host
     if "/" in target_host:
         logging.info(
             "[C-MOVE] Move Destination %s: CIDR host %s is informational - "
@@ -1023,10 +1142,77 @@ def handle_c_move(
         yield 0xA801, None
         return
 
-    # create a job for EACH StudyInstanceUID in the request.
-    # Weasis sends multiple StudyUIDs in one C-MOVE-RQ  -  process them all.
+    # create a job for EACH requested scope.
+    #
+    # Weasis sends multiple StudyUIDs in one C-MOVE-RQ - process them all.
+    # A SERIES- or IMAGE-level request can carry several SeriesInstanceUID /
+    # SOPInstanceUID values too (PS3.4 Annex C.4.2 permits UID-list matching
+    # at both levels), and narrowing that to the first value queued one series
+    # while the final response still said Success for the others.
+    #
+    # The number of jobs is capped by `_MAX_SCOPED_JOBS` so one request cannot
+    # queue an unbounded amount of work on this bridge; the excess is refused
+    # LOUDLY rather than dropped, because a silent drop is the defect.
+    # The cap is checked TWICE, and the order matters:
+    #   1. on the cardinality, computed from the input lengths, so an absurd
+    #      request is refused before `_request_scopes` allocates the
+    #      series-by-instance product (1000 x 1000 tuples used to be built
+    #      first and rejected afterwards);
+    #   2. on the study-multiplied plan, because one request can name several
+    #      studies as well as several scopes.
+    scope_count = _scope_cardinality(
+        request_level, request_series_uids, request_sop_uids
+    )
+    if study_uids:
+        scope_count *= len(study_uids)
+    if scope_count > _MAX_SCOPED_JOBS:
+        logging.warning(
+            "[C-MOVE] Request scopes %d retrievals (%d studies x %d scope "
+            "values) - over the %d limit, refusing the whole request",
+            scope_count,
+            len(study_uids),
+            scope_count // max(1, len(study_uids)),
+            _MAX_SCOPED_JOBS,
+        )
+        yield 0xC000, _failure_dataset(
+            [],
+            error_comment=(
+                f"Unable to process: request scopes {scope_count} retrievals, "
+                f"over the {_MAX_SCOPED_JOBS} limit"
+            ),
+        )
+        return
+
+    scope_pairs = _request_scopes(request_level, request_series_uids, request_sop_uids)
+    if not study_uids or not scope_pairs:
+        yield 0x0110, None
+        return
+
+    planned = [
+        (study, series_uid, sop_uid)
+        for study in study_uids
+        for series_uid, sop_uid in scope_pairs
+    ]
+    if len(planned) > _MAX_SCOPED_JOBS:
+        logging.warning(
+            "[C-MOVE] Request scopes %d retrievals (%d studies x %d scope "
+            "values) - over the %d limit, refusing the whole request",
+            len(planned),
+            len(study_uids),
+            len(scope_pairs),
+            _MAX_SCOPED_JOBS,
+        )
+        yield 0xC000, _failure_dataset(
+            [],
+            error_comment=(
+                f"Unable to process: request scopes {len(planned)} retrievals, "
+                f"over the {_MAX_SCOPED_JOBS} limit"
+            ),
+        )
+        return
+
     job_ids = []
-    for study_uid in study_uids:
+    for study_uid, series_uid, sop_uid in planned:
         job_id = move_jobs.create_job(
             study_uid,
             move_dest_ae,
@@ -1034,24 +1220,33 @@ def handle_c_move(
             target_port,
             expose_rejected=expose_rejected,
             request_level=request_level,
-            request_series_uid=request_series_uid,
-            request_sop_uid=request_sop_uid,
+            request_series_uid=series_uid,
+            request_sop_uid=sop_uid,
+            registry_host=registry_host,
+            # HELD, not pending: no worker may start the first scope while the
+            # rest of this request is still being inserted and its
+            # cancellation state is not installed yet. Released in one UPDATE
+            # below, after the callbacks are in place.
+            claimable=False,
         )
         job_ids.append(job_id)
         logging.info(
-            "[C-MOVE] Job #%d created for Study %s -> %s (level=%s)",
+            "[C-MOVE] Job #%d created for Study %s%s%s -> %s (level=%s)",
             job_id,
             study_uid,
+            f" series {series_uid}" if series_uid else "",
+            f" instance {sop_uid}" if sop_uid else "",
             move_dest_ae,
             request_level or "STUDY",
         )
 
     logging.info(
-        "[C-MOVE] Move Destination: %s -> %s:%d, Studies: %d (%s)",
+        "[C-MOVE] Move Destination: %s -> %s:%d, Studies: %d, jobs: %d (%s)",
         move_dest_ae,
         target_host,
         target_port,
         len(study_uids),
+        len(job_ids),
         ", ".join(study_uids),
     )
 
@@ -1095,6 +1290,15 @@ def handle_c_move(
     for job_id in job_ids:
         move_jobs.set_job_cancel_callback(job_id, _is_cancelled)
 
+    # PUBLICATION BARRIER. Every scope above was inserted as 'held'. Nothing
+    # could claim one; the cancellation callback above is the last piece of
+    # request state a worker reads. Releasing in a single UPDATE means a worker
+    # either sees no row at all or a row whose cancel callback is already
+    # installed - never the first scope of a request that is still being
+    # built, and never a job that reports is_job_cancelled() == False because
+    # the callback had not been registered yet.
+    move_jobs.release_held_jobs(job_ids)
+
     def _clear_callbacks():
         # Terminal cleanup: the callback closes over `event` (and through it
         # the association). Leaving it in the registry keeps the whole
@@ -1112,7 +1316,23 @@ def handle_c_move(
         # reactor already answered Cancel. The latch answers True forever and
         # holds NO reference to `event`: the worker reads "cancelled", stops,
         # and removes the latch itself in its own finally.
+        #
+        # Only jobs that still have a WORKER get a latch. A job the reactor
+        # just marked finished (or one that finished on its own) has nobody
+        # left to read it, and a job nobody ever claimed has no worker to
+        # stop - installing a latch there left an entry in the callback
+        # registry that nothing would ever remove.
         for job_id in job_ids:
+            try:
+                _c, _t, status = move_jobs.get_job_progress(job_id)
+            except Exception:
+                status = None
+            if status in ("success", "failed", "cancelled"):
+                move_jobs.clear_job_callback(job_id)
+                continue
+            if not move_jobs.job_has_live_worker(job_id):
+                move_jobs.clear_job_callback(job_id)
+                continue
             move_jobs.set_job_cancel_callback(job_id, lambda: True)
 
     # yield 1: (addr, port)  -  pynetdicom primes store_assoc
@@ -1133,7 +1353,40 @@ def handle_c_move(
                 continue
         return out
 
+    def _scan_jobs():
+        """`(completed, failed_tally, all_finished, any_failed)` right now.
+        poll: a job can finish between an earlier snapshot and the timeout
+        branch, and a stale zero-completed snapshot then answered 0xC000
+        ("nothing delivered") for a transfer that had just completed.
+
+        `failed_tally` is the number of instances the finished jobs accounted
+        for as NOT delivered. It is what the final response reports, because
+        pynetdicom copies the yielded count into
+        NumberOfFailedSuboperations and NumberOfCompletedSuboperations.
+        """
+        completed_total = 0
+        failed_tally = 0
+        finished = True
+        failed_job = False
+        for job_id in job_ids:
+            c, t, status = move_jobs.get_job_progress(job_id)
+            completed_total += c
+            if status not in ("success", "failed"):
+                finished = False
+            else:
+                failed_tally += max(0, t - c)
+                if status == "failed":
+                    failed_job = True
+        return completed_total, failed_tally, finished, failed_job
+
     def _finish_jobs_cancelled():
+        # LATCH FIRST, then finish. `finish_job` makes the row terminal, and a
+        # terminal job has no reader left - latching afterwards therefore
+        # looked at a finished row and skipped every job, so each worker's
+        # `is_job_cancelled()` read False and kept streaming the study
+        # (including its Storage Commitment) after the SCU had been told the
+        # move was cancelled.
+        _latch_cancelled()
         for job_id in job_ids:
             if move_jobs.finish_job(
                 job_id, success=False, error_message="Cancelled by SCU"
@@ -1141,7 +1394,6 @@ def handle_c_move(
                 # Count only when THIS call finished the job: the worker can
                 # finish it first, and a second counter bump would double-count.
                 move_jobs_counter.labels(status="failed").inc()
-        _latch_cancelled()
 
     # yield 2+: hold the DIMSE dialog (0.5 s DB poll, bounded by
     # move_poll_timeout) until every job is terminal  -  the final response is
@@ -1169,20 +1421,15 @@ def handle_c_move(
     #
     # sends 0x0000 Success and stops reading, so yielding 0 before an honest
     # 0xB000/0xC000 replaced the failure with Success. The count is therefore
-    # derived from what the jobs actually did:
+    # the tally the WORKERS produced (see below), and it is only ever 0 for a
+    # confirmed all-success transfer.
     #
-    #     completed_total >= expected_total (and expected_total > 0) -> 0
-    #         every attempted instance was delivered: 0x0000 is truthful and
-    #         pynetdicom opens NO move-destination association (the 0909
-    #         policy, one association fewer per C-MOVE);
-    #     otherwise -> max(1, expected_total)
-    #         a non-zero count opens the move-destination association before
-    #         the status is read. That is accepted deliberately: if that
-    #         association fails, pynetdicom answers 0xA801 ("move destination
-    #         unreachable"), a truthful report - while 0x0000 on a failed
-    #         transfer is not.
-    #
-    # Evidence: tmp/1111_cmove_yield_probe.py (pynetdicom 3.0.4).
+    # pynetdicom counts the sub-operations per Pending response. Because the
+    # bridge performs the stores on its OWN association, a Pending yield is
+    # never emitted, so the framework's counters are whatever this generator
+    # hands it as the initial count minus nothing - which makes that number the
+    # one the SCU reads as "failed" and "completed". That is why it is the real
+    # tally and not the study size.
     while True:
         if _is_cancelled():
             _finish_jobs_cancelled()
@@ -1195,18 +1442,7 @@ def handle_c_move(
             return
 
         # Aggregate terminal state across all jobs
-        total_completed = 0
-        expected_total = 0
-        all_finished = True
-        any_failed = False
-        for job_id in job_ids:
-            completed, total, status = move_jobs.get_job_progress(job_id)
-            total_completed += completed
-            expected_total += total
-            if status not in ("success", "failed"):
-                all_finished = False
-            if status == "failed":
-                any_failed = True
+        total_completed, failed_tally, all_finished, any_failed = _scan_jobs()
 
         # 0 is reserved for a CONFIRMED all-success transfer. On a failure path
         # the counters cannot prove completeness: `_stream_and_send_study`
@@ -1215,14 +1451,31 @@ def handle_c_move(
         # and then lost the association. A 0 there makes pynetdicom send 0x0000
         # Success and stop reading, and the 0xB000/0xC000 never reaches the
         # viewer. Keep the dialog open with a non-zero count.
-        failure_count = max(1, expected_total)
-
+        #
+        # The count handed to pynetdicom is the tally the WORKERS produced, not
+        # the study's size: the framework counts sub-operations itself and
+        # writes its counters into the final RSP, and since the bridge does the
+        # storing on its own association the framework performs none of them.
+        # `failed_tally` carries the undelivered instances so a partial move
+        # reports both sides honestly instead of "N failed, 0 completed".
+        failure_extra = failed_tally
         if all_finished:
             if any_failed:
                 failed_uids = _agg_failed_uids()
                 # Two yields, not one tuple: the reactor protocol is a bare
                 # sub-operation count followed by (status, identifier).
-                yield failure_count
+                #
+                # The count is the number of instances the WORKERS accounted
+                # for, not the study's size. pynetdicom counts the
+                # sub-operations itself (`store_results`) and writes its own
+                # numbers into the final RSP - and since the bridge delivers
+                # over its own association, the framework performs NONE of the
+                # stores, so a count of N made the SCU read "N failed, 0
+                # completed" for a transfer that had in fact delivered most of
+                # them. Yielding the real tally keeps the response honest while
+                # still being non-zero, which is what keeps the dialog open for
+                # the status yield below.
+                yield max(1, total_completed + failure_extra)
                 if total_completed == 0:
                     # Zero sub-operations completed: B000 ("Sub-operations
                     # Complete") would be a lie - say Failure (PS3.4 Table
@@ -1238,9 +1491,11 @@ def handle_c_move(
                     # C.4-2) + (0008,0058) Failed SOP Instance UID List.
                     yield 0xB000, _failure_dataset(failed_uids)
             else:
-                # All jobs succeeded: 0 sub-operations -> pynetdicom sends
-                # the final 0000 immediately and opens NO store_assoc
-                # (service_class.py:2136-2143 returns before the associate).
+                # All jobs succeeded. Yield 0 sub-operations: pynetdicom
+                # short-circuits to 0x0000 and opens NO move-destination
+                # association (which would raise, since the SCP AE has no
+                # requested contexts). A non-zero count made pynetdicom open
+                # store_assoc and answer 0xC515.
                 yield 0
             _clear_callbacks()
             return
@@ -1267,6 +1522,26 @@ def handle_c_move(
             # would keep sending and then rewrite the row to success. The
             # cancel state is what the worker already polls per instance.
             _cancel_state.cancelled = True
+            # Re-read the terminal state AFTER the timeout transitions: a job
+            # may have finished successfully between the snapshot above and
+            # here, and the earlier zero-completion view then answered 0xC000
+            # ("nothing delivered") for a transfer that just completed.
+            (
+                _completed_after,
+                _failed_after,
+                _finished_after,
+                _any_failed_after,
+            ) = _scan_jobs()
+            if _finished_after and not _any_failed_after:
+                # Every job completed on its own before the timeout landed.
+                logging.warning(
+                    "[C-MOVE] Move poll timeout (%ds) expired, but every job "
+                    "finished successfully - reporting Success",
+                    move_poll_timeout,
+                )
+                yield 0
+                _clear_callbacks()
+                return
             logging.warning(
                 "[C-MOVE] Move poll timeout (%ds) expired: %d job(s) still "
                 "unfinished (%s) - finished as failed, final status %s.",
@@ -1277,11 +1552,11 @@ def handle_c_move(
                     if timed_out_jobs
                     else "(none)"
                 ),
-                "0xC000" if total_completed == 0 else "0xB000",
+                "0xC000" if _completed_after == 0 else "0xB000",
             )
-            yield failure_count
+            yield max(1, _completed_after + _failed_after)
             failed_uids = _agg_failed_uids()
-            if total_completed == 0:
+            if _completed_after == 0:
                 # Nothing delivered before the poll timeout -> Failure, not a
                 # "sub-operations complete" Warning (PS3.4 Table C.4-2).
                 yield 0xC000, _failure_dataset(
@@ -1629,6 +1904,17 @@ def _proposed_ts_per_class(sop_registry):
 # the Storage Commitment context proposed on the main association.
 _MAX_CONTEXTS = 128
 
+# Bytes read from the head of a refetched instance to locate its file meta
+# group. A Part 10 preamble plus group 0002 is tens of bytes; 64 KiB is a
+# whole-megabyte-plus margin that still never pulls a dataset into memory.
+_FILE_META_PROBE = 64 * 1024
+
+# Bounded copy size for rebuilding a refetched instance behind a length-changing
+# file-meta prefix. One MiB keeps the copy at the same footprint as the download
+# loop above and never scales with the instance, which is the point: the refetch
+# path must not allocate in proportion to the blob it is rewriting.
+_TAIL_COPY_CHUNK = 1024 * 1024
+
 
 def _trim_optional_ts(num_classes, has_sc, optional_tokens):
     """Return the subset of optional tokens that fit the 128-context budget.
@@ -1697,6 +1983,29 @@ class _AssocGateAborted(Exception):
         self.host = host
         self.port = port
         self.ae_title = ae_title
+
+
+def _try_reserve_peer(host, port, ae_title):
+    """Reserve the peer for THIS thread without blocking; True on success.
+
+    The reservation is what makes "do not park a worker on a peer another
+    worker just claimed" enforceable: it is one atomic test-and-set under the
+    gate lock, so two workers cannot both observe the peer free and then claim
+    two jobs for it. The winner claims a job immediately afterwards; the loser
+    leaves the row pending and looks at another peer, so a job for a DIFFERENT
+    peer is never left unserved behind a blocking wait.
+
+    Re-entrant for the owning thread, counted like `_job_gate_enter`, so a
+    resume path that reserves again unwinds with the matching exits.
+    """
+    key = (host, port, ae_title)
+    me = threading.get_ident()
+    with _ASSOC_GATE_LOCK:
+        owner = _ASSOC_BUSY.get(key)
+        if owner is not None and owner[0] != me:
+            return False
+        _ASSOC_BUSY[key] = (me, owner[1] + 1) if owner else (me, 1)
+        return True
 
 
 def _job_gate_enter(host, port, ae_title, give_up=None):
@@ -1775,13 +2084,9 @@ def _job_gate_enter(host, port, ae_title, give_up=None):
 def _peer_is_busy(host, port, ae_title):
     """True when another thread holds the gate for this peer (R9).
 
-    The worker pool picks a job BEFORE it takes the gate, so with two workers
-    one of them could claim a second job for a peer the other one is already
-    streaming to and then sit blocked in the gate. That job is invisible to
-    the queue (already claimed) while it waits, and a different viewer's job
-    behind it waits too - a long transfer can push the second request past the
-    modality's own timeout. Asking before claiming keeps a gate-blocked job in
-    pending, where the other workers can see it.
+    An advisory read only: it is NOT the claim. `_try_reserve_peer` is what a
+    worker must go through, because a read followed by a separate claim lets
+    two workers both see the peer free.
     """
     key = (host, port, ae_title)
     with _ASSOC_GATE_LOCK:
@@ -1966,7 +2271,8 @@ def _associate_for_move(
     # known to be in the study, so dropping it makes the move silently
     # incomplete. The registry fill-in classes (CM7) are the ones dropped.
     budget = _MAX_CONTEXTS - 1  # Storage Commitment slot
-    protected = set(study_ts_by_class.keys()) if has_preflight else set()
+    observed = set(study_ts_by_class.keys()) if has_preflight else set()
+    protected = set(observed)
     if len(protected) * 2 > budget:
         logging.warning(
             "[C-MOVE] %d class(es) known to be in the study need %d baseline "
@@ -1979,7 +2285,28 @@ def _associate_for_move(
     while sum(len(v) for v in proposals.values()) > budget:
         candidates = [uid for uid in proposals if uid not in protected]
         if not candidates:
-            raise RuntimeError("presentation-context budget cannot fit")
+            # Every remaining class is one the pre-flight actually observed, so
+            # dropping one would make the move silently incomplete. The
+            # baselines still do not fit, which means the study itself has more
+            # SOP classes than 128 PCIDs can carry (PS3.8 7.1.1.13). Keep the
+            # proposal within the limit rather than raising: the classes that
+            # survive are still delivered, and the drop is logged as the
+            # incompleteness it is. Raising here failed the whole move for a
+            # study wide enough to trip this - the SCU got a Failure with no
+            # instance transferred at all.
+            while sum(len(v) for v in proposals.values()) > budget:
+                dropped_cls = list(proposals)[-1]
+                dropped_ts = proposals.pop(dropped_cls)
+                protected.discard(dropped_cls)
+                logging.error(
+                    "[C-MOVE] 128-context budget (PS3.8 7.1.1.13): study needs "
+                    "more SOP classes than one association can propose - "
+                    "dropped OBSERVED class %s (%d TS contexts); its "
+                    "instances cannot be delivered",
+                    dropped_cls,
+                    len(dropped_ts),
+                )
+            break
         dropped_cls = candidates[-1]
         dropped_ts = proposals.pop(dropped_cls)
         logging.info(
@@ -1998,7 +2325,78 @@ def _associate_for_move(
         if cls_uid in survivors
         for tok in toks
     ]
-    kept_tokens = set(_trim_optional_ts(len(survivors), True, flat))
+    # ORDER MATTERS: the whole-class drop above runs first, and the STORED
+    # syntaxes of classes the pre-flight proved are in scope are reserved
+    # before any speculative token is considered. The old order let a registry
+    # guess take the last free slot and then trimmed away the stored syntax of
+    # a class KNOWN to be in the study - invisible on a transcoding origin,
+    # fatal on a passthrough one, where it is the only form that can be sent.
+    reserved = [tok for tok in flat if tok[2] == "stored"]
+    speculative = [tok for tok in flat if tok[2] != "stored"]
+    # Storage Commitment is always requested on this association.
+    _room = (_MAX_CONTEXTS - 1) - (2 * len(survivors)) - len(reserved)
+    if _room >= len(speculative):
+        kept_tokens = set(reserved) | set(speculative)
+    elif _room <= 0:
+        if speculative:
+            logging.warning(
+                "[C-MOVE] 128-context budget: %d stored syntax(es) reach the "
+                "limit - dropping %d speculative context(s)",
+                len(reserved),
+                len(speculative),
+            )
+        # PS3.8 7.1.1.13 caps PCIDs at 128, and the Storage Commitment context
+        # is one of them. The stored syntaxes the pre-flight actually observed
+        # are what makes a passthrough origin deliverable, so they OUTRANK the
+        # registry fill-in classes: drop speculative classes first, and only
+        # trim a stored syntax when the budget is exhausted even without them.
+        # The baseline pair of every surviving class stays - EVRLE/IVRLE are
+        # the refetch targets, so a class with neither cannot be recovered.
+        _cap = _MAX_CONTEXTS - 1
+        while len(reserved) + 2 * len(survivors) > _cap:
+            drop_candidates = [uid for uid in proposals if uid not in protected]
+            if not drop_candidates:
+                # Every remaining class is observed. Failing here would refuse
+                # the whole move, so trim a stored syntax instead - the same
+                # overflow guard, one level down.
+                break
+            dropped_cls = drop_candidates[-1]
+            dropped_ts = proposals.pop(dropped_cls)
+            survivors.discard(dropped_cls)
+            # The class is gone from the proposal, so its stored token must go
+            # with it: leaving it in `reserved` would spend a context on a
+            # class no longer requested and could overflow the very budget this
+            # loop is protecting.
+            reserved = [tok for tok in reserved if tok[0] != dropped_cls]
+            logging.info(
+                "[C-MOVE] 128-context budget: dropped speculative class %s "
+                "(%d TS contexts) to keep %d observed stored syntax(es)",
+                dropped_cls,
+                len(dropped_ts),
+                len(reserved),
+            )
+        _stored_room = max(0, _cap - (2 * len(survivors)))
+        if len(reserved) > _stored_room:
+            logging.warning(
+                "[C-MOVE] 128-context budget: %d stored syntax(es) exceed the "
+                "%d slot(s) left after %d class baseline(s) - keeping the "
+                "first %d in canonical order",
+                len(reserved),
+                _stored_room,
+                len(survivors),
+                _stored_room,
+            )
+            reserved = reserved[:_stored_room]
+        kept_tokens = set(reserved)
+    else:
+        logging.info(
+            "[C-MOVE] 128-context budget: kept %d speculative context(s) of "
+            "%d after reserving %d stored syntax(es)",
+            int(_room),
+            len(speculative),
+            len(reserved),
+        )
+        kept_tokens = set(reserved) | set(speculative[: int(_room)])
     for tok in flat:
         if tok in kept_tokens:
             sop_uid, ts_uid, _kind = tok
@@ -2615,6 +3013,9 @@ def _stream_and_send_study(
     passthrough = 0
     transcoded = 0
     refetched = 0
+    # Instances the peer ACCEPTED with a Warning status (PS3.4 B.2.3.1). They
+    # count as delivered - the SCP holds them - so they are not in `failed`.
+    warned = 0
     sent_sop_uids = []
     # 0709: every SOP instance UID this job attempted, so the failed set
     # (seen minus delivered) feeds the (0008,0058) Failed SOP Instance UID
@@ -2626,7 +3027,18 @@ def _stream_and_send_study(
         the driver requested it via `_report_lost` (test_spill unpacks the
         historical 7 elements and does not set `_report_lost`). The
         (0008,0058) tail is computed here from the current seen/delivered
-        sets so the helper has no forward dependency."""
+        sets so the helper has no forward dependency.
+
+        The C-STORE warning tally is NOT part of this tuple: it is persisted
+        here (see `set_job_warning_count`) because widening a return value that
+        the tests and two call sites unpack positionally turned a repair into a
+        contract break. The worker already owns `move_jobs` and `job_id`, so it
+        can record the tally itself.
+        """
+        try:
+            move_jobs.set_job_warning_count(job_id, warned)
+        except Exception:
+            logging.debug("[C-MOVE] Job #%s: warning count not recorded", job_id)
         _d = {u for _c, u in sent_sop_uids if u}
         _f = sorted(u for u in seen_sop_uids if u not in _d)
         base = (completed, failed, total, sent_sop_uids, _f, cancelled, no_common)
@@ -2700,10 +3112,26 @@ def _stream_and_send_study(
             )
         ),
     )
-    resp = requests.get(
-        url, headers=headers, timeout=http_timeout, stream=True, cert=tls
-    )
-    resp.raise_for_status()
+    resp = None
+    try:
+        resp = requests.get(
+            url, headers=headers, timeout=http_timeout, stream=True, cert=tls
+        )
+        resp.raise_for_status()
+    except requests.RequestException as _get_err:
+        # The status check runs before a single body byte is read, so nothing
+        # will ever close this response for us: the pooled connection stays
+        # checked out for the life of the process and every later WADO GET
+        # opens another one. Release it before the failure propagates.
+        logging.warning(
+            "[C-MOVE] WADO-RS GET failed for study %s: %s", study_uid, _get_err
+        )
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        raise
 
     # B1 (2508): a reader thread prefetches the streamed multipart parts into a
     # bounded FIFO while this sender loop C-STORE-s them - the serial pipeline
@@ -2769,12 +3197,14 @@ def _stream_and_send_study(
             actual_ts,
             refetch_ts,
         )
+        r2 = None
         try:
             r2 = requests.get(
                 inst_url,
                 headers={"Accept": f"application/dicom; transfer-syntax={refetch_ts}"},
                 timeout=http_timeout,
                 cert=tls,
+                stream=True,
             )
             r2.raise_for_status()
         except requests.RequestException as rf_err:
@@ -2784,21 +3214,118 @@ def _stream_and_send_study(
                 sop_uid,
                 rf_err,
             )
+            # `raise_for_status()` raises BEFORE the streaming body is read, so
+            # the pooled socket this response holds is never returned by
+            # `iter_content` reaching EOF. Without this close the connection
+            # stayed checked out of the pool for the life of the process, and
+            # every subsequent refetch opened another one.
+            if r2 is not None:
+                try:
+                    r2.close()
+                except Exception:
+                    pass
             failed += 1
             return None
-        new_bytes = r2.content
-        with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as _f2:
-            _f2.write(
-                _ensure_file_meta_bytes(
-                    new_bytes,
-                    sop_class_uid,
-                    sop_uid,
-                    refetch_ts,
-                )
+        # The replacement is written STRAIGHT to a managed temp file in bounded
+        # chunks. Reading it into `r2.content` first buffered the whole instance
+        # in memory and bypassed the spill threshold the study stream respects:
+        # a large spilled instance needing a different transfer syntax cost
+        # exactly the memory the spill exists to avoid.
+        #
+        # `_ensure_file_meta_bytes` needs the LEADING bytes to locate the
+        # dataset, so the group-0002 prefix is rewritten once the whole file is
+        # on disk: the replacement header is written over the old one and the
+        # remainder of the file follows untouched when the length is unchanged.
+        # A length change is handled by a BOUNDED copy of the retained tail
+        # into a second temp file - reading the instance back to do it defeated
+        # the spill this whole path exists to respect.
+        _rtmp = None
+        _rtmp2 = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as _f2:
+                _rtmp = _f2.name
+            _prefix = b""
+            _written = 0
+            with open(_rtmp, "wb") as _out:
+                try:
+                    for chunk in r2.iter_content(1024 * 1024):
+                        if not chunk:
+                            continue
+                        if len(_prefix) < _FILE_META_PROBE:
+                            _prefix += chunk[: _FILE_META_PROBE - len(_prefix)]
+                        _out.write(chunk)
+                        _written += len(chunk)
+                finally:
+                    try:
+                        r2.close()
+                    except Exception:
+                        pass
+            if _written == 0:
+                raise ValueError("empty refetch body")
+            _fixed = _ensure_file_meta_bytes(
+                _prefix, sop_class_uid, sop_uid, refetch_ts
             )
-            _rtmp = _f2.name
+            if _fixed != _prefix:
+                # Only the prefix changed. When its LENGTH is unchanged the
+                # dataset behind it is already correct in place.
+                if len(_fixed) == len(_prefix):
+                    with open(_rtmp, "r+b") as _out:
+                        _out.seek(0)
+                        _out.write(_fixed)
+                else:
+                    # Length-changing prefix: build the replacement in a second
+                    # file from the new prefix plus the tail, copied in bounded
+                    # chunks. `_out.read()` loaded the entire instance into
+                    # memory to move a few bytes of header, which defeated
+                    # spilling for exactly the large instances it protects.
+                    _rtmp2 = _rtmp + ".fixed"
+                    with open(_rtmp, "rb") as _src, open(_rtmp2, "wb") as _dst:
+                        _dst.write(_fixed)
+                        _src.seek(len(_prefix))
+                        while True:
+                            _buf = _src.read(_TAIL_COPY_CHUNK)
+                            if not _buf:
+                                break
+                            _dst.write(_buf)
+                    try:
+                        _os.replace(_rtmp2, _rtmp)
+                    except OSError:
+                        _os.unlink(_rtmp2)
+                        _rtmp2 = None
+                        raise
+                    _rtmp2 = None
+        except Exception as _wf:
+            # A failed write or copy must not leave a partial file behind: the
+            # unlink below only runs on the success path. Both temp files are
+            # released here, because the second is created before the copy that
+            # can fail.
+            logging.warning(
+                "[C-MOVE] Instance %d (%s): refetched bytes could not be "
+                "written (%s)",
+                idx,
+                sop_uid,
+                _wf,
+            )
+            for _p in (_rtmp, _rtmp2):
+                if _p:
+                    _unlink_quiet(_p)
+            failed += 1
+            return None
         try:
             _t0 = time.perf_counter()
+            # C-CANCEL can arrive during the download above, after the
+            # per-instance check that preceded this instance. Sending now would
+            # open a new C-STORE after the SCU has been told the move stopped
+            # (PS3.4 C.4.2.3: no further sub-operations once cancelled).
+            if _shutdown_requested.is_set() or move_jobs.is_job_cancelled(job_id):
+                logging.info(
+                    "[C-MOVE] Instance %d (%s): cancelled after the refetch - "
+                    "not sending the replacement",
+                    idx,
+                    sop_uid,
+                )
+                failed += 1
+                return None
             status = assoc.send_c_store(_rtmp)
         except Exception as rs_err:
             logging.warning(
@@ -2809,10 +3336,8 @@ def _stream_and_send_study(
             )
             status = None
         finally:
-            try:
-                _os.unlink(_rtmp)
-            except OSError:
-                pass
+            if _rtmp:
+                _unlink_quiet(_rtmp)
         try:
             cstore_outbound_duration.labels(peer=ae_label(peer_ae)).observe(
                 time.perf_counter() - _t0
@@ -2995,22 +3520,46 @@ def _stream_and_send_study(
 
                 # Pass-through: raw bytes -> temp file -> pynetdicom reads directly.
                 # No dcmread(), no write_dataset(). Bytes untouched.
-                with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as _f:
-                    _f.write(
-                        _ensure_file_meta_bytes(
-                            dicom_bytes,
-                            sop_class_uid,
-                            sop_uid,
-                            actual_ts,
-                        )
-                    )
-                    if spill_path is not None:
-                        # W3 (0209): append the spilled excess from disk in
-                        # 1 MiB chunks - the spill file is never read whole.
-                        with open(spill_path, "rb") as _src:
-                            shutil.copyfileobj(_src, _f, 1024 * 1024)
-                    _tmp_path = _f.name
+                #
+                # Creation, writing, sending and unlinking are ONE cleanup
+                # scope: the old shape only unlinked after the send file had
+                # been built, so a filesystem that filled during the spill copy
+                # left a partial `.dcm` behind for the life of the process.
+                _tmp_path = None
                 try:
+                    with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as _f:
+                        _tmp_path = _f.name
+                        _f.write(
+                            _ensure_file_meta_bytes(
+                                dicom_bytes,
+                                sop_class_uid,
+                                sop_uid,
+                                actual_ts,
+                            )
+                        )
+                        if spill_path is not None:
+                            # W3 (0209): append the spilled excess from disk in
+                            # 1 MiB chunks - the spill file is never read whole.
+                            with open(spill_path, "rb") as _src:
+                                shutil.copyfileobj(_src, _f, 1024 * 1024)
+                    # The job can be cancelled or stopped while the instance is
+                    # being fetched or its send file built - work that can take
+                    # as long as the transfer itself. The check at the top of the
+                    # loop happened BEFORE it, so a cancel arriving in between
+                    # still started a new C-STORE.
+                    if (
+                        move_jobs.is_job_cancelled(job_id)
+                        or _shutdown_requested.is_set()
+                    ):
+                        logging.warning(
+                            "[C-MOVE] Job #%d cancelled/stopping before C-STORE "
+                            "of instance %d",
+                            job_id,
+                            idx + 1,
+                        )
+                        prefetch.stop()
+                        resp.close()
+                        return _out(cancelled=True)
                     if decision == "send_as_is":
                         # Stored TS accepted for this class -> main association.
                         _t0 = time.perf_counter()
@@ -3150,7 +3699,8 @@ def _stream_and_send_study(
                         resp.close()
                         return _out(lost=True)
                 finally:
-                    _unlink_quiet(_tmp_path)
+                    if _tmp_path:
+                        _unlink_quiet(_tmp_path)
                     if spill_path is not None:
                         _unlink_quiet(spill_path)
 
@@ -3197,13 +3747,63 @@ def _stream_and_send_study(
                     # Bridge: track successfully sent SOPs for Storage Commitment
                     if sop_uid:
                         sent_sop_uids.append((sop_class_uid, sop_uid))
+                        # Also on the JOB, immediately: this list is what the
+                        # resume skips, and a pass that raises never returns
+                        # its local copy - so an acknowledged instance was
+                        # re-sent on the resumed pass.
+                        try:
+                            move_jobs.add_job_delivered_sop(
+                                job_id, sop_uid, sop_class_uid
+                            )
+                        except Exception:
+                            logging.debug(
+                                "[C-MOVE] Job #%d: delivered SOP not recorded",
+                                job_id,
+                            )
                 else:
-                    failed += 1
-                    logging.warning(
-                        "[C-MOVE] C-STORE failed for instance %d: status=%s",
-                        idx + 1,
-                        _dimse_status_name(status.Status),
-                    )
+                    _st = int(status.Status or 0)
+                    if 0xB000 <= _st <= 0xBFFF:
+                        # PS3.4 B.2.3.1: a Warning status means the SCP ACCEPTED
+                        # the instance and stored it, having coerced one or more
+                        # elements. Counting it failed listed the SOP as
+                        # undelivered, made the move answer 0xC000, and re-sent
+                        # it on resume - while the peer already holds it.
+                        # Warnings are tracked on their own counter.
+                        warned += 1
+                        completed += 1
+                        if sent_via_refetch:
+                            transcoded += 1
+                        else:
+                            passthrough += 1
+                        try:
+                            cstore_warnings.labels(peer=ae_label(peer_ae)).inc()
+                        except Exception:
+                            pass
+                        if sop_uid:
+                            sent_sop_uids.append((sop_class_uid, sop_uid))
+                            try:
+                                move_jobs.add_job_delivered_sop(
+                                    job_id, sop_uid, sop_class_uid
+                                )
+                            except Exception:
+                                logging.debug(
+                                    "[C-MOVE] Job #%d: delivered SOP not recorded",
+                                    job_id,
+                                )
+                        logging.warning(
+                            "[C-MOVE] C-STORE warning for instance %d: status=%s "
+                            "- instance stored by the peer, counted as "
+                            "acknowledged",
+                            idx + 1,
+                            _dimse_status_name(_st),
+                        )
+                    else:
+                        failed += 1
+                        logging.warning(
+                            "[C-MOVE] C-STORE failed for instance %d: status=%s",
+                            idx + 1,
+                            _dimse_status_name(_st),
+                        )
             except (requests.RequestException, OSError, ValueError, KeyError) as e:
                 failed += 1
                 if spill_path is not None:
@@ -3343,6 +3943,39 @@ def _release_or_abort(assoc, timeout=3.0):
 # ---------------------------------------------------------------------------
 # Bridge: execute a single C-MOVE job: stream -> send -> finish
 # ---------------------------------------------------------------------------
+# Delivered UIDs recovered from the job record carry no SOP class when the
+# class was never recorded (an older row): the class is only needed for the
+# C-STORE context, which is already negotiated, so an empty string is harmless
+# there. Storage Commitment is skipped for such an entry, because a
+# Referenced SOP Class that was never observed must not be invented.
+_SOP_CLASS_UNKNOWN = ""
+
+
+def _delivered_sops_of(move_jobs, job_id):
+    """`[(sop_class, sop_uid), ...]` the job has already delivered, or None.
+
+    Read back after a pass raised: the pass's return value is the only other
+    carrier of this set, and a raise never produces one. `None` means the
+    record could not be read, so the caller keeps its aggregate fallback.
+    """
+    getter = getattr(move_jobs, "get_job_delivered_sops", None)
+    if getter is None:
+        return None
+    try:
+        return [(cls or _SOP_CLASS_UNKNOWN, uid) for cls, uid in getter(job_id)]
+    except Exception:
+        return None
+
+
+def _job_total_of(move_jobs, job_id):
+    """Instances the job has observed so far (0 when unreadable)."""
+    try:
+        _c, total, _s = move_jobs.get_job_progress(job_id)
+        return int(total or 0)
+    except Exception:
+        return 0
+
+
 def _execute_cmove_job(
     job_id,
     study_uid,
@@ -3368,6 +4001,7 @@ def _execute_cmove_job(
     request_level="",
     request_series_uid="",
     request_sop_uid="",
+    registry_host="",
 ):
     """Execute C-MOVE: stream study from Clarus, send instances to target SCP.
 
@@ -3385,6 +4019,13 @@ def _execute_cmove_job(
     """
     # Bridge: target_host/target_port come from job (resolved in handle_c_move).
     # No re-lookup needed  -  subnet resolution happened at C-MOVE time.
+    #
+    # `registry_host` is the peers.conf key the destination matched under. For
+    # a CIDR peer it is the SUBNET, while target_host is the client IP the
+    # association goes to; `scp_targets` is keyed by the former, so SCP health
+    # is recorded against it. A legacy job (no column) falls back to the
+    # connection address, which is what it recorded before.
+    health_host = registry_host or target_host
     if not target_host or not target_port:
         # Legacy job without target info  -  fall back to lookup
         if peers_file:
@@ -3454,7 +4095,7 @@ def _execute_cmove_job(
         except RuntimeError as e:
             logging.error("[C-MOVE] %s", e)
             logging.debug("[C-MOVE] Association traceback:", exc_info=True)
-            move_jobs.record_scp_failure(move_dest_ae, host=target_host)
+            move_jobs.record_scp_failure(move_dest_ae, host=health_host)
             if move_jobs.finish_job(job_id, success=False, error_message=str(e)):
                 move_jobs_counter.labels(status="failed").inc()
             return
@@ -3524,26 +4165,35 @@ def _execute_cmove_job(
             no_common_ts = _nc1
             resumed_lost = _lost1
         except Exception:
-            # A mid-stream raise does not undo what was already delivered. The
-            # counters live in `_c1`/`_f1`/`_t1` only once the call RETURNS, so
-            # resetting them to zero here threw away the progress pass 1 had
-            # made: the job then finished reporting 0 delivered and 0 failed
-            # for a study that had, in fact, moved. Read the partial counters
-            # back off the job record and keep them so the failure propagates
-            # with an honest tally.
+            # A mid-stream raise does not undo what was already delivered.
+            #
+            # The counters and the delivered UID list live in the pass's return
+            # value, which a raise never produces - so rebuilding the resume
+            # state from `get_job_progress` kept only AGGREGATE numbers and the
+            # skip set came back EMPTY. The resumed pass then re-sent instances
+            # the destination had already acknowledged. The per-instance
+            # accounting is recovered from the job's own delivered list
+            # instead; the aggregate counters remain the fallback for a job
+            # whose list is unreadable.
             logging.error(
                 "[C-MOVE] Job #%d: pass 1 raised mid-stream - preserving the "
                 "progress counted so far",
                 job_id,
             )
-            try:
-                # (completed_instances, total_instances, status), the same
-                # counters the 0xFF00 poll reports and the final RSP sums.
-                _c1, _t1, _ = move_jobs.get_job_progress(job_id)
-                _f1 = max(0, _t1 - _c1)
-            except Exception:
-                _c1, _f1, _t1 = 0, 0, 0
-            sent_sop_uids = []
+            recovered = _delivered_sops_of(move_jobs, job_id)
+            if recovered is not None:
+                sent_sop_uids = list(recovered)
+                _c1 = len(recovered)
+                _t1 = max(_c1, _job_total_of(move_jobs, job_id))
+                _f1 = 0
+            else:
+                try:
+                    # (completed_instances, total_instances, status), the same
+                    # counters the 0xFF00 poll reports and the final RSP sums.
+                    _c1, _t1, _ = move_jobs.get_job_progress(job_id)
+                    _f1 = max(0, _t1 - _c1)
+                except Exception:
+                    _c1, _f1, _t1 = 0, 0, 0
             _fs1 = []
             cancelled = False
             no_common_ts = False
@@ -3619,12 +4269,26 @@ def _execute_cmove_job(
                         qa_url=qa_url,
                     )
                     _c2, _f2, _t2, _s2, _fs2, _ca2, _nc2, _lost2 = r2
-                    # Union the delivered sets.
-                    sent_sop_uids = list(_s1) + list(_s2)
+                    # Merge pass 2 into what is ALREADY accumulated, never
+                    # into `_s1`: when pass 1 raised, `_s1` was never assigned
+                    # and this expression raised UnboundLocalError, which the
+                    # `except` below swallowed - so B was reported failed even
+                    # though the destination acknowledged it.
+                    sent_sop_uids = list(sent_sop_uids) + list(_s2)
                     cancelled = cancelled or _ca2
                     no_common_ts = no_common_ts or _nc2
                     resumed_lost = _lost2  # second loss => GIVE_UP below
                 except Exception:
+                    # The resumed pass may have delivered instances before it
+                    # raised, and a raise never produces a return value. Read
+                    # the job's own delivered journal so those
+                    # acknowledgements are not reported as failures.
+                    recovered2 = _delivered_sops_of(move_jobs, job_id)
+                    if recovered2 is not None:
+                        known = {u for _c, u in sent_sop_uids if u}
+                        sent_sop_uids = list(sent_sop_uids) + [
+                            (None, u) for u in recovered2 if u not in known
+                        ]
                     resumed_lost = True
 
         if resumed_lost:
@@ -3647,10 +4311,31 @@ def _execute_cmove_job(
         # `_t2` was never assigned - the binding stays inside the `try` that
         # raised, so it is read through a default instead of a NameError.
         _obs_total_p2 = (locals().get("_t2", 0) or 0) if not no_common_ts else 0
+        # What the passes OBSERVED as undelivered. This is evidence from the
+        # transfer itself and outranks the cached enumeration, which can be
+        # STALE: the WADO stream may hold instances the cache does not (a study
+        # that grew between the enumeration and the stream), and the peer can
+        # reject one of those. Reconciling only against the cache reported
+        # Success for a job that really left an instance behind.
+        observed_failed = {u for u in (set(_fs1) | set(_fs2)) if u}
+        observed_failed -= delivered
         if study_sop_uids is not None and study_sop_uids:
             study_uids_set = set(study_sop_uids)
-            total = len(study_uids_set)
-            ordered_uids = study_sop_uids
+            # The cache fixes the ORDER and the baseline of the tail, and the
+            # observed failures extend BOTH membership and total: an instance
+            # the cache never listed but the peer refused is part of the
+            # result, or the report claims a completeness the transfer did not
+            # have.
+            # The cache fixes the ORDER and the baseline of the tail, the
+            # delivered set and the observed failures extend BOTH membership
+            # and total. A UID the cache never listed but the transfer
+            # delivered is part of the result too: excluding it made the total
+            # smaller than the completed count on a study that grew between the
+            # enumeration and the stream.
+            total = len(study_uids_set | observed_failed | delivered)
+            ordered_uids = list(study_sop_uids) + sorted(
+                u for u in observed_failed if u not in study_uids_set
+            )
         else:
             # No authoritative list (degradation): total = largest pass total.
             # Pass 2 is included ONLY when it actually ran: a resumed job that
@@ -3658,9 +4343,9 @@ def _execute_cmove_job(
             # GET, and ignoring that total reported 0 failures for a job whose
             # GIVE_UP is the one thing we know about it (PS3.4 C.4.2.1.4.2:
             # the final status must be honest about undelivered instances).
-            total = max(_obs_total_p1, _obs_total_p2, completed)
+            total = max(_obs_total_p1, _obs_total_p2, completed, len(observed_failed))
             ordered_uids = None
-        if study_sop_uids is not None and study_sop_uids:
+        if ordered_uids is not None:
             failed_sop_uids = [u for u in ordered_uids if u not in delivered]
         else:
             # Degrade to the per-attempt failed sets when present, else [].
@@ -3734,6 +4419,12 @@ def _execute_cmove_job(
             move_jobs.update_job_progress(job_id, completed, failed, total)
         except Exception as e:
             logging.debug("[C-MOVE] reconciled progress write failed: %s", e)
+
+        # A C-STORE Warning means the peer STORED the instance (PS3.4
+        # B.2.3.1), so those UIDs stay out of the failed/undelivered tail. The
+        # tally itself is recorded by `_stream_and_send_study` as it goes (see
+        # `set_job_warning_count`), because the reactor - not this function -
+        # builds the final C-MOVE-RSP that reports 0xB000 for them.
 
         if no_common_ts:
             # No common transfer syntax: the job ends failed with zero slices
@@ -3813,7 +4504,7 @@ def _execute_cmove_job(
         # the RuntimeError catch above) touches the consecutive-failure
         # counter (D3, spec task #1).
         if failed == 0 and total > 0:
-            move_jobs.record_scp_success(move_dest_ae, host=target_host)
+            move_jobs.record_scp_success(move_dest_ae, host=health_host)
 
         # -- Finish job --
         job_success = failed == 0 and total > 0
@@ -3905,20 +4596,30 @@ def _cmove_worker(
         logging.info("[C-MOVE] Worker-%d started", worker_id)
 
         while not _shutdown_requested.is_set():
-            # Bridge: pick next pending job, LIMIT 1, skipping a peer another
-            # worker is already streaming to. Claiming a busy peer's job and
-            # handing it back parked every OTHER pending job behind it (the
-            # handback kept the row's created_at, so the next pick took the
-            # same busy peer again) and burned an UPDATE+commit twice a
-            # second for the whole transfer. Skipping at pick time leaves the
-            # row pending for the other workers to see.
-            job = move_jobs.pick_pending_job(
-                skip=lambda host, port, ae: bool(host)
-                and bool(port)
-                and _peer_is_busy(host, int(port), ae),
-            )
+            # Bridge: pick next pending job, LIMIT 1, RESERVING its peer
+            # atomically.
+            #
+            # The reservation is the claim test, not a peek: an earlier design
+            # read "is the peer busy?" and then claimed the row as two steps,
+            # so two workers could both find the peer free and claim two jobs
+            # for it - one then parked in the gate while a job for a DIFFERENT
+            # peer sat unserved. A failed reservation hands the row back
+            # WITHOUT charging an attempt, so a busy peer never burns a job's
+            # retry budget.
+            job = None
+            while job is None and not _shutdown_requested.is_set():
+                job = move_jobs.pick_pending_job(
+                    timeout=1.0,
+                    reserve=lambda host, port, ae: (
+                        _try_reserve_peer(host, int(port), ae)
+                        if host and port
+                        else True
+                    ),
+                    release=lambda host, port, ae: (
+                        _job_gate_exit(host, int(port), ae) if host and port else None
+                    ),
+                )
             if job is None:
-                # pick_pending_job() already waited via Condition
                 continue
 
             job_id = job["id"]
@@ -3973,6 +4674,7 @@ def _cmove_worker(
                     request_level=job.get("request_level", ""),
                     request_series_uid=job.get("request_series_uid", ""),
                     request_sop_uid=job.get("request_sop_uid", ""),
+                    registry_host=job.get("registry_host", ""),
                 )
             except Exception as e:
                 logging.error(
@@ -3984,6 +4686,21 @@ def _cmove_worker(
                 if move_jobs.finish_job(job_id, success=False, error_message=str(e)):
                     move_jobs_counter.labels(status="failed").inc()
             finally:
+                # Release the PICKER's reservation too.
+                #
+                # `pick_pending_job` reserved this peer at depth 1 and
+                # `_execute_cmove_job` took the same gate at depth 2 (it is
+                # re-entrant), then released only ITS OWN acquisition on the
+                # way out. The depth-1 claim therefore stayed in `_ASSOC_BUSY`
+                # for the life of the process, so every other worker saw that
+                # peer as permanently busy and skipped its jobs - one job per
+                # peer was the effective concurrency limit, and the leak grew
+                # with every peer tried.
+                _job_gate_exit(
+                    job.get("target_host", ""),
+                    int(job.get("target_port", 0) or 0),
+                    move_dest_ae,
+                )
                 # Bridge: clear cancel callback after job completes
                 move_jobs.clear_job_callback(job_id)
 

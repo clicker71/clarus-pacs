@@ -27,14 +27,58 @@
 /// ```
 pub fn extract_pixel_data(dicom_bytes: &[u8]) -> Option<&[u8]> {
     let (pixel_start, pixel_length) = find_pixel_data_location(dicom_bytes)?;
-    let pixel_end = pixel_start.saturating_add(pixel_length);
-
-    if pixel_end > dicom_bytes.len() {
-        // Pixel data extends beyond buffer - take what we have
-        return Some(&dicom_bytes[pixel_start..]);
+    if pixel_length == UNDEFINED_LENGTH {
+        // PS3.5 A.4: an encapsulated value is undefined length and is followed
+        // by its Sequence Delimitation Item. Its item stream is resolved by the
+        // decoder; here the value is bounded by the delimiter when one is
+        // present, never by end-of-file (which would swallow any trailing
+        // element, e.g. Data Set Trailing Padding).
+        return Some(bounded_encapsulated_value(dicom_bytes, pixel_start));
     }
+    // PS3.5 7.1.2: a defined-length value is bounded by its declared length.
+    // When the buffer ends before that, the callers split into two kinds and
+    // the difference matters:
+    //
+    // * a HEADER-ONLY prefix (the value bytes were never supplied) still
+    //   locates the region, and the slice is what the buffer holds - the
+    //   rendered-frame path reads metadata from such a prefix;
+    // * a value that STARTED and then stopped short is truncated, and a short
+    //   tail there is not a pixel payload at all.
+    //
+    // The two are told apart by whether the buffer contains any of the value:
+    // a prefix cut at the element header has none, a truncated payload has
+    // some. Declaring four bytes and supplying two is the truncated case and
+    // is refused.
+    let available = dicom_bytes.len().saturating_sub(pixel_start);
+    if pixel_length > available && available != 0 {
+        return None;
+    }
+    let end = pixel_start.checked_add(pixel_length.min(available))?;
+    Some(&dicom_bytes[pixel_start..end])
+}
 
-    Some(&dicom_bytes[pixel_start..pixel_end])
+/// Slice from `value_start` to the Sequence Delimitation Item that closes it.
+///
+/// The walk is by Item LENGTH, so a delimiter byte pattern inside a fragment
+/// value cannot end the value early; only a real (FFFE,E0DD) at item
+/// boundaries does. Without a delimiter in the buffer the whole remainder is
+/// returned, which is the bzip2-truncated-input case every decoder handles.
+fn bounded_encapsulated_value(data: &[u8], value_start: usize) -> &[u8] {
+    let mut pos = value_start;
+    while pos + 8 <= data.len() {
+        let tag_group = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        let tag_element = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+        if tag_group == 0xFFFE && tag_element == 0xE0DD {
+            return &data[value_start..pos];
+        }
+        let len = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+            as usize;
+        if len == UNDEFINED_LENGTH || pos + 8 + len > data.len() {
+            break;
+        }
+        pos += 8 + len;
+    }
+    &data[value_start..]
 }
 
 /// Locate the Pixel Data tag (7FE0,0010) in a DICOM header buffer.
@@ -47,8 +91,16 @@ pub fn extract_pixel_data(dicom_bytes: &[u8]) -> Option<&[u8]> {
 /// 2. Raw byte-scan fallback for non-standard encodings (pydicom-generated files)
 pub(crate) fn find_pixel_data_location(header: &[u8]) -> Option<(usize, usize)> {
     // 1. Fast path: Explicit VR LE sequential parse (standard DICOM)
-    if let Some(result) = find_pixel_data_explicit_vr(header) {
-        return Some(result);
+    match find_pixel_data_explicit_vr(header) {
+        WalkOutcome::Found(location) => return Some(location),
+        // The walk completed and there is no top-level Pixel Data. Falling
+        // back to the raw scan here returns a NESTED one: the scan excludes
+        // only Icon Image Sequences, so Pixel Data inside a defined-length
+        // private sequence would be served as if it were the image. A clean
+        // miss is an answer, not a failure to answer.
+        WalkOutcome::CleanMiss => return None,
+        // Only a walk that lost sync is worth a second, blinder opinion.
+        WalkOutcome::Desynced => {}
     }
     // 2. Fallback: raw byte-scan for (7FE0,0010) in LE
     //    Catches pydicom-generated Explicit VR LE files with non-standard
@@ -57,21 +109,50 @@ pub(crate) fn find_pixel_data_location(header: &[u8]) -> Option<(usize, usize)> 
     find_pixel_data_byte_scan(header)
 }
 
+/// How the sequential Explicit VR walk ended.
+///
+/// "Not found" and "could not walk" are different statements, and only the
+/// second one licenses the raw byte scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkOutcome {
+    Found((usize, usize)),
+    /// The dataset walked to its end with no top-level Pixel Data.
+    CleanMiss,
+    /// The walk lost sync: a header or a value did not fit the buffer, or the
+    /// buffer is not a Part 10 file at all.
+    Desynced,
+}
+
 /// Phase 1: Explicit VR Little Endian sequential parse.
 ///
 /// Standard DICOM binary layout - walks data elements from offset 132,
 /// skipping by VR-determined element sizes. Returns None if the parse
 /// loses sync (non-standard encoding, pydicom files, etc.).
-fn find_pixel_data_explicit_vr(header: &[u8]) -> Option<(usize, usize)> {
+fn find_pixel_data_explicit_vr(header: &[u8]) -> WalkOutcome {
     if header.len() < 132 {
-        return None;
+        return WalkOutcome::Desynced;
     }
     if &header[128..132] != b"DICM" {
-        return None;
+        return WalkOutcome::Desynced;
     }
 
     let mut offset: usize = 132;
     let data_len = header.len();
+
+    // PS3.5 7.1: Pixel Data is a top-level attribute of the Data Set. An
+    // instance can also carry a (7FE0,0010) INSIDE a sequence - the Icon Image
+    // Sequence (0088,0200) of PS3.3 C.7.6.1.1.5 is the standard one, a private
+    // sequence is another - and those are not the image the caller asked for.
+    //
+    // `depth` counts only the levels that a matching delimiter will close:
+    // an undefined-length Item opens one and its (FFFE,E00D) closes it, and an
+    // undefined-length sequence opens one and its (FFFE,E0DD) closes it. A
+    // DEFINED-length Item or sequence has no delimiter at all, so it is not
+    // counted - it is skipped by its length. Counting a defined-length Item
+    // left `depth` permanently above zero, and counting the sequence's E0DD
+    // against a depth the sequence never raised dropped it to zero inside an
+    // outer item, where a nested Pixel Data then looked top level.
+    let mut depth: usize = 0;
 
     while offset + 8 <= data_len {
         let group = u16::from_le_bytes([header[offset], header[offset + 1]]);
@@ -79,20 +160,44 @@ fn find_pixel_data_explicit_vr(header: &[u8]) -> Option<(usize, usize)> {
 
         // PS3.5 7.5: the item and delimitation tags of group FFFE carry NO
         // VR, so the two bytes a VR would occupy are part of their 32-bit
-        // length. Reading a VR here would put the walk four bytes out, and
-        // treating the four bytes after the tag as anything but a length
-        // would do the same. Each is an eight-byte header, and the walk
-        // reads on: an undefined-length sequence is entered, never skipped.
+        // length. Reading a VR here would put the walk four bytes out.
         if group == 0xFFFE {
-            offset += 8;
+            let len_at = offset + 4;
+            let Some(raw_len) = header.get(len_at..len_at + 4) else {
+                return WalkOutcome::Desynced;
+            };
+            let item_len = u32::from_le_bytes(raw_len.try_into().expect("4 bytes")) as usize;
+            match element {
+                0xE000 => {
+                    // PS3.5 7.5.1: a defined-length Item is closed by its own
+                    // length, not by an Item Delimitation Item, so it must not
+                    // change the depth - it is stepped over whole. Only the
+                    // undefined-length form opens a level that an E00D closes.
+                    if item_len == UNDEFINED_LENGTH {
+                        depth += 1;
+                        offset += 8;
+                    } else {
+                        offset = offset.saturating_add(8).saturating_add(item_len);
+                    }
+                }
+                0xE00D => {
+                    depth = depth.saturating_sub(1);
+                    offset += 8;
+                }
+                0xE0DD => {
+                    depth = depth.saturating_sub(1);
+                    offset += 8;
+                }
+                _ => offset += 8,
+            }
             continue;
         }
 
-        if group == 0x7FE0 && element == 0x0010 {
+        if group == 0x7FE0 && element == 0x0010 && depth == 0 {
             let vr = &header[offset + 4..offset + 6];
             if vr == b"OB" || vr == b"OW" {
                 if offset + 12 > data_len {
-                    return None;
+                    return WalkOutcome::Desynced;
                 }
                 let length = u32::from_le_bytes([
                     header[offset + 8],
@@ -105,76 +210,38 @@ fn find_pixel_data_explicit_vr(header: &[u8]) -> Option<(usize, usize)> {
                 // returned as it stands, because `extract_pixel_data`
                 // already takes the rest of the buffer when the declared
                 // length runs past it.
-                return Some((offset + 12, length));
+                return WalkOutcome::Found((offset + 12, length));
             }
-            return None;
+            return WalkOutcome::Desynced;
         }
 
-        // Skip to next element
-        if offset + 6 > data_len {
-            break;
-        }
-
-        let vr = &header[offset + 4..offset + 6];
-        // PS3.5 7.1.2: these VRs carry a 4-byte length after a 2-byte
-        // reserved field, so their header is 12 bytes and not 8. OV, UC and UR
-        // are in the same table; treating them as short VRs makes the walker
-        // read half of the length as a VR and desynchronise every element
-        // after the first one.
-        let is_long_vr = matches!(
-            vr,
-            b"OB" | b"OD" | b"OF" | b"OL" | b"OV" | b"OW" | b"SQ" | b"UC" | b"UR" | b"UT" | b"UN"
-        );
-
-        let elem_size = if is_long_vr {
-            if offset + 12 > data_len {
-                break;
-            }
-            let length = u32::from_le_bytes([
-                header[offset + 8],
-                header[offset + 9],
-                header[offset + 10],
-                header[offset + 11],
-            ]) as usize;
-            if length == UNDEFINED_LENGTH {
-                // PS3.5 7.5.1: the sentinel is the ABSENCE of a length, and
-                // only the 32-bit form can express it. A sequence written
-                // this way ends at its (FFFE,E0DD), so the walk steps past
-                // the header and into the item stream rather than adding a
-                // length it does not have - which would carry it past the
-                // end of the buffer and lose every element after it.
-                //
-                // An entered item stream can hold a NESTED (7FE0,0010): the
-                // Icon Image Sequence (0088,0200) of PS3.3 C.7.6.1.1.5
-                // carries a thumbnail this size, and it is not the image the
-                // caller asked for. The items of that sequence are skipped by
-                // their delimiters instead of entered, so the walk reaches the
-                // top-level Pixel Data that follows it.
-                if group == 0x0088 && element == 0x0200 {
-                    match skip_undefined_length_sequence(header, offset + 12) {
-                        Some(next) => next,
-                        None => break,
-                    }
-                } else {
-                    12
-                }
-            } else {
-                12 + length
-            }
-        } else {
-            if offset + 8 > data_len {
-                break;
-            }
-            let length = u16::from_le_bytes([header[offset + 6], header[offset + 7]]) as usize;
-            // A 16-bit length cannot express the sentinel (PS3.5 7.5.1), so
-            // 0xFFFF here is a real value length and not an escape.
-            8 + length
+        // Skip to the next element. PS3.5 7.1.2 with 6.2 Table 6.2-1: the
+        // width class decides between an 8-byte and a 12-byte header, and
+        // `vr_widths` is the one place that table is stated.
+        let Some(value) = super::vr_widths::explicit_value(header, offset + 4, false) else {
+            return WalkOutcome::Desynced;
         };
-
-        offset = offset.saturating_add(elem_size);
+        let header_len = 4 + value.header_len;
+        if value.len == UNDEFINED_LENGTH {
+            // PS3.5 7.5.1: the sentinel is the ABSENCE of a length, and only
+            // the 32-bit form can express it. An undefined-length SEQUENCE
+            // opens a level here so its own E0DD can close exactly that level
+            // rather than one belonging to an enclosing item.
+            depth += 1;
+            offset = offset.saturating_add(header_len);
+        } else {
+            offset = offset.saturating_add(header_len).saturating_add(value.len);
+        }
     }
 
-    None
+    // Reaching the end means the dataset was walked; if nothing opened a
+    // level that is left unclosed, this is a clean miss rather than a
+    // truncation. A nonzero depth means a delimiter never arrived.
+    if depth == 0 {
+        WalkOutcome::CleanMiss
+    } else {
+        WalkOutcome::Desynced
+    }
 }
 
 /// The undefined-length sentinel (PS3.5 7.5.1), meaningful only in the
@@ -201,20 +268,7 @@ fn skip_undefined_length_sequence(header: &[u8], start: usize) -> Option<usize> 
             // delimiter. An undefined-length child is entered, staying in
             // step with the outer depth.
             let vr = header.get(offset + 4..offset + 6)?;
-            let long_vr = matches!(
-                vr,
-                b"OB"
-                    | b"OD"
-                    | b"OF"
-                    | b"OL"
-                    | b"OV"
-                    | b"OW"
-                    | b"SQ"
-                    | b"UC"
-                    | b"UR"
-                    | b"UT"
-                    | b"UN"
-            );
+            let long_vr = super::vr_widths::is_long_form_vr(vr);
             let (hdr_len, len) = if long_vr {
                 let l = u32::from_le_bytes(header.get(offset + 8..offset + 12)?.try_into().ok()?);
                 (12usize, l as usize)
@@ -283,6 +337,39 @@ fn locate_icon_image_sequences(header: &[u8]) -> Vec<(usize, usize)> {
     out
 }
 
+/// Whether `data` is a walkable element stream from `start`.
+///
+/// Deliberately the same arithmetic the sequential walker uses: a buffer whose
+/// bytes do not form complete Explicit VR elements up to the first Pixel Data
+/// candidate is not a dataset, whatever tag pattern it happens to contain.
+fn walks_as_a_dataset(data: &[u8], start: usize) -> bool {
+    let mut offset = start;
+    let mut walked = 0usize;
+    while offset + 8 <= data.len() {
+        let group = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        let element = u16::from_le_bytes([data[offset + 2], data[offset + 3]]);
+        if group == 0xFFFE {
+            offset += 8;
+            continue;
+        }
+        if group == 0x7FE0 && element == 0x0010 {
+            // Reaching the candidate through complete elements is the proof.
+            return walked > 0 || offset == start;
+        }
+        let Some(value) = super::vr_widths::explicit_value(data, offset + 4, false) else {
+            return false;
+        };
+        if value.len == UNDEFINED_LENGTH {
+            return false;
+        }
+        offset = offset
+            .saturating_add(4 + value.header_len)
+            .saturating_add(value.len);
+        walked += 1;
+    }
+    false
+}
+
 /// Phase 2: Raw byte-scan for (7FE0,0010) tag in Little Endian.
 ///
 /// Brute-force search for the 4-byte tag pattern `E0 7F 10 00` starting
@@ -295,7 +382,14 @@ fn locate_icon_image_sequences(header: &[u8]) -> Vec<(usize, usize)> {
 fn find_pixel_data_byte_scan(header: &[u8]) -> Option<(usize, usize)> {
     const PATTERN: [u8; 4] = [0xE0, 0x7F, 0x10, 0x00]; // (7FE0,0010) LE
 
-    if header.len() < 140 {
+    // The 140-byte floor belongs to the Part 10 SHAPE (128-byte preamble plus
+    // "DICM" plus a 12-byte long-form Pixel Data header), and it was applied to
+    // every buffer before the start was chosen. A bare dataset has no preamble,
+    // so the smallest legal one - a 12-byte Pixel Data element header plus two
+    // sample bytes - is 14 bytes, and the documented bare mode refused it.
+    // Decide the dataset start first and let the bounds check below judge the
+    // candidate; only the Part 10 shape needs the preamble length.
+    if header.len() < 12 {
         return None;
     }
 
@@ -304,7 +398,33 @@ fn find_pixel_data_byte_scan(header: &[u8]) -> Option<(usize, usize)> {
     // has no stack, so the sequence's extent is located once, up front.
     let icon_ranges = locate_icon_image_sequences(header);
 
-    let mut search_from: usize = 132; // after DICM magic + meta header
+    // The byte pattern alone is not evidence: any four bytes of a JPEG or a
+    // text file followed by a plausible length would read as a pixel payload.
+    // Two shapes are accepted, and both are validated structurally rather than
+    // by inspection of the pattern:
+    //
+    // * a Part 10 file (PS3.10 7.1) - the 128-byte preamble and "DICM", then
+    //   the meta group and the dataset;
+    // * a BARE dataset, which is a header slice whose caller stripped the
+    //   preamble (the `bounded` metadata readers hand one over). It is only
+    //   accepted when the walk from offset 0 reaches the tag through complete
+    //   elements, which no arbitrary buffer does by accident.
+    let part10 = header.len() >= 132 && &header[128..132] == b"DICM";
+    // A 132-byte preamble with the magic stripped is the same Part 10 file
+    // minus its "DICM": the dataset still starts at 132, and a zero-filled
+    // preamble is the only thing that can occupy those bytes in a file whose
+    // elements have not been shifted.
+    let bare_with_preamble = header.len() >= 132 && header[..128].iter().all(|b| *b == 0);
+    let mut search_from: usize = if part10 || bare_with_preamble {
+        132 // after the preamble (and the magic, when it is there)
+    } else {
+        // A dataset with neither is verified by the same header rules the
+        // walker uses; if it cannot be walked from zero, the buffer is not one.
+        if !walks_as_a_dataset(header, 0) {
+            return None;
+        }
+        0
+    };
     while let Some(pos) = header[search_from..].windows(4).position(|w| w == PATTERN) {
         let abs = search_from + pos;
         if icon_ranges.iter().any(|&(s, e)| abs >= s && abs < e) {
@@ -487,8 +607,12 @@ mod tests {
         // that only called `extract_pixel_data` would stay green with the
         // walker broken and would be measuring the wrong thing.
         let dicom = make_undefined_sq_dicom(1024, 1024, 1024 * 1024);
-        let (start, length) = find_pixel_data_explicit_vr(&dicom)
-            .expect("the sequential walker gets past the undefined-length sequence");
+        let (start, length) = match find_pixel_data_explicit_vr(&dicom) {
+            WalkOutcome::Found(location) => location,
+            other => panic!(
+                "the sequential walker gets past the undefined-length sequence, got {other:?}"
+            ),
+        };
         assert_eq!(length, 1024 * 1024, "the declared value length");
         assert_eq!(start, dicom.len() - 1024 * 1024, "the payload offset");
 
@@ -687,5 +811,214 @@ mod tests {
         let frames = [0xFEu8, 0xFF, 0x00, 0xE0, 0x01, 0x02, 0x03, 0x04];
         buf.extend_from_slice(&frames);
         assert_eq!(extract_pixel_data(&buf), Some(frames.as_slice()));
+    }
+
+    // ---- A2b: extraction-scope regressions ------------------------------
+
+    /// A native element that declares more than the buffer holds is truncated.
+    ///
+    /// PS3.5 7.1.2 bounds the value by its declared length, so a two-byte tail
+    /// is not a four-byte payload: the old "take what we have" made a short
+    /// buffer answer for the whole element, and the caller sized a frame from
+    /// a value that was not there.
+    #[test]
+    fn a_truncated_native_payload_is_refused() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        buf.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        buf.extend_from_slice(b"OW");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&4u32.to_le_bytes()); // declares four bytes
+        buf.extend_from_slice(&[0xAA, 0xBB]); // supplies two
+        assert_eq!(extract_pixel_data(&buf), None);
+    }
+
+    /// A header-only prefix still locates the region.
+    ///
+    /// The rendered-frame path parses a prefix that stops at the PixelData
+    /// header; the value was never supplied, so there is nothing to truncate.
+    /// The distinction is "no value bytes at all" versus "started and stopped".
+    #[test]
+    fn a_header_only_prefix_still_locates_the_region() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        buf.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        buf.extend_from_slice(b"OW");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&4096u32.to_le_bytes());
+        assert_eq!(extract_pixel_data(&buf), Some([].as_slice()));
+    }
+
+    /// A nested Pixel Data inside a private sequence is not the image.
+    ///
+    /// PS3.5 7.1: Pixel Data is a top-level attribute. The Icon Image Sequence
+    /// (0088,0200) is the standard nesting, but the rule is about the level,
+    /// not about the tag that encloses it.
+    #[test]
+    fn a_private_sequences_pixel_data_is_not_the_image() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        // A private sequence (0029,1002) SQ, undefined length, one item.
+        buf.extend_from_slice(&0x0029u16.to_le_bytes());
+        buf.extend_from_slice(&0x1002u16.to_le_bytes());
+        buf.extend_from_slice(b"SQ");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Its own Pixel Data, deliberately distinguishable.
+        buf.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        buf.extend_from_slice(b"OB");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&[0xAA; 4]);
+        buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        buf.extend_from_slice(&0xE00Du16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        buf.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        // The real top-level payload.
+        let payload = [0x11u8, 0x22, 0x33, 0x44];
+        buf.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        buf.extend_from_slice(b"OW");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&payload);
+        assert_eq!(extract_pixel_data(&buf), Some(payload.as_slice()));
+    }
+
+    /// A dataset whose ONLY Pixel Data is nested must answer None.
+    ///
+    /// The sequential walk sees the whole dataset and finds no top-level
+    /// (7FE0,0010) - a CLEAN miss. Falling back to the raw byte scan there is
+    /// wrong: the scan excludes only Icon Image Sequences, so it returns the
+    /// private sequence's Pixel Data as if it were the image. The fallback is
+    /// licensed only by a walk that lost sync.
+    #[test]
+    fn a_clean_miss_does_not_fall_back_to_the_byte_scan() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        // A DEFINED-length private sequence holding one defined-length item
+        // whose only attribute is Pixel Data. Nothing follows it, so there is no
+        // top-level payload to find.
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        inner.extend_from_slice(b"OB");
+        inner.extend_from_slice(&[0, 0]);
+        inner.extend_from_slice(&4u32.to_le_bytes());
+        inner.extend_from_slice(&[0xAA; 4]);
+
+        let mut sq_value = Vec::new();
+        sq_value.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]); // (FFFE,E000)
+        sq_value.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+        sq_value.extend_from_slice(&inner);
+
+        buf.extend_from_slice(&0x0029u16.to_le_bytes());
+        buf.extend_from_slice(&0x1002u16.to_le_bytes());
+        buf.extend_from_slice(b"SQ");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&(sq_value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&sq_value);
+
+        assert_eq!(
+            extract_pixel_data(&buf),
+            None,
+            "a nested payload is not the image, and nothing top-level exists"
+        );
+    }
+
+    /// A defined-length Item is skipped by its length, not counted as a level.
+    #[test]
+    fn a_defined_length_sequence_does_not_hide_the_top_level_pixel_data() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        // (0008,1115) SQ, DEFINED length: one item of 8 + 4 bytes.
+        buf.extend_from_slice(&0x0008u16.to_le_bytes());
+        buf.extend_from_slice(&0x1115u16.to_le_bytes());
+        buf.extend_from_slice(b"SQ");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        // (0028,0010) US 512 inside the item.
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&512u16.to_le_bytes());
+        buf.extend_from_slice(&[0, 0]); // even-length pad for the item
+
+        let payload = [0x77u8, 0x88];
+        buf.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        buf.extend_from_slice(b"OW");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&payload);
+        assert_eq!(extract_pixel_data(&buf), Some(payload.as_slice()));
+    }
+
+    /// An encapsulated value stops at its Sequence Delimitation Item.
+    ///
+    /// PS3.5 A.4: the value is undefined length, and an element may follow it
+    /// (Data Set Trailing Padding). Taking everything to EOF swallowed that
+    /// element into the pixel payload.
+    #[test]
+    fn an_encapsulated_value_stops_at_its_delimiter() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 128]);
+        buf.extend_from_slice(b"DICM");
+        buf.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        buf.extend_from_slice(b"OB");
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Empty BOT item, then one frame item.
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let frame = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        buf.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&frame);
+        buf.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let value_len = extract_pixel_data(&buf).expect("located").len();
+        // Everything from the value offset to the delimiter: two item headers
+        // (16) plus the frame (4), and NOT the delimiter itself.
+        assert_eq!(value_len, 20, "the trailing element is excluded");
+
+        // A trailing element after the delimiter must not enter the value.
+        buf.extend_from_slice(&0x0028u16.to_le_bytes());
+        buf.extend_from_slice(&0x0010u16.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&512u16.to_le_bytes());
+        assert_eq!(
+            extract_pixel_data(&buf).expect("located").len(),
+            20,
+            "the element after the delimiter is still excluded"
+        );
+    }
+
+    /// A byte pattern alone is not a Pixel Data element.
+    ///
+    /// The fallback used to return any `E0 7F 10 00 OB|OW` sequence from a
+    /// buffer that is not DICOM at all. A bare dataset is still accepted (a
+    /// caller may hand over a slice with the preamble stripped), but only when
+    /// it walks as complete elements up to the tag.
+    #[test]
+    fn a_byte_pattern_in_non_dicom_data_is_refused() {
+        let mut junk = vec![0x42u8; 200];
+        junk.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        junk.extend_from_slice(b"OW");
+        junk.extend_from_slice(&[0, 0]);
+        junk.extend_from_slice(&4u32.to_le_bytes());
+        junk.extend_from_slice(&[0xAA; 4]);
+        assert_eq!(extract_pixel_data(&junk), None);
     }
 }

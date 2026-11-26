@@ -15,7 +15,7 @@ import json
 import logging
 import time
 import uuid
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 from pydicom import dcmwrite
@@ -87,23 +87,54 @@ def retry_after_seconds(headers, default=RETRY_AFTER_DEFAULT_SEC):
 # ---------------------------------------------------------------------------
 # Bridge: simple retry with fixed backoff (like Orthanc)
 # ---------------------------------------------------------------------------
-def _http_retry(request_func, max_retries=3, delay=2.0):
+def _http_retry(request_func, max_retries=3, delay=2.0, on_retry=None, deadline=None):
     """Execute HTTP request with fixed backoff  -  3 attempts, 2s delay.
 
     Retry on: 429, 5xx, timeouts, connection errors.
     No retry on: 4xx except 429 (client errors are permanent).
+
+    `on_retry` is called once per retried attempt. The shared helper serves
+    QIDO, WADO, Storage Commitment AND STOW, so it must not own the STOW
+    metric: incrementing `stow_retries` here counted a QIDO 503 followed by a
+    successful retry as a STOW retry even when no STOW POST ever happened, and
+    a QIDO-only deployment then reported STOW retry traffic it never generated.
+    Only the two STOW callers pass a counter.
+
+    `deadline` is an absolute `time.monotonic()` instant after which no FURTHER
+    attempt may start. httpx's `Timeout(total=...)` bounds each individual
+    connect/read/write/pool operation, not the elapsed time of the request, so
+    an origin that keeps trickling response bytes within the read timeout holds
+    a single POST alive far past the configured budget and the retry loop
+    cannot begin another attempt. Checking the deadline here bounds the NUMBER
+    of attempts in wall-clock terms; each caller additionally passes a
+    shrinking per-attempt timeout built from the same instant.
 
     Returns httpx.Response, including the final 5xx; raises the last
     transport exception (timeout / connection error).
     """
     last_exception = None
 
+    def _note_retry():
+        if on_retry is None:
+            return
+        try:
+            on_retry()
+        except Exception:
+            pass
+
     for attempt in range(max_retries + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            logging.warning(
+                "[RETRY] elapsed-time budget spent before attempt %d/%d",
+                attempt + 1,
+                max_retries + 1,
+            )
+            break
         try:
             resp = request_func()
             if resp.status_code == 429:
                 if attempt < max_retries:
-                    stow_retries.inc()
+                    _note_retry()
                     time.sleep(delay)
                     continue
                 return resp
@@ -152,7 +183,7 @@ def _http_retry(request_func, max_retries=3, delay=2.0):
             last_exception = e
 
         if attempt < max_retries:
-            stow_retries.inc()
+            _note_retry()
             time.sleep(delay)
 
     raise last_exception or Exception("Max retries exceeded")
@@ -169,6 +200,51 @@ class QidoMalformedBodyError(ValueError):
     """
 
 
+# Text marker on a STOW verdict whose outcome is UNKNOWN rather than refused:
+# the origin answered 2xx and the bridge could not read its per-SOP verdict.
+# The outbox worker must retry such an item without counting an attempt - the
+# origin may hold it - instead of burning a retry on a guess.
+STOW_UNVERIFIED = "stow-verdict-unreadable"
+
+
+class QidoPage:
+    """One QIDO-RS answer: its rows plus whether the origin left more behind.
+
+    PS3.18 10.6.1.4: an origin may answer FEWER rows than the requested limit
+    and still warn that the search did not complete, so `len(rows)` alone can
+    never prove an answer exhaustive. The evidence is in the response HEADER,
+    which a bare list cannot carry - a C-FIND handler built on the list alone
+    reported Success (0x0000, "no further matches exist", PS3.4
+    Table C.4.1-1) for searches the origin had explicitly left unfinished.
+    """
+
+    __slots__ = ("rows", "more")
+
+    def __init__(self, rows, more):
+        self.rows = rows
+        self.more = more
+
+    def __iter__(self):
+        # Keeps `for row in answer` working where only the rows are wanted.
+        return iter(self.rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+    def __eq__(self, other):
+        # `answer == []` is how a caller states "no matches"; the continuation
+        # flag is metadata about the answer, not part of what it contains.
+        if isinstance(other, QidoPage):
+            return self.rows == other.rows
+        return self.rows == other
+
+    def __repr__(self):
+        return f"QidoPage({self.rows!r}, more={self.more!r})"
+
+
 def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     """QIDO-RS GET with retry wrapper. Auth by nginx.
 
@@ -181,6 +257,11 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     `qa_base_url`), not by a query parameter: the bridge is a universal
     DICOMweb client, so it must not depend on any one server's private
     parameter for this.
+
+    Returns a `QidoPage`: the row list plus whether the origin reported more
+    matches than it returned. A plain list would lose that (PS3.18 10.6.1.4),
+    and a module-level "last page" flag would leak between concurrent C-FIND
+    generators, which outlive the call that set it.
     """
     if limit is not None:
         params = dict(params)
@@ -190,9 +271,10 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     def _do_qido():
         client = httpx.Client(timeout=httpx.Timeout(http_timeout + 10.0), cert=tls)
         try:
+            # PS3.18 8.3.1: space travels as %20, '+' is a literal qp-special.
+            qs = urlencode(params, quote_via=quote, safe="")
             return client.get(
-                url,
-                params=params,
+                url + "?" + qs,
                 headers={"Accept": "application/dicom+json"},
             )
         finally:
@@ -210,7 +292,7 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
     # answer a query and delivered nothing readable, which is the same failure
     # class as an HTML error page and must not read as "matched nothing".
     if resp.status_code == 204:
-        return []
+        return QidoPage([], False)
     if not resp.content:
         raise QidoMalformedBodyError(f"{url} answered 200 with an empty body")
     try:
@@ -230,7 +312,48 @@ def _qido_request(url, params, http_timeout=30, limit=None, offset=0, tls=None):
         raise QidoMalformedBodyError(
             f"{url} answered 200 with a JSON {type(body).__name__}, expected an array"
         )
-    return body
+    # PS3.18 10.6.1.4 / Annex F: each match is a DICOM JSON MODEL object. A
+    # `null` (or a string, or an array) is not a match, and letting it through
+    # moved the failure downstream - the row converters call `.items()` on it
+    # outside every C-FIND error handler. `[]` and 204 stay valid empty
+    # results; a WRONG row is an unreadable answer.
+    for position, row in enumerate(body):
+        if not isinstance(row, dict):
+            raise QidoMalformedBodyError(
+                f"{url} answered 200 with a {type(row).__name__} at row "
+                f"{position}, expected a JSON object"
+            )
+    return QidoPage(body, _qido_continuation(resp, body, limit))
+
+
+def _qido_continuation(resp, body, limit):
+    """Whether the origin says more matches exist beyond this page.
+
+    PS3.18 10.6.1.4: a QIDO-RS origin signals an incomplete answer either by
+    a Warning header carrying 299 ("The search did not fully complete") or by
+    returning exactly the number of matches that were asked for, which the
+    spec defines as possibly containing more. Both are treated the same way:
+    the answer is not known to be exhaustive.
+
+    A page SHORTER than the requested limit is exhaustive - the origin had the
+    room to send more and did not. With no limit there is no page size to
+    compare against, so only the Warning can say anything.
+    """
+    try:
+        warning = str(resp.headers.get("Warning", "") or "")
+    except (AttributeError, TypeError):
+        warning = ""
+    # The 299 warn-code is the first token of a Warning value, e.g.
+    # `299 origin "The search did not fully complete"`. Parse the CODE instead
+    # of searching the text: a substring test would also match 299 inside a
+    # message body or a longer warn-code such as 2990.
+    for field_value in warning.split(","):
+        token = field_value.strip().split(" ", 1)[0]
+        if token == "299":
+            return True
+    if limit is None:
+        return False
+    return len(body) >= int(limit)
 
 
 # ---------------------------------------------------------------------------
@@ -277,11 +400,31 @@ _STC_REASON_MAP = {
     "0213": _STC_RESOURCE_LIMITATION,
 }
 
+# The full value set PS3.3 C.14.1.1 defines for Failure Reason (0008,1197).
+# A code outside it is a defect of the origin and is answered as 0x0110.
+_STC_ENUMERATED_REASONS = frozenset(
+    {
+        _STC_PROCESSING_FAILURE,
+        _STC_NO_SUCH_SOP,
+        _STC_RESOURCE_LIMITATION,
+        0x0122,  # Referenced SOP Class not supported
+        0x0119,  # Class / Instance conflict
+        0x0131,  # Duplicate SOP Instance
+    }
+)
+
 # Sentinel on the return value for "the origin has no Commit resource".
 # The caller logs the misconfiguration WARN; there is deliberately NO
 # fallback to the local path (a silent fallback would mask the wrong knob
 # forever).
 STC_NO_RESOURCE = "no_commit_resource"
+
+# Sentinel meaning "the origin accepted the request and has not decided yet".
+# PS3.18 13.4.3 defines 202 for exactly this: processed (accepted), not
+# completed. Reporting it as a verdict - in either direction - is a claim the
+# origin never made, so it is carried out as its own signal and the caller
+# retries the Check instead of answering the modality.
+STC_PENDING = "commit_pending"
 
 
 def _stc_commit_request(clarus_url, tx_uid, sop_list, http_timeout=30, tls=None):
@@ -349,6 +492,19 @@ def _stc_commit_request(clarus_url, tx_uid, sop_list, http_timeout=30, tls=None)
         # not re-derived. ONE GET, and an idempotent answer is reported.
         return _stc_check_request(clarus_url, tx_uid, sop_list, http_timeout, tls=tls)
 
+    if status == 202:
+        # PS3.18 13.4.3: 202 Accepted means the origin TOOK the request and is
+        # still processing it - it is not a verdict, and it says nothing about
+        # any individual SOP. Mapping it to "all failed 0x0110" told the
+        # modality its instances were not committed while the origin was still
+        # deciding; the caller must keep the transaction pending and re-Check.
+        logging.info(
+            "[STC] commit tx=%s: HTTP 202 - origin still processing, "
+            "transaction stays pending",
+            tx_uid,
+        )
+        return [], [], STC_PENDING
+
     if status != 200:
         logging.warning(
             "[STC] commit tx=%s: HTTP %d -> all failed 0x0110 (%s)",
@@ -398,6 +554,18 @@ def _stc_check_request(clarus_url, tx_uid, sop_list, http_timeout=30, tls=None):
         )
         return [], _all_failed(sop_list), None
 
+    if resp.status_code == 202:
+        # Same rule as the Commit path: the origin has not finished processing
+        # this Transaction UID. Keeping the transaction pending is what makes
+        # the bounded re-Check happen; answering 0x0110 here reported a
+        # failure the origin never gave.
+        logging.info(
+            "[STC] check tx=%s: HTTP 202 - still processing, transaction stays "
+            "pending",
+            tx_uid,
+        )
+        return [], [], STC_PENDING
+
     if resp.status_code != 200:
         logging.warning(
             "[STC] check tx=%s: HTTP %d -> all failed 0x0110",
@@ -428,37 +596,81 @@ def _stc_map_verdict(payload, sop_list, tx_uid):
     Committed SOPs come from ReferencedSOPSequence (0008,1199); failed ones
     from FailedSOPSequence (0008,1198) with FailureReason (0008,1197). PS3.18
     F.2.3 maps US to a JSON Number, so the reason arrives as an integer and
-    `_stc_reason` resolves it to a DIMSE code. A SOP absent from BOTH
-    sequences is a protocol defect of the origin and is reported as
-    failed 0x0110 - the bridge reports, it does not guess.
-    """
-    committed = []
-    failed = []
-    seen = set()
+    `_stc_reason` resolves it to a DIMSE code.
 
+    The answer is projected onto the REQUEST. A Transaction UID identifies one
+    transaction (PS3.4 J.3.2), so the response may only speak about the SOPs
+    that were asked about: an origin that answers with a SOP the bridge never
+    submitted, or with a SOP that carries no verdict, was previously mapped
+    verbatim - SOP B committed and A failed for a request that named only A, or
+    BOTH verdicts recorded for A when the origin listed it in both sequences.
+    Each requested SOP therefore gets exactly ONE verdict, taken from the
+    response where it is unambiguous; anything else falls back to the
+    processing-failure code, which reports what is known instead of guessing.
+    """
+    requested = [(str(sop_class), str(sop_uid)) for sop_class, sop_uid in sop_list]
+    wanted = set(requested)
+
+    committed_pairs = []
+    failed_pairs = []
     for item in _stc_sequence_items(payload, _STC_REFERENCED_SOP_SEQUENCE):
         pair = _stc_pair(item)
         if pair is None:
             continue
-        seen.add(_stc_key(pair))
-        committed.append(pair)
-
+        committed_pairs.append(pair)
     for item in _stc_sequence_items(payload, _STC_FAILED_SOP_SEQUENCE):
         pair = _stc_pair(item)
         if pair is None:
             continue
-        reason = _stc_reason(item)
-        seen.add(_stc_key(pair))
-        failed.append((pair[0], pair[1], reason))
+        failed_pairs.append((pair[0], pair[1], _stc_reason(item)))
 
-    for sop_class, sop_uid in sop_list:
-        if (str(sop_class), str(sop_uid)) not in seen:
+    committed_keys = {_stc_key(p) for p in committed_pairs}
+    failed_by_key = {}
+    for sop_class, sop_uid, reason in failed_pairs:
+        failed_by_key.setdefault(_stc_key((sop_class, sop_uid)), reason)
+
+    # A response entry about a SOP that was never requested is not a verdict
+    # for this transaction; it is evidence the origin answered for a different
+    # one, and adopting it would report on an instance the modality did not ask
+    # about in this request.
+    for key in sorted(committed_keys | set(failed_by_key)):
+        if key not in wanted:
+            logging.warning(
+                "[STC] tx=%s: response names SOP %s which was not requested - "
+                "ignored",
+                tx_uid,
+                key[1],
+            )
+
+    committed = []
+    failed = []
+    for pair in requested:
+        key = _stc_key(pair)
+        in_committed = key in committed_keys
+        in_failed = key in failed_by_key
+        if in_committed and in_failed:
+            # Contradictory: the same SOP cannot be both stored and refused.
+            # The safe reading is the failure - reporting "committed" for an
+            # instance the origin also listed as failed would tell the modality
+            # its data is safe on the strength of an ambiguous answer.
+            logging.warning(
+                "[STC] tx=%s: SOP %s appears in BOTH sequences - reporting "
+                "the failure verdict",
+                tx_uid,
+                pair[1],
+            )
+            failed.append((pair[0], pair[1], failed_by_key[key]))
+        elif in_committed:
+            committed.append(pair)
+        elif in_failed:
+            failed.append((pair[0], pair[1], failed_by_key[key]))
+        else:
             logging.warning(
                 "[STC] tx=%s: SOP %s is in neither response sequence -> 0x0110",
                 tx_uid,
-                sop_uid,
+                pair[1],
             )
-            failed.append((sop_class, sop_uid, _STC_PROCESSING_FAILURE))
+            failed.append((pair[0], pair[1], _STC_PROCESSING_FAILURE))
 
     return committed, failed, None
 
@@ -521,7 +733,11 @@ def _stc_reason(item):
         code = int(text, 10)
     except (TypeError, ValueError):
         return _STC_PROCESSING_FAILURE
-    if 0 <= code <= 0xFFFF:
+    # PS3.3 C.14.1.1 enumerates the Failure Reason values; everything else is
+    # reported as the general processing failure. A bare range check here let
+    # a code the standard does not define (65535) travel to the modality as a
+    # DIMSE reason the bridge promised to normalise.
+    if code in _STC_ENUMERATED_REASONS:
         return code
     return _STC_PROCESSING_FAILURE
 
@@ -591,15 +807,20 @@ class StowBodyNotJsonObject(ValueError):
 def _stow_body_dict(response_text):
     """Parse a STOW-RS body and return the JSON object it must contain.
 
-    Returns None when the body is empty or not JSON at all (the caller treats
-    that as "no failure report"). Raises `StowBodyNotJsonObject` when the body
-    IS JSON but is not an object - a list or a scalar - because silently
-    returning [] there reported a malformed answer as a clean one.
+    Returns None only for an EMPTY body, which PS3.18 10.5.2 permits (the
+    response may be delivered with no content to report). Anything else that
+    is not a JSON object raises `StowBodyNotJsonObject`: a 2xx whose verdict
+    cannot be read states nothing about the instances, and answering "no
+    failures" for it acknowledged a result nobody reported.
     """
+    if response_text is None or not str(response_text).strip():
+        return None
     try:
         body = json.loads(response_text)
-    except (json.JSONDecodeError, TypeError):
-        return None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise StowBodyNotJsonObject(
+            f"STOW-RS body is not JSON ({len(str(response_text))} bytes)"
+        )
     if not isinstance(body, dict):
         raise StowBodyNotJsonObject(
             f"STOW-RS body is {type(body).__name__}, not a JSON object"
@@ -629,6 +850,40 @@ def _stow_seq_value(tag, seq_item):
             f"failed-SOP item({tag}) Value is {type(values).__name__}, not a list"
         )
     return values
+
+
+def _stow_referenced_uids(response_text):
+    """SOP Instance UIDs the origin explicitly ACCOUNTED FOR in a STOW answer.
+
+    Reads the Referenced SOP Sequence (0008,1199) - the instances the origin
+    reports having stored - so a 202 can be reconciled against the batch
+    instead of being read as "no failures, therefore everything is stored"
+    (PS3.18 10.5.3). A body the bridge cannot read yields an empty set, which
+    makes every SOP unaccounted: an unreadable verdict is not a delivered one.
+    """
+    try:
+        body = _stow_body_dict(response_text)
+    except StowBodyNotJsonObject:
+        return set()
+    if body is None:
+        return set()
+    seq = body.get("00081199")
+    if not isinstance(seq, dict):
+        return set()
+    items = seq.get("Value")
+    if not isinstance(items, list):
+        return set()
+    uids = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            values = _stow_seq_value("00081155", item.get("00081155", {}))
+        except StowBodyNotJsonObject:
+            continue
+        if values and isinstance(values[0], str) and values[0].strip():
+            uids.add(values[0].strip())
+    return uids
 
 
 def _parse_stow_failures_all(response_text):
@@ -678,6 +933,19 @@ def _parse_stow_failures_all(response_text):
         # 00081155 = Referenced SOP Instance UID (PS3.18 sec.10.5.2.1)
         ref_sops = _stow_seq_value("00081155", item.get("00081155", {}))
         ref_sop = ref_sops[0] if ref_sops else "?"
+        # The UID must be a non-empty STRING before it becomes an identity.
+        # A `Value` holding an object or an array was returned as-is, and the
+        # batch dictionary keyed by SOP UID then raised TypeError on the
+        # unhashable value - which the caller's generic handler mapped to a
+        # permanent 0xC000 for EVERY live SOP, including ones the origin had
+        # already stored. An unreadable verdict is not a refusal, so it takes
+        # the retryable path (`StowBodyNotJsonObject` -> 0xA700 / UNVERIFIED).
+        if not isinstance(ref_sop, str) or not ref_sop.strip():
+            raise StowBodyNotJsonObject(
+                "00081155 Value[0] is "
+                f"{type(ref_sop).__name__}, not a non-empty SOP Instance UID"
+            )
+        ref_sop = ref_sop.strip()
 
         failures.append(
             {
@@ -770,8 +1038,23 @@ def stow_single_instance(
     # requests(timeout=30) only covers connect+read, not total elapsed time.
     # httpx.Timeout(N) covers the entire request lifecycle.
     total_timeout = http_timeout + 10
+    # Absolute budget for the whole STOW attempt sequence. `httpx.Timeout()`
+    # bounds each operation, so a slow origin that keeps sending response data
+    # inside the read timeout can hold one POST open well past the budget; the
+    # deadline is what bounds the attempt in wall-clock terms.
+    deadline = time.monotonic() + total_timeout
     base = dicomweb_base(clarus_url)
     stow_url = f"{base}/studies"
+
+    def _attempt_timeout():
+        """Per-attempt httpx timeout, shrunk to whatever budget is left.
+
+        A fixed per-operation timeout on every attempt let a sequence of
+        near-timeout attempts total far more than the configured budget. Each
+        attempt is bounded by the REMAINING time, so the sequence cannot.
+        """
+        remaining = max(1.0, deadline - time.monotonic())
+        return httpx.Timeout(remaining)
 
     # P30: Keep-Alive  -  reuse client for connection persistence (x2 throughput).
     # Without Keep-Alive: TCP-handshake (~30-100ms) on every slice.
@@ -791,7 +1074,7 @@ def stow_single_instance(
                 },
             )
         # Fallback: create+close client per request (backward compat)
-        _c = httpx.Client(timeout=httpx.Timeout(total_timeout), cert=tls)
+        _c = httpx.Client(timeout=_attempt_timeout(), cert=tls)
         try:
             return _c.post(
                 stow_url,
@@ -808,7 +1091,7 @@ def stow_single_instance(
             _c.close()
 
     try:
-        resp = _http_retry(_do_stow)
+        resp = _http_retry(_do_stow, on_retry=stow_retries.inc, deadline=deadline)
         # Bridge: STOW requests counter by HTTP status
         stow_requests.labels(status=str(resp.status_code)).inc()
         sop_uid = str(getattr(dataset, "SOPInstanceUID", "?"))
@@ -821,8 +1104,13 @@ def stow_single_instance(
             try:
                 rejection = _parse_stow_failures(resp.text, sop_uid)
             except StowBodyNotJsonObject as e:
+                # PS3.18 10.5.2: a 2xx states that the request was processed,
+                # not that the instance was stored. An unreadable verdict means
+                # the outcome is UNKNOWN, and the marker tells the outbox worker
+                # so - retrying costs one re-send, while a guessed failure marks
+                # an instance undelivered that the origin may already hold.
                 logging.error("[STOW-RS] malformed response body: %s", e)
-                return (0xA700, resp.status_code, str(e))
+                return (0xA700, resp.status_code, f"{STOW_UNVERIFIED}: {e}")
             if rejection:
                 logging.error(
                     "[STOW-RS] Server rejected SOP %s: %s - check clarus-server logs",
@@ -830,6 +1118,25 @@ def stow_single_instance(
                     rejection["reason"],
                 )
                 return (0xA700, resp.status_code, rejection["reason"])
+
+            # PS3.18 10.5.3: a 202 says the request was ACCEPTED, and its
+            # per-SOP verdict is what states what became of the instance. An
+            # empty failure list is not that verdict - a bodiless 202 leaves
+            # the outcome unknown. Reporting 0x0000 there claimed the instance
+            # was stored on the strength of a status that never said so.
+            if resp.status_code == 202 and sop_uid not in _stow_referenced_uids(
+                resp.text
+            ):
+                logging.error(
+                    "[STOW-RS] HTTP 202 without a per-SOP verdict for %s - "
+                    "reporting it unverified, not stored",
+                    sop_uid,
+                )
+                return (
+                    0xA700,
+                    resp.status_code,
+                    f"{STOW_UNVERIFIED}: no per-SOP verdict on 202",
+                )
 
             logging.debug("-> STOW-RS: %d OK (SOP: %s)", resp.status_code, sop_uid)
             return (0x0000, resp.status_code, "OK")
@@ -894,20 +1201,33 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
 
     boundary = f"BOUNDARY_{uuid.uuid4().hex[:16]}"
     total_timeout = http_timeout + 10
+    # Same elapsed-time budget as the single-instance path: `httpx.Timeout()`
+    # bounds each operation, not the request, so the deadline is what stops a
+    # trickling origin from holding one POST open past the budget.
+    deadline = time.monotonic() + total_timeout
     base = dicomweb_base(clarus_url)
     stow_url = f"{base}/studies"
 
+    def _attempt_timeout():
+        remaining = max(1.0, deadline - time.monotonic())
+        return httpx.Timeout(remaining)
+
     body = bytearray()
-    pre_failed = []
-    for sop_uid, ds, raw_bytes in payloads:
+    # R4: re-serialization is per-SOP work and can raise on ONE bad instance
+    # (an invalid value for its VR). Outside this guard that exception escaped
+    # before the function returned the `(results, retry_after)` tuple it
+    # promises, so the whole batch had no outcome and the retry re-sent every
+    # other SOP with it. A failed part is reported as 0xC000 (this instance is
+    # unwritable) and the rest of the batch still goes.
+    #
+    # Verdicts live in a list INDEXED BY INPUT POSITION, not a pre-failed list
+    # plus a live list: emitting the failures first and the delivered ones
+    # after it returned the batch out of order (`[B failure, A success]` for
+    # `[A, B]`), which this function promises never to do.
+    verdicts = [None] * len(payloads)
+    live_indexes = []
+    for position, (sop_uid, ds, raw_bytes) in enumerate(payloads):
         if raw_bytes is None:
-            # R4: re-serialization is per-SOP work and can raise on ONE bad
-            # instance (an invalid value for its VR). Outside this guard that
-            # exception escaped before the function returned the `(results,
-            # retry_after)` tuple it promises, so the whole batch had no
-            # outcome and the retry re-sent every other SOP with it. A failed
-            # part is reported as 0xC000 (this instance is unwritable) and the
-            # rest of the batch still goes.
             try:
                 _ensure_stow_ts(ds)
                 buf = io.BytesIO()
@@ -919,7 +1239,7 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     sop_uid,
                     e,
                 )
-                pre_failed.append((sop_uid, 0xC000, None, f"Serialize error: {e}"))
+                verdicts[position] = (sop_uid, 0xC000, None, f"Serialize error: {e}")
                 continue
         else:
             dicom_bytes = raw_bytes
@@ -927,16 +1247,21 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
         body += b"Content-Type: application/dicom\r\n\r\n"
         body += dicom_bytes
         body += b"\r\n"
+        live_indexes.append(position)
     body += b"--" + boundary.encode("ascii") + b"--\r\n"
 
-    failed_uids = {entry[0] for entry in pre_failed}
-    live_payloads = [
-        (uid, ds, raw) for uid, ds, raw in payloads if uid not in failed_uids
-    ]
-    if not live_payloads:
+    def _emit(default_status, http_status, msg_by_uid=None):
+        """Fill the remaining verdict slots, in payload order."""
+        for position in live_indexes:
+            uid = payloads[position][0]
+            msg = (msg_by_uid or {}).get(uid, default_status[1])
+            verdicts[position] = (uid, default_status[0], http_status, msg)
+        return verdicts
+
+    if not live_indexes:
         # Every part was unwritable: nothing to POST, and the caller still gets
         # the promised tuple with the per-SOP verdicts.
-        return pre_failed, None
+        return verdicts, None
 
     headers = {
         "Content-Type": (
@@ -952,7 +1277,7 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 content=bytes(body),
                 headers=headers,
             )
-        _c = httpx.Client(timeout=httpx.Timeout(total_timeout), cert=tls)
+        _c = httpx.Client(timeout=_attempt_timeout(), cert=tls)
         try:
             return _c.post(
                 stow_url,
@@ -963,31 +1288,29 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
             _c.close()
 
     try:
-        resp = _http_retry(_do_stow)
+        resp = _http_retry(_do_stow, on_retry=stow_retries.inc, deadline=deadline)
         stow_requests.labels(status=str(resp.status_code)).inc()
 
         if resp.status_code in (200, 201, 202):
-            # Per-SOP outcome: server may reject a subset (0008,1198) in a 2xx.
+            # PS3.18 10.5.2: a 2xx says the request was PROCESSED, not that
+            # every instance in it was STORED. The per-SOP verdict lives in
+            # the Failed SOP Sequence, so an answer the bridge cannot read is
+            # an UNKNOWN outcome - the origin may have kept SOP A and refused
+            # SOP B (10.5.1.1.1) - and must be retried, never acknowledged.
             try:
                 failed = _parse_stow_failures_all(resp.text)
             except StowBodyNotJsonObject as e:
-                # PS3.18 10.5.2: the response must be a DICOM JSON object. A
-                # list or scalar body states nothing about the batch, so it is
-                # a server-side reject, not a clean answer - and it must be
+                # A list or scalar body states nothing about the batch. It is
                 # returned in the SAME `(results, retryafter)` shape as every
                 # other outcome, or the caller unpacks two values from a
                 # three-tuple and dies with ValueError.
                 logging.error("[STOW-RS] malformed batch response body: %s", e)
                 return (
-                    pre_failed
-                    + [
-                        (uid, 0xA700, resp.status_code, f"Malformed response: {e}")
-                        for uid, _ds, _raw in live_payloads
-                    ],
+                    _emit((0xA700, f"{STOW_UNVERIFIED}: {e}"), resp.status_code),
                     None,
                 )
             failed_by_uid = {f["sop_uid"]: f["reason"] for f in failed}
-            sent = {uid for uid, _ds, _raw in live_payloads}
+            sent = {payloads[p][0] for p in live_indexes}
             # PS3.18 10.5: a rejection the server reported for a SOP the client
             # did not send means the two sides disagree about the batch. Marking
             # every sent SOP as delivered would claim a success nobody stated,
@@ -1000,29 +1323,62 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                     len(unmatched),
                 )
                 return (
-                    pre_failed
-                    + [
-                        (uid, 0xA700, resp.status_code, "Unmatched failure response")
-                        for uid, _ds, _raw in live_payloads
-                    ],
+                    _emit((0xA700, "Unmatched failure response"), resp.status_code),
                     None,
                 )
-            results = list(pre_failed)
-            for sop_uid, ds, raw_bytes in live_payloads:
+            for position in live_indexes:
+                sop_uid = payloads[position][0]
                 if sop_uid in failed_by_uid:
-                    results.append(
-                        (sop_uid, 0xA700, resp.status_code, failed_by_uid[sop_uid])
+                    verdicts[position] = (
+                        sop_uid,
+                        0xA700,
+                        resp.status_code,
+                        failed_by_uid[sop_uid],
                     )
                 else:
-                    results.append((sop_uid, 0x0000, resp.status_code, "OK"))
+                    verdicts[position] = (sop_uid, 0x0000, resp.status_code, "OK")
             if failed:
                 logging.error(
                     "[STOW-RS] Batch: %d/%d SOPs rejected by server - "
                     "will re-send individually on retry",
                     len(failed),
-                    len(live_payloads),
+                    len(live_indexes),
                 )
-            return results, None
+            # PS3.18 10.5.3: on a 202 the origin reports what it did WITH A
+            # PER-SOP VERDICT. An empty failure list is not that proof - a 202
+            # with no body, or one naming only some of the batch, leaves the
+            # rest in an UNKNOWN state. Acknowledging them as stored claimed a
+            # success the origin never stated, so anything the response did not
+            # explicitly account for is reported UNVERIFIED (retryable) rather
+            # than delivered. The 200 compatibility path is unchanged: there
+            # the origin has completed the request and "no failures" is its
+            # complete answer.
+            if resp.status_code == 202:
+                referenced = _stow_referenced_uids(resp.text)
+                unaccounted = [
+                    payloads[p][0]
+                    for p in live_indexes
+                    if payloads[p][0] not in failed_by_uid
+                    and payloads[p][0] not in referenced
+                ]
+                if unaccounted:
+                    logging.error(
+                        "[STOW-RS] HTTP 202 without a per-SOP verdict for "
+                        "%d/%d SOP(s) - reporting them unverified, not "
+                        "stored",
+                        len(unaccounted),
+                        len(live_indexes),
+                    )
+                    for position in live_indexes:
+                        sop_uid = payloads[position][0]
+                        if sop_uid in unaccounted:
+                            verdicts[position] = (
+                                sop_uid,
+                                0xA700,
+                                resp.status_code,
+                                f"{STOW_UNVERIFIED}: no per-SOP verdict on 202",
+                            )
+            return verdicts, None
 
         # / Disk full  -  whole batch retryable.
         # 2908: _http_retry does NOT retry 507; backoff comes from the
@@ -1035,53 +1391,27 @@ def stow_batch_instances(payloads, clarus_url, http_timeout=30, client=None, tls
                 backoff,
             )
             msg = f"Disk full - retry after {backoff}s"
-            return (
-                pre_failed + [(uid, 0xA700, 507, msg) for uid, _, _ in live_payloads],
-                backoff,
-            )
+            return _emit((0xA700, msg), 507), backoff
 
         # non-2xx  -  whole batch shares one outcome.
         dimse_status, _, msg = _http_status_to_dimse(resp.status_code)
-        return (
-            pre_failed
-            + [
-                (uid, dimse_status, resp.status_code, msg)
-                for uid, _, _ in live_payloads
-            ],
-            None,
-        )
+        return _emit((dimse_status, msg), resp.status_code), None
     except httpx.ConnectError:
         logging.warning("-> STOW-RS: CONNECTION REFUSED")
         stow_requests.labels(status="error").inc()
-        return (
-            pre_failed
-            + [
-                (uid, 0xA700, None, "Connection refused") for uid, _, _ in live_payloads
-            ],
-            None,
-        )
+        return _emit((0xA700, "Connection refused"), None), None
     except httpx.TimeoutException:
         logging.warning("-> STOW-RS: TOTAL TIMEOUT after %.0fs", total_timeout)
         stow_requests.labels(status="error").inc()
-        return (
-            pre_failed
-            + [(uid, 0xA700, None, "Total timeout") for uid, _, _ in live_payloads],
-            None,
-        )
+        return _emit((0xA700, "Total timeout"), None), None
     except httpx.TransportError as e:
         # Transient mid-request transport break (Read/Write/RemoteProtocol):
         # retryable, so 0xA700 per SOP, not the permanent 0xC000.
         logging.warning("-> STOW-RS: TRANSPORT ERROR (%s)", e)
         stow_requests.labels(status="error").inc()
-        return (
-            pre_failed + [(uid, 0xA700, None, str(e)) for uid, _, _ in live_payloads],
-            None,
-        )
+        return _emit((0xA700, str(e)), None), None
     except Exception as e:
         logging.warning("-> STOW-RS: ERROR (%s)", e)
         logging.debug("-> STOW-RS: Full traceback follows:", exc_info=True)
         stow_requests.labels(status="error").inc()
-        return (
-            pre_failed + [(uid, 0xC000, None, str(e)) for uid, _, _ in live_payloads],
-            None,
-        )
+        return _emit((0xC000, str(e)), None), None

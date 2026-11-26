@@ -17,5 +17,7 @@
 pub mod record;
 pub mod store;
 
-pub use record::{OutputReference, WorkItemCode, WorkItemError, WorkItemRecord};
+pub use record::{
+    MINTED_BY_READINESS, OutputReference, WorkItemCode, WorkItemError, WorkItemRecord,
+};
 pub use store::{StoreError, StoreFilter, WorkItemStore};

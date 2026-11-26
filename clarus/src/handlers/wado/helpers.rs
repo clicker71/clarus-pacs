@@ -129,6 +129,36 @@ pub fn find_instance<'a>(
         .ok_or_else(|| WadoError::NotFound(sop_uid.to_string()))
 }
 
+/// Resolve an instance that must belong to `series_uid`.
+///
+/// PS3.18 10.4.1.1.1 addresses a Retrieve Instance resource by study AND series
+/// AND instance, so an instance outside the named series is not this resource.
+/// `find_instance` searched the whole study, which let `/studies/S/series/B/
+/// instances/X` answer 200 with X's bytes from series A. An instance that
+/// exists in the study but not in the series is a 404 for THIS URL (not a 400:
+/// the request is well formed, the target resource simply does not exist).
+pub fn find_instance_in_series<'a>(
+    manifest: &'a Manifest,
+    series_uid: &str,
+    sop_uid: &str,
+) -> Result<&'a InstanceRecord, WadoError> {
+    let series = manifest
+        .series
+        .iter()
+        .find(|s| {
+            crate::handlers::wado::helpers::attr_text_from(
+                &s.attrs,
+                clarus_core::query::tag::SERIES_INSTANCE_UID,
+            ) == Some(series_uid)
+        })
+        .ok_or_else(|| WadoError::NotFound(sop_uid.to_string()))?;
+    series
+        .instances
+        .iter()
+        .find(|i| attr_text(i, clarus_core::query::tag::SOP_INSTANCE_UID) == Some(sop_uid))
+        .ok_or_else(|| WadoError::NotFound(sop_uid.to_string()))
+}
+
 /// The text value of a DICOM attribute list, by tag.
 ///
 /// Returns `None` when the tag is absent or its value is not text - callers
@@ -339,11 +369,27 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Serde-free bulk-data-URI injection over the native renderer's metadata
 /// bytes. Output is byte-identical to the frozen WADO goldens (the serde-era
 /// `inject_bulk_data_uris` + `serde_json::to_string`).
+///
+/// `pixel` is what the DICOM bytes said about PixelData (7FE0,0010), from
+/// `clarus_adapters::bit_depth::pixel_data_element`. The renderer stops AT that
+/// element, so the JSON never contains it and the injector cannot learn either
+/// fact from `meta`:
+///
+/// - `present == false` means the instance has no PixelData. An SR, a
+///   presentation state and every other non-image SOP class is in that set, and
+///   synthesizing an entry for them published a `BulkDataURI` that resolves to
+///   nothing - worse, the `/frames/1` URI is not even a resource those SOP
+///   classes have.
+/// - `vr` is the element's wire VR. Labelling an encapsulated (`OB`) value as
+///   `OW` mis-declares the value's structure, and for a multi-frame instance the
+///   `/frames/1` URI addresses only the FIRST frame rather than the value the
+///   metadata attribute represents.
 pub fn inject_bulk_data_uris_native(
     meta: &[u8],
     study_uid: &str,
     series_uid: &str,
     sop_uid: &str,
+    pixel: clarus_adapters::bit_depth::PixelDataElement,
 ) -> Vec<u8> {
     let body = if meta.len() >= 2 && meta[0] == b'{' && meta[meta.len() - 1] == b'}' {
         &meta[1..meta.len() - 1]
@@ -433,15 +479,32 @@ pub fn inject_bulk_data_uris_native(
         }
     }
 
-    // PixelData always injected (DEV-015), sorted last (7FE00010 max tag).
-    // Only when it wasn't already present in the input.
-    if !pixel_present {
+    // PixelData is NOT synthesized here any more. The renderer stops at the
+    // element, so only the DICOM bytes can say whether the instance has one at
+    // all - and a non-image SOP class must not advertise a bulk-data URI for an
+    // attribute it does not carry. When the element IS present, its URI is the
+    // full PixelData value, not a single frame: `/frames/1` would publish only
+    // the first frame of a multi-frame instance.
+    if !pixel_present && pixel.present {
         if !first {
             out.push(b',');
         }
-        out.extend_from_slice(b"\"7FE00010\":{\"BulkDataURI\":\"");
+        // `OB` is the encapsulated form; a native value is `OW`. The VR comes
+        // from the element header when the dataset is Explicit VR; an Implicit
+        // VR dataset carries none, and `OW` is the dictionary default for a
+        // native PixelData there.
+        let vr = match pixel.vr {
+            Some([hi, lo]) => [hi, lo],
+            None => *b"OW",
+        };
+        out.extend_from_slice(b"\"");
+        out.extend_from_slice(PIXEL_DATA_TAG.as_bytes());
+        out.extend_from_slice(b"\":{\"BulkDataURI\":\"");
         out.extend_from_slice(pixel_uri.as_bytes());
-        out.extend_from_slice(br#"","vr":"OW"}"#);
+        out.extend_from_slice(br#"","vr":""#);
+        out.extend_from_slice(&vr);
+        out.push(b'"');
+        out.push(b'}');
     }
     out.push(b'}');
 
@@ -475,6 +538,94 @@ mod tests {
         format!("{}/bulkdata/{tag}", uri_prefix())
     }
 
+    /// An instance that HAS PixelData, as a native (unencapsulated) value:
+    /// the renderer stops at the element and the header says `OW`.
+    fn pixel_native() -> clarus_adapters::bit_depth::PixelDataElement {
+        clarus_adapters::bit_depth::PixelDataElement {
+            present: true,
+            vr: Some(*b"OW"),
+        }
+    }
+
+    /// An instance that HAS PixelData as an encapsulated value (`OB`).
+    fn pixel_encapsulated() -> clarus_adapters::bit_depth::PixelDataElement {
+        clarus_adapters::bit_depth::PixelDataElement {
+            present: true,
+            vr: Some(*b"OB"),
+        }
+    }
+
+    /// A non-image instance (SR, presentation state, ...): no PixelData.
+    fn pixel_absent() -> clarus_adapters::bit_depth::PixelDataElement {
+        clarus_adapters::bit_depth::PixelDataElement {
+            present: false,
+            vr: None,
+        }
+    }
+
+    /// No PixelData in the instance -> no PixelData in the metadata.
+    ///
+    /// The injector used to append a fabricated `7FE00010` with a `BulkDataURI`
+    /// unconditionally. For a Structured Report - which has no Pixel Data
+    /// attribute at all - that published a reference that resolves to nothing,
+    /// on a SOP class that does not even have the resource.
+    #[test]
+    fn a_non_image_instance_gets_no_pixel_data_reference() {
+        let m = meta(&[
+            (
+                "00080016",
+                r#"{"Value":["1.2.840.10008.5.1.4.1.1.88.33"],"vr":"UI"}"#,
+            ),
+            ("00080018", r#"{"Value":["1.2.3.4"],"vr":"UI"}"#),
+        ]);
+        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP, pixel_absent());
+        let text = String::from_utf8_lossy(&native);
+        assert!(
+            !text.contains("7FE00010"),
+            "an SR must not advertise Pixel Data: {text}"
+        );
+        assert!(
+            !text.contains("/frames/"),
+            "an SR has no frames resource: {text}"
+        );
+        // The rest of the document is untouched.
+        assert!(text.contains("\"00080018\""));
+    }
+
+    /// An encapsulated (`OB`) PixelData must be labelled `OB`, not `OW`.
+    ///
+    /// The appended entry carried a hardcoded `OW`. For an encapsulated value
+    /// that is the wrong VR - the value is a sequence of items, not 16-bit
+    /// words - so a client that trusts the label parses the wrong structure.
+    #[test]
+    fn an_encapsulated_pixel_data_is_labelled_ob() {
+        let m = meta(&[("00080016", r#"{"Value":["1.2.3"],"vr":"UI"}"#)]);
+        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP, pixel_encapsulated());
+        let text = String::from_utf8_lossy(&native);
+        assert!(
+            text.contains(r#""7FE00010":{"BulkDataURI":""#),
+            "the reference must still be present: {text}"
+        );
+        assert!(
+            text.ends_with(r#""vr":"OB"}}"#),
+            "the VR must match the element's, got: {text}"
+        );
+    }
+
+    /// An Implicit VR instance carries no VR on the wire, so the injector falls
+    /// back to the dictionary default (`OW`) rather than emitting nothing.
+    #[test]
+    fn an_implicit_vr_pixel_data_falls_back_to_ow() {
+        let m = meta(&[("00080016", r#"{"Value":["1.2.3"],"vr":"UI"}"#)]);
+        let implicit = clarus_adapters::bit_depth::PixelDataElement {
+            present: true,
+            vr: None,
+        };
+        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP, implicit);
+        let text = String::from_utf8_lossy(&native);
+        assert!(text.ends_with(r#""vr":"OW"}}"#), "got: {text}");
+    }
+
     /// Renderer grammar fixture matching `extract_full_metadata_bytes` output:
     /// ascending hex keys (BTreeMap order), `{"Value":...,"vr":"VR"}` objects.
     fn meta(entries: &[(&str, &str)]) -> Vec<u8> {
@@ -502,7 +653,7 @@ mod tests {
             ),
             ("00280010", r#"{"Value":[8],"vr":"US"}"#),
         ]);
-        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP);
+        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP, pixel_native());
         let expected = format!(
             "{{\"00020010\":{{\"Value\":[\"1.2.840.10008.1.2.1\"],\"vr\":\"UI\"}},\
              \"00100010\":{{\"Value\":[{{\"Alphabetic\":\"WADO^SMOKE\"}}],\"vr\":\"PN\"}},\
@@ -534,7 +685,7 @@ mod tests {
             ),
             ("0040A020", r#"{"InlineBinary":"c2hvcnQ=","vr":"OB"}"#),
         ]);
-        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP);
+        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP, pixel_native());
         let expected = format!(
             "{{\"00080016\":{{\"Value\":[\"1.2.840.10008.5.1.4.1.1.2\"],\"vr\":\"UI\"}},\
              \"0040A010\":{{\"BulkDataURI\":\"{}\",\"vr\":\"OW\"}},\
@@ -557,7 +708,7 @@ mod tests {
             ),
             ("7FE00010", r#"{"Value":["c2hvcnQ="],"vr":"OB"}"#),
         ]);
-        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP);
+        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP, pixel_native());
         let expected = format!(
             "{{\"00080016\":{{\"Value\":[\"1.2.840.10008.5.1.4.1.1.2\"],\"vr\":\"UI\"}},\
              \"7FE00010\":{{\"BulkDataURI\":\"{}\",\"vr\":\"OB\"}}}}",
@@ -585,7 +736,7 @@ mod tests {
             ),
             ("00081030", r#"{"Value":["Study {1} [x]"],"vr":"LO"}"#),
         ]);
-        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP);
+        let native = inject_bulk_data_uris_native(&m, STUDY, SERIES, SOP, pixel_native());
         let expected = format!(
             "{{\"00081030\":{{\"Value\":[\"Study {{1}} [x]\"],\"vr\":\"LO\"}},\
              \"00100010\":{{\"Value\":[{{\"Alphabetic\":\"A}}][\\\"B\"}}],\"vr\":\"PN\"}},\

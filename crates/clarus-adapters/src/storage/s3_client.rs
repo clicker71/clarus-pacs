@@ -79,8 +79,22 @@ impl S3Client {
     }
 
     /// Build the full URL for an S3 object.
+    ///
+    /// SigV4 signs the canonical URI, i.e. the path AS SENT, so the key must be
+    /// percent-encoded here and signed in that same encoded form - otherwise a
+    /// key containing a space, `+`, `%` or a non-ASCII byte signs one path and
+    /// sends another, which AWS answers with `SignatureDoesNotMatch`.
+    ///
+    /// S3 key slashes are path separators and stay literal (unlike a value in
+    /// the canonical query, where `/` becomes `%2F`), which is what
+    /// `uri_encode(key, false)` encodes for.
     fn object_url(&self, key: &str) -> String {
-        format!("{}/{}/{}", self.endpoint, self.bucket, key)
+        format!(
+            "{}/{}/{}",
+            self.endpoint,
+            self.bucket,
+            uri_encode(key, false)
+        )
     }
 
     /// Build URL with query parameters for ListObjectsV2.
@@ -157,7 +171,17 @@ impl S3Client {
     /// LIST/walk and disaster-recovery download from a Windows dev box).
     /// The prefix comes from `[s3] prefix` (default `store/`); pass `""` for none.
     pub fn s3_key(&self, blake3: &str) -> String {
-        format!("{}{}", self.prefix, super::cas_rel_path(blake3))
+        // Keys are stored in the lowercase (write) form. The digest comparison
+        // in this module is case-insensitive, so an uppercase key from a caller
+        // or a hand-built URL must resolve to the SAME object - on the cloud a
+        // key is a byte string and a case variant is a different, absent object.
+        // `to_ascii_lowercase` (not `to_lowercase`) because hex is ASCII and a
+        // Unicode fold could change the byte length.
+        format!(
+            "{}{}",
+            self.prefix,
+            super::cas_rel_path(&blake3.to_ascii_lowercase())
+        )
     }
 
     /// Read object from S3 as a synchronous reader. Supports optional byte range.
@@ -409,10 +433,21 @@ impl ObjectStore for S3Client {
             }
 
             let xml = resp.bytes().map_err(|e| S3Error::Request(e.to_string()))?;
-            items.extend(parse_list_objects(&xml));
+            // Parse and VALIDATE before taking the entries: a page that is not
+            // a listing, or that claims truncation without a token, must not
+            // contribute rows to a result the caller reads as complete.
+            let (page_items, next) = parse_page(&xml)?;
+            items.extend(page_items);
 
-            match next_continuation_token(&xml) {
-                Some(next) => token = Some(next),
+            match next {
+                Some(next) => {
+                    // A compatible endpoint can echo the same token: the next
+                    // request would ask for the page just returned and append
+                    // its entries again, forever. Per-request timeouts do not
+                    // stop a stream of successful repeats.
+                    ensure_token_advanced(prefix, token.as_deref(), &next)?;
+                    token = Some(next);
+                }
                 None => break,
             }
         }
@@ -635,6 +670,23 @@ fn parse_list_objects(xml: &[u8]) -> Vec<ObjectInfo> {
     items
 }
 
+/// Refuse a listing page whose token repeats the one just used.
+///
+/// ListObjectsV2 asks for the next page with the token the previous page
+/// returned, so a token identical to the previous one asks for the page just
+/// answered. The request SUCCEEDS, so no timeout or retry limit stops it: an
+/// uncapped scrub would append the same entries forever. A sequence of DISTINCT
+/// tokens is the normal case and must pass.
+fn ensure_token_advanced(prefix: &str, previous: Option<&str>, next: &str) -> Result<(), S3Error> {
+    if previous == Some(next) {
+        return Err(S3Error::Request(format!(
+            "list prefix={prefix}: continuation token did not advance ({next}), \
+             refusing to loop"
+        )));
+    }
+    Ok(())
+}
+
 /// Extract `<NextContinuationToken>` from a ListObjectsV2 page.
 ///
 /// Only present when `<IsTruncated>true</IsTruncated>`; its presence IS the
@@ -649,7 +701,48 @@ fn next_continuation_token(xml: &[u8]) -> Option<String> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-/// Extract text between `<open>` and `</close>` tags.
+/// Whether the page declares `<IsTruncated>true</IsTruncated>`.
+///
+/// ListObjectsV2 states truncation explicitly, so a page that says it is
+/// truncated but carries no usable continuation token is a broken answer, not
+/// the last page. Treating it as the last page silently ends a scrub early.
+fn page_is_truncated(xml: &[u8]) -> bool {
+    extract_text(xml, 0, b"<IsTruncated>", b"</IsTruncated>").eq_ignore_ascii_case("true")
+}
+
+/// Validate one listing page and return its entries plus the next token.
+///
+/// `Ok(None)` for the token means the page is complete. A page declaring
+/// truncation without a token, or a page that is not a ListBucketResult at
+/// all, is an error - S3 can answer HTTP 200 with an unexpected body, and
+/// returning those partial entries as a complete inventory is exactly the
+/// silent truncation this walk exists to avoid.
+fn parse_page(xml: &[u8]) -> Result<(Vec<ObjectInfo>, Option<String>), S3Error> {
+    if !xml
+        .windows(b"ListBucketResult".len())
+        .any(|w| w == b"ListBucketResult")
+    {
+        return Err(S3Error::Request(
+            "list: response is not a ListBucketResult document".to_string(),
+        ));
+    }
+    let truncated = page_is_truncated(xml);
+    let token = next_continuation_token(xml);
+    if truncated && token.is_none() {
+        return Err(S3Error::Request(
+            "list: page says IsTruncated=true but carries no NextContinuationToken".to_string(),
+        ));
+    }
+    Ok((parse_list_objects(xml), token))
+}
+
+/// Extract text between `<open>` and `</close>` tags, XML-decoding it.
+///
+/// The value is XML TEXT, not raw bytes: S3 writes a key or a token containing
+/// `&`, `<` or `>` as `&amp;`, `&lt;`, `&gt;`. Returning the escaped form gave
+/// the caller an object name that does not exist (`archive/a&amp;b.dcm`), and
+/// feeding an escaped continuation token back into the next request asked the
+/// server for a page it had never issued.
 fn extract_text(xml: &[u8], search_from: usize, open: &[u8], close: &[u8]) -> String {
     let start = match xml[search_from..]
         .windows(open.len())
@@ -662,7 +755,61 @@ fn extract_text(xml: &[u8], search_from: usize, open: &[u8], close: &[u8]) -> St
         Some(p) => start + p,
         None => return String::new(),
     };
-    String::from_utf8_lossy(&xml[start..end]).into_owned()
+    xml_unescape(&String::from_utf8_lossy(&xml[start..end]))
+}
+
+/// Decode the five predefined XML entities and numeric character references.
+///
+/// XML 1.0 4.6 defines `&lt; &gt; &amp; &apos; &quot;`; anything else appears
+/// as a numeric reference (`&#38;` / `&#x26;`), which is how a byte sequence
+/// the predefined entities cannot express is carried. A bare `&` that starts
+/// neither is left as-is rather than dropped - S3 keys may contain one, and
+/// silently deleting it would rename the object.
+fn xml_unescape(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let Some(semi) = after.find(';') else {
+            out.push('&');
+            rest = after;
+            continue;
+        };
+        let entity = &after[..semi];
+        let decoded = match entity {
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "amp" => Some('&'),
+            "apos" => Some('\''),
+            "quot" => Some('"'),
+            _ => entity.strip_prefix('#').and_then(|num| {
+                let code = match num.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                    None => num.parse::<u32>().ok()?,
+                };
+                char::from_u32(code)
+            }),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &after[semi + 1..];
+            }
+            // Not an entity this decoder knows: emit the `&` and rescan from
+            // the next byte, so `a&b;c` keeps its `&` instead of swallowing
+            // `b;c`.
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // -- Tests --------------------------------------------------------------
@@ -816,6 +963,137 @@ mod tests {
         assert_ne!(from_hex_string, from_raw);
     }
 
+    /// The PRODUCTION signer, end to end, against a complete request vector.
+    ///
+    /// The published AWS test suite vectors sign requests whose signed headers
+    /// include `range`; this signer signs exactly
+    /// `host;x-amz-content-sha256;x-amz-date`, so the expected value is derived
+    /// from that canonical form rather than pasted from a vector signing a
+    /// different set. Deriving it here is legitimate precisely because the
+    /// independent steps below are ALSO checked: if `sign_aws_v4_at` built a
+    /// different canonical request, the derived signature would not match.
+    ///
+    /// The vector is the AWS SigV4 "GET Object" example: GET on
+    /// `https://examplebucket.s3.amazonaws.com/test.txt` at
+    /// 20130524T000000Z, empty payload.
+    #[test]
+    fn the_production_signer_matches_a_complete_request_vector() {
+        let access = "AKIAIOSFODNN7EXAMPLE";
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let url = "https://examplebucket.s3.amazonaws.com/test.txt";
+        let amz_date = "20130524T000000Z";
+
+        // Independent derivation of the expected signature from the canonical
+        // request the signer is REQUIRED to build (SigV4 "Task 1-3").
+        let payload_hash = hex_sha256(b"");
+        assert_eq!(
+            payload_hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let canonical_headers = format!(
+            "host:examplebucket.s3.amazonaws.com\n\
+             x-amz-content-sha256:{payload_hash}\n\
+             x-amz-date:{amz_date}\n"
+        );
+        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let canonical_request =
+            format!("GET\n/test.txt\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+        let cr_hash = hex_sha256(canonical_request.as_bytes());
+        let string_to_sign =
+            format!("AWS4-HMAC-SHA256\n{amz_date}\n20130524/us-east-1/s3/aws4_request\n{cr_hash}");
+
+        let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), b"20130524");
+        let region_key = hmac_sha256(&date_key, b"us-east-1");
+        let service_key = hmac_sha256(&region_key, b"s3");
+        let signing_key = hmac_sha256(&service_key, b"aws4_request");
+        let expected = crate::hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+        assert_eq!(
+            sign_aws_v4_at("GET", url, b"", access, secret, "us-east-1", amz_date),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access}/20130524/us-east-1/s3/aws4_request, \
+                 SignedHeaders={signed_headers}, Signature={expected}"
+            ),
+            "the production signer must build this exact canonical request"
+        );
+    }
+
+    /// A key with a character that must be escaped is signed and sent as the
+    /// SAME path.
+    #[test]
+    fn an_object_key_with_a_space_is_encoded_in_the_url() {
+        let client = S3Client::new(
+            "https://s3.example.com",
+            "ak",
+            "sk",
+            "region",
+            "bucket",
+            "store/",
+        );
+        let key = "store/aa/bb/my file+%.dcm";
+        let url = client.object_url(key);
+        assert!(
+            url.ends_with("store/aa/bb/my%20file%2B%25.dcm"),
+            "the key must be percent-encoded, slashes kept: {url}"
+        );
+        // The signed canonical URI is the encoded path.
+        let (_, uri, _) = parse_url_parts(&url);
+        assert_eq!(uri, "/bucket/store/aa/bb/my%20file%2B%25.dcm");
+    }
+
+    #[test]
+    fn xml_text_is_decoded_to_the_real_key_and_token() {
+        let esc = xml_unescape;
+        assert_eq!(esc("archive/a&amp;b.dcm"), "archive/a&b.dcm");
+        assert_eq!(esc("a&lt;b&gt;c"), "a<b>c");
+        assert_eq!(esc("&quot;q&quot;&apos;p&apos;"), "\"q\"'p'");
+        // Numeric references, decimal and hex.
+        assert_eq!(esc("&#38;&#x26;"), "&&");
+        // A bare ampersand is preserved, not swallowed.
+        assert_eq!(esc("a&b"), "a&b");
+        assert_eq!(esc("a&unknown;b"), "a&unknown;b");
+    }
+
+    /// A listing whose Key is escaped yields the real object name.
+    #[test]
+    fn a_listed_key_is_returned_unescaped() {
+        let xml = b"<ListBucketResult>\
+            <IsTruncated>false</IsTruncated>\
+            <Contents><Key>archive/a&amp;b.dcm</Key><Size>12</Size>\
+            <LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>\
+            </ListBucketResult>";
+        let (items, next) = parse_page(xml).expect("a valid page");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "archive/a&b.dcm");
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn a_truncated_page_without_a_token_is_an_error() {
+        let xml = b"<ListBucketResult>\
+            <IsTruncated>true</IsTruncated>\
+            <Contents><Key>a.dcm</Key><Size>1</Size></Contents>\
+            </ListBucketResult>";
+        let err = parse_page(xml).expect_err("truncated with no token must not be a final page");
+        assert!(format!("{err}").contains("NextContinuationToken"), "{err}");
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_listing_is_an_error() {
+        let err = parse_page(b"<Error><Code>AccessDenied</Code></Error>")
+            .expect_err("a non-listing body must not read as an empty inventory");
+        assert!(format!("{err}").contains("ListBucketResult"), "{err}");
+    }
+
+    #[test]
+    fn a_valid_empty_final_page_succeeds() {
+        let xml = b"<ListBucketResult><IsTruncated>false</IsTruncated>\
+            <KeyCount>0</KeyCount></ListBucketResult>";
+        let (items, next) = parse_page(xml).expect("an empty final page is valid");
+        assert!(items.is_empty());
+        assert_eq!(next, None);
+    }
+
     #[test]
     fn canonical_query_sorts_and_keeps_the_wire_encoding() {
         // Build order is max-keys, list-type, prefix; the canonical form is
@@ -855,5 +1133,17 @@ mod tests {
         assert_eq!(signed, "list-type=2&max-keys=10&prefix=store%2F01%2F");
         assert!(!signed.contains("%252F"), "double-encoded: {signed}");
         assert!(sent_query.contains("prefix=store%2F01%2F"), "{sent_query}");
+    }
+
+    #[test]
+    fn a_repeated_continuation_token_is_refused() {
+        // The first page has no previous token, so any token advances.
+        assert!(ensure_token_advanced("p", None, "t1").is_ok());
+        // Distinct tokens are the normal multi-page sequence.
+        assert!(ensure_token_advanced("p", Some("t1"), "t2").is_ok());
+        // A token identical to the previous one asks for the page just read.
+        let err = ensure_token_advanced("p", Some("t1"), "t1")
+            .expect_err("a repeating token must not loop forever");
+        assert!(format!("{err}").contains("did not advance"), "{err}");
     }
 }

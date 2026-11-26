@@ -119,6 +119,17 @@ impl DailyIndexSet {
         if self.date.is_none() {
             self.date = Some(date::open_appender(&self.root, &self.day)?);
         }
+        // Repair a poisoned writer before handing it back. A failed write (an
+        // ENOSPC is the everyday case) poisons the handle, and freeing disk
+        // space does NOT un-poison it: the registry kept returning the same
+        // dead handle, which rejected every same-day retry before it wrote a
+        // byte. Reopen under the registry's exclusive access, which is what
+        // `reopen` is for. A repair that fails leaves the writer poisoned, so
+        // a caller still cannot mistakenly treat it as healthy.
+        let w = self.date.as_mut().expect("just initialised");
+        if w.is_poisoned() {
+            w.reopen(&self.root)?;
+        }
         Ok(self.date.as_mut().expect("just initialised"))
     }
 
@@ -127,18 +138,33 @@ impl DailyIndexSet {
         &mut self,
         modality: &str,
     ) -> Result<&mut ModalityIndex, modality::ModalityIndexError> {
-        if let Some(pos) = self.modality.iter().position(|(m, _)| m == modality) {
-            return Ok(&mut self.modality[pos].1);
+        let pos = match self.modality.iter().position(|(m, _)| m == modality) {
+            Some(pos) => pos,
+            None => {
+                let idx = modality::open_appender(&self.root, modality, &self.day)?;
+                self.modality.push((modality.to_string(), idx));
+                self.modality.len() - 1
+            }
+        };
+        // Same repair rule as `date_writer`: a poisoned handle is reopened
+        // rather than reused, or every retry after a transient full disk is
+        // rejected without ever touching the file.
+        let w = &mut self.modality[pos].1;
+        if w.is_poisoned() {
+            w.reopen(&self.root)?;
         }
-        let idx = modality::open_appender(&self.root, modality, &self.day)?;
-        self.modality.push((modality.to_string(), idx));
-        Ok(&mut self.modality.last_mut().expect("just pushed").1)
+        Ok(&mut self.modality[pos].1)
     }
 
     /// Open (or reuse) the mutable `sop_owner` appender for the current day.
     pub fn sop_owner_writer(&mut self) -> Result<&mut SopOwnerIndex, sop_owner::SopOwnerError> {
         if self.sop_owner.is_none() {
             self.sop_owner = Some(sop_owner::open_appender(&self.root, &self.day)?);
+        }
+        // Same repair rule as `date_writer`.
+        let w = self.sop_owner.as_mut().expect("just initialised");
+        if w.is_poisoned() {
+            w.reopen(&self.root)?;
         }
         Ok(self.sop_owner.as_mut().expect("just initialised"))
     }
@@ -250,6 +276,13 @@ where
 }
 
 /// Zero-allocation hotpath append of a study UID to the modality index.
+///
+/// A UID that does not fit [`MOD_ROW_LEN`] is an `InvalidInput` error, not a
+/// panic: `format_row` asserts on the buffer and the staging buffer is a fixed
+/// stack array, so a 65-byte UID aborted the process from a hot path that has
+/// no business panicking on caller data. PS3.5 9.1 caps a UID at 64 characters,
+/// which needs 65 bytes with the newline - exactly `MOD_ROW_LEN` - so a
+/// conformant UID still fits and only an over-long one is refused.
 pub fn append_modality_row<F>(
     set: &mut DailyIndexSet,
     now: F,
@@ -262,7 +295,11 @@ where
     let day = now();
     set.rollover_if_needed(day);
     let mut row = [0u8; MOD_ROW_LEN];
-    let filled = modality::format_row(study_uid, &mut row);
+    // Checked BEFORE `format_row`: that helper asserts, and an assert in the
+    // no-alloc hot path is a process abort on input the caller controls.
+    let Some(filled) = modality::format_row_warm(study_uid, &mut row) else {
+        return Err(modality::ModalityIndexError::InvalidModality);
+    };
     set.modality_writer(modality)?.append(filled)
 }
 
@@ -458,5 +495,81 @@ mod tests {
         // A day after the active one still rolls forward.
         assert!(set.rollover_if_needed(*b"20240118"));
         assert_eq!(set.current_day(), b"20240118");
+    }
+
+    /// A poisoned writer is repaired on the next same-day access.
+    ///
+    /// A failed write (ENOSPC is the everyday cause) poisons the handle. Freeing
+    /// disk space does not undo that, and the registry used to hand the SAME
+    /// dead handle back, so every retry for the rest of the day failed before
+    /// writing a byte - a transient full disk became a permanent outage for
+    /// that index until the process restarted.
+    #[test]
+    fn a_poisoned_modality_writer_is_repaired_on_the_next_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = *b"20240115";
+        let mut set = DailyIndexSet::new(dir.path().to_path_buf(), day);
+
+        // Poison the live handle the way a failed append would.
+        {
+            let w = set.modality_writer("CT").expect("writer");
+            w.poison_for_test();
+            assert!(w.is_poisoned());
+        }
+
+        // The next access must return a HEALTHY writer, not the dead one.
+        let mut row = [0u8; MOD_ROW_LEN];
+        let filled = modality::format_row("1.2.3", &mut row);
+        let w = set.modality_writer("CT").expect("writer");
+        assert!(
+            !w.is_poisoned(),
+            "a poisoned handle must be reopened, not handed back"
+        );
+        w.append(filled).expect("append after repair");
+
+        let uids = modality::read_study_uids(dir.path(), "CT", &day).expect("read");
+        assert_eq!(uids, vec!["1.2.3".to_string()]);
+    }
+
+    /// The same repair rule on the date index.
+    #[test]
+    fn a_poisoned_date_writer_is_repaired_on_the_next_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = *b"20240115";
+        let mut set = DailyIndexSet::new(dir.path().to_path_buf(), day);
+
+        {
+            let w = set.date_writer().expect("writer");
+            w.poison_for_test();
+            assert!(w.is_poisoned());
+        }
+
+        let blob = [3u8; 32];
+        append_date_row(&mut set, || day, &blob).expect("append after repair");
+        let data = std::fs::read(date::file_path(dir.path(), &day)).expect("read");
+        assert_eq!(data.len(), DATE_ROW_LEN, "the row landed in the file");
+    }
+
+    /// A study UID that does not fit the staging buffer is an error, not a panic.
+    ///
+    /// `MOD_ROW_LEN` is 65 = the PS3.5 64-char maximum plus the newline, so a
+    /// conformant UID fits exactly. The next byte over used to hit
+    /// `format_row`'s assert and abort the process from the hot path.
+    #[test]
+    fn an_oversized_study_uid_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = *b"20240115";
+        let mut set = DailyIndexSet::new(dir.path().to_path_buf(), day);
+
+        // 64 chars: conformant, must still work.
+        let max_uid = "1".repeat(64);
+        append_modality_row(&mut set, || day, "CT", &max_uid).expect("a 64-char UID fits");
+
+        // 65 chars: over the PS3.5 cap and one byte past the buffer.
+        let over = "1".repeat(65);
+        assert!(
+            append_modality_row(&mut set, || day, "CT", &over).is_err(),
+            "an over-long UID must be an error"
+        );
     }
 }

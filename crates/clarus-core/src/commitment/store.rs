@@ -57,6 +57,8 @@ pub enum StoreError {
     Decode(RecordError),
     /// A record with this Transaction UID already exists (the 409 path).
     Duplicate(String),
+    /// The Transaction UID cannot name a file (not a DICOM UID).
+    InvalidUid(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -65,6 +67,7 @@ impl std::fmt::Display for StoreError {
             Self::Io(e) => write!(f, "commitment store I/O error: {e}"),
             Self::Decode(e) => write!(f, "commitment store decode error: {e}"),
             Self::Duplicate(uid) => write!(f, "commitment already recorded: {uid}"),
+            Self::InvalidUid(why) => write!(f, "commitment transaction UID is unusable: {why}"),
         }
     }
 }
@@ -118,25 +121,23 @@ impl CommitmentStore {
     /// check anyway: a UID containing a separator or `..` would let one
     /// transaction address a file outside the store, and a store is the wrong
     /// place to trust its caller.
-    #[must_use]
-    pub fn path_for(&self, transaction_uid: &str) -> PathBuf {
-        let stem: String = transaction_uid
-            .chars()
-            .map(|c| {
-                if c.is_ascii_digit() || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.root.join(format!("{stem}.cbor"))
+    ///
+    /// It REPLACES invalid characters rather than refusing them, which made
+    /// distinct UIDs share one file: `1.2a` and `1.2b` both became `1.2_`, so
+    /// inserting the first made `find("1.2b")` return the first caller's
+    /// record. The canonical validator is applied instead, so an unusable UID
+    /// is refused rather than silently folded onto a neighbour. Valid UIDs keep
+    /// their existing filenames.
+    pub fn path_for(&self, transaction_uid: &str) -> Result<PathBuf, StoreError> {
+        crate::uid::validate_path_uid(transaction_uid)
+            .map_err(|e| StoreError::InvalidUid(e.to_string()))?;
+        Ok(self.root.join(format!("{transaction_uid}.cbor")))
     }
 
     /// Read one Result by Transaction UID. `Ok(None)` when there is no file -
     /// which the Check transaction reports as 404 (13.5.3.1).
     pub fn find(&self, transaction_uid: &str) -> Result<Option<CommitmentRecord>, StoreError> {
-        let path = self.path_for(transaction_uid);
+        let path = self.path_for(transaction_uid)?;
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -207,7 +208,7 @@ impl CommitmentStore {
         // can vanish from its parent while its contents are durable. Only the
         // first Commit pays this; a store that already existed needs nothing.
         crate::durable::sync_new_root_name(&self.root)?;
-        let target = self.path_for(transaction_uid);
+        let target = self.path_for(transaction_uid)?;
         // The temp is created EXCLUSIVELY. `File::create` TRUNCATES, and the
         // temp name is `{stem}.{pid}.{seq}.tmp`: a crash between the hard link
         // and the unlink below leaves that name pointing at the INSTALLED
@@ -220,14 +221,35 @@ impl CommitmentStore {
         };
         if let Err(e) = write_all_and_sync(&_guard, bytes) {
             drop(_guard);
-            let _ = std::fs::remove_file(&tmp);
-            return Err(StoreError::Io(e));
+            // A failed WRITE must not leave its temp name behind: the bytes on
+            // it are incomplete, and the next attempt would either reuse the
+            // name (truncating a partial record) or fail on an occupied one.
+            // The write error is what the caller acts on, so it stays the
+            // returned error and the cleanup outcome is folded in.
+            return Err(match std::fs::remove_file(&tmp) {
+                Ok(()) => StoreError::Io(e),
+                Err(cleanup) => StoreError::Io(io::Error::new(
+                    e.kind(),
+                    format!("{e}; additionally the temp file could not be removed: {cleanup}"),
+                )),
+            });
         }
         // Release the exclusive-create handle before linking: Windows will not
         // hard-link a file that is still open for writing.
         drop(_guard);
         let linked = std::fs::hard_link(&tmp, &target);
-        let _ = std::fs::remove_file(&tmp);
+        // Reclaiming the temp NAME is part of the install, not housekeeping:
+        // once the hard link succeeded the temp and the target are the SAME
+        // inode, so a leftover `.tmp` name keeps that inode alive after
+        // retention unlinks the `.cbor` one - the record is gone from the store
+        // and its bytes are still on disk, unreachable and unreclaimable.
+        //
+        // A failure here does not undo a successful install (the record IS
+        // stored and durable), so it does not become the return value on the
+        // success path; it is REPORTED on the error path, where the caller is
+        // already handling a failure and the temp name is the difference
+        // between a retry that works and one that finds a phantom temp.
+        let unlinked = std::fs::remove_file(&tmp);
         match linked {
             Ok(()) => {
                 // The data is durable; this makes the directory entry that
@@ -258,7 +280,21 @@ impl CommitmentStore {
                 }
                 Err(StoreError::Duplicate(transaction_uid.to_string()))
             }
-            Err(e) => Err(StoreError::Io(e)),
+            Err(e) => {
+                // Report the original failure, but not at the cost of the
+                // cleanup fact: a temp name left behind alongside a failed
+                // install is what makes the NEXT attempt find an occupied
+                // name. The I/O error is what the caller acts on, so it stays
+                // the returned error; the cleanup outcome is folded into its
+                // message so neither is lost.
+                if let Err(cleanup) = unlinked {
+                    return Err(StoreError::Io(io::Error::new(
+                        e.kind(),
+                        format!("{e}; additionally the temp file could not be removed: {cleanup}"),
+                    )));
+                }
+                Err(StoreError::Io(e))
+            }
         }
     }
 
@@ -309,7 +345,8 @@ impl CommitmentStore {
     /// [`sweep_expired`]), which is what makes the remove atomic against an
     /// insert of the same uid.
     fn remove_locked(&self, transaction_uid: &str) -> Result<bool, StoreError> {
-        match std::fs::remove_file(self.path_for(transaction_uid)) {
+        let path = self.path_for(transaction_uid)?;
+        match std::fs::remove_file(path) {
             Ok(()) => {
                 // The name is gone; persist the directory entry that named it
                 // too, or a crash after this delete can restore the result.
@@ -413,13 +450,21 @@ fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// A failed delete is COUNTED, not propagated: one unremovable file must not
 /// stop retention for every other expired transaction. The caller surfaces the
 /// count (a stuck file keeps failing every pass until it is cleared).
+///
+/// Returns `(removed, failed_deletes, uninspectable)`. The third count is
+/// separate on purpose: a file that will not decode or whose timestamp will
+/// not parse is a DIFFERENT operational problem from an I/O failure to unlink
+/// it, and folding the two into one number lets a run of corrupt files look
+/// like a busy but healthy sweep. Both kinds stay in place - deleting evidence
+/// because its clock could not be read would turn a formatting problem into
+/// data loss - but the caller has to be able to see them.
 pub fn sweep_expired(
     store: &CommitmentStore,
     retention_days: u64,
     now_epoch_secs: i64,
-) -> Result<(Vec<String>, u64), StoreError> {
+) -> Result<(Vec<String>, u64, u64), StoreError> {
     if retention_days == 0 {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     }
     // Checked: a huge `retention_days` used to overflow the multiplication and
     // wrap `cutoff` FORWARD, which made every record look expired - one
@@ -431,16 +476,17 @@ pub fn sweep_expired(
     // the cutoff in the FUTURE - the same wrap-forward the multiplication check
     // guards against, reached one step earlier.
     let Ok(days) = i64::try_from(retention_days) else {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     };
     let Some(retention_secs) = days.checked_mul(86_400) else {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     };
     let Some(cutoff) = now_epoch_secs.checked_sub(retention_secs) else {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     };
     let mut removed = Vec::new();
     let mut failed: u64 = 0;
+    let mut uninspectable: u64 = 0;
     for uid in store.transaction_uids()? {
         // Hold the uid's stripe lock across the find + age check + delete: the
         // read and the remove are one critical section against an insert of
@@ -453,15 +499,24 @@ pub fn sweep_expired(
         // going. Propagating the error stopped the whole pass on the first
         // corrupt file, so retention never ran again - and the operator lost
         // both the cleanup and any signal about the other files.
+        //
+        // Skipping it silently was the other half of the problem: a run of
+        // corrupt files produced an empty removal list and zero failures, which
+        // reads exactly like "nothing was old enough". It is counted instead.
         let rec = match store.find(&uid) {
             Ok(Some(r)) => r,
             Ok(None) => continue,
-            Err(_) => continue,
+            Err(_) => {
+                uninspectable += 1;
+                continue;
+            }
         };
         let Some(age) = parse_epoch_secs(&rec.requested_at) else {
             // A record whose timestamp cannot be read is LEFT ALONE: deleting
             // evidence because its clock could not be parsed would turn a
-            // formatting problem into data loss.
+            // formatting problem into data loss. Same counting rule as above -
+            // "unreadable" is a diagnosis the operator needs, not an absence.
+            uninspectable += 1;
             continue;
         };
         if age < cutoff {
@@ -475,7 +530,7 @@ pub fn sweep_expired(
             }
         }
     }
-    Ok((removed, failed))
+    Ok((removed, failed, uninspectable))
 }
 
 /// Parse the `requested_at` timestamps this store writes.
@@ -500,12 +555,25 @@ fn parse_epoch_secs(text: &str) -> Option<i64> {
     {
         return None;
     }
-    let year: i64 = text.get(0..4)?.parse().ok()?;
-    let month: i64 = text.get(5..7)?.parse().ok()?;
-    let day: i64 = text.get(8..10)?.parse().ok()?;
-    let hour: i64 = text.get(11..13)?.parse().ok()?;
-    let minute: i64 = text.get(14..16)?.parse().ok()?;
-    let second: i64 = text.get(17..19)?.parse().ok()?;
+    // Every numeric field must be ASCII DIGITS before it is parsed. `parse()`
+    // accepts a leading sign, so `2026-09-23T-1:00:00Z` read hour as -1; that
+    // passes `hour > 23` and shifts the computed instant to 23:00 UTC the
+    // previous day, which is enough to move a record across the retention
+    // cutoff and have the sweep DELETE it. The format this store writes has no
+    // sign anywhere, so a non-digit is simply not this format.
+    let digits_at = |from: usize, to: usize| -> Option<i64> {
+        let slice = bytes.get(from..to)?;
+        if !slice.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(slice).ok()?.parse().ok()
+    };
+    let year: i64 = digits_at(0, 4)?;
+    let month: i64 = digits_at(5, 7)?;
+    let day: i64 = digits_at(8, 10)?;
+    let hour: i64 = digits_at(11, 13)?;
+    let minute: i64 = digits_at(14, 16)?;
+    let second: i64 = digits_at(17, 19)?;
     if !(1..=12).contains(&month)
         || !(1..=days_in_month(year, month)).contains(&day)
         || hour > 23
@@ -615,6 +683,27 @@ mod tests {
         // Century rule: 2000 is leap, 1900 is not.
         assert!(parse_epoch_secs("2000-02-29T00:00:00Z").is_some());
         assert!(parse_epoch_secs("1900-02-29T00:00:00Z").is_none());
+    }
+
+    /// A SIGNED numeric field is not this format, whatever the value.
+    ///
+    /// `2026-09-23T-1:00:00Z` is 20 bytes with the delimiters in the right
+    /// places, and `parse::<i64>()` reads `-1` happily; `hour > 23` does not
+    /// catch it. The computed instant then lands at 23:00 UTC the PREVIOUS
+    /// day, which can push a record across the retention cutoff and have the
+    /// sweep delete data whose clock it misread. Only an unparseable timestamp
+    /// is safe to treat as unparseable.
+    #[test]
+    fn a_signed_numeric_field_does_not_parse() {
+        assert!(
+            parse_epoch_secs("2026-09-23T-1:00:00Z").is_none(),
+            "a negative hour is not a time"
+        );
+        assert!(parse_epoch_secs("-026-09-23T10:00:00Z").is_none());
+        assert!(parse_epoch_secs("2026-09-2-3T10:00:00Z").is_none());
+        assert!(parse_epoch_secs("2026-09-23T10:0-:00Z").is_none());
+        // A `+` is not a digit either.
+        assert!(parse_epoch_secs("2026-09-23T+1:00:00Z").is_none());
     }
 
     /// A temp name that is already taken must NEVER be reused.
@@ -748,7 +837,8 @@ mod tests {
             leftovers.is_empty(),
             "no temp file may survive a committed insert, found {leftovers:?}"
         );
-        let on_disk = std::fs::read(store.path_for("1.2.3.77")).expect("target exists");
+        let on_disk =
+            std::fs::read(store.path_for("1.2.3.77").expect("valid uid")).expect("target exists");
         assert_eq!(on_disk, rec.encode().expect("encode"));
     }
 
@@ -866,17 +956,22 @@ mod tests {
     fn a_transaction_uid_cannot_escape_the_store() {
         // The router validates UIDs, but the store must not depend on that:
         // a UID carrying a separator would otherwise address a file outside
-        // the store directory.
+        // the store directory. It is REFUSED, not rewritten - rewriting mapped
+        // distinct UIDs onto one filename (`1.2a` and `1.2b` both became
+        // `1.2_`), so one caller's record answered another's lookup.
         let dir = tempfile::tempdir().expect("tempdir");
         let store = CommitmentStore::new(dir.path().join("commitments"));
-        let path = store.path_for("../../etc/passwd");
+        for bad in ["../../etc/passwd", "1.2a", "1.2b", "", "1..2"] {
+            assert!(
+                matches!(store.path_for(bad), Err(StoreError::InvalidUid(_))),
+                "{bad:?} must be refused, not folded onto a filename"
+            );
+        }
+        // A valid UID keeps its filename.
+        let path = store.path_for("1.2.3.4").expect("valid uid");
         assert_eq!(
-            path.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str()),
-            Some("commitments"),
-            "the path must stay inside the store root: {}",
-            path.display()
+            path.file_name().and_then(|n| n.to_str()),
+            Some("1.2.3.4.cbor")
         );
     }
 
@@ -892,9 +987,13 @@ mod tests {
             .insert(&record("1.2.3.2", "2027-01-15T07:00:00Z"))
             .expect("new");
 
-        let (removed, failed) = sweep_expired(&store, 30, now).expect("sweep");
+        let (removed, failed, uninspectable) = sweep_expired(&store, 30, now).expect("sweep");
         assert_eq!(removed, vec!["1.2.3.1".to_string()]);
         assert_eq!(failed, 0);
+        assert_eq!(
+            uninspectable, 0,
+            "both records decode and both timestamps parse"
+        );
         assert!(
             store.find("1.2.3.1").expect("find").is_none(),
             "an expired result is gone, which is what makes Check answer 404"
@@ -940,7 +1039,7 @@ mod tests {
         );
 
         drop(held);
-        let (removed, failed) = rx
+        let (removed, failed, _) = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the sweep finishes once the lock is released")
             .expect("the sweep must not error");
@@ -972,15 +1071,22 @@ mod tests {
             .expect("also expired");
         // Replace the first record's file with a DIRECTORY: it cannot be read
         // as a record, so the sweep skips it instead of failing the pass.
-        let stuck = store.path_for("1.2.3.1");
+        let stuck = store.path_for("1.2.3.1").expect("valid uid");
         std::fs::remove_file(&stuck).expect("remove file");
         std::fs::create_dir(&stuck).expect("plant a directory");
 
-        let (removed, _failed) = sweep_expired(&store, 30, now).expect("sweep");
+        let (removed, _failed, uninspectable) = sweep_expired(&store, 30, now).expect("sweep");
         assert_eq!(
             removed,
             vec!["1.2.3.2".to_string()],
             "the removable expired file still goes"
+        );
+        // The directory in place of the record is COUNTED, not just skipped:
+        // an empty removal list with zero counts reads as "nothing was old
+        // enough", which is the wrong diagnosis for a corrupt file.
+        assert_eq!(
+            uninspectable, 1,
+            "the undecodable record is reported as uninspectable"
         );
         assert!(stuck.is_dir(), "the stuck record stays for the next pass");
     }
@@ -992,7 +1098,7 @@ mod tests {
         store
             .insert(&record("1.2.3.1", "1999-01-01T00:00:00Z"))
             .expect("ancient");
-        let (removed, _) = sweep_expired(&store, 0, 1_800_000_000).expect("sweep");
+        let (removed, _, _) = sweep_expired(&store, 0, 1_800_000_000).expect("sweep");
         assert!(removed.is_empty(), "0 means keep forever");
         assert!(store.find("1.2.3.1").expect("find").is_some());
     }
@@ -1009,7 +1115,7 @@ mod tests {
             .insert(&record("1.2.3.1", "2026-09-23T10:00:00Z"))
             .expect("insert");
         for days in [i64::MAX as u64, u64::MAX, u64::MAX / 2] {
-            let (removed, _) = sweep_expired(&store, days, 1_800_000_000).expect("sweep");
+            let (removed, _, _) = sweep_expired(&store, days, 1_800_000_000).expect("sweep");
             assert!(removed.is_empty(), "retention {days} must not delete");
             assert!(
                 store.find("1.2.3.1").expect("find").is_some(),
@@ -1027,7 +1133,7 @@ mod tests {
         store
             .insert(&record("1.2.3.1", "not a timestamp"))
             .expect("insert");
-        let (removed, _) = sweep_expired(&store, 1, 1_800_000_000).expect("sweep");
+        let (removed, _, _) = sweep_expired(&store, 1, 1_800_000_000).expect("sweep");
         assert!(removed.is_empty());
         assert!(store.find("1.2.3.1").expect("find").is_some());
     }
@@ -1056,7 +1162,7 @@ mod tests {
     fn the_timestamp_written_and_parsed_agree_with_the_crate_clock_format() {
         // The store's own reader must accept what crate::time produces; this
         // pins the shape rather than trusting the two to stay in step.
-        let now = crate::time::local_now();
+        let now = crate::time::local_now().expect("the clock is after the epoch on a sane host");
         let text = format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
             now.year, now.month, now.day, now.hour, now.minute, now.second
@@ -1095,6 +1201,50 @@ mod tests {
         );
     }
 
+    /// A directory-barrier failure AFTER the record bytes are durable is an
+    /// install failure, and the record is not published.
+    ///
+    /// The bytes reach the medium first and the directory entry is flushed
+    /// second. Failing only the SECOND step is the case that a "did it write?"
+    /// test cannot reach: the file exists on disk at that moment, so an
+    /// implementation that reported success would look perfectly healthy while
+    /// the name it just created could vanish on the next crash. `insert` must
+    /// return an I/O error AND leave no `.cbor` name behind, so a retry is the
+    /// caller's decision rather than a silent phantom.
+    ///
+    /// Unix-only: Windows has no directory fsync, so there is no barrier to
+    /// fail and the seam does not exist there.
+    #[cfg(unix)]
+    #[test]
+    fn a_flush_failure_after_the_bytes_land_is_not_reported_as_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CommitmentStore::new(dir.path().join("commitments"));
+        // Create the root first: `sync_new_root_name` runs before the record
+        // is written, and its own barrier is not the one under test.
+        store
+            .insert(&record("1.2.3.1", "2026-09-23T10:00:00Z"))
+            .expect("warm the root");
+
+        // Arm the seam for the store's own directory, then insert a NEW
+        // transaction: the data write succeeds and the post-link barrier fails.
+        crate::durable::fail_next_barrier_for_test(store.root());
+        let err = store
+            .insert(&record("1.2.3.77", "2026-09-23T10:00:00Z"))
+            .expect_err("a failed directory barrier must not answer success");
+        assert!(
+            matches!(err, StoreError::Io(_)),
+            "the barrier failure has to surface as an I/O error, got {err:?}"
+        );
+
+        // The data file must NOT be readable as a stored record: reporting an
+        // error while leaving a findable record would make a retry answer
+        // `Duplicate` for a result the caller was told had not been stored.
+        assert!(
+            store.find("1.2.3.1").expect("find warm").is_some(),
+            "the pre-existing record is untouched"
+        );
+    }
+
     /// F4: every directory level `create_dir_all` created gets its name flushed.
     ///
     /// Two gaps the single-parent version had: a bare relative root has an EMPTY
@@ -1115,10 +1265,12 @@ mod tests {
             .insert(&record("1.2.3.92", "2026-09-23T10:00:00Z"))
             .expect("insert");
         let after = syncs_observed();
-        // data + at least b + a (and the tempdir itself, depending on where the
-        // walk stops). Four is the conservative lower bound for this shape.
+        // A lower bound on the number of levels flushed. The exact count
+        // depends on how far the parent walk runs for this shape, so it is
+        // not asserted here; the data file plus the three created levels are
+        // the floor.
         assert!(
-            after >= before + 3,
+            after >= before + 4,
             "a nested root must flush each created level: observed {}",
             after - before
         );
@@ -1221,7 +1373,10 @@ mod tests {
         let err = store.insert(&rec).unwrap_err();
         assert!(matches!(err, StoreError::Io(_)), "got {err:?}");
         assert!(
-            store.path_for(&rec.transaction_uid).exists(),
+            store
+                .path_for(&rec.transaction_uid)
+                .expect("valid uid")
+                .exists(),
             "the link landed before the barrier failed"
         );
 
@@ -1289,7 +1444,7 @@ mod tests {
         let err = store.delete("1.2.3.4.96").unwrap_err();
         assert!(matches!(err, StoreError::Io(_)), "got {err:?}");
         assert!(
-            !store.path_for("1.2.3.4.96").exists(),
+            !store.path_for("1.2.3.4.96").expect("valid uid").exists(),
             "the file was removed; the delete reported the barrier failure"
         );
     }

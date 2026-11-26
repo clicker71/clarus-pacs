@@ -32,6 +32,7 @@ from http.server import ThreadingHTTPServer
 from pydicom.uid import ImplicitVRLittleEndian
 from pynetdicom import AE, _config, evt
 from pynetdicom.sop_class import (
+    ModalityPerformedProcedureStep,
     ModalityWorklistInformationFind,
     PatientRootQueryRetrieveInformationModelFind,
     PatientRootQueryRetrieveInformationModelMove,
@@ -56,6 +57,7 @@ from clean_code.commit_tracker import CommitTracker
 from clean_code.config import (
     VERSION,
     ConfParser,
+    resolve_config_path,
     validate_clarus_url,
 )
 from clean_code.handlers.cfind import handle_c_find
@@ -71,10 +73,22 @@ from clean_code.handlers.cstore import (
     handle_c_store,
     set_max_concurrent_cstore,
 )
+from clean_code.handlers.mpps import handle_n_create, handle_n_set
 from clean_code.handlers.naction import _sop_confirm, handle_n_action
 from clean_code.health_checker import HealthChecker
-from clean_code.http_helpers import STC_NO_RESOURCE, _stc_commit_request
+from clean_code.http_helpers import (
+    STC_NO_RESOURCE,
+    STC_PENDING,
+    STOW_UNVERIFIED,
+    _stc_commit_request,
+)
 from clean_code.http_server import make_bridge_handler
+from clean_code.inbound_guard import (
+    install_guarded_dul,
+    make_calling_ae_guard,
+    make_pdu_ceiling_handler,
+    normalise_ae_title,
+)
 from clean_code.metrics import (
     ae_label,
     associations_total,
@@ -103,6 +117,7 @@ from clean_code.protocol import (
     NON_IMAGE_TS,
 )  # 31.08 TS order
 from clean_code.registry import (
+    RegistryConfigError,
     _get_sop_registry_uids,
     _load_printer_registry,
     _load_sop_registry,
@@ -167,7 +182,8 @@ def _parse_args():
         "--config",
         default=_default_config,
         help="Path to configuration file (default: clbridge.conf "
-        "in script directory)",
+        "in the SCRIPT/EXECUTABLE directory, NOT the current working "
+        "directory - pass --config ./clbridge.conf to read the one here)",
     )
     # --regenerate-uids for tests/anonymization (NOT in config - too dangerous for prod)
     parser.add_argument(
@@ -199,6 +215,14 @@ def _populate_args(cfg):
     # endpoint. Empty port = off, which leaves the bridge with exactly one AE.
     args.expose_port = cfg.get_int("server", "expose_port", default=None)
     args.expose_ae_title = cfg.get("server", "expose_ae_title", default="CLBRIDGE_QA")
+    # [server] require_known_peers: refuse an inbound association whose
+    # Calling AE Title is not listed in peers.conf. Default ON - the allowlist
+    # is the deployment's own peer list, and an unknown caller is either a
+    # typo or an unauthorised peer. A deployment whose modalities cannot be
+    # enumerated in the file turns it off; nothing else changes.
+    args.require_known_peers = cfg.get_bool(
+        "server", "require_known_peers", default=True
+    )
 
     # [dicomweb]
     # 2908: single clarus_url knob (replaces host/clarus_port, NO fallback).
@@ -209,6 +233,13 @@ def _populate_args(cfg):
     # query parameter: the bridge must work against any DICOMweb server, and a
     # Clarus-only parameter would make it useless elsewhere.
     args.qa_url = cfg.get("dicomweb", "qa_url", default="").strip().rstrip("/")
+    # A relative mTLS path in the config file means "next to that file". Passing
+    # it through verbatim made the certificate resolvable only from the working
+    # directory the service manager happened to choose, so a restart from a
+    # different cwd silently failed to load the key pair.
+    _cfg_path = getattr(cfg, "path", None) or getattr(cfg, "config_path", None)
+    tls_cert = resolve_config_path(tls_cert, _cfg_path)
+    tls_key = resolve_config_path(tls_key, _cfg_path)
     args.tls_client_cert = tls_cert
     args.tls_client_key = tls_key
     args.tls_pair = (tls_cert, tls_key) if tls_cert and tls_key else None
@@ -383,6 +414,26 @@ def _validate_config(cfg):
         eport != port,
         f"server.expose_port {eport} must differ from server.port",
     )
+    # [server] require_known_peers: a boolean knob. get_bool maps anything it
+    # does not recognise to False, which would silently DISARM the inbound
+    # allowlist - so a value that is neither a known truthy nor a known falsy
+    # spelling is a startup error rather than a quiet downgrade.
+    _knob = cfg.get("server", "require_known_peers")
+    if _knob is not None and _knob.strip().lower() not in (
+        "true",
+        "1",
+        "yes",
+        "on",
+        "false",
+        "0",
+        "no",
+        "off",
+    ):
+        check(
+            False,
+            f"server.require_known_peers {_knob!r} is not a boolean "
+            "(true/false, 1/0, yes/no, on/off)",
+        )
 
     # DICOMweb
     # 2908: clarus_url validated fail-fast (scheme, host, legacy-key removal,
@@ -848,8 +899,8 @@ def _pid_is_alive(pid: int) -> bool:
         return True
 
 
-def _write_pid_file(path: str) -> None:
-    """Layer 3: atomic PID file via O_EXCL.
+def _write_pid_file(path: str) -> bool:
+    """Layer 3: atomic PID file via O_EXCL. Returns True when the file is OURS.
 
     Order: platform default (/var/run on Linux, next to the script
     elsewhere); if not writable, fall back next to the script; if
@@ -858,6 +909,12 @@ def _write_pid_file(path: str) -> None:
 
     The FATAL path exits via os._exit(1) because _write_pid_file is
     called from _fatal_pid_error.
+
+    A False return is the only signal that the create failed for a reason the
+    caller can work around (a permission or space error, NOT a live foreign
+    pid). The old signature returned None on every path, so the caller could
+    not tell "written" from "gave up" and reported a path it did not own to
+    the shutdown path, which then deleted a file it had never created.
     """
     pid = str(os.getpid())
     try:
@@ -885,7 +942,7 @@ def _write_pid_file(path: str) -> None:
                     path,
                     e2,
                 )
-                return
+                return False
         else:
             try:
                 old_pid_int = int(old_pid)
@@ -930,7 +987,7 @@ def _write_pid_file(path: str) -> None:
                         path,
                         e,
                     )
-                    return
+                    return False
     except OSError as e:
         # PermissionError is an OSError. NOT fatal: the service must start.
         logging.warning(
@@ -938,10 +995,35 @@ def _write_pid_file(path: str) -> None:
             path,
             e,
         )
-        return
-    with os.fdopen(fd, "w") as f:
-        f.write(pid)
+        return False
+    # The write and the close can fail too, and a buffered write reports its
+    # error from `close()` inside the `with` block, not from `os.open`. An
+    # exception escaping here aborted startup instead of falling back to the
+    # next candidate location. The record this call created is removed on the
+    # way out so a later instance does not read a truncated pid as stale-but-
+    # live; `True` is returned only once the full record is on disk.
+    #
+    # The file object is gone BEFORE the unlink: on Windows an open handle
+    # makes `os.remove` fail with a sharing violation, which is how the first
+    # version of this guard left the very record it meant to delete.
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(pid)
+            f.flush()
+            os.fsync(f.fileno())
+    except (OSError, ValueError) as e:
+        logging.warning(
+            "[WARN] Cannot write PID file %s: %s. Continuing without it.",
+            path,
+            e,
+        )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
     logging.info("[PID] %s written (pid=%s)", path, pid)
+    return True
 
 
 def _acquire_pid_file(port: int) -> str:
@@ -983,10 +1065,16 @@ def _acquire_pid_file(port: int) -> str:
                 candidate,
             )
             continue
-        # A live foreign pid inside _write_pid_file exits the process; a
-        # stale one is overwritten and we return that same path.
-        _write_pid_file(candidate)
-        return candidate
+        # A live foreign pid inside _write_pid_file exits the process; a stale
+        # one is overwritten and True is returned. A False means THIS candidate
+        # could not be taken, so the next one is tried instead of reporting a
+        # path the process does not own.
+        if _write_pid_file(candidate):
+            return candidate
+        logging.warning(
+            "[WARN] PID file %s could not be acquired; trying the next location.",
+            candidate,
+        )
 
     logging.warning(
         "[WARN] No writable PID file location found (tried: %s). "
@@ -994,6 +1082,152 @@ def _acquire_pid_file(port: int) -> str:
         ", ".join(candidates),
     )
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Startup ownership lock - one instance per DIMSE port, OS-backed
+# ---------------------------------------------------------------------------
+# The PID file is a RECORD, not a lock: it is created empty and filled two
+# lines later, so a second process that reads it in that window sees an empty
+# file, calls it stale, and replaces it. Both then reach
+# `_init_components()` - and its `recover_in_progress_jobs()` rewrites the
+# shared database - before either listener binds. The port probes do not close
+# that window either: they are separate checks, and both processes can pass
+# them.
+#
+# The lock below is the OS's own answer to "who owns this name", held for the
+# life of the process and released by the kernel if the process dies. It is
+# taken BEFORE recovery and released only at exit, so no second instance can
+# reach the database while the first is starting up.
+_startup_lock_handle = None
+
+
+def _acquire_startup_lock(port: int) -> bool:
+    """Take the exclusive per-port startup lock. False when another instance holds it.
+
+    POSIX: `flock(LOCK_EX | LOCK_NB)` on a lock file beside the PID file.
+    Windows: `msvcrt.locking` on the first byte, which is exclusive and
+    non-blocking.
+
+    Non-blocking on purpose: a second instance must FAIL FAST with a clear
+    message rather than queue behind the first and start when it stops.
+
+    The handle is kept in a module global so it stays open for the process
+    lifetime; the kernel drops it on any exit, including SIGKILL, which is what
+    makes a crash self-healing where a plain PID file is not.
+    """
+    global _startup_lock_handle
+    candidates = []
+    default = _default_pid_path(port)
+    fallback = _fallback_pid_path(port)
+    candidates.append(default + ".lock")
+    if fallback != default:
+        candidates.append(fallback + ".lock")
+
+    for lock_path in candidates:
+        directory = os.path.dirname(lock_path) or "."
+        if not os.path.isdir(directory) or not os.access(directory, os.W_OK):
+            continue
+        try:
+            handle = open(lock_path, "a+b")
+        except OSError as e:
+            logging.debug("[STARTUP-LOCK] cannot open %s: %s", lock_path, e)
+            continue
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            logging.error(
+                "[FATAL] Another clbridge instance owns %s - refusing to "
+                "start a second one on this DIMSE port.",
+                lock_path,
+            )
+            return False
+        except Exception as e:  # pragma: no cover - platform oddity
+            handle.close()
+            logging.debug("[STARTUP-LOCK] %s unusable: %s", lock_path, e)
+            continue
+        _startup_lock_handle = handle
+        logging.info("[STARTUP-LOCK] %s acquired", lock_path)
+        return True
+
+    # No writable location: the PID-file policy already WARNs and runs without
+    # it, and refusing to start would break deployments that run from a
+    # read-only image. The lock is the stronger guard; say clearly that it is
+    # not in use.
+    logging.warning(
+        "[STARTUP-LOCK] no writable lock location - starting WITHOUT the "
+        "exclusive startup guard"
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Persistent-state lock - one owner per STATE DIRECTORY, whatever the ports
+# ---------------------------------------------------------------------------
+# The startup lock above is keyed by DIMSE port, which answers "who serves this
+# port". It does NOT answer "who owns this database": two instances can take
+# different ports - and therefore different locks - while pointing at the same
+# `sop_index_dir`, and `_init_components` then calls
+# `recover_in_progress_jobs()` on the SAME move_jobs.db. The second instance
+# resets the first's in-progress jobs to pending, both claim them, and the same
+# instances are delivered twice.
+#
+# This lock is keyed by the resolved state directory and is held only across
+# startup, which is the window where recovery rewrites shared state. It is
+# deliberately separate from the port lock: running two bridges with distinct
+# ports AND distinct state stays supported.
+_state_lock_handle = None
+
+
+def _acquire_state_lock(state_dir: str) -> bool:
+    """Take a non-blocking exclusive lock on `state_dir`. False when held.
+
+    Held for the process lifetime, like the port lock: the OS drops it on any
+    exit, so a crash cannot leave the state directory permanently locked.
+    """
+    global _state_lock_handle
+    lock_path = os.path.join(state_dir, ".clbridge-state.lock")
+    try:
+        handle = open(lock_path, "a+b")
+    except OSError as e:
+        logging.warning(
+            "[STATE-LOCK] cannot open %s: %s - starting WITHOUT the state "
+            "lock; two instances sharing this directory could reset each "
+            "other's in-progress jobs",
+            lock_path,
+            e,
+        )
+        return True
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        logging.error(
+            "[FATAL] Another clbridge instance owns the state directory %s - "
+            "refusing to start a second one against the same move_jobs.db.",
+            state_dir,
+        )
+        return False
+    _state_lock_handle = handle
+    logging.info("[STATE-LOCK] %s acquired", lock_path)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1230,11 +1464,27 @@ def _start_background_services(
 
     stc_presence = bool(getattr(args, "storage_commitment_presence", False))
 
+    class _CommitStillPending(Exception):
+        """The origin accepted the commitment request and has not decided yet.
+
+        Raised from `_resolve_stc` so the tracker treats this tick as "nothing
+        delivered": the batch stays in its working set and is asked again,
+        rather than reporting a verdict the origin never produced (PS3.18
+        13.4.3).
+        """
+
     def _resolve_stc(job):
         """Ask the origin ONCE and report its verdict verbatim (true-mode).
 
         Only wired in true-mode; false-mode leaves `resolve` unset so the
         tracker runs its own heuristic, byte-for-byte as before.
+
+        Raises `_CommitStillPending` when the origin answers 202: PS3.18 13.4.3
+        says that means "accepted, not yet decided", so there is no verdict to
+        report and the batch must stay in the tracker. `_resolve` treats a
+        raised exception as "not delivered", which is exactly the desired
+        outcome here - the next tick asks again - whereas reporting would have
+        invented an answer the origin never gave.
         """
         committed, failed, sentinel = _stc_commit_request(
             args.clarus_url,
@@ -1243,6 +1493,8 @@ def _start_background_services(
             http_timeout=args.http_timeout,
             tls=args.tls_pair,
         )
+        if sentinel == STC_PENDING:
+            raise _CommitStillPending(job.tx_uid)
         if sentinel == STC_NO_RESOURCE:
             # The WARN already named the misconfiguration; there is
             # deliberately no fallback to the local path.
@@ -1594,6 +1846,19 @@ def _outbox_worker(
                     except Exception:
                         pass
             else:
+                # PS3.18 10.5.2: a 2xx that the bridge could not read states
+                # nothing about the instance - the origin may hold it. That is
+                # not a refusal and must not consume a retry, or a delivery
+                # nothing proved wrong reaches undelivered/. Requeue and let
+                # the next pass re-send it.
+                if msg and STOW_UNVERIFIED in msg:
+                    outbox.requeue(uid, msg)
+                    logging.warning(
+                        "[OUTBOX-WORKER] SOP %s: STOW verdict unreadable - "
+                        "returned to pending without a retry bump",
+                        uid,
+                    )
+                    continue
                 outbox.mark_failed(uid, msg or "Unknown error")
                 _delivered_total += 1
                 _delivered_failed += 1
@@ -1770,6 +2035,49 @@ def _outbox_worker(
                 with _progress_lock:
                     _last_progress = time.time()
                 result = _dequeue_safe()
+                # The health verdict may have flipped DURING the idle wait, and
+                # the check at the top of the loop cannot see it: the wait put
+                # us past that check. This applies to BOTH outcomes below - a
+                # dequeue that returned an SOP from another study goes on to
+                # flush the buffered batch at the study boundary, which charged
+                # a retry per item for a guaranteed failure the same way an idle
+                # flush did. So the verdict is read once, here, before either
+                # path can send a STOW.
+                if health_checker is not None and not health_checker.is_healthy():
+                    logging.warning(
+                        "[OUTBOX-WORKER] Server went down during the idle "
+                        "wait with %d buffered item(s) - returning them to "
+                        "pending instead of flushing",
+                        len(_batch),
+                    )
+                    for _uid, _ds, _bp, _raw, _mod in list(_batch):
+                        try:
+                            outbox.requeue(_uid, "server down")
+                        except Exception as e:
+                            logging.error(
+                                "[OUTBOX-WORKER] Could not return %s to " "pending: %s",
+                                _uid,
+                                e,
+                            )
+                    _batch = []
+                    _batch_study = None
+                    _batch_bytes = 0
+                    _batch_started_at = 0.0
+                    # The item dequeue just claimed was taken AFTER the server
+                    # went down, so it has not failed either - give it back
+                    # unburned rather than carrying it into a doomed send.
+                    if result[0] is not None:
+                        try:
+                            outbox.requeue(result[0], "server down")
+                        except Exception as e:
+                            logging.error(
+                                "[OUTBOX-WORKER] Could not return %s to pending: %s",
+                                result[0],
+                                e,
+                            )
+                        result = (None, None, None, None)
+                    outbox_pending_files.set(outbox.pending_count())
+                    continue
                 if result[0] is None:
                     _deliver_batch()
                     continue
@@ -1807,6 +2115,14 @@ def _outbox_worker(
         sop_uid, ds, blob_path, raw_bytes = result
         # ds is already a pydicom Dataset from dequeue() -- no dcmread needed.
 
+        # The queue is no longer idle the moment an item is CLAIMED, not when a
+        # later flush happens to observe pending work. A steady trickle of one
+        # SOP per study always emptied the queue before each flush, so
+        # `pending == 0` held on every drain with `_queue_was_empty` already
+        # True: the summaries never ran and `_study_stats` grew by one entry per
+        # study for the life of the process.
+        _queue_was_empty = False
+
         # Study context for batching + INFO-level delivery logging.
         try:
             _study_uid = str(getattr(ds, "StudyInstanceUID", ""))
@@ -1816,6 +2132,28 @@ def _outbox_worker(
         # Study boundary HARD: never mix studies in one batch. Switch flushes.
         if _batch and _study_uid != _batch_study:
             _deliver_batch()
+            # The flush can set `_pause_until` (a 507 with Retry-After). The
+            # item just dequeued belongs to the NEXT study and is not part of
+            # that failed batch, but appending it here and then meeting the
+            # byte limit sent another STOW immediately - straight through the
+            # backoff the server just asked for. It goes back to pending
+            # UNBURNED: nothing about this item failed.
+            if _pause_until > time.time():
+                logging.warning(
+                    "[OUTBOX-WORKER] 507 pause began during the study switch - "
+                    "returning %s to pending unburned",
+                    sop_uid,
+                )
+                try:
+                    outbox.requeue(sop_uid, "retry-after pause")
+                except Exception as e:
+                    logging.error(
+                        "[OUTBOX-WORKER] Could not return %s to pending: %s",
+                        sop_uid,
+                        e,
+                    )
+                outbox_pending_files.set(outbox.pending_count())
+                continue
 
         if _study_uid and _study_uid != _current_study:
             _current_study = _study_uid
@@ -1978,6 +2316,14 @@ _FORWARD_BATCH_MAX_SOP = 20
 _FORWARD_BATCH_WINDOW_S = 0.5
 _FORWARD_PAUSE_S = 5.0
 
+# PS3.4 Table B.2-1: the C-STORE WARNING statuses. The set is ENUMERATED, not
+# the 0xB000..0xBFFF range: the status space is not a range, and accepting
+# undefined codes there reported an instance as archived on a code the standard
+# does not define. 0xB000 and 0xB006 mean the instance was stored with a
+# coercion or a discarded element; 0xB007 means it was NOT stored as sent, so it
+# stays on the failure path.
+_CSTORE_WARNING_STATUSES = frozenset({0xB000, 0xB006})
+
 
 def _forward_blob_pair(raw_bytes):
     """Read (sop_class_uid, stored_ts_uid) from a stored DICOM file's meta.
@@ -2007,12 +2353,25 @@ def _forward_blob_size(blob_path):
         return 0
 
 
+# True when the last `_forward_open_assoc` call reached the peer and the
+# peer rejected every proposed presentation context. Reset on every call.
+_LAST_OPEN_REFUSED = False
+
+
 def _forward_open_assoc(
     calling_ae, dest_ae, host, port, pairs, network_timeout, dimse_timeout, acse_timeout
 ):
     """Open ONE association carrying one requested context per distinct
-    (sop_class, stored_ts) pair of the batch. Returns an
-    established association or None on any failure."""
+    (sop_class, stored_ts) pair of the batch. Returns the established
+    association, or None on any failure.
+
+    On None, `_LAST_OPEN_REFUSED` says whether the peer ANSWERED and rejected
+    every proposed context (a capability verdict) or was never reached at all
+    (a transport failure). The distinction is published here rather than in the
+    return value because every caller and every test treats this function as
+    "association or None", and widening that tuple would have changed a contract
+    nothing else in the module needs.
+    """
     ae = AE(ae_title=calling_ae)
     ae.network_timeout = network_timeout
     ae.acse_timeout = acse_timeout
@@ -2024,15 +2383,30 @@ def _forward_open_assoc(
     for sop_class, ts_uid in sorted(pairs):
         if sop_class and ts_uid:
             ae.add_requested_context(sop_class, ts_uid)
+    global _LAST_OPEN_REFUSED
+    _LAST_OPEN_REFUSED = False
     try:
         assoc = ae.associate(host, port, ae_title=dest_ae)
     except Exception:
         return None
     if not assoc.is_established:
+        # The peer ANSWERED and refused everything it was offered: every
+        # proposed presentation context was rejected, so no A-ASSOCIATE-AC was
+        # sent. `is_established` is False for this AND for a silent/refused
+        # peer, and an unreachable peer also reports is_aborted - so the
+        # refusal evidence is taken ONLY from rejected_contexts, which is
+        # populated from the A-ASSOCIATE-RJ/AC result and stays empty when no
+        # response ever arrived.
+        refused = False
+        try:
+            refused = bool(getattr(assoc, "rejected_contexts", None) or [])
+        except Exception:
+            refused = False
         try:
             assoc.release()
         except Exception:
             pass
+        _LAST_OPEN_REFUSED = refused
         return None
     # Counted only once the association is actually established: a refused
     # association is not an association made.
@@ -2053,6 +2427,7 @@ def _forward_process_batch(
     network_timeout,
     dimse_timeout,
     acse_timeout,
+    settled=None,
 ):
     """Deliver ONE already-claimed batch of forward items over a single
     association.
@@ -2063,16 +2438,18 @@ def _forward_process_batch(
                each ALREADY atomically claimed into forward/in_progress via
                dequeue() (so mark_delivered/mark_failed/requeue know the mover).
         dest_ae/host/port/calling_ae/timeouts: association parameters.
+        settled: set the CALLER owns for THIS call. Every UID whose queue
+               transition this call completed is added to it. It is passed in
+               rather than published as a function attribute because an
+               attribute outlives the call: a batch that raised before the
+               `finally` left the previous batch's set in place, and the
+               caller then skipped a UID that was due for retry. A per-call
+               set also survives an exception, which is exactly when the
+               caller needs it.
 
     Returns True if the association was usable (even if individual RSPs were
     non-zero); False if the association could NOT be established at all, in
     which case the CALLER requeues the whole batch (no retry burn) and pauses.
-
-    `_forward_process_batch.handled` carries the UIDs this call already
-    settled (delivered / failed / requeued) before returning False for a lost
-    association. The caller requeues only the items NOT in that set: the ones
-    after the loss were never attempted on the wire, and the ones before it
-    must not be requeued twice.
 
     Per instance it READS every C-STORE-RSP: 0x0000 -> mark_delivered;
     a non-zero RSP -> mark_failed (backoff, then undelivered at max retries);
@@ -2085,7 +2462,7 @@ def _forward_process_batch(
     reproducible everywhere, and keeps the wire test's exact-order pin valid.
     """
     items = sorted(items, key=lambda item: item[0])
-    self_handled = set()
+    self_handled = settled if settled is not None else set()
 
     # Items that lost their sop_class / stored_ts cannot be proposed over any
     # negotiated context. They used to be silently dropped from `pairs` while
@@ -2105,10 +2482,19 @@ def _forward_process_batch(
                 uid,
             )
             forward_failed_total.inc()
+            # Same rule as the context-rejection path: settled only on a
+            # successful transition, so a failed one is left to recovery.
             try:
                 forward_outbox.mark_failed(uid, "missing sop_class/stored_ts")
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.error(
+                    "[FORWARD] SOP %s: cannot record the failure (%s) - "
+                    "leaving it for recovery",
+                    uid,
+                    exc,
+                )
+                continue
+            self_handled.add(uid)
     if not sendable:
         # Nothing sendable remained; every item was already failed above, so
         # the batch is terminal (not retryable).
@@ -2124,6 +2510,37 @@ def _forward_process_batch(
         dimse_timeout,
         acse_timeout,
     )
+    if assoc is None and _LAST_OPEN_REFUSED:
+        # The peer answered and rejected every context: a capability verdict.
+        # Charging the batch against its retry budget is what stops an
+        # incompatible SOP class from being re-proposed forever; the items
+        # reach undelivered/ and the operator sees them.
+        logging.warning(
+            "[FORWARD] %s at %s:%s rejected every proposed context - "
+            "charging the retry budget for %d item(s)",
+            dest_ae,
+            host,
+            port,
+            len(sendable),
+        )
+        for uid, _sop_class, _stored_ts, _blob_path in sendable:
+            forward_failed_total.inc()
+            # Settled only when the transition actually happened. Recording the
+            # UID unconditionally let a raising `mark_failed` count as handled,
+            # so the caller never requeued the item and it stayed in
+            # in_progress/ with no retry and no verdict.
+            try:
+                forward_outbox.mark_failed(uid, "all presentation contexts rejected")
+            except Exception as exc:
+                logging.error(
+                    "[FORWARD] SOP %s: cannot record the context rejection "
+                    "(%s) - leaving it for recovery",
+                    uid,
+                    exc,
+                )
+                continue
+            self_handled.add(uid)
+        return True
     if assoc is None:
         logging.warning(
             "[FORWARD] Cannot associate with %s at %s:%s - batch %d requeued, "
@@ -2165,8 +2582,14 @@ def _forward_process_batch(
                 forward_failed_total.inc()
                 try:
                     forward_outbox.mark_failed(uid, "context not covered")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.error(
+                        "[FORWARD] SOP %s: cannot record the context verdict "
+                        "(%s) - leaving it for recovery",
+                        uid,
+                        exc,
+                    )
+                    continue
                 self_handled.add(uid)
                 continue
 
@@ -2184,6 +2607,12 @@ def _forward_process_batch(
             # wire.
             _send_path = blob_path
             _mods_extra = None
+            # The temp file this re-serialization creates, recorded at CREATION.
+            # `_mods_extra` is only assigned after `save_as` succeeds, so a
+            # `save_as` that raised part-way left a file holding patient data,
+            # in the outbox directory, with nothing referencing it - neither
+            # the failure branch below nor the `finally` could find it.
+            _tmp_send_path = None
             try:
                 _mods_json = forward_outbox.read_mods_sidecar(blob_path)
             except Exception:
@@ -2210,6 +2639,7 @@ def _forward_process_batch(
                         suffix=".dcm", delete=False, dir=_os_fwd.path.dirname(blob_path)
                     )
                     _fh.close()
+                    _tmp_send_path = _fh.name
                     _fds.save_as(_fh.name, enforce_file_format=True)
                     _send_path = _fh.name
                     _mods_extra = _fh.name
@@ -2221,6 +2651,15 @@ def _forward_process_batch(
                         uid,
                         mods_err,
                     )
+                    # A partial file from the failed write holds patient data.
+                    if _tmp_send_path:
+                        try:
+                            import os as _os_fwd_part
+
+                            _os_fwd_part.unlink(_tmp_send_path)
+                        except OSError:
+                            pass
+                        _tmp_send_path = None
                     _send_path = blob_path
                     _mods_extra = None
                     _blob_size = _forward_blob_size(blob_path)
@@ -2252,6 +2691,24 @@ def _forward_process_batch(
                     )
                 except Exception:
                     pass
+                # The association is the batch's transport. Once it is gone,
+                # every remaining send raises the same way: the loop used to
+                # requeue each item in turn and then return True, so the worker
+                # treated the batch as settled and retried WITHOUT the
+                # association-failure pause - hammering a peer that had already
+                # closed on us. Returning False hands the whole unsettled batch
+                # back for requeue-and-pause, while the items already settled
+                # above stay settled because they are in `self_handled`.
+                try:
+                    still_up = bool(assoc.is_established)
+                except Exception:
+                    still_up = False
+                if not still_up:
+                    logging.warning(
+                        "[FORWARD] association closed during the batch - "
+                        "abandoning the rest for a paused retry"
+                    )
+                    return False
                 self_handled.add(uid)
                 continue
             finally:
@@ -2291,12 +2748,30 @@ def _forward_process_batch(
             # WAS stored. Treating 0xB000/0xB006/0xB007 as a failure marked a
             # delivered instance failed, retried it, and eventually parked it in
             # undelivered/ while the destination held it all along.
-            if (
-                rsp_status == 0x0000
-                or (0xB000 <= (rsp_status or 0) <= 0xBFFF)
-                or rsp_status in (0x0001, 0x0107)
-            ):
-                forward_outbox.mark_delivered(uid)
+            #
+            # The set is ENUMERATED, not the whole 0xB000..0xBFFF range: PS3.4
+            # Table B.2-1 defines exactly 0xB000 (coercion), 0xB006 (element
+            # discarded) and 0xB007 (data set does not match SOP class) as
+            # C-STORE warnings - and 0xB007 in particular means the instance was
+            # NOT stored as sent. Treating an undefined status in that range as
+            # delivered told the modality (and the forward channel) that an
+            # instance was archived on the strength of a code the standard does
+            # not define, so anything unrecognised stays on the failure path.
+            if rsp_status == 0x0000 or rsp_status in _CSTORE_WARNING_STATUSES:
+                # Settled only when the transition actually happened: recording
+                # the UID unconditionally let a raising mark_delivered count as
+                # handled, so the caller never requeued the item and it stayed
+                # in in_progress/ with no retry and no verdict.
+                try:
+                    forward_outbox.mark_delivered(uid)
+                except Exception as exc:
+                    logging.error(
+                        "[FORWARD] SOP %s: cannot record the delivery (%s) - "
+                        "leaving it for recovery",
+                        uid,
+                        exc,
+                    )
+                    continue
                 self_handled.add(uid)
                 forward_delivered_total.inc()
                 try:
@@ -2319,10 +2794,18 @@ def _forward_process_batch(
                 if not getattr(assoc, "is_established", False):
                     logging.warning(
                         "[FORWARD] association lost before SOP %s - handing "
-                        "back the rest of the batch uncharged",
+                        "back the rest of the batch uncharged, %s included",
+                        uid,
                         uid,
                     )
-                    self_handled.add(uid)
+                    # This SOP's C-STORE-RSP never arrived and its claim is
+                    # still open: it must go back to pending/ with the unsent
+                    # items, NOT be reported as settled. Settling it left the
+                    # claimed blob in in_progress/ for the 300 s reaper, so a
+                    # SOP that only needed a re-send waited out the stuck
+                    # sweep - and if the destination was reachable again by
+                    # then, the reaper's requeue was the only thing that saved
+                    # it. Earlier UIDs are legitimately settled and stay so.
                     return False
                 # Association still up: this one instance produced no answer.
                 # Requeueing it for free let a single instance that always
@@ -2347,7 +2830,19 @@ def _forward_process_batch(
                 # move_to_undelivered internally (outbox.py semantics).
                 msg = str(rsp_status)
                 forward_failed_total.inc()
-                forward_outbox.mark_failed(uid, f"C-STORE {msg}")
+                # Same rule as every other transition in this loop: a failed
+                # mark_failed is left for recovery rather than counted as
+                # settled.
+                try:
+                    forward_outbox.mark_failed(uid, f"C-STORE {msg}")
+                except Exception as exc:
+                    logging.error(
+                        "[FORWARD] SOP %s: cannot record the rejection (%s) - "
+                        "leaving it for recovery",
+                        uid,
+                        exc,
+                    )
+                    continue
                 self_handled.add(uid)
                 logging.warning("[FORWARD] SOP %s rejected: %s", uid, msg)
         if delivered_any:
@@ -2357,10 +2852,9 @@ def _forward_process_batch(
                 pass
         return True
     finally:
-        # Published for the caller's requeue path (see the docstring): the
-        # UIDs this call already settled, whether it returned True or gave up
-        # on a lost association.
-        _forward_process_batch.handled = self_handled
+        # `settled` is the caller's set (see the docstring): whether this call
+        # returns True, gives up on a lost association or raises, the UIDs it
+        # already transitioned are visible to the recovery path.
         try:
             assoc.release()
         except Exception:
@@ -2425,6 +2919,12 @@ def _forward_worker(
         # thing draining the forward queue, so losing it leaves claimed items
         # in forward/in_progress and forwarding silently stops until restart.
         # Treat an escape as an association-level failure (requeue, no burn).
+        #
+        # The settlement set is created HERE, per batch, and handed in: it must
+        # describe this call only. Reading it off the function (`handled`) meant
+        # an exception before the `finally` re-published it left the PREVIOUS
+        # batch's UIDs in place, and recovery then skipped a SOP that was due
+        # for retry.
         handled = set()
         try:
             assoc_ok = _forward_process_batch(
@@ -2437,8 +2937,8 @@ def _forward_worker(
                 network_timeout,
                 dimse_timeout,
                 acse_timeout,
+                settled=handled,
             )
-            handled = set(getattr(_forward_process_batch, "handled", set()))
         except Exception as e:
             logging.error(
                 "[FORWARD] batch processing raised %s: %s - requeueing %d item(s)",
@@ -2479,6 +2979,7 @@ def _register_handlers(
     commit_tracker=None,
     forward_outbox=None,
     expose_rejected=False,
+    allowlist_titles=(),
 ):
     """Register DIMSE event handlers. Returns list of (event, handler) tuples.
 
@@ -2486,6 +2987,10 @@ def _register_handlers(
     Rejected Instances AE builds its own set with the flag on, every other AE
     uses the default. It only affects the QIDO/WADO query the C-FIND and
     C-MOVE handlers issue - the DIMSE behaviour is identical.
+
+    `allowlist_titles` is the calling-AE allowlist the owning AE was armed
+    with (empty when the filter is off); it only feeds the warning handler,
+    because the refusal itself happens in the AE's negotiation.
     """
     # Bridge: verbose HTTP logging when DEBUG level is active
     verbose = args.log_level == "DEBUG"
@@ -2598,7 +3103,15 @@ def _register_handlers(
         )
 
     def on_n_action(event):
-        yield from handle_n_action(
+        # pynetdicom 3.0.4 unpacks the EVT_N_ACTION handler's return value as a
+        # `(status, dataset)` pair:
+        #     usr_status, ds = cast(UserReturnType, user_response)
+        # (service_class.py, _n_action_scp). `handle_n_action` is a plain
+        # function that RETURNS that pair, so `yield from` here turned this
+        # adapter into a GENERATOR and handed pynetdicom a generator object to
+        # unpack - a Storage Commitment request could never complete. The
+        # contract is a pair, so the adapter returns a pair.
+        return handle_n_action(
             event,
             args.clarus_url,
             verbose,
@@ -2610,6 +3123,26 @@ def _register_handlers(
             ),
             tls=args.tls_pair,
             stc_presence=stc_presence,
+        )
+
+    # MPPS (PS3.18 section 15): the two DIMSE operations that write a performed
+    # procedure step are translated into the two DICOMweb transactions. Nothing
+    # is answered from local state - the origin server owns the record - so the
+    # handlers only need the DICOMweb base URL, the timeout and the mTLS pair.
+    def on_n_create(event):
+        return handle_n_create(
+            event,
+            args.clarus_url,
+            http_timeout=args.http_timeout,
+            tls=args.tls_pair,
+        )
+
+    def on_n_set(event):
+        return handle_n_set(
+            event,
+            args.clarus_url,
+            http_timeout=args.http_timeout,
+            tls=args.tls_pair,
         )
 
     # DIMSE association lifecycle handlers.
@@ -2644,12 +3177,37 @@ def _register_handlers(
             pass
         register_assoc_released(assoc_id)
 
+    # T1 (21.11): PS3.8 9.3.2.2 negotiated maximum PDU length.
+    #
+    # The REAL bound is `GuardedDUL` (inbound_guard.py), installed at
+    # EVT_CONN_OPEN: it reads the six-byte header and refuses before reading
+    # the body, so an oversized P-DATA-TF never enters memory and never
+    # reaches DIMSE. The EVT_PDU_RECV handler is the dispatch-level backstop
+    # for a PDU that arrives by a path where no guarded provider was
+    # installed.
+    #
+    # T3 (21.11): the calling-AE allowlist is decided in ONE place
+    # (`make_calling_ae_guard`) and BOTH the warning and the A-ASSOCIATE-RJ
+    # come from it. pynetdicom's own require_calling_aet is deliberately not
+    # used: it compares case-sensitively, so it would refuse a peer the
+    # warning reports as known.
+    #
+    # All three handlers come from clean_code.inbound_guard so the wire tests
+    # drive the same code the bridge runs.
     handlers = [
+        (evt.EVT_CONN_OPEN, install_guarded_dul),
+        (
+            evt.EVT_REQUESTED,
+            make_calling_ae_guard(allowlist_titles),
+        ),
+        (evt.EVT_PDU_RECV, make_pdu_ceiling_handler()),
         (evt.EVT_C_STORE, on_c_store),
         (evt.EVT_C_ECHO, on_c_echo),
         (evt.EVT_C_FIND, on_c_find),
         (evt.EVT_C_MOVE, on_c_move),
         (evt.EVT_N_ACTION, on_n_action),
+        (evt.EVT_N_CREATE, on_n_create),
+        (evt.EVT_N_SET, on_n_set),
         (evt.EVT_ACCEPTED, on_assoc_accepted),
         (evt.EVT_RELEASED, on_assoc_released),
         (evt.EVT_ABORTED, on_assoc_released),  # Same cleanup as release
@@ -2659,8 +3217,96 @@ def _register_handlers(
 
 
 # ---------------------------------------------------------------------------
+# T3: inbound calling-AE allowlist from peers.conf
+# ---------------------------------------------------------------------------
+def _load_calling_ae_allowlist(peers_file, enabled):
+    """Distinct AE titles named in peers.conf, or [] when the knob is off.
+
+    Read at START-UP only, and read through the same parser the C-MOVE
+    destination uses (`parse_peers_conf`), so a peer is written once and both
+    directions agree on what an entry means. A CIDR row names the same AE as an
+    exact row, so the titles are de-duplicated.
+
+    Start-up is deliberate: the guard is consulted while the A-ASSOCIATE-RQ is
+    being negotiated, when the peer is not yet allowed to do anything, and it
+    reads from a plain tuple bound into the handler. Teaching the lazyloaded
+    peer table to feed it would mean mutating that tuple from the reload
+    thread mid-negotiation. A peer added to peers.conf therefore takes effect
+    on restart, which is the same contract the C-MOVE destination list already
+    has for a NEW peer.
+
+    No file, or a file that names nobody, yields [] - "no filter". The ARMED
+    case is handled by the caller, which refuses to start: `require_known_peers`
+    with an empty allowlist is a configuration hole, and pynetdicom only
+    restricts Calling AE Titles when the list is non-empty, so leaving the knob
+    on would read as "filtered" while nothing was filtered.
+    """
+    if not enabled or not peers_file:
+        return []
+    from clean_code.config import parse_peers_conf
+
+    titles = []
+    seen = set()
+    for ae_title, _host, _port in parse_peers_conf(peers_file):
+        key = normalise_ae_title(ae_title)
+        if key and key not in seen:
+            seen.add(key)
+            titles.append(key)
+    return titles
+
+
+def _apply_calling_ae_allowlist(target_ae, args):
+    """Bind the inbound calling-AE allowlist onto `target_ae`.
+
+    Extracted from `_init_dimse_ae` so the fail-closed rule is reachable from a
+    test without building a whole SCP AE.
+
+    An armed filter (`require_known_peers=true`) with an empty allowlist is a
+    startup error, not a warning: pynetdicom only restricts Calling AE Titles
+    when the list is non-empty, so starting would produce an OPEN listener
+    while the config and the log both read as "filtered". The explicit opt-out
+    is `require_known_peers=false`.
+
+    Returns the titles bound onto `target_ae` (empty when no filter is armed), so
+    the caller can reuse them for the QA AE and the handler wiring.
+    """
+    _peers_file = getattr(args, "peers_file", None)
+    _required = bool(getattr(args, "require_known_peers", False))
+    _allowed_calling_aets = _load_calling_ae_allowlist(_peers_file, _required)
+    if _allowed_calling_aets:
+        target_ae.require_calling_aet = list(_allowed_calling_aets)
+        logging.info(
+            "[PEER] Inbound calling-AE allowlist active: %d title(s) from %s",
+            len(_allowed_calling_aets),
+            _peers_file,
+        )
+    elif _required:
+        raise RuntimeError(
+            f"require_known_peers is on but {_peers_file or '(no peers_file)'} "
+            "lists no AE titles - refuse to start an unfiltered listener"
+        )
+    return _allowed_calling_aets
+
+
+# ---------------------------------------------------------------------------
 # SCP AE construction: contexts + handlers + shutdown monitor
 # ---------------------------------------------------------------------------
+def _is_addr_in_use(exc):
+    """True when `exc` is a bind conflict rather than a generic start failure.
+
+    A port already held is an OPERATOR problem (another instance, a stray
+    listener) and deserves its own message; anything else is a bridge fault.
+    """
+    import errno
+
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in (
+        errno.EADDRINUSE,
+        10048,  # WSAEADDRINUSE on Windows
+    ):
+        return True
+    return "address already in use" in str(exc).lower()
+
+
 def _init_dimse_ae(
     args,
     sop_index,
@@ -2683,6 +3329,30 @@ def _init_dimse_ae(
     # default is False - any Called AE Title would be accepted, which let a
     # misconfigured peers.conf loop C-MOVE back into the bridge's own SCP.
     ae.require_called_aet = True
+    # T3 (21.11): calling-AE allowlist.
+    #
+    # The REFUSAL is pynetdicom's (`ae.require_calling_aet`): it answers with a
+    # real A-ASSOCIATE-RJ through its own state machine, which is the one path
+    # that actually puts the PDU on the wire.
+    #
+    # The COMPARISON is ours: pynetdicom compares case-sensitively
+    # (acse.py:330-334), so a peer announcing `ct_room` against `CT_ROOM`
+    # would be refused while a case-insensitive warning called it known.
+    # `make_calling_ae_guard` folds the received title in place on
+    # EVT_REQUESTED, before negotiation compares it, so one rule decides both
+    # the warning and the rejection. Titles here are already folded by
+    # `_load_calling_ae_allowlist`.
+    #
+    # The list comes from peers.conf, the SAME file the C-MOVE destination and
+    # the N-EVENT requestor already resolve through, so a peer is configured in
+    # one place. An armed knob with no titles is a startup error - see
+    # `_apply_calling_ae_allowlist`.
+    #
+    # Both values are read defensively: _init_dimse_ae is also called with a
+    # hand-built args object, where a missing knob must mean "no filter"
+    # rather than an AttributeError that leaves the bridge unable to build its
+    # AE at all.
+    _allowed_calling_aets = _apply_calling_ae_allowlist(ae, args)
     # DIMSE timeouts - from config [dimse] (inbound - outbound).
     # Inbound: bridge as SCP - C-STORE from modality, C-FIND from viewer.
     # inbound_network_timeout: 0 = disabled (SCP should wait for client, ).
@@ -2777,6 +3447,13 @@ def _init_dimse_ae(
         target_ae.add_supported_context(
             StorageCommitmentPushModel, ImplicitVRLittleEndian
         )
+        # PS3.4 F.7: the MPPS SOP Class is proposed with Implicit VR Little
+        # Endian, the transfer syntax its data set is defined over. Without a
+        # supported context an A-ASSOCIATE requesting MPPS alone is rejected
+        # outright, so a modality cannot open its association at all.
+        target_ae.add_supported_context(
+            ModalityPerformedProcedureStep, ImplicitVRLittleEndian
+        )
         target_ae.add_supported_context(
             StudyRootQueryRetrieveInformationModelMove, ImplicitVRLittleEndian
         )
@@ -2799,6 +3476,7 @@ def _init_dimse_ae(
         health_checker,
         commit_tracker=commit_tracker,
         forward_outbox=forward_outbox,
+        allowlist_titles=_allowed_calling_aets,
     )
 
     # QA AE (AIRA 57.2.1 Expose Rejected Instances). A DIMSE association has
@@ -2822,6 +3500,12 @@ def _init_dimse_ae(
         expose_ae.acse_timeout = ae.acse_timeout
         expose_ae.dimse_timeout = ae.dimse_timeout
         expose_ae.maximum_associations = args.max_associations
+        # The QA AE is a second inbound listener: it owes the same PDU ceiling
+        # and the same calling-AE allowlist as the ordinary one, for the same
+        # reasons and against the same peers.conf. Both come from the shared
+        # handler list below; the allowlist titles are canonical, so the
+        # EVT_REQUESTED folding applies here unchanged.
+        expose_ae.require_calling_aet = list(_allowed_calling_aets)
         _register_contexts(expose_ae)
         expose_handlers = _register_handlers(
             args,
@@ -2833,6 +3517,7 @@ def _init_dimse_ae(
             commit_tracker=commit_tracker,
             forward_outbox=forward_outbox,
             expose_rejected=True,
+            allowlist_titles=_allowed_calling_aets,
         )
     elif args.expose_port:
         logging.warning(
@@ -2871,18 +3556,45 @@ def _init_dimse_ae(
             args.expose_port,
         )
 
-        def _serve_expose():
-            try:
-                expose_ae.start_server(
-                    (args.bridge_host, args.expose_port),
-                    block=True,
-                    evt_handlers=expose_handlers,
+        # BIND the QA listener HERE, synchronously, and report the result.
+        #
+        # A thread that binds on its own schedule can lose the port after the
+        # preflight probe and set the shutdown flag while the ordinary AE has
+        # no server yet: the monitor then calls `ae.shutdown()` against an
+        # empty server list, and the normal listener starts afterwards - after
+        # its workers have already begun to exit. Binding in the caller makes
+        # the outcome part of the return value instead of a race.
+        try:
+            expose_server = expose_ae.start_server(
+                (args.bridge_host, args.expose_port),
+                block=False,
+                evt_handlers=expose_handlers,
+            )
+        except Exception as exc:
+            # A QA listener that cannot bind is a startup failure for THAT AE.
+            # It must not be silently degraded: the QA workstation would
+            # connect to nothing, and the operator would read a single log line.
+            if _is_addr_in_use(exc):
+                logging.error(
+                    "[FATAL] Expose AE cannot bind %s:%d: %s",
+                    args.bridge_host,
+                    args.expose_port,
+                    exc,
                 )
-            except Exception as exc:
-                logging.error("[DIMSE] Expose AE stopped: %s", exc)
-                _shutdown_requested.set()
-
-        threading.Thread(target=_serve_expose, name="dimse-expose", daemon=True).start()
+                raise RuntimeError(
+                    f"Expose AE cannot bind {args.bridge_host}:{args.expose_port}"
+                ) from exc
+            logging.error("[DIMSE] Expose AE stopped: %s", exc)
+            _shutdown_requested.set()
+            raise RuntimeError("Expose AE failed to start") from exc
+        if expose_server is None:
+            logging.error(
+                "[FATAL] Expose AE did not start on %s:%d",
+                args.bridge_host,
+                args.expose_port,
+            )
+            raise RuntimeError("Expose AE failed to start")
+        logging.info("[DIMSE] Expose AE listening (bound synchronously)")
 
     # Bridge: register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -2892,6 +3604,28 @@ def _init_dimse_ae(
         signal.signal(signal.SIGBREAK, _signal_handler)
 
     return ae, expose_ae, handlers
+
+
+def _start_main_listener(ae, host, port, handlers):
+    """Start the blocking DIMSE listener unless shutdown has already begun.
+
+    Returns True when the listener was started, False when it was skipped.
+
+    A signal that arrives after handler registration but before this point has
+    already fired the shutdown monitor: it called `ae.shutdown()` while no
+    server was registered, so it shut down nothing and the monitor thread is
+    gone. pynetdicom 3.0.4 only stops servers that exist when `shutdown()` runs
+    (ae.py), so starting a blocking listener now would serve connections with
+    every worker already exiting and nothing left to stop it.
+    """
+    if _shutdown_requested.is_set():
+        logging.warning(
+            "[DIMSE] Shutdown requested before the listener started - not "
+            "starting the blocking server"
+        )
+        return False
+    ae.start_server((host, port), block=True, evt_handlers=handlers)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2987,8 +3721,15 @@ def main():
             args.move_poll_timeout,
         )
 
-    # Bridge: load SOP class registry
-    sop_registry = _load_sop_registry(args.sop_registry)
+    # Bridge: load SOP class registry. A registry file that exists but yields
+    # no usable entry is a configuration error, not a reason to fall back to
+    # the built-ins (which would re-enable a class the file disables), so it
+    # stops startup - with the operator-facing reason, not a traceback.
+    try:
+        sop_registry = _load_sop_registry(args.sop_registry)
+    except RegistryConfigError as exc:
+        logging.error("[STARTUP] %s", exc)
+        sys.exit(1)
 
     # - Duplicate-instance and port checks BEFORE any component starts -
     # `_init_components` calls `move_jobs.recover_in_progress_jobs()`, which
@@ -3022,6 +3763,20 @@ def main():
     _pid_path = _acquire_pid_file(args.bridge_port)
     if _pid_path:
         set_pid_path(_pid_path)
+
+    # Exclusive STARTUP ownership, taken before any component touches the
+    # database and held for the life of the process. The PID file above only
+    # records; this is what makes two concurrent starts impossible.
+    if not _acquire_startup_lock(args.bridge_port):
+        sys.exit(1)
+
+    # Ownership of the STATE DIRECTORY, which is a different question from
+    # ownership of the DIMSE port: two instances may take different ports and
+    # still share `sop_index_dir`, and `_init_components` below resets
+    # in-progress C-MOVE jobs in the shared database. Taken before that call,
+    # for the same reason the port lock is.
+    if not _acquire_state_lock(os.path.dirname(args.sop_index_dir) or "."):
+        sys.exit(1)
 
     # initialize components
     sop_index, move_jobs, printer_registry, driver_registry = _init_components(args)
@@ -3131,9 +3886,7 @@ def main():
 
     try:
         # Bridge: start_server blocks, but signal handlers will trigger shutdown
-        ae.start_server(
-            (args.bridge_host, args.bridge_port), block=True, evt_handlers=handlers
-        )
+        _start_main_listener(ae, args.bridge_host, args.bridge_port, handlers)
     except KeyboardInterrupt:
         # Bridge: Ctrl+C in terminal
         logging.info("KeyboardInterrupt received")
@@ -3148,7 +3901,12 @@ def main():
         logging.info("Waiting up to 30s for in-flight operations to complete...")
         ae.shutdown()  # Idempotent - monitor may have already called it
         if expose_ae is not None:
-            expose_ae.shutdown()
+            # The QA listener was bound synchronously in `_init_dimse_ae`; a
+            # non-blocking server is closed through its own shutdown.
+            try:
+                expose_ae.shutdown()
+            except Exception:
+                pass
         logging.info("DICOM server stopped")
 
         # Bridge: stop HTTP server - before joining threads

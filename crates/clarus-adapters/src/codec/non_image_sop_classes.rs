@@ -1,10 +1,19 @@
 // Copyright (C) 2026 Daniil Solgalov <clicker71@github>. License: LGPLv3.
 
-//! Non-image SOP Class UIDs - skip transcoding.
+//! SOP Class UIDs that carry no Pixel Data - skip transcoding.
 //!
-//! These SOP classes have no pixel data (SR, RT structures, Presentation State,
-//! Encapsulated documents, Segmentation). Transcoding them is pointless and
-//! causes errors (pydicom/image crate can't find PixelData tag).
+//! These classes have no pixel data (SR, RT structures, Presentation State,
+//! Encapsulated documents, Surface Segmentation). Transcoding them is pointless
+//! and causes errors (pydicom/image crate can't find PixelData tag).
+//!
+//! Segmentation Storage (66.4) is NOT one of them: PS3.3 C.8.20.2 makes
+//! Samples per Pixel, Photometric Interpretation, Pixel Representation,
+//! Bits Allocated and Bits Stored Type 1, and the IOD carries Pixel Data, so a
+//! SEG instance is as much an image as a CT instance
+//! (`standard/ps3.3/segmentation-image-module-C.8.20.2.json`). Its
+//! REPRESENTATION can still be untranscodable - a BINARY segmentation stores
+//! one bit per pixel and no compressed syntax carries that - but that is a
+//! question about the representation and the target, not about the class.
 //!
 //! See PS3.6 Table A.1-1, PS3.4 Annex B.5.
 //!
@@ -52,10 +61,19 @@ pub fn is_image_sop_class(uid: &str) -> bool {
         | "1.2.840.10008.5.1.4.1.1.104.2"  // Encapsulated CDA
         | "1.2.840.10008.5.1.4.1.1.104.3"  // Encapsulated STL
         | "1.2.840.10008.5.1.4.1.1.104.4"  // Encapsulated OBJ
-        // -- Spatial Registration & Segmentation -------
+        // PS3.3 A.85: the 3D Manufacturing IODs encapsulate a document in
+        // Encapsulated Document (0042,0011) and have no Image Pixel Module, so
+        // Encapsulated MTL (104.5) belongs here beside STL and OBJ. It carries
+        // a material library, not pixels.
+        | "1.2.840.10008.5.1.4.1.1.104.5"  // Encapsulated MTL
+        // -- Spatial Registration & Surface Segmentation -------
+        // Surface Segmentation (66.5) is a polygon mesh with no Segmentation
+        // Image Module and no Pixel Data (PS3.3 A.57,
+        // `standard/ps3.3/surface-segmentation-a57.json`).
+        // Segmentation Storage (66.4) is NOT listed: it carries Pixel Data
+        // like any other image (PS3.3 C.8.20.2).
         | "1.2.840.10008.5.1.4.1.1.66.1"   // Spatial Registration
-        | "1.2.840.10008.5.1.4.1.1.66.5"   // Surface Segmentation
-        | "1.2.840.10008.5.1.4.1.1.66.4" // Segmentation
+        | "1.2.840.10008.5.1.4.1.1.66.5" // Surface Segmentation
     )
 }
 
@@ -80,9 +98,42 @@ mod tests {
         assert!(!is_image_sop_class("1.2.840.10008.5.1.4.1.1.11.1")); // GSPS
         assert!(!is_image_sop_class("1.2.840.10008.5.1.4.1.1.481.3")); // RT Structure Set
         assert!(!is_image_sop_class("1.2.840.10008.5.1.4.1.1.104.1")); // Encapsulated PDF
-        assert!(!is_image_sop_class("1.2.840.10008.5.1.4.1.1.66.4")); // Segmentation
         assert!(!is_image_sop_class("1.2.840.10008.5.1.4.1.1.66.5")); // Surface Segmentation
         assert!(!is_image_sop_class("1.2.840.10008.5.1.4.1.1.66.1")); // Spatial Registration
+    }
+
+    /// PS3.3 A.85 makes the 3D Manufacturing IODs an Encapsulated Document
+    /// without an Image Pixel Module, so the whole 104.x family is non-image -
+    /// including MTL, which carries a material library and no pixels.
+    #[test]
+    fn every_encapsulated_document_class_is_non_image() {
+        for uid in [
+            "1.2.840.10008.5.1.4.1.1.104.1", // PDF
+            "1.2.840.10008.5.1.4.1.1.104.2", // CDA
+            "1.2.840.10008.5.1.4.1.1.104.3", // STL
+            "1.2.840.10008.5.1.4.1.1.104.4", // OBJ
+            "1.2.840.10008.5.1.4.1.1.104.5", // MTL
+        ] {
+            assert!(!is_image_sop_class(uid), "{uid} must be non-image");
+        }
+        // Segmentation Storage stays an image: it carries Pixel Data like any
+        // other image (PS3.3 C.8.20.2), and classifying it as non-image would
+        // make its pixels unreachable.
+        assert!(
+            is_image_sop_class("1.2.840.10008.5.1.4.1.1.66.4"),
+            "Segmentation"
+        );
+    }
+
+    #[test]
+    fn segmentation_storage_is_an_image_class() {
+        // PS3.3 C.8.20.2: the Segmentation Image Module makes the pixel
+        // attributes Type 1 and the IOD carries Pixel Data, so a SEG instance
+        // must reach the transcoding path. Classifying it as pixel-free made
+        // every segmentation skip transcoding and stay in its stored syntax.
+        assert!(is_image_sop_class("1.2.840.10008.5.1.4.1.1.66.4"));
+        // Its neighbour differs exactly on this question.
+        assert!(!is_image_sop_class("1.2.840.10008.5.1.4.1.1.66.5"));
     }
 
     #[test]

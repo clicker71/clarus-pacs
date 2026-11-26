@@ -329,8 +329,26 @@ fn read_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Resu
     file.read_at(buf, offset)
 }
 
-/// Windows has the same positional primitive; `seek_read` does not move the
-/// handle position either.
+/// Windows positional read.
+///
+/// `seek_read` reads from `offset` and ALSO moves the shared file cursor to the
+/// end of that read. A range read therefore leaves the caller's cursor wrong:
+/// with the cursor at 6, a four-byte read at offset 0 moves it to 4, and the
+/// next ordinary read starts there instead of at 6.
+///
+/// The callers in this module are affected only if they interleave ordinary
+/// reads with range sends over the SAME handle, which they do not: every use
+/// here is a positional copy that never reads sequentially afterwards. The
+/// defect is therefore real but latent, and this comment states it rather than
+/// claiming the cursor is left alone (which it is not).
+///
+/// Restoring the position is not possible from a `&File`: `Seek` needs
+/// `&mut`, and the cached handle is held shared for the duration of a transfer.
+/// Doing it properly needs either a mutable handle and a save/restore pair, or
+/// `GetFinalPathNameByHandleW` and a second opened handle - the first changes
+/// the transfer API for a bug no caller can currently reach, the second needs a
+/// Win32 binding this crate does not take. Recorded here so the next reader
+/// does not trust the old comment.
 #[cfg(windows)]
 fn read_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::windows::fs::FileExt as _;

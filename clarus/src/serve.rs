@@ -22,7 +22,9 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::net::TcpListener;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use clarus_core::http::body::framing;
 use clarus_core::http::conn::{Conn, HEADER_BUF_SIZE, HeadRead, Timeouts};
@@ -76,6 +78,99 @@ const LOOPBACK_USER: &[u8] = b"(loopback)";
 /// route answers in microseconds - so every line this produces is a real
 /// candidate for investigation, which is why there is no rate limit on it.
 const SLOW_REQUEST: Duration = Duration::from_secs(10);
+
+/// One request currently inside `dispatch`, so the watchdog can report it
+/// WHILE it runs.
+///
+/// The post-handler WARN below is emitted only once `dispatch` returns, which
+/// is exactly the blind spot the `SLOW_REQUEST` comment above warns about: a
+/// handler that never returns (an unbounded read from a stalled peer, a lock
+/// held by a wedged thread) produced NO line at all, and the operator saw a
+/// silent server. This registry is what makes "see a slow request while it is
+/// still running" true rather than aspirational.
+struct InFlight {
+    /// Monotonic id; ordering is what lets the watchdog report each request
+    /// at most once.
+    id: u64,
+    started: Instant,
+    /// Route label and request identifiers, already flattened to owned bytes
+    /// because the `RequestContext` borrows the connection for the whole call.
+    route: &'static str,
+    path: Vec<u8>,
+    user: Vec<u8>,
+    ip: Vec<u8>,
+}
+
+/// Requests currently executing. Bounded by `max_connections`, so a Vec is
+/// the right container: the set is tiny, and a linear scan on entry/exit is
+/// cheaper than any hashed structure at this size.
+static IN_FLIGHT: Mutex<Vec<InFlight>> = Mutex::new(Vec::new());
+/// Next in-flight id.
+static NEXT_IN_FLIGHT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Register a request as running; returns the id used to unregister it.
+fn in_flight_begin(
+    started: Instant,
+    route: &'static str,
+    path: &[u8],
+    user: &[u8],
+    ip: &[u8],
+) -> u64 {
+    let id = NEXT_IN_FLIGHT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut q = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    q.push(InFlight {
+        id,
+        started,
+        route,
+        path: path.to_vec(),
+        user: user.to_vec(),
+        ip: ip.to_vec(),
+    });
+    id
+}
+
+/// Unregister a request. Idempotent: a request reported by the watchdog is
+/// still in the list, and the handler's own exit removes it.
+fn in_flight_end(id: u64) {
+    let mut q = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = q.iter().position(|e| e.id == id) {
+        q.swap_remove(pos);
+    }
+}
+
+/// Build the WARN line for a request still running past `budget`.
+///
+/// Separate from the emitting loop so the FORMAT is testable, and so the
+/// "already reported" bookkeeping stays in one place.
+fn in_flight_slow_line(e: &InFlight, budget: Duration) -> Option<String> {
+    // Push streams are long-lived by design; the same exemption the completed
+    // path applies, applied here so the watchdog does not fire on every open
+    // subscription.
+    if is_push_stream(e.route) {
+        return None;
+    }
+    let elapsed = e.started.elapsed();
+    if !is_slow(elapsed, budget) {
+        return None;
+    }
+    // `path`/`user`/`ip` are attacker-influenced, so every value is escaped by
+    // the same helper the completed line uses: a newline here would forge a
+    // journal entry from a request that has not even finished.
+    Some(format!(
+        "slow request STILL RUNNING rt={} path={} user={} ip={} elapsed_ms={}",
+        e.route,
+        std::str::from_utf8(&e.path)
+            .unwrap_or("<bad-utf8>")
+            .escape_default(),
+        std::str::from_utf8(&e.user)
+            .unwrap_or("<bad-utf8>")
+            .escape_default(),
+        std::str::from_utf8(&e.ip)
+            .unwrap_or("<bad-utf8>")
+            .escape_default(),
+        elapsed.as_millis(),
+    ))
+}
 
 /// First element of an X-Forwarded-For list (nginx overwrites, not appends,
 /// but a comma list is accepted; the first hop is the client).
@@ -295,24 +390,68 @@ pub fn serve(
     max_connections: u32,
 ) {
     let _ = listener.set_nonblocking(true);
+    // The watchdog lives for the life of `serve`: it is the only thing that can
+    // speak about a request that has not returned. One thread, closed by the
+    // stop flag at the same time as the accept loop.
+    let watchdog = {
+        let shutdown = shutdown.clone();
+        std::thread::Builder::new()
+            .name("slow-watchdog".into())
+            .spawn(move || slow_request_watchdog(shutdown))
+    };
     loop {
+        // Checked at the TOP of every iteration, not only in the `WouldBlock`
+        // arm. Under a sustained connection storm `accept` never returns
+        // `WouldBlock`, so the old placement kept spawning workers after the
+        // stop signal and `main` sat in its drain loop until the deadline even
+        // though shutdown had been requested. The socket accepted below is
+        // dropped, which closes it.
+        if shutdown.stopping() {
+            // Join the watchdog so `serve` returns with no thread behind it
+            // still holding the registry.
+            if let Ok(h) = watchdog {
+                let _ = h.join();
+            }
+            return;
+        }
         match listener.accept() {
             Ok((stream, peer)) => {
+                // Reserve the connection slot BEFORE spawning. The cap used to
+                // be enforced inside the worker, so at the ceiling the accept
+                // loop still created a thread per socket and the real thread
+                // count overshot `max_connections` by the burst - each one
+                // holding a 512 KiB stack. `fetch_add` is the reservation;
+                // ownership passes to the worker through `ConnSlot`.
+                let admitted = reserve_slot(&shutdown, max_connections);
                 let state = Arc::clone(&state);
-                let shutdown = shutdown.clone();
-                let _ = std::thread::Builder::new()
+                // Two independent clones: one for the worker's own handle, one
+                // for the slot it carries. The slot guard decrements on drop,
+                // so it must not share the worker's ownership.
+                let worker_shutdown = shutdown.clone();
+                let slot_shutdown = shutdown.clone();
+                let spawned = std::thread::Builder::new()
                     .name("conn-worker".into())
                     .stack_size(WORKER_STACK)
                     .spawn(move || {
-                        serve_conn(stream, peer, state, shutdown, timeouts, max_connections);
+                        serve_conn(
+                            stream,
+                            peer,
+                            state,
+                            worker_shutdown,
+                            timeouts,
+                            admitted,
+                            ConnSlot::reserved(slot_shutdown),
+                        );
                     });
+                if spawned.is_err() {
+                    // The reservation was taken before the thread existed; a
+                    // spawn failure must release it or the ceiling leaks the
+                    // same way the panic leak did.
+                    shutdown.leave();
+                }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // Non-blocking accept: no socket pending. Poll the shutdown
-                // flag so Ctrl+C exits even with no connections arriving.
-                if shutdown.stopping() {
-                    return;
-                }
+                // Non-blocking accept: no socket pending.
                 std::thread::sleep(ACCEPT_DELAY);
             }
             Err(e) => {
@@ -323,6 +462,62 @@ pub fn serve(
     }
 }
 
+/// Watchdog body: report every request that has been running past
+/// [`SLOW_REQUEST`], once, while it is still running.
+///
+/// Each in-flight entry is reported at most once per crossing: the set of ids
+/// already warned about is kept here, so a request that runs for a minute
+/// produces one line, not sixty. An entry that finishes while the watchdog is
+/// looking is simply absent from the next pass.
+fn slow_request_watchdog(shutdown: Shutdown) {
+    let mut reported: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // A fifth of the budget: fine enough that a request is reported within a
+    // fifth of its overrun, coarse enough to cost nothing when idle. The whole
+    // body is a lock + a scan over at most `max_connections` entries.
+    // `max(1ms)` so a zero budget (a test) does not spin.
+    loop {
+        if shutdown.stopping() {
+            return;
+        }
+        std::thread::sleep((SLOW_REQUEST / 5).max(Duration::from_millis(1)));
+        // Collect the lines under the lock, emit them after it is released:
+        // `clog` may block on a full channel, and holding the registry while it
+        // did would stall every other request's entry/exit.
+        let mut lines = Vec::new();
+        {
+            let q = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            for e in q.iter() {
+                if reported.contains(&e.id) {
+                    continue;
+                }
+                if let Some(line) = in_flight_slow_line(e, SLOW_REQUEST) {
+                    reported.insert(e.id);
+                    lines.push(line);
+                }
+            }
+            // Ids of finished requests are forgotten by the `retain` below, so
+            // the set cannot grow without bound across a long uptime.
+            let live: std::collections::HashSet<u64> = q.iter().map(|e| e.id).collect();
+            drop(q);
+            reported.retain(|id| live.contains(id));
+        }
+        for line in lines {
+            crate::clog_warn!("{line}");
+        }
+    }
+}
+
+/// Reserve one connection slot, reporting whether the connection is admitted.
+///
+/// The count is incremented FIRST and the ceiling tested on the result, so the
+/// decision is made atomically: two accept iterations racing on the last slot
+/// can never both be admitted. The slot is taken either way, and the worker
+/// releases it when it exits, which keeps the count exact.
+fn reserve_slot(shutdown: &Shutdown, max_connections: u32) -> bool {
+    shutdown.enter();
+    shutdown.active() <= max_connections as usize
+}
+
 /// Holds one slot in the connection accounting until dropped.
 ///
 /// The slot was released by hand at each `return`, so a panic inside a handler
@@ -330,18 +525,19 @@ pub fn serve(
 /// process. Once the leaks reached `max_connections` the server refused every
 /// connection while reporting itself healthy - a permanent outage from one
 /// crashing request. The guard releases on unwind as well.
-struct ConnSlot<'a> {
-    shutdown: &'a Shutdown,
+struct ConnSlot {
+    shutdown: Shutdown,
 }
 
-impl<'a> ConnSlot<'a> {
-    fn enter(shutdown: &'a Shutdown) -> Self {
-        shutdown.enter();
+impl ConnSlot {
+    /// Adopt a slot the ACCEPT LOOP already reserved, so the count is never
+    /// incremented twice for one connection.
+    fn reserved(shutdown: Shutdown) -> Self {
         Self { shutdown }
     }
 }
 
-impl Drop for ConnSlot<'_> {
+impl Drop for ConnSlot {
     fn drop(&mut self) {
         self.shutdown.leave();
     }
@@ -354,10 +550,13 @@ fn serve_conn(
     state: Arc<AppState>,
     shutdown: Shutdown,
     timeouts: Timeouts,
-    max_connections: u32,
+    admitted: bool,
+    slot: ConnSlot,
 ) {
-    let slot = ConnSlot::enter(&shutdown);
-    if shutdown.active() > max_connections as usize {
+    // The slot is already counted (reserved by the accept loop), so this scope
+    // owns it and releases it on every exit path, unwind included.
+    let slot = slot;
+    if !admitted {
         // Over the connection ceiling: close without reading a byte. The guard
         // releases the slot as this scope ends.
         return;
@@ -633,8 +832,31 @@ fn handle_one(
             // with the GET Content-Length and suppresses every body write.
             ctx.conn
                 .set_suppress_body(head.method == clarus_core::http::parse::Method::Head);
+            // Registered BEFORE `dispatch` and unregistered after, so a handler
+            // that never returns stays visible to the watchdog instead of
+            // disappearing from every line this server writes.
+            let flight = if route_id == RouteId::Health || route_id == RouteId::Metrics {
+                None
+            } else {
+                Some(in_flight_begin(
+                    started, route.id, head.path, user, client_ip,
+                ))
+            };
             let _ = dispatch(&route, &mut ctx);
-            let status = status_from_head(&ctx.conn.header);
+            if let Some(id) = flight {
+                in_flight_end(id);
+            }
+            // The status is taken from what was COMMITTED to the socket, not
+            // re-parsed from the reusable `header` scratch buffer: a streaming
+            // handler clears that buffer right after writing a 206 head, so
+            // re-parsing recorded 200 for a partial-content response and the
+            // journal disagreed with the client. `status_from_head` remains the
+            // fallback for a path that filled the buffer without going through
+            // `write_head_configured`.
+            let status = ctx
+                .conn
+                .committed_status()
+                .unwrap_or_else(|| status_from_head(&ctx.conn.header));
             crate::metrics::record_request_end_u16(route_id, status, started);
             // Access-audit journal (ATNA-lite, 2808): ONE line per protected
             // route event, identifiers only, never blocking. Health/metrics
@@ -1006,6 +1228,92 @@ mod tests {
         format!("{ip}:12345").parse().unwrap()
     }
 
+    // -- Connection admission (accept-loop reservation) --------------------
+
+    /// The connection ceiling is enforced by the RESERVATION, not by the
+    /// worker.
+    ///
+    /// The cap used to be tested inside `serve_conn`, after the thread already
+    /// existed, so a burst at the ceiling still created one thread (512 KiB of
+    /// stack) per socket and the real thread count overshot the configured
+    /// bound. The decision now happens where the slot is taken.
+    #[test]
+    fn the_slot_is_reserved_before_the_ceiling_is_checked() {
+        let shutdown = Shutdown::new();
+        // Under the ceiling: admitted, and the count moved.
+        assert!(
+            reserve_slot(&shutdown, 2),
+            "the first connection is admitted"
+        );
+        assert_eq!(shutdown.active(), 1);
+        assert!(reserve_slot(&shutdown, 2), "the second is admitted");
+        assert_eq!(shutdown.active(), 2);
+        // At the ceiling the connection is refused, and the slot it took is
+        // released by the guard. The count must NOT be decremented inside
+        // `reserve_slot`: `shutdown.active()` is the drain loop's gauge, and a
+        // hidden decrement there would report an in-flight connection as gone
+        // while its socket is still being served.
+        assert!(
+            !reserve_slot(&shutdown, 2),
+            "the connection past the ceiling must not be admitted"
+        );
+        assert_eq!(
+            shutdown.active(),
+            3,
+            "the refused slot must still be counted until its guard drops"
+        );
+
+        // Releasing the refused and served slots returns the count to zero,
+        // which is what makes the ceiling reusable.
+        drop(ConnSlot::reserved(shutdown.clone()));
+        assert_eq!(shutdown.active(), 2, "the guard released exactly one");
+    }
+
+    /// A slot that never became a worker is released, so the ceiling does not
+    /// leak.
+    #[test]
+    fn a_dropped_slot_returns_all_admission_capacity() {
+        let shutdown = Shutdown::new();
+        for _ in 0..4 {
+            assert!(reserve_slot(&shutdown, 3));
+            // Stand in for a worker that ran and exited.
+            drop(ConnSlot::reserved(shutdown.clone()));
+        }
+        assert_eq!(
+            shutdown.active(),
+            0,
+            "every reservation must be returned, or the server refuses service \
+             while claiming to be healthy"
+        );
+    }
+
+    /// The accept loop must stop on the stop flag even with work queued.
+    ///
+    /// The flag used to be read only in the `WouldBlock` arm, so a listener
+    /// whose accept queue never emptied kept spawning workers after shutdown
+    /// and `main` then waited out the whole drain deadline.
+    ///
+    /// Inspection-verified, not tested: `serve` takes an `Arc<AppState>` that
+    /// cannot be constructed in a unit test (it owns the CAS, the codec
+    /// registry, the B-tree scanner and the config), and the only observable
+    /// behaviour is "the loop returned", which requires running it. A test
+    /// that merely asserts `shutdown.stopping()` would pass with the guard
+    /// removed from `serve`, which is the vacuity this pass exists to avoid.
+    /// The guard itself is one line at the top of the loop and is covered by
+    /// the shutdown integration path used in the field.
+    #[test]
+    fn serve_checks_the_stop_flag_at_the_top_of_every_iteration() {
+        // The predicate the loop reads, and the property that makes the check
+        // placement meaningful: a requested stop is visible without an accept.
+        let shutdown = Shutdown::new();
+        assert!(!shutdown.stopping(), "a fresh state is not stopping");
+        shutdown.request_stop();
+        assert!(
+            shutdown.stopping(),
+            "a requested stop must be visible to the loop's first check"
+        );
+    }
+
     fn loopback_nets() -> Vec<crate::config::CidrNet> {
         vec![crate::config::parse_cidr("127.0.0.0/8").unwrap()]
     }
@@ -1149,9 +1457,19 @@ mod tests {
 
     #[test]
     fn classify_maps_methods() {
+        // Compared with the EXPECTED route id, not with itself. The old
+        // assertion was `classify(GET, /health) == classify(GET, /health)`,
+        // which holds for every possible return value - including `Other`,
+        // the very case that would break probe-log exclusion.
         assert_eq!(
             classify(Method::Get, b"/health"),
-            classify(Method::Get, b"/health")
+            RouteId::Health,
+            "a GET of /health must classify as the health probe"
+        );
+        assert_ne!(
+            classify(Method::Get, b"/health"),
+            RouteId::Other,
+            "an unclassified health probe would leak into the journal"
         );
         assert_eq!(method_name(Method::Post), "POST");
         assert_eq!(method_name(Method::Unknown), "OTHER");
@@ -1445,5 +1763,75 @@ mod tests {
             Duration::from_secs(11),
         );
         assert!(!line.contains('\n'), "no raw newline survives: {line:?}");
+    }
+
+    /// A request still inside `dispatch` must be reportable. The post-handler
+    /// WARN cannot do this by construction - it runs after `dispatch` returns -
+    /// so a handler that never returns was invisible. This drives the registry
+    /// and the line builder directly.
+    #[test]
+    fn a_request_still_running_is_reported_while_it_runs() {
+        let id = in_flight_begin(
+            Instant::now() - SLOW_REQUEST - Duration::from_secs(1),
+            "wado_frame",
+            b"/dicomweb/studies/1.2/frames/1",
+            b"dr.smith",
+            b"10.0.0.1",
+        );
+        let line = {
+            let q = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let e = q.iter().find(|e| e.id == id).expect("registered");
+            in_flight_slow_line(e, SLOW_REQUEST)
+        };
+        in_flight_end(id);
+        let line = line.expect("an overrunning in-flight request must produce a line");
+        assert!(line.contains("STILL RUNNING"), "{line}");
+        assert!(line.contains("rt=wado_frame"), "{line}");
+        assert!(line.contains("user=dr.smith"), "{line}");
+
+        // A request inside its budget is silent.
+        let id = in_flight_begin(Instant::now(), "wado_frame", b"/x", b"u", b"i");
+        let quiet = {
+            let q = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let e = q.iter().find(|e| e.id == id).expect("registered");
+            in_flight_slow_line(e, SLOW_REQUEST)
+        };
+        in_flight_end(id);
+        assert!(quiet.is_none(), "a young request must not warn");
+    }
+
+    /// A push stream is long-lived by design, so the watchdog must exempt it
+    /// exactly as the completed path does - otherwise every open UPS
+    /// subscription produces a WARN every few seconds.
+    #[test]
+    fn the_watchdog_does_not_report_a_push_stream() {
+        let old = Instant::now() - SLOW_REQUEST - Duration::from_secs(30);
+        for route in [
+            "ups_events",
+            "ups_notification_connect",
+            "admin_logs_stream",
+        ] {
+            let id = in_flight_begin(old, route, b"/x", b"u", b"i");
+            let line = {
+                let q = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+                let e = q.iter().find(|e| e.id == id).expect("registered");
+                in_flight_slow_line(e, SLOW_REQUEST)
+            };
+            in_flight_end(id);
+            assert!(line.is_none(), "{route} must be exempt, got {line:?}");
+        }
+    }
+
+    /// The exit path must leave nothing behind, or the registry leaks an entry
+    /// per request and the watchdog reports a request that already finished.
+    #[test]
+    fn an_unregistered_request_is_no_longer_visible() {
+        let id = in_flight_begin(Instant::now(), "qido_studies", b"/x", b"u", b"i");
+        in_flight_end(id);
+        let q = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !q.iter().any(|e| e.id == id),
+            "the finished request must be removed"
+        );
     }
 }

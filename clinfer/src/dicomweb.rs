@@ -104,6 +104,9 @@ pub const TAG_REQUESTED_PROCEDURE_CODE_SEQUENCE: &str = "00321064";
 pub const TAG_INPUT_READINESS_STATE: &str = "00404041";
 /// (0008,0100) CodeValue, inside a code sequence item.
 pub const TAG_CODE_VALUE: &str = "00080100";
+/// (0008,0119) LongCodeValue - the alternate to CodeValue for a code whose
+/// identifier exceeds SH's 16-character cap (PS3.3 Table 8.8-1, PS3.6).
+pub const TAG_LONG_CODE_VALUE: &str = "00080119";
 /// (0008,0102) CodingSchemeDesignator, inside a code sequence item.
 pub const TAG_CODING_SCHEME_DESIGNATOR: &str = "00080102";
 /// (0074,1000) UnifiedProcedureStepState.
@@ -392,6 +395,20 @@ pub struct Parameter {
     pub value: ParamValue,
 }
 
+/// The Code Value of a `CodeSequenceMacro` item: the plain (0008,0100)
+/// CodeValue, or (0008,0119) LongCodeValue when the code is longer than SH
+/// can carry (PS3.3 Table 8.8-1). Absent or empty reads as no code.
+fn code_sequence_value(item: &Json) -> Option<&str> {
+    item.attribute(TAG_CODE_VALUE)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            item.attribute(TAG_LONG_CODE_VALUE)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
+}
+
 impl WorkitemCode {
     /// Read a `CodeSequenceMacro` item from a sequence's first item.
     ///
@@ -400,10 +417,7 @@ impl WorkitemCode {
     /// echoed as a half-code.
     #[must_use]
     pub fn from_item(item: &Json) -> Option<Self> {
-        let value = item.attribute(TAG_CODE_VALUE)?.trim().to_string();
-        if value.is_empty() {
-            return None;
-        }
+        let value = code_sequence_value(item)?.to_string();
         Some(Self {
             scheme: item.attribute(TAG_CODING_SCHEME_DESIGNATOR)?.to_string(),
             meaning: item.attribute(TAG_CODE_MEANING).unwrap_or("").to_string(),
@@ -415,8 +429,7 @@ impl WorkitemCode {
 /// The Code Value of an assignment sequence's first item, when present.
 fn assignment_code_value(value: &Json, tag: &str) -> Option<String> {
     let item = value.attribute_item(tag)?;
-    let code_value = item.attribute(TAG_CODE_VALUE)?.trim();
-    (!code_value.is_empty()).then(|| code_value.to_string())
+    code_sequence_value(item).map(str::to_string)
 }
 
 impl WorkItem {
@@ -758,15 +771,16 @@ impl Dicomweb {
     }
 
     /// Update a workitem's attributes: `POST /workitems/{uid}` with the
-    /// Transaction UID in the payload.
+    /// Transaction UID on BOTH carriages the standard gives it.
     ///
     /// PS3.18 11.6.1: Update is a POST on the workitem resource whose payload
     /// is the attribute set to modify; 11.6.1.4 requires that payload to
     /// comply with PS3.4 CC.2.6.2, which for an IN PROGRESS workitem makes the
     /// Transaction UID (0008,1195) an Attribute OF the data set. PS3.18
-    /// 11.6.1.2 additionally allows it as a query parameter, and this server
-    /// accepts both - but the payload form is what dcm4chee-arc reads, so it
-    /// is the interoperable one and the one used here.
+    /// 11.6.1.2 additionally names it as the `?TransactionUid=` query
+    /// parameter. The same UID is sent on both: the body is the carriage
+    /// dcm4chee-arc reads, and the query is the carriage Clarus routes on -
+    /// a client that sends only one of them breaks the other origin.
     ///
     /// This is the FIRST of the two requests a conformant completion sends
     /// (AIW-I 4.84.4.1.2.1: "all created instances listed in Output
@@ -800,28 +814,15 @@ impl Dicomweb {
             // there is no attribute to send.
             return Ok(());
         }
-        // The Transaction UID is the FIRST attribute of the payload: it is
-        // the locking Attribute CC.2.6.2 requires in the data set, and it
-        // travels with the merge attributes in one request.
-        let locking = [(TAG_TRANSACTION_UID.to_string(), transaction_uid.to_string())];
-        // The performed report and the outputs are ONE (0074,1216) item, so a
-        // caller that has outputs but no report has no standard place to put
-        // them: (0040,4033) is a child of that sequence (PS3.3 Table
-        // C.30.3-1), not a top-level attribute, and emitting it top-level
-        // would be the very shape a standard origin discards. The locking UID
-        // still has to travel, so the request is sent with it alone and the
-        // outputs are reported as undeliverable rather than dropped in
-        // silence.
-        let body = match performed {
-            Some(performed) => encode_performed_report(&locking, outputs, performed),
-            None => encode_attributes(&locking),
-        };
-        // No query parameter: the locking UID is in the payload, per
-        // CC.2.6.2, which is the carriage dcm4chee-arc reads.
+        // The Transaction UID rides on BOTH carriages: the body field
+        // (0008,1195, per CC.2.6.2, read by dcm4chee-arc) and the
+        // `?TransactionUid=` query parameter (PS3.18 11.6.1.2, the form
+        // Clarus routes on). Sending only one of them breaks the other
+        // origin, so the request carries both.
         let request = Request::json(
             Method::Post,
-            self.client.url(&format!("/workitems/{uid}")),
-            body,
+            self.client.url(&update_path(uid, transaction_uid)),
+            update_body(transaction_uid, outputs, performed),
         );
         let response = self.client.send_retrying(&request, &mut 0)?;
         if !response.is_success() {
@@ -1517,6 +1518,52 @@ pub fn capabilities_has_workitems_and_subscribers(document: &Wadl) -> (bool, boo
     (true, subscribers)
 }
 
+/// The Update request target: `POST /workitems/{uid}?TransactionUid={tx}`.
+///
+/// PS3.18 11.6.1.2 names the Transaction UID as a query parameter of the
+/// Update, alongside its presence in the data set (CC.2.6.2). Both are
+/// sent because the two origins in the field read different carriages:
+/// Clarus routes the Update by the query string - the parameterised form
+/// is the one whose Output Information Sequence is parsed - while
+/// dcm4chee-arc reads the body. The UID is percent-encoded even though
+/// its repertoire is digits and dots: the encoder is free and keeps a
+/// value that happens to carry an unusual byte from corrupting the query.
+fn update_path(uid: &str, transaction_uid: &str) -> String {
+    format!(
+        "/workitems/{uid}?TransactionUid={}",
+        form_encode(transaction_uid)
+    )
+}
+
+/// The Update body: the locking Transaction UID (0008,1195) followed by
+/// the merge attributes.
+///
+/// The Transaction UID is the FIRST attribute of the payload: it is the
+/// locking Attribute CC.2.6.2 requires in the data set for an IN PROGRESS
+/// workitem, and it travels with the merge attributes in one request. The
+/// same UID is the `?TransactionUid=` parameter of [`update_path`]; this
+/// field is the other carriage and is not redundant - dcm4chee-arc reads
+/// the body, so dropping it would leave that origin without the lock.
+///
+/// The performed report and the outputs are ONE (0074,1216) item, so a
+/// caller that has outputs but no report has no standard place to put
+/// them: (0040,4033) is a child of that sequence (PS3.3 Table C.30.3-1),
+/// not a top-level attribute, and emitting it top-level would be the very
+/// shape a standard origin discards. The locking UID still has to travel,
+/// so the body carries it alone and the caller reports the outputs as
+/// undeliverable rather than dropping them in silence.
+fn update_body(
+    transaction_uid: &str,
+    outputs: &[OutputRef],
+    performed: Option<&PerformedReport>,
+) -> Vec<u8> {
+    let locking = [(TAG_TRANSACTION_UID.to_string(), transaction_uid.to_string())];
+    match performed {
+        Some(performed) => encode_performed_report(&locking, outputs, performed),
+        None => encode_attributes(&locking),
+    }
+}
+
 fn status_error(response: crate::http::Response) -> Error {
     Error::Status(StatusError {
         status: response.status,
@@ -1969,15 +2016,14 @@ pub fn scheduled_processing_parameters(value: &Json) -> Vec<Parameter> {
 fn read_parameter(item: &Json) -> Option<Parameter> {
     let name_item = item.get(TAG_CONCEPT_NAME_CODE_SEQUENCE)?;
     let name_first = name_item.get("Value")?.as_array()?.first()?;
-    let name = name_first.attribute(TAG_CODE_VALUE)?.trim();
-    if name.is_empty() {
+    let Some(name) = code_sequence_value(name_first) else {
         eprintln!(
             "WARN scheduled processing parameter without a Concept Name Code Value \
              value type {:?}: skipped",
             item.attribute(TAG_VALUE_TYPE).unwrap_or("")
         );
         return None;
-    }
+    };
     let value = match item.attribute(TAG_VALUE_TYPE).unwrap_or("") {
         "TEXT" => match item.attribute(TAG_TEXT_VALUE) {
             Some(text) => ParamValue::Text(text.to_string()),
@@ -2024,14 +2070,13 @@ fn read_parameter(item: &Json) -> Option<Parameter> {
                 );
                 return None;
             };
-            let code_value = nested.attribute(TAG_CODE_VALUE).unwrap_or("").trim();
-            if code_value.is_empty() {
+            let Some(code_value) = code_sequence_value(nested) else {
                 eprintln!(
                     "WARN scheduled processing parameter '{name}' has no Code Value in its \
                      Concept Code Sequence: skipped"
                 );
                 return None;
-            }
+            };
             ParamValue::Code {
                 scheme: nested
                     .attribute(TAG_CODING_SCHEME_DESIGNATOR)
@@ -2245,6 +2290,76 @@ mod tests {
         assert_eq!(item.modality, "DX");
         assert_eq!(item.study_description, "CHEST PA");
         assert_eq!(item.body_part, "CHEST");
+    }
+
+    #[test]
+    fn a_code_sequence_item_reads_long_code_value_when_code_value_is_absent() {
+        // PS3.3 Table 8.8-1: a code over 16 chars travels in (0008,0119)
+        // LongCodeValue, not in the SH-capped (0008,0100) CodeValue. A
+        // reader that checks only CodeValue misses it.
+        let item = json::parse(
+            br#"{"00080119":{"vr":"UC","Value":["A-VERY-LONG-CODE-VALUE"]},
+                 "00080102":{"Value":["99CLARUS"]},
+                 "00080104":{"Value":["long code"]}}"#,
+        )
+        .expect("parses");
+        let code = WorkitemCode::from_item(&item).expect("code");
+        assert_eq!(code.value, "A-VERY-LONG-CODE-VALUE");
+        assert_eq!(code.scheme, "99CLARUS");
+
+        // And the ordinary path still prefers CodeValue when it is present.
+        let short = json::parse(
+            br#"{"00080100":{"Value":["SHORT"]},
+                 "00080102":{"Value":["99CLARUS"]},
+                 "00080104":{"Value":["short code"]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            WorkitemCode::from_item(&short).expect("code").value,
+            "SHORT"
+        );
+    }
+
+    #[test]
+    fn an_assignment_code_reads_long_code_value() {
+        let item = json::parse(
+            br#"{"00404025":{"vr":"SQ","Value":[
+                   {"00080119":{"vr":"UC","Value":["STATION-WITH-A-LONG-NAME"]}}]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            assignment_code_value(&item, TAG_SCHEDULED_STATION_NAME_CODE_SEQUENCE),
+            Some("STATION-WITH-A-LONG-NAME".to_string())
+        );
+    }
+
+    #[test]
+    fn a_code_parameter_reads_long_code_value() {
+        // A CODE parameter whose Concept Code Sequence item carries the code
+        // in (0008,0119) instead of (0008,0100).
+        let document = json::parse(
+            br#"{"00080018":{"Value":["1.2.3"]},
+                 "00741000":{"Value":["SCHEDULED"]},
+                 "00741210":{"vr":"SQ","Value":[
+                   {"0040A043":{"vr":"SQ","Value":[
+                      {"00080100":{"Value":["P1"]}}]},
+                    "0040A040":{"Value":["CODE"]},
+                    "0040A168":{"vr":"SQ","Value":[
+                      {"00080119":{"vr":"UC","Value":["LONG-PARAM-CODE"]},
+                       "00080102":{"Value":["99CLARUS"]}}]}}]}}"#,
+        )
+        .expect("parses");
+        let workitem = WorkItem::from_json(&document).expect("workitem");
+        let params = workitem.scheduled_processing_parameters;
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "P1");
+        match &params[0].value {
+            ParamValue::Code { scheme, value } => {
+                assert_eq!(value, "LONG-PARAM-CODE");
+                assert_eq!(scheme, "99CLARUS");
+            }
+            other => panic!("expected a CODE parameter, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2851,6 +2966,33 @@ mod tests {
                 "the station code is present"
             );
         }
+    }
+
+    /// The Update carries the Transaction UID on BOTH carriages: the
+    /// `?TransactionUid=` query parameter (PS3.18 11.6.1.2) AND the
+    /// (0008,1195) data-set attribute (CC.2.6.2).
+    ///
+    /// Clarus routes the Update by the query string, so the parameterised
+    /// form is the one whose Output Information Sequence is parsed;
+    /// dcm4chee-arc reads the body, so the field is the other half. A client
+    /// that drops either one breaks the matching origin, which is why both
+    /// are pinned here: delete the query append and the first assertion
+    /// reddens, delete the body field and the second reddens.
+    #[test]
+    fn the_update_carries_the_transaction_uid_on_both_carriages() {
+        let path = update_path("1.2.3", "2.25.9");
+        assert_eq!(
+            path, "/workitems/1.2.3?TransactionUid=2.25.9",
+            "the UID must ride as the 11.6.1.2 query parameter"
+        );
+
+        let body = update_body("2.25.9", &[], None);
+        let document = json::parse(&body).expect("the update body is valid JSON");
+        assert_eq!(
+            document.attribute(TAG_TRANSACTION_UID),
+            Some("2.25.9"),
+            "the UID must also stay in the body, where dcm4chee-arc reads it"
+        );
     }
 
     /// A report fixture with both datetimes set, so an assertion that reads

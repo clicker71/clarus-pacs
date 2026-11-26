@@ -62,13 +62,52 @@ impl CronSchedule {
         let month = parse_field(fields[3], 1, 12)?;
         let dow = parse_field(fields[4], 0, 6)?;
 
-        Ok(Self {
+        let schedule = Self {
             minutes,
             hours,
             dom,
             month,
             dow,
-        })
+        };
+        // A schedule whose day-of-month and month can never coincide is
+        // ACCEPTED by every field check and then never fires: the migration
+        // worker searches, finds nothing, retries on the next tick, and does
+        // so forever with no diagnosis. `0 2 31 2 *` (31 February) is the
+        // canonical example. Refuse it at config time instead.
+        //
+        // The check is calendar-aware rather than a per-month maximum, so a
+        // legitimately sparse schedule still passes: `0 2 29 2 *` matches
+        // 29 February in a leap year, which is a real date.
+        if !schedule.can_match_a_calendar_date() {
+            return Err(format!(
+                "cron expression '{}' can never match a calendar date: \
+                 day-of-month {} does not occur in month {}",
+                expr,
+                field_to_string(&schedule.dom, 1, 31),
+                field_to_string(&schedule.month, 1, 12)
+            ));
+        }
+
+        Ok(schedule)
+    }
+
+    /// Whether some real calendar date can satisfy the day-of-month and month
+    /// fields.
+    ///
+    /// Walked over a leap year (2024) so 29 February is reachable, and every
+    /// day of every selected month; the weekday field cannot rescue a date
+    /// that does not exist, so it plays no part. Cron's usual `dom` OR `dow`
+    /// semantics do not apply here either: this implementation ANDs the
+    /// fields (see [`CronSchedule::matches`]), so an impossible `dom` is
+    /// impossible regardless of `dow`.
+    fn can_match_a_calendar_date(&self) -> bool {
+        for &month in &self.month {
+            let last = days_in_month(2024, month);
+            if self.dom.iter().any(|&d| d <= last) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Check whether the given local datetime matches this schedule.
@@ -89,25 +128,52 @@ impl CronSchedule {
 
     /// Find the next matching datetime after `after` (local server time).
     ///
-    /// Searches minute-by-minute, up to 2 years ahead.
-    /// Returns `None` if no match is found (should never happen in practice).
+    /// Searches by CALENDAR DAY, not minute-by-minute. A minute scan needs a
+    /// bound, and any bound is wrong for a sparse schedule: `0 2 29 2 *` next
+    /// fires on 29 February 2032, which is four years ahead, so the old
+    /// 2-year search returned `None` and the worker logged a no-match error
+    /// and repeated the scan hourly until the date came into range - an error
+    /// line for a schedule that was perfectly valid.
+    ///
+    /// The walk is bounded by the calendar instead: a schedule is rejected at
+    /// parse time when it cannot match a real date (see
+    /// [`CronSchedule::can_match_a_calendar_date`]), and the longest real gap
+    /// is four years (29 February across a skipped leap century), so 366 * 8
+    /// days is provably enough and costs nothing per day beyond a date build.
     pub fn next_after(
         &self,
         after: &chrono::DateTime<chrono::Local>,
     ) -> Option<chrono::DateTime<chrono::Local>> {
-        let mut candidate = *after + chrono::Duration::minutes(1);
-        // Truncate to minute boundary
-        candidate = candidate
+        // Start at the next whole minute, then advance day by day.
+        let start = (*after + chrono::Duration::minutes(1))
             .with_second(0)
             .and_then(|t| t.with_nanosecond(0))
-            .unwrap_or(candidate);
-
-        // Search up to 2 years (~ 1M minutes) - cron always repeats.
-        for _ in 0..1_051_200 {
-            if self.matches(&candidate) {
-                return Some(candidate);
+            .unwrap_or(*after + chrono::Duration::minutes(1));
+        let start_day = start.date_naive();
+        for offset in 0..(366 * 8) {
+            let date = start_day + chrono::Duration::days(offset);
+            let (mon, dom, dow) = (
+                chrono::Datelike::month(&date) as u8,
+                chrono::Datelike::day(&date) as u8,
+                chrono::Datelike::weekday(&date).num_days_from_sunday() as u8,
+            );
+            if !self.month.contains(&mon) || !self.dom.contains(&dom) || !self.dow.contains(&dow) {
+                continue;
             }
-            candidate += chrono::Duration::minutes(1);
+            // This date can fire: walk its hours and minutes in order, and
+            // stop at the first instant still in the future.
+            for &hour in &self.hours {
+                for &minute in &self.minutes {
+                    let Some(naive) = date.and_hms_opt(hour as u32, minute as u32, 0) else {
+                        continue;
+                    };
+                    if let Some(candidate) = naive.and_local_timezone(chrono::Local).earliest()
+                        && candidate > *after
+                    {
+                        return Some(candidate);
+                    }
+                }
+            }
         }
         None
     }
@@ -129,6 +195,23 @@ impl std::fmt::Display for CronSchedule {
 
 // -- Cron field parsing --------------------------------------------------
 
+/// Days in `month` for a leap year.
+///
+/// Retention schedules are matched against real calendar dates, so a
+/// day-of-month of 31 must be recognised as absent from February. Leap-year
+/// counts are used so the check is permissive where the calendar allows
+/// (`29 February`), never inventing a date that would satisfy a schedule the
+/// operator did not write.
+fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// Parse a single cron field into a sorted, deduplicated list of allowed values.
 fn parse_field(field: &str, min: u8, max: u8) -> Result<Vec<u8>, String> {
     let mut values: Vec<u8> = Vec::new();
@@ -146,6 +229,19 @@ fn parse_field(field: &str, min: u8, max: u8) -> Result<Vec<u8>, String> {
     } else {
         (field, 1u8)
     };
+
+    // A step needs something to step THROUGH. `5/15` (a bare singleton with a
+    // step) used to fall into the scalar branch below, which parsed `5` and
+    // silently discarded the `/15` - so a schedule the operator wrote as
+    // "every 15 minutes starting at 5" actually ran once an hour at :05, and
+    // nothing said so. Only `*` and an explicit range define a step domain;
+    // anything else carrying a step is a startup error.
+    if step != 1 && base != "*" && !base.contains('-') {
+        return Err(format!(
+            "step '{}' needs '*' or a range before '/', got '{}'",
+            base, field
+        ));
+    }
 
     if base == "*" {
         // */N or just *
@@ -682,6 +778,75 @@ mod tests {
         let next = c.next_after(&now).unwrap();
         // Should be next day, not same minute
         assert_eq!(next, dt("2026-01-16", "02:00"));
+    }
+
+    /// A step on a bare singleton is REFUSED rather than silently discarded.
+    ///
+    /// `5/15 * * * *` fell into the scalar branch, parsed `5`, and dropped the
+    /// `/15` - so a schedule the operator wrote as "every 15 minutes from :05"
+    /// actually fired once an hour at :05, with no warning. The refusal must
+    /// name the field, and the legitimate step forms must keep working.
+    #[test]
+    fn a_step_on_a_singleton_is_refused_not_ignored() {
+        let err = CronSchedule::parse("5/15 * * * *").expect_err("a singleton step is invalid");
+        assert!(
+            err.contains("range") || err.contains("'*'"),
+            "the refusal must say what a step needs, got: {err}"
+        );
+        // `*/15` and `1-10/2` are the two defined step forms and still parse.
+        assert!(CronSchedule::parse("*/15 * * * *").is_ok());
+        assert!(CronSchedule::parse("1-10/2 * * * *").is_ok());
+        // A bare singleton with no step is unchanged.
+        assert!(CronSchedule::parse("5 * * * *").is_ok());
+    }
+
+    /// A schedule whose day-of-month cannot exist in any selected month is
+    /// REFUSED at config time.
+    ///
+    /// `0 2 31 2 *` passed every per-field bound and then never fired: the
+    /// worker searched, found nothing, logged a no-match error and retried
+    /// forever. A genuinely sparse schedule must still be accepted - 29
+    /// February is a real date in a leap year.
+    #[test]
+    fn a_schedule_that_can_never_match_a_date_is_refused() {
+        for bad in [
+            "0 2 31 2 *",      // 31 February
+            "0 2 31 4 *",      // 31 April
+            "0 2 31 6,9,11 *", // 31 in the 30-day months only
+            "0 2 30 2 *",      // 30 February
+        ] {
+            assert!(
+                CronSchedule::parse(bad).is_err(),
+                "{bad} can never match a calendar date and must be refused"
+            );
+        }
+        // The sparse-but-real schedule still parses.
+        assert!(
+            CronSchedule::parse("0 2 29 2 *").is_ok(),
+            "29 February is a real date in a leap year"
+        );
+        // And a day that exists in at least ONE selected month is fine.
+        assert!(CronSchedule::parse("0 2 31 1,2 *").is_ok());
+    }
+
+    /// A leap-day schedule must find its next occurrence even when that is
+    /// more than two years away.
+    ///
+    /// `0 2 29 2 *` next fires on 29 February 2032 from a 2028 base; the old
+    /// minute loop stopped after two years and returned `None`, so the worker
+    /// logged a no-match error and rescanned hourly until the date came into
+    /// range. Revert to the bounded minute scan and this test fails.
+    #[test]
+    fn a_sparse_schedule_finds_a_match_more_than_two_years_out() {
+        let c = CronSchedule::parse("0 2 29 2 *").unwrap();
+        let now = dt("2028-03-01", "00:00");
+        assert_eq!(c.next_after(&now), Some(dt("2032-02-29", "02:00")));
+        // The ordinary case is unchanged.
+        let daily = CronSchedule::parse("0 2 * * *").unwrap();
+        assert_eq!(
+            daily.next_after(&dt("2026-01-15", "03:00")),
+            Some(dt("2026-01-16", "02:00"))
+        );
     }
 
     // -- BackendSchedule -----------------------------------------------

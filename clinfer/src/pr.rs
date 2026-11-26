@@ -254,7 +254,11 @@ impl PrProfile {
     #[must_use]
     pub fn of(result: &RuleResult) -> Self {
         Self {
-            color: result.color.clone(),
+            // A per-class colour map and a label offset are presentation
+            // decisions of this writer, not properties a model file
+            // declares: the GSPS layer colour defaults to the writer's own
+            // and a site that needs another one edits it here.
+            color: None,
             series_description: result.series_description.clone(),
             label: result.label.clone(),
         }
@@ -1562,7 +1566,7 @@ mod tests {
     /// must be written before the series UID that carries it.
     #[test]
     fn the_referenced_series_item_lists_its_sequence_before_the_series_uid() {
-        let bytes = serialize(&identity(), &PrProfile::of(&pr_rule_result(None, None)));
+        let bytes = serialize(&identity(), &PrProfile::of(&pr_rule_result(None)));
         let tags = first_item_tags(&bytes, (0x0008, 0x1115));
         let image_seq = tags
             .iter()
@@ -1592,7 +1596,7 @@ mod tests {
     /// the Graphic Object Sequence (0070,0009).
     #[test]
     fn the_annotation_item_lists_its_text_object_before_its_graphic() {
-        let bytes = serialize(&identity(), &PrProfile::of(&pr_rule_result(None, None)));
+        let bytes = serialize(&identity(), &PrProfile::of(&pr_rule_result(None)));
         let tags = first_item_tags(&bytes, (0x0070, 0x0001));
         assert!(tags.len() > 2, "the annotation item is read: {tags:?}");
         let text = tags
@@ -1681,7 +1685,7 @@ mod tests {
         // and a reader is entitled to stop at the first descent. The write
         // order groups attributes by MODULE, so a group can land late by
         // accident - the presentation's own 0070 group is the one that did.
-        let bytes = serialize(&identity(), &PrProfile::of(&pr_rule_result(None, None)));
+        let bytes = serialize(&identity(), &PrProfile::of(&pr_rule_result(None)));
         let tags = top_level_tags(&bytes);
         assert!(
             tags.len() > 20,
@@ -1722,15 +1726,12 @@ mod tests {
     }
 
     /// A pr result, for the profile constructor the tests share.
-    fn pr_rule_result(color: Option<&str>, series_description: Option<&str>) -> RuleResult {
+    fn pr_rule_result(series_description: Option<&str>) -> RuleResult {
         RuleResult {
             kind: crate::conf::ResultKind::Pr,
-            color: color.map(str::to_string),
             profile_version: 1,
             series_description: series_description.map(str::to_string),
             label: LabelProfile::default(),
-            sr: None,
-            measurements: None,
         }
     }
 
@@ -1769,7 +1770,7 @@ mod tests {
 
     #[test]
     fn the_file_meta_names_the_gsps_sop_class_and_explicit_vr() {
-        let bytes = serialize(&identity(), &PrProfile::of(&pr_rule_result(None, None)));
+        let bytes = serialize(&identity(), &PrProfile::of(&pr_rule_result(None)));
         let text = String::from_utf8_lossy(&bytes[..400]);
         assert!(
             text.contains(GSPS_SOP_CLASS_UID),
@@ -2656,7 +2657,7 @@ mod tests {
             patient_id: None,
             ..identity_without_study_values()
         };
-        let profile = PrProfile::of(&pr_rule_result(Some("#FF3B30"), None));
+        let profile = PrProfile::of(&pr_rule_result(None));
         let bytes = serialize(&identity, &profile);
 
         assert_eq!(&bytes[128..132], b"DICM");
@@ -2710,7 +2711,7 @@ mod tests {
             source_cols: 80,
             ..identity_without_study_values()
         };
-        let profile = PrProfile::of(&pr_rule_result(Some("#FF3B30"), None));
+        let profile = PrProfile::of(&pr_rule_result(None));
         let bytes = serialize(&identity, &profile);
 
         // Find (0008,1115) in the dataset.

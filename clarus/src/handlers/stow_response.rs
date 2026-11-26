@@ -7,11 +7,18 @@
 
 #![forbid(unsafe_code)]
 
-use clarus_ports::stow_response::InstanceOutcome;
+use clarus_ports::stow_response::{FailureClass, InstanceOutcome};
 
 use crate::handlers::DICOM_JSON_CONTENT_TYPE;
 use crate::handlers::DICOM_XML_CONTENT_TYPE;
 use crate::handlers::json_common::push_json_str;
+
+/// (0000,0902) Error Comment text for a study/patient conflict.
+///
+/// One constant for both serialisations: the JSON entry and the XML writer
+/// each used to build their own string, and only one of them said anything.
+const STUDY_PATIENT_CONFLICT_COMMENT: &str =
+    "Study Instance UID already stored under a different patient";
 
 // -- StowAccum ------------------------------------------------------------
 
@@ -33,6 +40,15 @@ pub struct ReferencedItem {
     /// Which accepted outcome produced this item, so a demotion can decrement
     /// the matching counter instead of only `accepted`.
     pub kind: ReferencedKind,
+    /// The pre-rendered DICOM JSON entry for this instance, when the caller
+    /// supplied one.
+    ///
+    /// Held HERE rather than in a parallel `Vec` on the accumulator: the entry
+    /// is optional per item, so a positional index into a separate list goes
+    /// stale as soon as one item is recorded without an entry. Demoting that
+    /// item used to remove the NEXT item's entry, leaving an XML/<JSON>
+    /// disagreement (XML said stored, JSON had lost the entry).
+    pub json_entry: Option<String>,
 }
 
 /// The accepted outcome kind behind a [`ReferencedItem`].
@@ -50,8 +66,14 @@ pub enum ReferencedKind {
 /// One rejected instance, as the response must describe it.
 #[derive(Debug, Clone, Default)]
 pub struct FailedItem {
-    /// (0009,0902) local "Error Comment". Absent for a pure SOP conflict,
-    /// which carries only the failure reason.
+    /// (0000,0902) Error Comment. Absent for a pure SOP conflict, which
+    /// carries only the failure reason.
+    ///
+    /// PS3.18 I.2.1: the per-instance response module carries Error Comment
+    /// alongside Failure Reason. Both serialisers read this ONE field, so the
+    /// two bodies cannot describe a different answer - emitting the local-use
+    /// (0009,0902) from the XML writer meant a client looking the standard tag
+    /// up found nothing.
     pub error_comment: Option<String>,
     pub sop_class_uid: Option<String>,
     pub sop_instance_uid: Option<String>,
@@ -93,11 +115,21 @@ pub struct StowAccum {
     pub conflict_sops: Vec<String>,
     /// Number of instances that failed processing.
     pub failed: u32,
-    /// ReferencedSOPSequence JSON entries (native bytes) for accepted
-    /// instances.
-    pub referenced_sops: Vec<String>,
+    /// How many of `failed` were the server's own fault (an unreadable
+    /// manifest, a failed persistence step) rather than the payload's.
+    ///
+    /// The distinction only matters when NOTHING was accepted: a request whose
+    /// every refusal is a store failure is a 5xx, while one carrying a bad
+    /// instance is a 400 (PS3.18 10.5.3.1). A mixed batch is 202 either way,
+    /// which is why this is a counter and not a per-request flag.
+    pub store_failures: u32,
     /// FailedSOPSequence JSON entries (native bytes) for failed/conflict
     /// instances.
+    ///
+    /// Still a parallel list because a [`FailedItem`] has no optional shape:
+    /// every failure produces exactly one entry, appended in the same call
+    /// that pushes its structured twin. A demotion appends to both, so the
+    /// indices stay aligned for the failure sequences.
     pub failed_sops: Vec<String>,
     /// The SAME two sequences in their structured form.
     ///
@@ -129,7 +161,9 @@ impl StowAccum {
         // The structured mirror is derived HERE from the outcome, not from the
         // caller's pre-rendered strings: the caller supplies JSON bytes only,
         // and a second argument would let the two representations disagree.
-        self.record_structured(outcome);
+        // The entry lands ON the item it describes, so an item recorded
+        // without one cannot shift the entry of the item after it.
+        self.record_structured(outcome, referenced_sop);
         match outcome {
             InstanceOutcome::Stored {
                 study_instance_uid,
@@ -143,9 +177,6 @@ impl StowAccum {
                 }
                 if self.patient_id.is_none() {
                     self.patient_id = Some(patient_id.clone());
-                }
-                if let Some(entry) = referenced_sop {
-                    self.referenced_sops.push(entry);
                 }
             }
             InstanceOutcome::Idempotent {
@@ -163,9 +194,6 @@ impl StowAccum {
                 }
                 if self.patient_id.is_none() {
                     self.patient_id = Some(patient_id.clone());
-                }
-                if let Some(entry) = referenced_sop {
-                    self.referenced_sops.push(entry);
                 }
             }
             InstanceOutcome::Updated {
@@ -185,9 +213,6 @@ impl StowAccum {
                 if self.patient_id.is_none() {
                     self.patient_id = Some(patient_id.clone());
                 }
-                if let Some(entry) = referenced_sop {
-                    self.referenced_sops.push(entry);
-                }
             }
             InstanceOutcome::Conflict {
                 sop_instance_uid, ..
@@ -198,8 +223,25 @@ impl StowAccum {
                     self.failed_sops.push(entry);
                 }
             }
-            InstanceOutcome::Failed { .. } => {
+            InstanceOutcome::StudyPatientConflict {
+                sop_instance_uid, ..
+            } => {
+                // Counted as a conflict: the request was answered with an
+                // existing resource (a study) in a state that prevents the
+                // store. A batch whose only refusals are this one must answer
+                // 409, not 400, and a mixed batch 202 - the same rule the
+                // per-SOP conflict follows.
+                self.conflicts = self.conflicts.saturating_add(1);
+                self.conflict_sops.push(sop_instance_uid.clone());
+                if let Some(entry) = failed_sop {
+                    self.failed_sops.push(entry);
+                }
+            }
+            InstanceOutcome::Failed { class, .. } => {
                 self.failed = self.failed.saturating_add(1);
+                if *class == FailureClass::StoreFailure {
+                    self.store_failures = self.store_failures.saturating_add(1);
+                }
                 if let Some(entry) = failed_sop {
                     self.failed_sops.push(entry);
                 }
@@ -212,7 +254,7 @@ impl StowAccum {
     /// `coerced` is not on the outcome, so a coerced store is marked by the
     /// caller through [`Self::mark_last_referenced_coerced`]; everything else
     /// is read straight off the variant.
-    fn record_structured(&mut self, outcome: &InstanceOutcome) {
+    fn record_structured(&mut self, outcome: &InstanceOutcome, json_entry: Option<String>) {
         match outcome {
             InstanceOutcome::Stored {
                 sop_class_uid,
@@ -227,6 +269,7 @@ impl StowAccum {
                 series_instance_uid: series_instance_uid.clone(),
                 coerced: false,
                 kind: ReferencedKind::Stored,
+                json_entry,
             }),
             InstanceOutcome::Idempotent {
                 sop_class_uid,
@@ -241,6 +284,7 @@ impl StowAccum {
                 series_instance_uid: series_instance_uid.clone(),
                 coerced: false,
                 kind: ReferencedKind::Idempotent,
+                json_entry,
             }),
             InstanceOutcome::Updated {
                 sop_class_uid,
@@ -257,6 +301,7 @@ impl StowAccum {
                 // holds exactly what the client sent.
                 coerced: true,
                 kind: ReferencedKind::Updated,
+                json_entry,
             }),
             InstanceOutcome::Conflict {
                 sop_class_uid,
@@ -268,10 +313,26 @@ impl StowAccum {
                 sop_instance_uid: Some(sop_instance_uid.clone()),
                 failure_reason: 272,
             }),
+            // A pure SOP conflict answers 409 and carries only the failure
+            // reason; a study/patient conflict is the one conflict that has
+            // something to say, so it carries the SAME comment in both
+            // serialisations (the JSON entry below and the XML writer both
+            // read this field).
+            InstanceOutcome::StudyPatientConflict {
+                sop_class_uid,
+                sop_instance_uid,
+                ..
+            } => self.failed_items.push(FailedItem {
+                error_comment: Some(STUDY_PATIENT_CONFLICT_COMMENT.to_string()),
+                sop_class_uid: Some(sop_class_uid.clone()),
+                sop_instance_uid: Some(sop_instance_uid.clone()),
+                failure_reason: 272,
+            }),
             InstanceOutcome::Failed {
                 sop_class_uid,
                 sop_instance_uid,
                 reason,
+                ..
             } => self.failed_items.push(FailedItem {
                 error_comment: Some(reason.clone()),
                 sop_class_uid: sop_class_uid.clone(),
@@ -312,12 +373,10 @@ impl StowAccum {
             .iter()
             .position(|it| it.sop_instance_uid == sop_instance_uid);
         if let Some(idx) = idx {
+            // Removing the ITEM removes its entry too, because the entry is a
+            // field of that item. A positional index into a separate List would
+            // remove the next item's entry as soon as any item lacked one.
             let item = self.referenced_items.remove(idx);
-            // The pre-rendered JSON entries mirror the structured items one to
-            // one, so the same index removes the matching ReferencedSOP entry.
-            if idx < self.referenced_sops.len() {
-                self.referenced_sops.remove(idx);
-            }
             self.accepted = self.accepted.saturating_sub(1);
             match item.kind {
                 ReferencedKind::Stored => {
@@ -352,6 +411,17 @@ impl StowAccum {
     /// Returns true if any instance was accepted.
     pub fn has_any_accepted(&self) -> bool {
         self.accepted > 0
+    }
+
+    /// Whether the JSON ReferencedSOPSequence has anything to write.
+    ///
+    /// The entry is per item and optional, so "non-empty" is a question about
+    /// the items, not about a counter: an accepted instance whose caller
+    /// supplied no entry (XML-only bookkeeping) must not emit an empty `Value`.
+    fn has_any_referenced_entry(&self) -> bool {
+        self.referenced_items
+            .iter()
+            .any(|item| item.json_entry.is_some())
     }
 
     /// Returns true if any conflict or failure occurred.
@@ -436,7 +506,13 @@ fn determine_status(accum: &StowAccum) -> u16 {
         (true, false) if accum.warned > 0 => 202,
         (true, false) => 200,
         (false, true) => {
-            if accum.conflicts > 0 && accum.failed == 0 {
+            if accum.conflicts == 0 && accum.failed > 0 && accum.store_failures == accum.failed {
+                // Every refusal was the server failing to persist a request it
+                // understood. Retrying the SAME payload is the right client
+                // action, so 400 (which says "your request is wrong") would
+                // send it to fix bytes that are fine.
+                500
+            } else if accum.conflicts > 0 && accum.failed == 0 {
                 409
             } else {
                 400
@@ -454,28 +530,33 @@ fn build_body(accum: &StowAccum) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(b'{');
     let mut wrote = false;
-    if !accum.failed_sops.is_empty() {
+    if !accum.failed_items.is_empty() {
         // { "00081198": { "vr": "SQ", "Value": [ entries ] } }
         body.extend_from_slice(b"\"00081198\":{\"Value\":[");
-        for (i, e) in accum.failed_sops.iter().enumerate() {
+        for (i, item) in accum.failed_items.iter().enumerate() {
             if i > 0 {
                 body.push(b',');
             }
-            body.extend_from_slice(e.as_bytes());
+            body.extend_from_slice(&failed_item_json(item));
         }
         body.extend_from_slice(b"],\"vr\":\"SQ\"}");
         wrote = true;
     }
-    if !accum.referenced_sops.is_empty() {
+    if accum.has_any_referenced_entry() {
         if wrote {
             body.push(b',');
         }
         body.extend_from_slice(b"\"00081199\":{\"Value\":[");
-        for (i, e) in accum.referenced_sops.iter().enumerate() {
-            if i > 0 {
+        let mut first = true;
+        for item in &accum.referenced_items {
+            let Some(entry) = &item.json_entry else {
+                continue;
+            };
+            if !first {
                 body.push(b',');
             }
-            body.extend_from_slice(e.as_bytes());
+            first = false;
+            body.extend_from_slice(entry.as_bytes());
         }
         body.extend_from_slice(b"],\"vr\":\"SQ\"}");
     }
@@ -501,13 +582,13 @@ fn build_body_xml(accum: &StowAccum) -> Vec<u8> {
     clarus_core::query::xml::write_xml_doc_start(&mut body);
     if !accum.failed_items.is_empty() {
         push_sq_start(&mut body, 0x0008_1198, "FailedSOPSequence");
-        for item in &accum.failed_items {
-            push_item_start(&mut body);
-            // (0009,0902) Error Comment is a Clarion local-use element: an
-            // ODD group, so no standard keyword exists and the stream leaves it
-            // empty rather than inventing one.
+        // PS3.19 A.1.1: `Item` is numbered one-based WITHIN each sequence, so
+        // the counter restarts here and again for the referenced sequence.
+        for (i, item) in accum.failed_items.iter().enumerate() {
+            push_item_start(&mut body, i + 1);
+            // (0000,0902) Error Comment, VR LO (PS3.18 I.2.1).
             if let Some(comment) = &item.error_comment {
-                push_attr(&mut body, 0x0009_0902, "", "LO", comment);
+                push_attr(&mut body, 0x0000_0902, "ErrorComment", "LO", comment);
             }
             if let (Some(sc), Some(si)) = (&item.sop_class_uid, &item.sop_instance_uid) {
                 push_attr(&mut body, 0x0008_1150, "ReferencedSOPClassUID", "UI", sc);
@@ -527,8 +608,8 @@ fn build_body_xml(accum: &StowAccum) -> Vec<u8> {
     }
     if !accum.referenced_items.is_empty() {
         push_sq_start(&mut body, 0x0008_1199, "ReferencedSOPSequence");
-        for item in &accum.referenced_items {
-            push_item_start(&mut body);
+        for (i, item) in accum.referenced_items.iter().enumerate() {
+            push_item_start(&mut body, i + 1);
             push_attr(
                 &mut body,
                 0x0008_1150,
@@ -570,8 +651,15 @@ fn build_body_xml(accum: &StowAccum) -> Vec<u8> {
 // the output is byte-identical to what the streaming writer produces for the
 // same element.
 
-fn push_item_start(out: &mut Vec<u8>) {
-    out.extend_from_slice(b"<Item number=\"1\">\n");
+/// Open one `<Item number="N">`.
+///
+/// PS3.19 A.1.1: the numbering is one-based and restarts inside each
+/// sequence, so the caller passes the position in ITS OWN loop. A fixed
+/// `number="1"` made two stored instances collide on the same item number.
+fn push_item_start(out: &mut Vec<u8>, number: usize) {
+    out.extend_from_slice(b"<Item number=\"");
+    out.extend_from_slice(number.to_string().as_bytes());
+    out.extend_from_slice(b"\">\n");
 }
 
 fn push_item_end(out: &mut Vec<u8>) {
@@ -626,23 +714,76 @@ fn push_tag_hex(out: &mut Vec<u8>, tag: u32) {
     }
 }
 
-/// Escape the five XML metacharacters.
+/// Escape the five XML metacharacters and drop what XML 1.0 cannot represent.
 ///
 /// A failure reason carries the client's own text (a parse error message, an
 /// SOP UID echoed back), so it is untrusted: emitting it raw lets a crafted
 /// DICOM file close the element and inject markup into the response. `&` must
 /// be replaced first or the other replacements would be re-escaped.
+///
+/// XML 1.0 section 2.2 defines Char as `#x9 | #xA | #xD | [#x20-#xD7FF] |
+/// [#xE000-#xFFFD] | [#x10000-#x10FFFF]`. A NUL or a vertical tab is NOT a
+/// Char, and a document holding one is not well-formed at all - a strict
+/// parser rejects the WHOLE response, including the successful SOP references
+/// it also carries. Such bytes are replaced with U+FFFD (the Unicode
+/// replacement character) rather than deleted, so the text keeps its length
+/// and a reader can see that something was dropped.
+///
+/// A `char` above U+FFFD is always legal, so only the low range needs testing;
+/// the surrogate range cannot occur in a Rust `char`.
 fn push_xml_escaped(out: &mut Vec<u8>, s: &str) {
-    for b in s.bytes() {
-        match b {
-            b'&' => out.extend_from_slice(b"&amp;"),
-            b'<' => out.extend_from_slice(b"&lt;"),
-            b'>' => out.extend_from_slice(b"&gt;"),
-            b'"' => out.extend_from_slice(b"&quot;"),
-            b'\'' => out.extend_from_slice(b"&apos;"),
-            _ => out.push(b),
+    for c in s.chars() {
+        match c {
+            '&' => out.extend_from_slice(b"&amp;"),
+            '<' => out.extend_from_slice(b"&lt;"),
+            '>' => out.extend_from_slice(b"&gt;"),
+            '"' => out.extend_from_slice(b"&quot;"),
+            '\'' => out.extend_from_slice(b"&apos;"),
+            '\t' | '\n' | '\u{20}'..='\u{D7FF}' | '\u{E000}'.. => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            // U+FFFD, encoded as EF BF BD: the replacement character says the
+            // byte was dropped instead of silently shortening the text.
+            _ => out.extend_from_slice(b"\xEF\xBF\xBD"),
         }
     }
+}
+
+/// Render one [`FailedItem`] as a DICOM JSON item.
+///
+/// Rendered from the SAME struct the XML writer reads, so the two bodies
+/// cannot state different things. Tag order is ascending and `Value` precedes
+/// `vr`, matching the byte shape this server has always emitted (and what
+/// [`build_failed_sop_entry`] writes, whose output is pinned by a test).
+fn failed_item_json(item: &FailedItem) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(b'{');
+    let mut wrote = false;
+    if let Some(comment) = &item.error_comment {
+        out.extend_from_slice(b"\"00000902\":{\"Value\":[");
+        push_json_str(&mut out, comment);
+        out.extend_from_slice(b"],\"vr\":\"LO\"}");
+        wrote = true;
+    }
+    if let (Some(sc), Some(si)) = (&item.sop_class_uid, &item.sop_instance_uid) {
+        if wrote {
+            out.push(b',');
+        }
+        out.extend_from_slice(b"\"00081150\":{\"Value\":[");
+        push_json_str(&mut out, sc);
+        out.extend_from_slice(b"],\"vr\":\"UI\"},\"00081155\":{\"Value\":[");
+        push_json_str(&mut out, si);
+        out.extend_from_slice(b"],\"vr\":\"UI\"}");
+        wrote = true;
+    }
+    if wrote {
+        out.push(b',');
+    }
+    out.extend_from_slice(b"\"00081197\":{\"Value\":[");
+    out.extend_from_slice(item.failure_reason.to_string().as_bytes());
+    out.extend_from_slice(b"],\"vr\":\"US\"}}");
+    out
 }
 
 // -- Helpers --------------------------------------------------------------
@@ -712,6 +853,29 @@ pub fn build_conflict_failed_sop_entry(sop_class_uid: &str, sop_instance_uid: &s
     String::from_utf8(out).expect("conflict_failed_sop_entry is valid UTF-8")
 }
 
+/// Build a FailedSOPSequence entry for a study-level patient conflict.
+///
+/// Same wire shape as [`build_conflict_failed_sop_entry`] - `(0008,1197)`
+/// Failure Reason 0110H/272 (PS3.18 Table I.2-2 "Processing failure", the
+/// general code, since Table I.2-2 defines no patient-mismatch code) plus an
+/// Error Comment naming the reason - with a comment that describes the STUDY
+/// collision rather than a SOP UID reuse. As with the SOP-level entry the
+/// comment never names the stored patient.
+pub fn build_study_conflict_failed_sop_entry(
+    sop_class_uid: &str,
+    sop_instance_uid: &str,
+) -> String {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"{\"00000902\":{\"Value\":[");
+    push_json_str(&mut out, STUDY_PATIENT_CONFLICT_COMMENT);
+    out.extend_from_slice(b"],\"vr\":\"LO\"},\"00081150\":{\"Value\":[");
+    push_json_str(&mut out, sop_class_uid);
+    out.extend_from_slice(b"],\"vr\":\"UI\"},\"00081155\":{\"Value\":[");
+    push_json_str(&mut out, sop_instance_uid);
+    out.extend_from_slice(b"],\"vr\":\"UI\"},\"00081197\":{\"Value\":[272],\"vr\":\"US\"}}");
+    String::from_utf8(out).expect("study_conflict_failed_sop_entry is valid UTF-8")
+}
+
 /// Build a FailedSOPSequence JSON entry for a processing failure.
 pub fn build_failed_sop_entry(
     sop_class_uid: Option<&str>,
@@ -771,13 +935,97 @@ mod tests {
 
         // Assembled body: failed (00081198) before referenced (00081199).
         let mut acc = StowAccum::default();
-        acc.referenced_sops
-            .push(build_referenced_sop_entry(SC, SI, STU, SER, false));
-        acc.failed_sops
-            .push(build_failed_sop_entry(None, None, "boom"));
+        acc.referenced_items.push(ReferencedItem {
+            sop_class_uid: SC.to_string(),
+            sop_instance_uid: SI.to_string(),
+            study_instance_uid: STU.to_string(),
+            series_instance_uid: SER.to_string(),
+            coerced: false,
+            kind: ReferencedKind::Stored,
+            json_entry: Some(build_referenced_sop_entry(SC, SI, STU, SER, false)),
+        });
+        acc.failed_items.push(FailedItem {
+            error_comment: Some("boom".to_string()),
+            sop_class_uid: None,
+            sop_instance_uid: None,
+            failure_reason: 272,
+        });
         assert_eq!(
             String::from_utf8(build_body(&acc)).unwrap(),
             "{\"00081198\":{\"Value\":[{\"00000902\":{\"Value\":[\"boom\"],\"vr\":\"LO\"},\"00081197\":{\"Value\":[272],\"vr\":\"US\"}}],\"vr\":\"SQ\"},\"00081199\":{\"Value\":[{\"00081150\":{\"Value\":[\"1.2.840.10008.5.1.4.1.1.2\"],\"vr\":\"UI\"},\"00081155\":{\"Value\":[\"1.2.3.4.5.6.7.1\"],\"vr\":\"UI\"},\"00081190\":{\"Value\":[\"/dicomweb/studies/1.2.3.4.study/series/1.2.3.4.series/instances/1.2.3.4.5.6.7.1\"],\"vr\":\"UR\"}}],\"vr\":\"SQ\"}}"
+        );
+    }
+
+    /// A study-level patient conflict is a Conflict for status purposes: a
+    /// batch whose only refusals are these must answer 409 (PS3.18 Table
+    /// 10.5.3-1 "unable to store ANY Instances due to a conflict"), and a
+    /// mixed batch 202 - the same rule the per-SOP conflict follows.
+    #[test]
+    fn a_study_patient_conflict_is_a_conflict_for_status() {
+        let mut accum = StowAccum::default();
+        let outcome = InstanceOutcome::StudyPatientConflict {
+            sop_class_uid: SC.to_string(),
+            sop_instance_uid: SI.to_string(),
+            study_instance_uid: STU.to_string(),
+        };
+        accum.record(
+            &outcome,
+            None,
+            Some(build_study_conflict_failed_sop_entry(SC, SI)),
+        );
+        assert_eq!(accum.conflicts, 1, "counted as a conflict");
+        assert_eq!(accum.failed, 0);
+        assert_eq!(
+            determine_status(&accum),
+            409,
+            "nothing stored and only study-patient conflicts -> 409"
+        );
+
+        // The structured mirror must carry the same refusal, or the XML body
+        // would describe a different outcome than the JSON one.
+        assert_eq!(accum.failed_items.len(), 1);
+        assert_eq!(accum.failed_items[0].failure_reason, 272);
+        assert_eq!(
+            accum.failed_items[0].error_comment.as_deref(),
+            Some("Study Instance UID already stored under a different patient")
+        );
+        assert!(
+            !accum.failed_sops[0].contains("PAT-"),
+            "the entry must not leak a stored patient identifier"
+        );
+
+        // One stored + one study-patient conflict -> 202.
+        let mut mixed = StowAccum::default();
+        mixed.record(
+            &InstanceOutcome::Stored {
+                sop_class_uid: SC.to_string(),
+                sop_instance_uid: SI.to_string(),
+                study_instance_uid: STU.to_string(),
+                series_instance_uid: SER.to_string(),
+                patient_id: "PAT-A".to_string(),
+            },
+            Some(build_referenced_sop_entry(SC, SI, STU, SER, false)),
+            None,
+        );
+        mixed.record(
+            &outcome,
+            None,
+            Some(build_study_conflict_failed_sop_entry(SC, SI)),
+        );
+        assert_eq!(
+            determine_status(&mixed),
+            202,
+            "a partially stored batch is Accepted, not Conflict"
+        );
+    }
+
+    /// The native entry is byte-exact with the same shape as the SOP conflict
+    /// entry: only the Error Comment differs.
+    #[test]
+    fn study_conflict_entry_matches_the_conflict_shape() {
+        assert_eq!(
+            build_study_conflict_failed_sop_entry(SC, SI),
+            "{\"00000902\":{\"Value\":[\"Study Instance UID already stored under a different patient\"],\"vr\":\"LO\"},\"00081150\":{\"Value\":[\"1.2.840.10008.5.1.4.1.1.2\"],\"vr\":\"UI\"},\"00081155\":{\"Value\":[\"1.2.3.4.5.6.7.1\"],\"vr\":\"UI\"},\"00081197\":{\"Value\":[272],\"vr\":\"US\"}}"
         );
     }
 
@@ -980,10 +1228,249 @@ mod tests {
             text.contains("<Value number=\"1\">272</Value>"),
             "failure reason must be the decimal 272: {text}"
         );
-        // The conflict entry carries no error comment and does not leak the
-        // existing patient's identity - the same rule the JSON entry follows.
-        assert!(!text.contains("00090902"), "{text}");
+        // A pure conflict carries no Error Comment, so the standard tag must
+        // be absent - nobody has anything to say about it.
+        assert!(!text.contains("tag=\"00000902\""), "{text}");
         assert!(!text.contains("OTHER"), "no PHI on the wire: {text}");
+    }
+
+    /// PS3.18 I.2.1: Error Comment is (0000,0902) in EVERY representation.
+    #[test]
+    fn the_error_comment_uses_the_standard_tag_in_both_representations() {
+        let mut accum = StowAccum::default();
+        accum.record(
+            &InstanceOutcome::StudyPatientConflict {
+                sop_class_uid: SC.to_string(),
+                sop_instance_uid: SI.to_string(),
+                study_instance_uid: STU.to_string(),
+            },
+            None,
+            None,
+        );
+
+        let (_, _, xml, _) = build_stow_response(&accum, true);
+        let xml_text = String::from_utf8(xml).unwrap();
+        assert!(
+            xml_text.contains("tag=\"00000902\" vr=\"LO\" keyword=\"ErrorComment\""),
+            "the standard Error Comment tag must be present: {xml_text}"
+        );
+
+        let (_, _, json, _) = build_stow_response(&accum, false);
+        let json_text = String::from_utf8(json).unwrap();
+        assert!(json_text.contains("\"00000902\""), "{json_text}");
+        // The comment itself is identical in both, which is the point: the
+        // field is one value rendered twice, not two independently written
+        // strings that can drift.
+        assert!(
+            xml_text.contains(STUDY_PATIENT_CONFLICT_COMMENT),
+            "{xml_text}"
+        );
+        assert!(
+            json_text.contains(STUDY_PATIENT_CONFLICT_COMMENT),
+            "{json_text}"
+        );
+    }
+
+    /// PS3.19 A.1.1: item numbers are one-based WITHIN each sequence.
+    #[test]
+    fn xml_items_are_numbered_within_each_sequence() {
+        let mut accum = StowAccum::default();
+        for (i, sop) in ["1.2.3.4.1", "1.2.3.4.2"].iter().enumerate() {
+            accum.record(
+                &InstanceOutcome::Stored {
+                    sop_class_uid: SC.to_string(),
+                    sop_instance_uid: sop.to_string(),
+                    study_instance_uid: STU.to_string(),
+                    series_instance_uid: SER.to_string(),
+                    patient_id: "P1".to_string(),
+                },
+                Some(format!("entry{i}")),
+                None,
+            );
+        }
+        for sop in ["1.2.3.4.9", "1.2.3.4.8"] {
+            accum.record(
+                &InstanceOutcome::Conflict {
+                    sop_class_uid: SC.to_string(),
+                    sop_instance_uid: sop.to_string(),
+                    existing_patient_id: "OTHER".to_string(),
+                    conflicting_patient_id: "P1".to_string(),
+                },
+                None,
+                None,
+            );
+        }
+        let (_, _, body, _) = build_stow_response(&accum, true);
+        let text = String::from_utf8(body).unwrap();
+        assert_eq!(text.matches("<Item number=\"1\">").count(), 2, "{text}");
+        assert_eq!(text.matches("<Item number=\"2\">").count(), 2, "{text}");
+        assert!(!text.contains("<Item number=\"3\">"), "{text}");
+    }
+
+    /// XML 1.0 section 2.2: a NUL is not a Char, so the document would be
+    /// rejected whole - losing the successful references it also carries.
+    #[test]
+    fn xml_drops_characters_the_encoding_cannot_represent() {
+        let mut accum = StowAccum::default();
+        accum.record(
+            &InstanceOutcome::Failed {
+                sop_class_uid: None,
+                sop_instance_uid: None,
+                reason: "bad\u{0}byte\u{b}here".to_string(),
+                class: FailureClass::InvalidInput,
+            },
+            None,
+            None,
+        );
+        let (_, _, body, _) = build_stow_response(&accum, true);
+        let text = String::from_utf8(body).unwrap();
+        assert!(!text.contains('\u{0}'), "NUL leaked into the document");
+        assert!(!text.contains('\u{b}'), "vertical tab leaked");
+        // Replaced, not silently deleted: the reader can see something went.
+        assert!(text.contains("bad\u{FFFD}byte\u{FFFD}here"), "{text}");
+    }
+
+    /// A request the server itself could not persist is not a bad request.
+    #[test]
+    fn an_all_store_failed_request_is_a_server_error_not_400() {
+        let mut accum = StowAccum::default();
+        accum.record(
+            &InstanceOutcome::Failed {
+                sop_class_uid: None,
+                sop_instance_uid: None,
+                reason: "the study's existing manifest is unreadable".to_string(),
+                class: FailureClass::StoreFailure,
+            },
+            None,
+            Some(build_failed_sop_entry(None, None, "unreadable manifest")),
+        );
+        assert_eq!(determine_status(&accum), 500);
+        let (status, _, _, _) = build_stow_response(&accum, false);
+        assert_eq!(status, 500);
+
+        // A payload the client must fix still answers 400.
+        let mut bad = StowAccum::default();
+        bad.record(
+            &InstanceOutcome::Failed {
+                sop_class_uid: None,
+                sop_instance_uid: None,
+                reason: "not a data set".to_string(),
+                class: FailureClass::InvalidInput,
+            },
+            None,
+            Some(build_failed_sop_entry(None, None, "not a data set")),
+        );
+        assert_eq!(determine_status(&bad), 400);
+
+        // And a mixed batch stays a partial success regardless of the class.
+        let mut mixed = StowAccum::default();
+        mixed.record(
+            &InstanceOutcome::Stored {
+                sop_class_uid: SC.to_string(),
+                sop_instance_uid: SI.to_string(),
+                study_instance_uid: STU.to_string(),
+                series_instance_uid: SER.to_string(),
+                patient_id: "P1".to_string(),
+            },
+            Some("ok".to_string()),
+            None,
+        );
+        mixed.record(
+            &InstanceOutcome::Failed {
+                sop_class_uid: None,
+                sop_instance_uid: None,
+                reason: "manifest".to_string(),
+                class: FailureClass::StoreFailure,
+            },
+            None,
+            Some(build_failed_sop_entry(None, None, "manifest")),
+        );
+        assert_eq!(determine_status(&mixed), 202);
+    }
+
+    /// Demoting an item that had no JSON entry must not take the NEXT item's
+    /// entry with it: XML and JSON have to agree about B.
+    #[test]
+    fn demoting_an_entryless_item_leaves_the_next_entry_intact() {
+        let mut accum = StowAccum::default();
+        // A: recorded without an entry.
+        accum.record(
+            &InstanceOutcome::Stored {
+                sop_class_uid: SC.to_string(),
+                sop_instance_uid: "1.2.3.4.A".to_string(),
+                study_instance_uid: STU.to_string(),
+                series_instance_uid: SER.to_string(),
+                patient_id: "P1".to_string(),
+            },
+            None,
+            None,
+        );
+        // B: recorded WITH an entry.
+        accum.record(
+            &InstanceOutcome::Stored {
+                sop_class_uid: SC.to_string(),
+                sop_instance_uid: "1.2.3.4.B".to_string(),
+                study_instance_uid: STU.to_string(),
+                series_instance_uid: SER.to_string(),
+                patient_id: "P1".to_string(),
+            },
+            Some(build_referenced_sop_entry(SC, "1.2.3.4.B", STU, SER, false)),
+            None,
+        );
+        assert!(accum.demote_to_failed("1.2.3.4.A", SC, "manifest"));
+
+        let (_, _, json, _) = build_stow_response(&accum, false);
+        let json_text = String::from_utf8(json).unwrap();
+        assert!(
+            json_text.contains("1.2.3.4.B"),
+            "B must survive A's demotion: {json_text}"
+        );
+
+        let (_, _, xml, _) = build_stow_response(&accum, true);
+        let xml_text = String::from_utf8(xml).unwrap();
+        assert!(xml_text.contains("1.2.3.4.B"), "{xml_text}");
+    }
+
+    /// The sharper positional case: the entryless item sits FIRST and is NOT
+    /// demoted, so any scheme that indexes entries by position walks off the
+    /// list and silently drops B - while XML still reports it.
+    #[test]
+    fn an_entryless_item_does_not_shift_the_entries_of_later_items() {
+        let mut accum = StowAccum::default();
+        // A: no JSON entry, and it is DEMOTED.
+        accum.record(
+            &InstanceOutcome::Stored {
+                sop_class_uid: SC.to_string(),
+                sop_instance_uid: "1.2.3.4.A".to_string(),
+                study_instance_uid: STU.to_string(),
+                series_instance_uid: SER.to_string(),
+                patient_id: "P1".to_string(),
+            },
+            None,
+            None,
+        );
+        // C: with an entry, recorded BEFORE A is demoted.
+        accum.record(
+            &InstanceOutcome::Stored {
+                sop_class_uid: SC.to_string(),
+                sop_instance_uid: "1.2.3.4.C".to_string(),
+                study_instance_uid: STU.to_string(),
+                series_instance_uid: SER.to_string(),
+                patient_id: "P1".to_string(),
+            },
+            Some(build_referenced_sop_entry(SC, "1.2.3.4.C", STU, SER, false)),
+            None,
+        );
+
+        let (_, _, json, _) = build_stow_response(&accum, false);
+        let json_text = String::from_utf8(json).unwrap();
+        assert!(
+            json_text.contains("1.2.3.4.C"),
+            "C's entry belonged to C, not to its position: {json_text}"
+        );
+        let (_, _, xml, _) = build_stow_response(&accum, true);
+        let xml_text = String::from_utf8(xml).unwrap();
+        assert!(xml_text.contains("1.2.3.4.C"), "{xml_text}");
     }
 
     /// A coerced store carries Warn Reason (0008,1196) = 45056 in XML too.
@@ -1025,6 +1512,7 @@ mod tests {
                 sop_class_uid: None,
                 sop_instance_uid: None,
                 reason: "bad </DicomAttribute><evil a=\"b\">&".to_string(),
+                class: FailureClass::InvalidInput,
             },
             None,
             None,
@@ -1050,6 +1538,7 @@ mod tests {
                 sop_class_uid: None,
                 sop_instance_uid: None,
                 reason: "boom".to_string(),
+                class: FailureClass::InvalidInput,
             },
             None,
             Some(entry),

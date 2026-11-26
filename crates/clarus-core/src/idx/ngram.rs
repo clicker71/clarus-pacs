@@ -92,13 +92,15 @@ pub fn name_ngrams(name: &str) -> Vec<String> {
 /// Normalize a DICOM PersonName for **fuzzy matching** by replacing the PN
 /// separator characters with a space.
 ///
-/// Per PS3.5 Section 6.2.1 a Person Name groups are separated by `^` and group
-/// components by `=`. A fuzzymatch query typed by hand uses spaces where a
-/// stored name has `^`/`=`; without normalization the bitap threshold (exactly
-/// one edit) would count `^`<->space as a first edit and reject a name that is
-/// otherwise a 1-edit match. Replacing both separators with a space lets both
-/// sides line up, so e.g. query `Солгалов Даниил` matches stored
-/// `СОЛГАЛОВ^ДАННИЛ^ЮРЬЕВИЧ` (only the `И`<->`Н` in `Даниил`/`Даннил` counts).
+/// Per PS3.5 6.2 the CARET `^` (5EH) separates COMPONENTS within one component
+/// group, and the EQUALS `=` (3DH) separates COMPONENT GROUPS
+/// (standard/ps3.5/pn-delimiters.json). A fuzzymatch query typed by hand uses
+/// spaces where a stored name has `^`/`=`; without normalization the bitap
+/// threshold (exactly one edit) would count `^`<->space as a first edit and
+/// reject a name that is otherwise a 1-edit match. Replacing both separators
+/// with a space lets both sides line up, so e.g. query `Солгалов Даниил`
+/// matches stored `СОЛГАЛОВ^ДАННИЛ^ЮРЬЕВИЧ` (only the `И`<->`Н` in
+/// `Даниил`/`Даннил` counts).
 ///
 /// Applied ONLY in the fuzzy path (n-gram indexing, fuzzy query grams, and the
 /// bitap predicate, before lowercasing). Exact search and wildcards use the raw

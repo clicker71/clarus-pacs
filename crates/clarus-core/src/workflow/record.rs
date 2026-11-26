@@ -95,6 +95,25 @@ pub struct PerformedSeries {
     pub series_instance_uid: String,
     /// Referenced SOP instances of the series (Referenced Image Sequence).
     pub references: Vec<MppsReference>,
+    /// (0040,0220) Referenced Non-Image Composite Object Sequence - the
+    /// NON-image composites (SR, Presentation State) this series produced.
+    /// Kept apart from [`Self::references`] because PS3.4 Table F.7.2-1 gives
+    /// each its own sequence: folding them together reported a structured
+    /// report as an image.
+    pub non_image_refs: Vec<MppsReference>,
+}
+
+/// A UID field that may be copied into the joined text must not carry any of
+/// the separators that structure it.
+///
+/// The record's fields are `String`, so a caller can hand in anything; the
+/// joined text is delimiter-encoded, so a series UID containing `\u{1e}` writes
+/// TWO series where the caller passed one, and reading the record back silently
+/// invents a series that was never referenced. PS3.5 9 limits a UID to digits
+/// and dots, none of which are separators, so a value that fails this is not a
+/// UID at all.
+fn series_component_is_clean(value: &str) -> bool {
+    !value.contains(['\u{1e}', '\u{1c}', '\u{1d}', '\u{1f}'])
 }
 
 /// Join performed series into one text value - the append-only
@@ -109,10 +128,22 @@ pub struct PerformedSeries {
 /// as well as on read: writing it would append a dangling `class<US>` item the
 /// reader would have to reject anyway. An empty series_instance_uid is legal
 /// (legacy round trip) and is written as an empty first field.
-fn join_performed_series(series: &[PerformedSeries]) -> String {
+///
+/// An item with NO series UID and NO references is refused rather than written:
+/// it joins to the empty string, which the reader cannot tell apart from "no
+/// performed series at all". Storing it would mean answering a later read with
+/// an empty list after accepting a one-item one - the record would lose a value
+/// the caller supplied. The ambiguity is rejected at the write boundary, where
+/// the caller can still fix it.
+fn join_performed_series(series: &[PerformedSeries]) -> Result<String, MppsError> {
     let mut joined = String::new();
     let mut first_series = true;
     for s in series {
+        if !series_component_is_clean(&s.series_instance_uid) {
+            return Err(MppsError::Malformed(
+                "performed series UID contains a format separator",
+            ));
+        }
         if !first_series {
             joined.push('\u{1e}');
         }
@@ -120,6 +151,13 @@ fn join_performed_series(series: &[PerformedSeries]) -> String {
         joined.push_str(&s.series_instance_uid);
         let mut first_ref = true;
         for r in &s.references {
+            if !series_component_is_clean(&r.sop_class_uid)
+                || !series_component_is_clean(&r.sop_instance_uid)
+            {
+                return Err(MppsError::Malformed(
+                    "referenced SOP UID contains a format separator",
+                ));
+            }
             if r.sop_instance_uid.is_empty() {
                 continue;
             }
@@ -131,8 +169,47 @@ fn join_performed_series(series: &[PerformedSeries]) -> String {
             joined.push('\u{1f}');
             joined.push_str(&r.sop_instance_uid);
         }
+        // ESC marks the switch to the NON-image list. It can only appear
+        // after the image list ends, so a reader that meets it knows where the
+        // boundary is; a legacy value never contains it and decodes as before.
+        //
+        // FS must still introduce the reference section when the non-image list
+        // is the FIRST one, or the marker would be read as part of the series
+        // UID (`splitn(2, FS)` never fires and the ESC lands inside the UID).
+        let mut first_non_image = true;
+        for r in &s.non_image_refs {
+            if !series_component_is_clean(&r.sop_class_uid)
+                || !series_component_is_clean(&r.sop_instance_uid)
+            {
+                return Err(MppsError::Malformed(
+                    "referenced SOP UID contains a format separator",
+                ));
+            }
+            if r.sop_instance_uid.is_empty() {
+                continue;
+            }
+            if first_non_image {
+                joined.push(if first_ref { '\u{1c}' } else { '\u{1d}' });
+                joined.push('\u{1b}');
+                first_ref = false;
+                first_non_image = false;
+            } else {
+                joined.push('\u{1d}');
+            }
+            joined.push_str(&r.sop_class_uid);
+            joined.push('\u{1f}');
+            joined.push_str(&r.sop_instance_uid);
+        }
+        if first_ref && s.series_instance_uid.is_empty() {
+            // Nothing was written for this item: no series UID and no usable
+            // reference. The joined text is now indistinguishable from an
+            // empty list, so refuse instead of losing the item.
+            return Err(MppsError::Malformed(
+                "a performed series with no UID and no reference cannot be stored",
+            ));
+        }
     }
-    joined
+    Ok(joined)
 }
 
 /// Split a joined performed-series list back into series, dropping empty items
@@ -152,8 +229,15 @@ fn split_performed_series(joined: &str) -> Vec<PerformedSeries> {
         let mut series_parts = item.splitn(2, '\u{1c}');
         let series_instance_uid = series_parts.next().unwrap_or("").to_string();
         let mut references = Vec::new();
+        let mut non_image_refs = Vec::new();
         if let Some(rest) = series_parts.next() {
-            for ref_item in rest.split('\u{1d}') {
+            // ESC splits the image list from the non-image list; a legacy
+            // value has no ESC, so everything stays in `references`.
+            let (image_part, non_image_part) = match rest.split_once('\u{1b}') {
+                Some((a, b)) => (a, b),
+                None => (rest, ""),
+            };
+            for ref_item in image_part.split('\u{1d}') {
                 if ref_item.is_empty() {
                     continue;
                 }
@@ -168,10 +252,26 @@ fn split_performed_series(joined: &str) -> Vec<PerformedSeries> {
                     sop_instance_uid,
                 });
             }
+            for ref_item in non_image_part.split('\u{1d}') {
+                if ref_item.is_empty() {
+                    continue;
+                }
+                let mut parts = ref_item.split('\u{1f}');
+                let sop_class_uid = parts.next().unwrap_or("").to_string();
+                let sop_instance_uid = parts.next().unwrap_or("").to_string();
+                if sop_instance_uid.is_empty() {
+                    continue;
+                }
+                non_image_refs.push(MppsReference {
+                    sop_class_uid,
+                    sop_instance_uid,
+                });
+            }
         }
         out.push(PerformedSeries {
             series_instance_uid,
             references,
+            non_image_refs,
         });
     }
     out
@@ -202,6 +302,7 @@ fn split_legacy_references(joined: &str) -> Vec<PerformedSeries> {
                 sop_class_uid,
                 sop_instance_uid,
             }],
+            non_image_refs: Vec::new(),
         });
     }
     out
@@ -224,9 +325,16 @@ const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 /// record would be re-sent and rejected forever. The size of a record is a
 /// property of its content, so the buffer is sized from the result rather than
 /// guessed.
+/// Retry an encoding into a growing buffer.
+///
+/// ONLY a capacity failure is retried: it is the one error a larger buffer can
+/// cure. Every other error is returned as it came, because turning a validation
+/// failure into `BufferFull` names the wrong cause - the caller reads "record
+/// too large" for a record that is perfectly small and merely invalid.
 fn encode_growing<E>(
     mut encode_to: impl FnMut(&mut CborWriter<'_>) -> Result<(), E>,
-) -> Result<Vec<u8>, CborError> {
+    is_capacity: impl Fn(&E) -> bool,
+) -> Result<Vec<u8>, E> {
     let mut cap = 512;
     loop {
         let mut buf = vec![0u8; cap];
@@ -234,11 +342,13 @@ fn encode_growing<E>(
             let mut writer = CborWriter::new(&mut buf);
             match encode_to(&mut writer) {
                 Ok(()) => writer.written(),
-                Err(_) if cap < MAX_RECORD_BYTES => {
-                    cap = cap.saturating_mul(2).min(MAX_RECORD_BYTES);
-                    continue;
+                Err(e) => {
+                    if is_capacity(&e) && cap < MAX_RECORD_BYTES {
+                        cap = cap.saturating_mul(2).min(MAX_RECORD_BYTES);
+                        continue;
+                    }
+                    return Err(e);
                 }
-                Err(_) => return Err(CborError::BufferFull),
             }
         };
         buf.truncate(written);
@@ -418,7 +528,10 @@ impl SpsRecord {
 
     /// Encode into a freshly allocated `Vec<u8>`.
     pub fn encode(&self) -> Result<Vec<u8>, SpsError> {
-        encode_growing(|w| self.encode_to(w)).map_err(SpsError::Cbor)
+        encode_growing(
+            |w| self.encode_to(w),
+            |e| matches!(e, SpsError::Cbor(CborError::BufferFull)),
+        )
     }
 
     /// Parse an SPS record from `buf`.
@@ -428,10 +541,20 @@ impl SpsRecord {
             return Err(SpsError::Malformed("top-level record is not a map"));
         };
         let mut rec = SpsRecord::default();
+        // The identity key is REQUIRED, not defaulted: a record without an SPS
+        // Instance UID is a nameless worklist entry, and filling the gap from
+        // `Default` produced a record that decodes "successfully" and can never
+        // be addressed again - the store then holds a row no request can reach
+        // and no delete can name. PS3.4 F.6.1.1.2 makes (0040,0001) the key of
+        // the entry, so its absence is malformed input, not an empty value.
+        let mut seen_sps_uid = false;
         for _ in 0..n {
             let key = read_key(&mut reader)?;
             match key {
-                S_SPS_UID => rec.sps_uid = read_text(&mut reader)?,
+                S_SPS_UID => {
+                    rec.sps_uid = read_text(&mut reader)?;
+                    seen_sps_uid = true;
+                }
                 S_STATION_AET => rec.station_aet = read_text(&mut reader)?,
                 S_SPS_START_DATE => rec.sps_start_date = read_text(&mut reader)?,
                 S_SPS_START_TIME => rec.sps_start_time = read_text(&mut reader)?,
@@ -462,6 +585,9 @@ impl SpsRecord {
         }
         if !reader.is_empty() {
             return Err(SpsError::Cbor(CborError::TrailingData));
+        }
+        if !seen_sps_uid {
+            return Err(SpsError::Malformed("missing sps_uid"));
         }
         Ok(rec)
     }
@@ -605,7 +731,7 @@ impl MppsRecord {
         // skips a single value rather than a nested array.
         if let Some(series) = &self.performed_series {
             writer.write_u64(M_PERFORMED_SERIES_V2)?;
-            writer.write_text(&join_performed_series(series))?;
+            writer.write_text(&join_performed_series(series)?)?;
         }
         // The discontinuation reason is written even when it is an empty
         // string: an empty value is the standard's own "created zero-length at
@@ -623,7 +749,10 @@ impl MppsRecord {
 
     /// Encode into a freshly allocated `Vec<u8>`.
     pub fn encode(&self) -> Result<Vec<u8>, MppsError> {
-        encode_growing(|w| self.encode_to(w)).map_err(MppsError::Cbor)
+        encode_growing(
+            |w| self.encode_to(w),
+            |e| matches!(e, MppsError::Cbor(CborError::BufferFull)),
+        )
     }
 
     /// Parse an MPPS record from `buf`.
@@ -633,11 +762,24 @@ impl MppsRecord {
             return Err(MppsError::Malformed("top-level record is not a map"));
         };
         let mut rec = MppsRecord::default();
+        // Both identity keys are REQUIRED (PS3.4 F.7.2-1: (0008,1115)-series
+        // and the MPPS Instance UID / Procedure Step State identity). Defaulting
+        // them produced a record that decodes and then cannot be addressed: an
+        // MPPS row with no status reads as "not started", which is a claim the
+        // performer never made, and one with no UID cannot be found or deleted.
+        let mut seen_mpps_uid = false;
+        let mut seen_status = false;
         for _ in 0..n {
             let key = read_key(&mut reader)?;
             match key {
-                M_MPPS_UID => rec.mpps_uid = read_text(&mut reader)?,
-                M_STATUS => rec.status = read_text(&mut reader)?,
+                M_MPPS_UID => {
+                    rec.mpps_uid = read_text(&mut reader)?;
+                    seen_mpps_uid = true;
+                }
+                M_STATUS => {
+                    rec.status = read_text(&mut reader)?;
+                    seen_status = true;
+                }
                 M_MODALITY => rec.modality = Some(read_text(&mut reader)?),
                 M_STATION_AE => rec.station_ae = Some(read_text(&mut reader)?),
                 M_STATION_NAME => rec.station_name = Some(read_text(&mut reader)?),
@@ -675,6 +817,12 @@ impl MppsRecord {
         }
         if !reader.is_empty() {
             return Err(MppsError::Cbor(CborError::TrailingData));
+        }
+        if !seen_mpps_uid {
+            return Err(MppsError::Malformed("missing mpps_uid"));
+        }
+        if !seen_status {
+            return Err(MppsError::Malformed("missing status"));
         }
         Ok(rec)
     }
@@ -740,21 +888,80 @@ mod tests {
     #[test]
     fn sps_unknown_key_is_skipped() {
         // A record written by a newer build carries a key this reader does not
-        // know. Mirror the record's own encoding capacity, then append key 999.
-        let mut buf = vec![0u8; 4096];
+        // know. The record is COMPLETE - every required key present - plus the
+        // unknown one, so the test measures tolerance of the extra key and not
+        // tolerance of a missing required key, which is now refused.
+        let bytes = sps_sample().encode().expect("encode");
+        let complete = SpsRecord::decode(&bytes).expect("complete decode");
+
+        // Rewrite the map header with one more entry and append the unknown
+        // entry after the original body.
+        let mut extended = Vec::with_capacity(bytes.len() + 16);
+        let extra = count_map_entries(&bytes) as u8 + 1;
+        extended.push(0xa0 | extra);
+        extended.extend_from_slice(&bytes[1..]);
+        // Key 999 (0x18 0xE7), then the text "ignored".
+        extended.extend_from_slice(&[0x18, 0xe7, 0x67]);
+        extended.extend_from_slice(b"ignored");
+
+        let decoded = SpsRecord::decode(&extended).expect("tolerant decode");
+        assert_eq!(decoded, complete, "an unknown key changes nothing");
+    }
+
+    /// Count the entries of a one-byte-header CBOR map.
+    fn count_map_entries(bytes: &[u8]) -> usize {
+        match bytes.first() {
+            Some(b) if b & 0xe0 == 0xa0 => (b & 0x1f) as usize,
+            _ => panic!("expected a small CBOR map"),
+        }
+    }
+
+    /// A record that omits a required key is refused rather than defaulted.
+    ///
+    /// `SpsRecord::decode` used to fill the gap from `Default`, producing a
+    /// record with an empty identity that decoded "successfully" and could
+    /// never be addressed again. PS3.4 F.6.1.1.2 makes (0040,0001) the key of
+    /// the entry, so its absence is malformed input.
+    #[test]
+    fn an_sps_record_without_its_uid_is_refused() {
+        let mut buf = vec![0u8; 256];
         let written = {
             let mut writer = CborWriter::new(&mut buf);
-            // A two-entry map: the required sps_uid plus an unknown key.
-            writer.write_map_header(2).unwrap();
-            writer.write_u64(S_SPS_UID).unwrap();
-            writer.write_text("1.2.3").unwrap();
-            writer.write_u64(999).unwrap();
-            writer.write_text("ignored").unwrap();
+            // A one-entry map carrying only an OPTIONAL key.
+            writer.write_map_header(1).unwrap();
+            writer.write_u64(S_MODALITY).unwrap();
+            writer.write_text("CT").unwrap();
             writer.written()
         };
-        buf.truncate(written);
-        let decoded = SpsRecord::decode(&buf).expect("tolerant decode");
-        assert_eq!(decoded.sps_uid, "1.2.3");
+        let err = SpsRecord::decode(&buf[..written]);
+        assert!(
+            matches!(&err, Err(SpsError::Malformed(m)) if m.contains("sps_uid")),
+            "a record with no SPS UID is not a worklist entry, got {err:?}"
+        );
+    }
+
+    /// An MPPS record that omits its UID or its status is refused.
+    ///
+    /// A defaulted status reads as "not started", which is a claim the
+    /// performer never made; a defaulted UID names nothing, so the row can be
+    /// neither found nor deleted.
+    #[test]
+    fn an_mpps_record_without_its_identity_is_refused() {
+        for omit in [M_MPPS_UID, M_STATUS] {
+            let mut buf = vec![0u8; 256];
+            let written = {
+                let mut writer = CborWriter::new(&mut buf);
+                writer.write_map_header(1).unwrap();
+                writer.write_u64(omit).unwrap();
+                writer.write_text("X").unwrap();
+                writer.written()
+            };
+            let decoded = MppsRecord::decode(&buf[..written]);
+            assert!(
+                decoded.is_err(),
+                "omitting key {omit} must be refused, got {decoded:?}"
+            );
+        }
     }
 
     #[test]
@@ -791,12 +998,70 @@ mod tests {
                         sop_instance_uid: "1.2.3.5".to_string(),
                     },
                 ],
+                non_image_refs: Vec::new(),
             }]),
             ..mpps_sample()
         };
         let bytes = rec.encode().expect("encode");
         let decoded = MppsRecord::decode(&bytes).expect("decode");
         assert_eq!(decoded, rec);
+    }
+
+    /// A separator inside a UID field is refused, not written into the format.
+    ///
+    /// The performed-series list is delimiter-encoded, and the fields are
+    /// public `String`s. A series UID carrying `\u{1e}` therefore wrote TWO
+    /// series where the caller passed one, and reading the record back invented
+    /// a series that was never referenced. PS3.5 9 limits a UID to digits and
+    /// dots, so the value is not a UID at all and the write boundary is the
+    /// right place to say so.
+    #[test]
+    fn a_separator_inside_a_performed_series_uid_is_refused() {
+        for (uid, ref_class, ref_inst) in [
+            ("1.2\u{1e}3", "1.2.3", "1.2.4"),
+            ("1.2.3", "1.2\u{1f}3", "1.2.4"),
+            ("1.2.3", "1.2.3", "1.2\u{1c}4"),
+            ("1.2.3", "1.2.3", "1.2\u{1d}4"),
+        ] {
+            let rec = MppsRecord {
+                performed_series: Some(vec![PerformedSeries {
+                    series_instance_uid: uid.to_string(),
+                    references: vec![MppsReference {
+                        sop_class_uid: ref_class.to_string(),
+                        sop_instance_uid: ref_inst.to_string(),
+                    }],
+                    non_image_refs: Vec::new(),
+                }]),
+                ..mpps_sample()
+            };
+            assert!(
+                matches!(rec.encode(), Err(MppsError::Malformed(_))),
+                "a separator in {uid:?}/{ref_class:?}/{ref_inst:?} must be refused"
+            );
+        }
+    }
+
+    /// A performed series with no UID and no reference is refused, not stored
+    /// as an indistinguishable empty list.
+    #[test]
+    fn an_empty_performed_series_item_is_refused() {
+        let rec = MppsRecord {
+            performed_series: Some(vec![PerformedSeries::default()]),
+            ..mpps_sample()
+        };
+        assert!(
+            matches!(rec.encode(), Err(MppsError::Malformed(_))),
+            "`Some(vec![default])` joins to the same text as `Some(vec![])`"
+        );
+
+        // The empty LIST is still storable: it says "no series", which the
+        // reader can tell apart from the one-item case above precisely because
+        // that case never reaches the disk.
+        let rec = MppsRecord {
+            performed_series: Some(vec![]),
+            ..mpps_sample()
+        };
+        rec.encode().expect("an empty list is a valid statement");
     }
 
     #[test]

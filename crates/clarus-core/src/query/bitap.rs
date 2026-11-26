@@ -88,6 +88,37 @@ pub fn bitap_match(pattern: &str, text: &str) -> bool {
     if plen == 0 {
         return true;
     }
+    // A 1-scalar pattern is degenerate under SUBSTRING bitap: `finish` is bit 0
+    // and the 1-error seed `| 1` keeps that bit set, so the first text scalar
+    // of any non-empty text reads as a 1-edit match (a query for one name
+    // returns every study). Bind it to whole-name Levenshtein-1 instead: a
+    // single scalar is within one edit of a text iff the text is empty (one
+    // deletion), has exactly one scalar (zero or one substitution), or has
+    // exactly two scalars one of which is the pattern scalar (one insertion).
+    if plen == 1 {
+        let p = fold_case(pattern.chars().next().expect("plen == 1"));
+        let mut chars = text.chars();
+        let matched = match (chars.next(), chars.next(), chars.next()) {
+            (None, _, _) => true,       // empty text: the scalar is deleted
+            (Some(_), None, _) => true, // one scalar: 0 or 1 substitution
+            (Some(a), Some(b), None) => {
+                // Two scalars: match only if one of them is the pattern scalar
+                // (one insertion of the other scalar).
+                fold_case(a) == p || fold_case(b) == p
+            }
+            // Three or more scalars cannot be reached from a 1-scalar pattern
+            // by edits, so the edit distance alone rejects them. The matching
+            // CONTRACT, however, is substring search (PS3.4 C.2.2.2.5: a
+            // single-value key matches when the stored value CONTAINS it), and
+            // an exact occurrence costs zero edits. Rejecting the whole text
+            // here also discarded zero-edit hits: `PatientName=ц` no longer
+            // found "цЭОцШОхНО". The containment test only fires on a literal
+            // occurrence, so the leak the guards below pin down - an unrelated
+            // long name matching from the 1-edit seed - stays closed.
+            (Some(_), Some(_), Some(_)) => chars.any(|c| fold_case(c) == p),
+        };
+        return matched;
+    }
     if plen > MASK_CAP {
         return text.to_lowercase().contains(&pattern.to_lowercase());
     }
@@ -411,5 +442,66 @@ mod tests {
         assert!(bitap_match("Anonymo", "anonymo"));
         assert!(bitap_match("anonymo", "Anonymo"));
         assert!(bitap_match("Anonymo", "ANONYMO"));
+    }
+
+    /// Leak guard: a 1-scalar pattern must NOT match an unrelated long name.
+    /// Before the `plen == 1` branch the pre-seeded `| 1` fired on the FIRST
+    /// text scalar, so `PatientName=李` returned every non-empty study.
+    #[test]
+    fn one_scalar_pattern_does_not_match_unrelated_long_text() {
+        assert!(!bitap_match("李", "PS18CHECK^PATIENT"));
+    }
+
+    /// Leak guard, Latin spelling: the class is script-agnostic.
+    #[test]
+    fn one_scalar_latin_pattern_does_not_match_three_unrelated_scalars() {
+        assert!(!bitap_match("Q", "abc"));
+    }
+
+    /// Leak guard: a 3-scalar text without the pattern scalar is two edits away
+    /// from a 1-scalar pattern (delete + substitute), so it must not match.
+    #[test]
+    fn one_scalar_pattern_does_not_match_three_scalars_without_it() {
+        assert!(!bitap_match("李", "XYZ"));
+    }
+
+    /// Zero edits: the pattern equals the text.
+    #[test]
+    fn one_scalar_pattern_matches_itself() {
+        assert!(bitap_match("李", "李"));
+    }
+
+    /// One substitution: a single different scalar is within one edit.
+    #[test]
+    fn one_scalar_pattern_matches_one_substitution() {
+        assert!(bitap_match("李", "王"));
+    }
+
+    /// One insertion: the pattern scalar is present among two text scalars.
+    #[test]
+    fn one_scalar_pattern_matches_two_scalars_containing_it() {
+        assert!(bitap_match("李", "李X"));
+        assert!(bitap_match("李", "X李"));
+    }
+
+    /// One deletion: an empty text is the pattern with its single scalar
+    /// deleted. This is the secondary bug the branch also corrects - the
+    /// scalar path returned false on empty text.
+    #[test]
+    fn one_scalar_pattern_matches_empty_text() {
+        assert!(bitap_match("李", ""));
+    }
+
+    /// The substring contract survives the 1-scalar branch: an exact
+    /// occurrence is zero edits, so a long name that CONTAINS the scalar must
+    /// match even though edit distance alone would reject it.
+    #[test]
+    fn one_scalar_pattern_matches_its_exact_occurrence_in_a_long_text() {
+        assert!(bitap_match("ц", "цЭОцШОхНО"));
+        assert!(bitap_match("Q", "abcQdef"));
+        // Case folding applies, as it does everywhere else in the matcher.
+        assert!(bitap_match("q", "ABCQDEF"));
+        // And the absence guard still holds for the same long text.
+        assert!(!bitap_match("Ы", "цЭОцШОхНО"));
     }
 }

@@ -105,4 +105,42 @@ fn idx_oappend_never_allocates() {
             .expect("append");
     });
     assert!(zero_alloc_roll, "registry append must not allocate");
+
+    // -- The WARM append path ------------------------------------------------
+    //
+    // The blocks above exercise the ordinary `append` methods. The three
+    // `append_warm` variants exist precisely because they must carry NO
+    // allocator call in ANY branch (their `io::Error` is deliberately not
+    // propagated), yet nothing measured them: an allocation added there would
+    // have passed this whole gate.
+    //
+    // `writers_mut` opens all three writers at once, which is COLD (it pushes
+    // a modality bucket entry and opens files), so it is called outside the
+    // measured window - exactly as the warm/cold split documents.
+    let mut warm_set = DailyIndexSet::new(dir.path().to_path_buf(), day);
+    {
+        let (d, m, s) = warm_set.writers_mut("CT").expect("writers");
+        let mut staging = [0u8; date::ROW_LEN];
+        d.append_warm(&[0u8; 32], &mut staging).expect("warm date");
+        let mut row = [0u8; 128];
+        m.append_warm(modality::format_row("warm0", &mut row))
+            .expect("warm modality");
+        s.append_warm(modality::format_row("warm1", &mut row))
+            .expect("warm sop owner");
+    }
+    let (zero_alloc_warm, _) = allocate_env(|| {
+        let (d, m, s) = warm_set.writers_mut("CT").expect("writers");
+        let mut staging = [0u8; date::ROW_LEN];
+        d.append_warm(&[0x11u8; 32], &mut staging)
+            .expect("warm date");
+        let mut row = [0u8; 128];
+        m.append_warm(modality::format_row("uid-warm", &mut row))
+            .expect("warm modality");
+        s.append_warm(modality::format_row("sop-warm", &mut row))
+            .expect("warm sop owner");
+    });
+    assert!(
+        zero_alloc_warm,
+        "all three WARM appends (date, modality, sop_owner) must not allocate"
+    );
 }

@@ -82,10 +82,15 @@ def test_undelivered_items_keep_their_sidecars(tmp_path):
 # CM3 - a registry entry the parser cannot read is refused, loudly
 # ---------------------------------------------------------------------------
 class TestSopRegistryRefusal:
-    def test_an_entry_without_accept_falls_back_and_says_so(self, tmp_path, caplog):
-        """An entry missing `accept` meant the parser desynchronised. Loading
-        it as-is silently turned an unreadable class into an accepted one."""
-        from clean_code.registry import _BUILTIN_SOP_CLASSES, _load_sop_registry
+    def test_an_entry_without_accept_fails_startup_and_says_so(self, tmp_path, caplog):
+        """An entry missing `accept` meant the parser desynchronised.
+
+        Loading it as-is silently turned an unreadable class into an accepted
+        one. Restoring the built-ins instead was worse for the one-class file
+        that exists to switch a class OFF: the built-in `accept: true` came
+        back. A present file with no usable entry is a configuration error.
+        """
+        from clean_code.registry import RegistryConfigError, _load_sop_registry
 
         path = tmp_path / "sop_classes.yaml"
         path.write_text(
@@ -95,13 +100,9 @@ class TestSopRegistryRefusal:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR):
-            registry = _load_sop_registry(str(path))
+            with pytest.raises(RegistryConfigError):
+                _load_sop_registry(str(path))
 
-        assert registry == _BUILTIN_SOP_CLASSES()
-        assert (
-            "1.2.840.10008.5.1.4.1.1.2" not in registry
-            or registry["1.2.840.10008.5.1.4.1.1.2"].get("accept") is not None
-        )
         assert any(
             "without `accept`" in r.message for r in caplog.records
         ), "the operator must be told which UID and which file"

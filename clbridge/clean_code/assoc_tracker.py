@@ -115,15 +115,23 @@ def record_cstore(assoc_id: int, study_uid: str, modality: str) -> bool:
     Returns True if this is the FIRST instance for this study_uid
     (caller should log INFO about new study).
     """
-    if not study_uid:
-        return False
-
     with _assoc_lock:
         info = _assoc_registry.get(assoc_id)
         if info is None:
             return False  # Association not tracked (should not happen)
 
+        # Count the instance even when the dataset names no study. A C-STORE
+        # always carries a SOP Instance UID, but the Study Instance UID is a
+        # separate element a nonconforming sender can omit; returning early
+        # left `instance_count` at zero, so the release log reported "no
+        # instances received" for an association that had stored several.
         info.instance_count += 1
+
+        # The study UID only decides whether a study bucket is updated. An
+        # unnamed study is counted but never bucketed: keying a bucket on ""
+        # would merge every anonymous instance into one phantom study.
+        if not study_uid:
+            return False
 
         if study_uid not in info.studies:
             info.studies[study_uid] = {

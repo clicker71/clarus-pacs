@@ -121,22 +121,28 @@ fn filter_hotpaths_are_allocation_free() {
         });
         assert_eq!(matches, 128, "every candidate must match the hot query");
 
-        // A batch of *negative* candidates (wrong modality / wrong date) exercises
-        // the predicate short-circuit path, which must also be allocation-free.
-        let miss = Manifest {
+        // A batch of *negative* candidates exercises the predicate
+        // short-circuit path, which must also be allocation-free.
+        //
+        // ONE FIXTURE PER PREDICATE. The original fixture failed BOTH the
+        // modality and the date check, so a predicate that stopped consulting
+        // either one still produced `matched == 0` and the test passed.
+        let wrong_modality = Manifest {
             study: StudyQido {
+                // Date IS in range (the filter's window is 20260101..20261231);
+                // only the modality is wrong.
                 attrs: vec![
-                    (0x0008_0020, AttrValue::UInt(19_990_101)), // StudyDate < from
-                    (0x0008_0060, AttrValue::Text("MR".into())), // Modality != CT
+                    (0x0008_0020, AttrValue::UInt(20_260_601)),
+                    (0x0008_0060, AttrValue::Text("MR".into())),
                 ],
                 ..Default::default()
             },
-            ..m
+            ..m.clone()
         };
         let matched = assert_zero_alloc(|| {
             let mut n = 0usize;
             for _ in 0..128 {
-                if filter.matches_prebuilt(&miss.study.attrs, &expected) {
+                if filter.matches_prebuilt(&wrong_modality.study.attrs, &expected) {
                     n += 1;
                 }
             }
@@ -144,7 +150,32 @@ fn filter_hotpaths_are_allocation_free() {
         });
         assert_eq!(
             matched, 0,
-            "a mismatch must not allocate and must not match"
+            "a wrong MODALITY alone must be rejected (and must not allocate)"
+        );
+
+        let wrong_date = Manifest {
+            study: StudyQido {
+                // Modality IS CT; only the date is out of range.
+                attrs: vec![
+                    (0x0008_0020, AttrValue::UInt(19_990_101)),
+                    (0x0008_0060, AttrValue::Text("CT".into())),
+                ],
+                ..Default::default()
+            },
+            ..m.clone()
+        };
+        let matched = assert_zero_alloc(|| {
+            let mut n = 0usize;
+            for _ in 0..128 {
+                if filter.matches_prebuilt(&wrong_date.study.attrs, &expected) {
+                    n += 1;
+                }
+            }
+            n
+        });
+        assert_eq!(
+            matched, 0,
+            "an out-of-range DATE alone must be rejected (and must not allocate)"
         );
 
         // Sanity: the ordinary exact-match path agrees with the budgeted forms.

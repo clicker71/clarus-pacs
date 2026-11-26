@@ -13,12 +13,47 @@ import httpx
 import pytest
 from clean_code.http_helpers import (
     _http_retry,
+    _qido_request,
     dicomweb_base,
     retry_after_seconds,
     stow_single_instance,
 )
 
 URL = "http://127.0.0.1:8024/dicomweb"
+
+
+# ---------------------------------------------------------------------------
+# _qido_request tests
+# ---------------------------------------------------------------------------
+
+
+def test_qido_space_encoded_as_percent20():
+    """PS3.18 8.3.1: a space in a QIDO value travels as %20, not '+'.
+
+    httpx form-encodes dict params with space -> '+', which the server reads
+    as a literal qp-special, so a glob against a spaced value matched nothing.
+    """
+    captured = {}
+
+    def fake_get(self, url, headers=None, **kwargs):
+        captured["url"] = url
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.content = b"[]"
+        resp.json.return_value = []
+        return resp
+
+    with patch.object(httpx.Client, "get", fake_get):
+        _qido_request(
+            URL,
+            {"PatientName": "D?ST4^TEST^77781757 \u00e5\u00e4\u00f6\u00c5\u00c4\u00d6"},
+        )
+
+    url = captured["url"]
+    assert "%3F" in url, f"'?' must stay encoded as %3F, got {url}"
+    assert "%20" in url, f"space must travel as %20, got {url}"
+    assert "%C3%A5" in url, f"UTF-8 bytes must be percent-encoded, got {url}"
+    assert "+" not in url, f"space must not become '+', got {url}"
 
 
 # ---------------------------------------------------------------------------
@@ -178,11 +213,17 @@ class TestStowStatusCodeMapping:
         return ds
 
     def test_stow_200_returns_success(self):
-        """HTTP 200 → DIMSE 0x0000."""
+        """HTTP 200 → DIMSE 0x0000, once the verdict is readable.
+
+        PS3.18 10.5.2: a 2xx only says the request was processed; the outcome
+        comes from the body. A success here therefore needs an actual DICOM
+        JSON object - an unreadable one is an unknown outcome and is retried.
+        """
         ds = self._make_stow_dataset()
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.ok = True
+        mock_resp.text = "{}"
 
         with patch("clean_code.http_helpers._http_retry", return_value=mock_resp):
             status, http_status, reason = stow_single_instance(
@@ -192,6 +233,20 @@ class TestStowStatusCodeMapping:
             )
         assert status == 0x0000
         assert http_status == 200
+
+    def test_stow_200_with_an_unreadable_verdict_is_retried(self):
+        """A 2xx whose body cannot be read states nothing about the instance."""
+        ds = self._make_stow_dataset()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.ok = True
+        mock_resp.text = "<html>proxy</html>"
+
+        with patch("clean_code.http_helpers._http_retry", return_value=mock_resp):
+            status, http_status, reason = stow_single_instance(ds, URL, False)
+        assert status == 0xA700
+        assert http_status == 200
+        assert "stow-verdict-unreadable" in reason
 
     def test_stow_507_insufficient_storage(self):
         """HTTP 507 → DIMSE 0xA700 (Out of Resources)."""
@@ -253,7 +308,8 @@ class TestStowBatchInstances:
         client.post.return_value = resp
 
         with patch(
-            "clean_code.http_helpers._http_retry", side_effect=lambda req: req()
+            "clean_code.http_helpers._http_retry",
+            side_effect=lambda req, **_kwargs: req(),
         ):
             results, _ = stow_batch_instances(
                 payloads,
@@ -292,7 +348,13 @@ class TestStowBatchInstances:
         ]
 
     def test_partial_failure_from_failed_sop_sequence(self):
-        """FailedSOPSequence (0008,1198): only the failing SOP is marked 0xA700."""
+        """FailedSOPSequence (0008,1198): the failing SOP is marked 0xA700.
+
+        PS3.18 10.5.3: on a 202 the per-SOP verdict is what states what became
+        of each instance, so an instance the response does NOT account for is
+        UNVERIFIED, not stored. This answer names only the failed SOP, so the
+        other one is retryable rather than claimed as delivered.
+        """
         uid_ok = "1.1.1.9"
         uid_bad = "1.1.1.8"
         payloads = [
@@ -313,9 +375,40 @@ class TestStowBatchInstances:
             results, _ = stow_batch_instances(payloads, URL)
 
         by_uid = {uid: (st, hs, msg) for uid, st, hs, msg in results}
-        assert by_uid[uid_ok][0] == 0x0000  # accepted SOP stays OK
+        assert by_uid[uid_ok][0] == 0xA700  # no verdict on a 202 -> unverified
         assert by_uid[uid_bad][0] == 0xA700  # rejected SOP retries
         assert "code=272" in by_uid[uid_bad][2]
+
+    def test_a_202_that_names_every_sop_confirms_the_others(self):
+        """The positive half of the rule above: an explicit verdict is trusted.
+
+        A 202 whose Referenced SOP Sequence (0008,1199) names the stored
+        instance IS the origin's answer, so that SOP is delivered and only the
+        one it refuses is retried.
+        """
+        uid_ok = "1.1.1.19"
+        uid_bad = "1.1.1.18"
+        payloads = [
+            _make_payload(uid_ok, uid_ok.encode()),
+            _make_payload(uid_bad, uid_bad.encode()),
+        ]
+
+        resp = MagicMock()
+        resp.status_code = 202
+        resp.text = (
+            '{"00081199":{"Value":[{"00081155":{"Value":["' + uid_ok + '"]}}]},'
+            '"00081198":{"Value":[{"00081197":{"Value":[272]}'
+            ',"00081155":{"Value":["' + uid_bad + '"]}}]}}'
+        )
+
+        with patch("clean_code.http_helpers._http_retry", return_value=resp):
+            from clean_code.http_helpers import stow_batch_instances
+
+            results, _ = stow_batch_instances(payloads, URL)
+
+        by_uid = {uid: (st, hs, msg) for uid, st, hs, msg in results}
+        assert by_uid[uid_ok][0] == 0x0000
+        assert by_uid[uid_bad][0] == 0xA700
 
     def test_total_5xx_marks_all_retryable(self):
         """HTTP 500 on the whole batch -> every SOP is 0xA700 (retryable)."""
@@ -366,7 +459,8 @@ class TestStowBatchInstances:
         client.post.return_value = resp
 
         with patch(
-            "clean_code.http_helpers._http_retry", side_effect=lambda req: req()
+            "clean_code.http_helpers._http_retry",
+            side_effect=lambda req, **_kwargs: req(),
         ):
             stow_batch_instances(payloads, URL, client=client)
 

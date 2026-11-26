@@ -91,25 +91,21 @@ impl StudyQidoIndex {
     pub fn new() -> Self {
         StudyQidoIndex::default()
     }
-    /// Build the full index from a `manifests/` directory, decoding only the
-    /// study section of each manifest (never series/instances/frames).
+    /// Build the index from a `manifests/` directory, decoding only the study
+    /// section of each manifest (never series/instances/frames), and report how
+    /// many manifest files could not be decoded (corrupt) and were skipped.
     ///
-    /// A corrupt manifest is skipped (mirrors the cold-scan resilience: a bad
-    /// study simply does not match); the index is marked built even if empty.
-    ///
-    /// Returns just the built index (the corrupt count is available via
-    /// [`Self::build_with_corrupt`]).
-    pub fn build_from_dir(manifests_dir: &Path) -> Self {
-        Self::build_with_corrupt(manifests_dir).0
-    }
-
-    /// Build the index like [`Self::build_from_dir`] but also report how many
-    /// manifest files could not be decoded (corrupt) and were therefore skipped.
+    /// This is the ONLY build entry point. A convenience wrapper that returned
+    /// just the index was removed: it could hand a caller a `built` index that
+    /// was missing a corrupt manifest, or one built from a directory it could
+    /// not list, with no signal at all. The count is monotonic per build run
+    /// (each bad file counted once), and `1` is reported for a scan that could
+    /// not enumerate the directory, in which case the returned index is
+    /// UNBUILT.
     ///
     /// This is the surface the server-side lazy index builder uses to feed the
     /// `MANIFEST_CORRUPT` degradation signal: a corrupt manifest that the RAM
-    /// scanner silently skips would otherwise be invisible until restart. The
-    /// count is monotonic per build run (each bad file counted once).
+    /// scanner silently skips would otherwise be invisible until restart.
     pub fn build_with_corrupt(manifests_dir: &Path) -> (Self, u64) {
         let mut by_uid: HashMap<String, Arc<StudyQido>> = HashMap::new();
         let mut corrupt: u64 = 0;
@@ -213,19 +209,64 @@ impl StudyQidoIndex {
             return;
         }
         let built = other.snapshot();
-        let mut st = self.state.write().expect("study index write");
+        // Everything expensive happens BEFORE the write lock.
+        //
+        // The clone of the scanned map and the replay of live mutations used to
+        // run under `state.write()`, so a QIDO reader could not take its
+        // snapshot for as long as the archive is large - the wait grew with the
+        // number of studies, which is the opposite of the short-lock contract.
+        // The mutation list is read under a SHORT read lock, merged outside any
+        // lock, and only the finished map is published under the write lock.
+        //
+        // No test can observe this: `RwLock` is not fair and grants a reader
+        // whenever the writer is between acquisitions, so a reader loop makes
+        // progress whether the clone is under the lock or not. The property is
+        // therefore held by construction, and this comment is its record - a
+        // future edit that moves the clone back under the lock will not be
+        // caught by a test.
+        //
         // Entries stamped at or after the point the build STARTED were written
         // while it was in flight, so the built snapshot cannot contain them.
+        let live: Vec<(String, Option<Arc<StudyQido>>)> = {
+            let st = self.state.read().expect("study index read");
+            st.entry_gen
+                .iter()
+                .filter(|(_, g)| **g >= start_gen)
+                .map(|(uid, _)| (uid.clone(), st.by_uid.get(uid).map(Arc::clone)))
+                .collect()
+        };
+        // Tracks which UIDs the out-of-lock merge already applied, so the
+        // under-lock pass can tell a NEW mutation from one it has seen.
+        let mut applied: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(live.len());
         let mut merged = (*built).clone();
+        for (uid, qido) in live {
+            match qido {
+                Some(qido) => {
+                    merged.insert(uid.clone(), qido);
+                }
+                None => {
+                    merged.remove(&uid);
+                }
+            }
+            applied.insert(uid);
+        }
+        let mut st = self.state.write().expect("study index write");
+        // A mutation that landed between the read above and this write is
+        // stamped at least `start_gen` and is neither in `built` nor in
+        // `live`, so replay it again here. Only entries this merge has not
+        // already applied are touched, and each is one `Arc` clone - no
+        // archive-sized work happens under the lock.
         for (uid, entry_generation) in st.entry_gen.iter() {
-            if *entry_generation >= start_gen {
-                match st.by_uid.get(uid) {
-                    Some(qido) => {
-                        merged.insert(uid.clone(), Arc::clone(qido));
-                    }
-                    None => {
-                        merged.remove(uid);
-                    }
+            if *entry_generation < start_gen || applied.contains(uid.as_str()) {
+                continue;
+            }
+            match st.by_uid.get(uid) {
+                Some(qido) => {
+                    merged.insert(uid.clone(), Arc::clone(qido));
+                }
+                None => {
+                    merged.remove(uid);
                 }
             }
         }
@@ -234,7 +275,7 @@ impl StudyQidoIndex {
     }
 
     /// Mark the index as built (no-op on readers; used for an explicitly empty
-    /// store where `build_from_dir` found zero manifests but is authoritative).
+    /// store where the build found zero manifests but is authoritative).
     pub fn mark_built(&self) {
         let mut st = self.state.write().expect("study index write");
         st.built = true;
@@ -422,7 +463,8 @@ mod tests {
         seed_manifest(&manifests, "1.2.2", "bob", 20260202);
         seed_manifest(&manifests, "1.2.1", "alice", 20260101);
 
-        let idx = StudyQidoIndex::build_from_dir(&manifests);
+        let (idx, corrupt) = StudyQidoIndex::build_with_corrupt(&manifests);
+        assert_eq!(corrupt, 0, "the fixture directory is clean");
         assert!(idx.ready());
         assert_eq!(idx.len(), 2);
         // Same ascending order as the cold manifest scan (string sort).
@@ -602,9 +644,11 @@ mod tests {
         seed_manifest(&manifests, "1.2.5", "dave", 20260105);
 
         // Build via `write_study_manifest_full` produces the same StudyQido
-        // section that build_from_dir reads.
+        // section that the build reads. The result is CHECKED: a fixture
+        // whose write silently failed would make this test assert on an index
+        // that simply never saw the study.
         let mut tmp = attrs_for("1.2.6", "erin", 20260106);
-        let _ = write_study_manifest_full(&manifests, &mut tmp, &[]);
+        write_study_manifest_full(&manifests, &mut tmp, &[]).expect("write 1.2.6");
 
         assert!(!reader.ready());
         builder.build_and_swap(&manifests);
@@ -647,9 +691,10 @@ mod tests {
         let _g = serial();
         let manifests = tempfile::tempdir().expect("temp");
         let manifests = manifests.path().to_path_buf();
-        let _ =
-            write_study_manifest_full(&manifests, &mut attrs_for("1.2.50", "ha", 20260150), &[]);
-        let builder = StudyQidoIndex::build_from_dir(&manifests);
+        write_study_manifest_full(&manifests, &mut attrs_for("1.2.50", "ha", 20260150), &[])
+            .expect("write 1.2.50");
+        let (builder, corrupt) = StudyQidoIndex::build_with_corrupt(&manifests);
+        assert_eq!(corrupt, 0, "the fixture directory is clean");
 
         let live = StudyQidoIndex::new();
         // Stamped early: the swap-time generation is far above this by the time
@@ -690,8 +735,8 @@ mod tests {
         let _g = serial();
         let manifests = tempfile::tempdir().expect("temp");
         let manifests = manifests.path().to_path_buf();
-        let _ =
-            write_study_manifest_full(&manifests, &mut attrs_for("1.2.50", "ha", 20260150), &[]);
+        write_study_manifest_full(&manifests, &mut attrs_for("1.2.50", "ha", 20260150), &[])
+            .expect("write 1.2.50");
 
         let live = StudyQidoIndex::new();
         // MORE THAN ONE mutation before the scan, so the counter is well past
@@ -733,8 +778,8 @@ mod tests {
         let _g = serial();
         let manifests = tempfile::tempdir().expect("temp");
         let manifests = manifests.path().to_path_buf();
-        let _ =
-            write_study_manifest_full(&manifests, &mut attrs_for("1.2.70", "ha", 20260170), &[]);
+        write_study_manifest_full(&manifests, &mut attrs_for("1.2.70", "ha", 20260170), &[])
+            .expect("write 1.2.70");
 
         let live = StudyQidoIndex::new();
         live.upsert("1.2.71", &attrs_for("1.2.71", "ko", 20260171));
@@ -765,8 +810,8 @@ mod tests {
         let _g = serial();
         let manifests = tempfile::tempdir().expect("temp");
         let manifests = manifests.path().to_path_buf();
-        let _ =
-            write_study_manifest_full(&manifests, &mut attrs_for("1.2.60", "ha", 20260160), &[]);
+        write_study_manifest_full(&manifests, &mut attrs_for("1.2.60", "ha", 20260160), &[])
+            .expect("write 1.2.60");
 
         let live = StudyQidoIndex::new();
         live.upsert("1.2.60", &attrs_for("1.2.60", "ha", 20260160));

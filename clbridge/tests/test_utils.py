@@ -7,6 +7,7 @@ import pytest
 from clean_code.streaming import (
     DICM_MAGIC,
     DICM_OFFSET,
+    MultipartFramingError,
     _is_valid_dicom,
     _parse_content_length,
     _stream_multipart_instances,
@@ -96,13 +97,15 @@ class MockResponse:
 class TestMultipartEdgeCases:
     """Edge cases for _stream_multipart_instances() — P10 Content-Length framing."""
 
-    def test_empty_body_returns_nothing(self):
-        """Final delimiter only, no parts — yields nothing."""
+    def test_an_empty_body_is_a_framing_failure(self):
+        """No part and, critically, no closing delimiter either: the origin
+        stopped before it said anything. PS3.18 8.7.2 makes the closing
+        delimiter the end of the body, so EOF without it is a truncated
+        stream, not an empty answer."""
         boundary = "abc123"
-        body = f"--{boundary}--\r\n".encode("ascii")
-        resp = MockResponse([body], boundary)
-        results = list(_stream_multipart_instances(resp))
-        assert results == []
+        resp = MockResponse([], boundary)
+        with pytest.raises(MultipartFramingError):
+            list(_stream_multipart_instances(resp))
 
     def test_boundary_appears_in_dicom_data(self):
         """Boundary-like bytes inside DICOM part — Content-Length prevents collision."""
@@ -126,16 +129,16 @@ class TestMultipartEdgeCases:
         assert len(part_bytes) == len(dicom_body)
         assert part_ts is None  # no transfer-syntax param in this fixture
 
-    def test_truncated_chunk_without_boundary(self):
-        """Stream ends mid-part without final boundary — flush remaining."""
+    def test_a_body_without_the_closing_delimiter_is_a_framing_failure(self):
+        """The part arrived whole, but the origin never sent the closing
+        delimiter. Reporting success here claimed a complete answer for a
+        body the origin did not finish."""
         boundary = "abc123"
-        dicom_body = _make_dicom_body(200)  # Must be >= 132 for DICM magic
+        dicom_body = _make_dicom_body(200)
         part = _make_part(boundary, len(dicom_body), body=dicom_body)
         resp = MockResponse([part], boundary)
-        results = list(_stream_multipart_instances(resp))
-        assert len(results) == 1
-        part_bytes, part_index, part_ts = results[0]
-        assert len(part_bytes) == len(dicom_body)
+        with pytest.raises(MultipartFramingError):
+            list(_stream_multipart_instances(resp))
 
     def test_multiple_parts(self):
         """Two parts, each with Content-Length — both extracted correctly."""

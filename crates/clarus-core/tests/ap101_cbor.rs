@@ -215,16 +215,30 @@ fn cbor_codec_never_allocates() {
     assert!(zero_alloc, "CBOR parser must not allocate");
 
     // A-009-3: encode -> decode round-trips with no allocation.
+    //
+    // The second encode goes into its OWN buffer. Writing it back over `buf`
+    // made the previous `assert_eq!(written2, written)` a length comparison
+    // only: the bytes it claimed to compare had already been overwritten, so a
+    // codec that changed a byte but not the length passed.
+    let mut buf2 = [0u8; 4096];
     let (zero_alloc, written2) = allocate_env(|| {
-        let w = encode_manifest_payload(&mut buf);
+        let w = encode_manifest_payload(&mut buf2);
         // Decode is the inverse of encode: yielding the exact original
         // structure proves the byte stream round-trips without losing or
         // adding any item.
-        assert_manifest_structure(&buf[..w]);
+        assert_manifest_structure(&buf2[..w]);
         w
     });
     assert!(zero_alloc, "encode+decode must not allocate");
-    assert_eq!(written2, written, "roundtrip must reproduce the same bytes");
+    assert_eq!(
+        written2, written,
+        "roundtrip must reproduce the same LENGTH"
+    );
+    assert_eq!(
+        &buf2[..written2],
+        &buf[..written],
+        "the second encode must be BYTE-identical to the first"
+    );
     assert!(written > 0, "payload must not be empty");
 
     // CborReader::skip_value() - the shallow-read skip.

@@ -154,7 +154,7 @@ pub fn encode(samples: &[u8], w: u32, h: u32, color: ColorType) -> Result<Vec<u8
     // Table Based Image Data (spec 22): minimum code size, then the LZW codes
     // wrapped in sub-blocks.
     out.push(CODE_BITS);
-    lzw_encode_into(&mut out, samples);
+    let _eoi_width = lzw_encode_into(&mut out, samples);
 
     // Trailer (spec 26).
     out.push(0x3B);
@@ -250,7 +250,7 @@ impl<'a> BitWriter<'a> {
 /// 4095 and the byte is 8 bits, the key fits 20 bits; `1 << 20` entries with a
 /// `0xFFFF` sentinel for "empty" is the smallest flat table that cannot alias a
 /// real code (codes never exceed 4095).
-fn lzw_encode_into(out: &mut Vec<u8>, samples: &[u8]) {
+fn lzw_encode_into(out: &mut Vec<u8>, samples: &[u8]) -> u32 {
     const EMPTY: u16 = 0xFFFF;
     let clear: u16 = 1 << CODE_BITS;
     let eoi: u16 = clear + 1;
@@ -298,8 +298,25 @@ fn lzw_encode_into(out: &mut Vec<u8>, samples: &[u8]) {
         prefix = byte as u16;
     }
     writer.write(prefix, width);
+    // GIF spec 24: the decoder appends a dictionary entry for every code it
+    // reads after a Clear, so its next-free code reaches `1 << width` one code
+    // BEFORE the encoder's does. When the final data code leaves the encoder
+    // exactly on that boundary, the decoder has already widened by the time it
+    // reads EOI - so EOI must be written at the new width. Writing it at the
+    // old width makes the decoder consume one bit too few, and the leftover
+    // bits are misread as the start of the next block. Only a stream that lands
+    // on the boundary shows it (a 255-byte incompressible input does, at
+    // width 9), which is why ordinary round-trips never caught it.
+    if width < 12 && next == (1u16 << width) {
+        width += 1;
+    }
     writer.write(eoi, width);
     writer.finish();
+    // The width EOI actually carried. A caller that must know how the stream
+    // ended (the boundary test) cannot recover it from the bit stream without a
+    // second decoder, and a second decoder is the weak oracle this module
+    // already refuses to keep.
+    width
 }
 
 #[cfg(test)]
@@ -448,5 +465,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The width the PRODUCTION encoder writes EOI at, for `samples`.
+    fn eoi_width_of(src: &[u8]) -> u32 {
+        let mut out = Vec::new();
+        lzw_encode_into(&mut out, src)
+    }
+
+    /// EOI must carry the width the DECODER will be reading.
+    ///
+    /// GIF spec 24: a decoder appends a dictionary entry for every code it
+    /// reads after a Clear, including the first data code - whose entry the
+    /// encoder only adds when it emits the second. That one-entry lead makes
+    /// the decoder reach `next == 1 << width` one code before the encoder does,
+    /// so when the final data code leaves the encoder exactly ON that boundary
+    /// the decoder has already widened and EOI must carry the new width.
+    /// Writing EOI one bit short leaves leftover bits that the decoder misreads
+    /// as the start of the next block.
+    ///
+    /// A 255-byte incompressible input is the boundary case: its final encoder
+    /// state is exactly `next == 1 << width` at width 9, and 256 bytes is one
+    /// code past it. If the two produce the same EOI width, the boundary is not
+    /// being honoured.
+    #[test]
+    fn eoi_width_is_widened_when_the_stream_ends_on_the_boundary() {
+        // 255 leaves the encoder ON the boundary (width 9, next 512).
+        assert_eq!(
+            eoi_width_of(&incompressible(255)),
+            10,
+            "EOI must take the widened width the decoder is already reading"
+        );
+        // 254 stops one code short of the boundary and must NOT widen.
+        assert_eq!(
+            eoi_width_of(&incompressible(254)),
+            9,
+            "off the boundary, EOI keeps the current width"
+        );
     }
 }

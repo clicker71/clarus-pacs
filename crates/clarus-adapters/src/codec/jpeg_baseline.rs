@@ -46,10 +46,15 @@ impl DicomCodec for JpegBaselineCodec {
 
         let frames = meta.frames.max(1) as usize;
         // A single frame may legitimately arrive split across fragments
-        // (PS3.5 A.4 lets an encoder break a codestream anywhere). JPEG
-        // Baseline always interleaves its components into ONE codestream per
-        // frame, so there is no per-component split to preserve here.
-        let fragments = super::coalesce_single_frame_fragments(fragments, frames, 1);
+        // (PS3.5 A.4 lets an encoder break a codestream anywhere), so the
+        // fragment count alone cannot tell a split frame from a frame
+        // boundary. The Basic Offset Table is what distinguishes them: a
+        // non-empty table gives one offset per frame (PS3.5 A.4), and the
+        // fragments between two offsets belong to one frame. Counting
+        // fragments instead rejected a conformant two-frame file whose first
+        // frame arrived in two fragments, because 3 fragments != 2 frames.
+        let bot = super::jpegls::extract_basic_offset_table(dicom_bytes);
+        let fragments = group_fragments_by_frame(fragments, bot, frames)?;
         if fragments.len() != frames {
             return Err(CodecError::DecodeFailed(format!(
                 "JPEG Baseline: fragment count {} != NumberOfFrames {}",
@@ -84,6 +89,19 @@ impl DicomCodec for JpegBaselineCodec {
             } else {
                 3
             };
+            // PS3.3 C.7.6.3.1.1: SamplesPerPixel describes the value that is
+            // stored, so the decoded JPEG format and the attribute have to
+            // agree. They were not compared, and a three-component codestream
+            // declared as one sample decoded as colour behind metadata that
+            // says monochrome - every downstream consumer then reads 3N bytes
+            // as N samples.
+            if s != meta.samples_per_pixel as usize {
+                return Err(CodecError::DecodeFailed(format!(
+                    "JPEG Baseline: decoded {s} component(s) but SamplesPerPixel (0028,0002) \
+                     declares {}",
+                    meta.samples_per_pixel
+                )));
+            }
             if samples == 0 {
                 samples = s;
             } else if s != samples {
@@ -144,10 +162,48 @@ impl DicomCodec for JpegBaselineCodec {
         let width = pixels.columns;
         let height = pixels.rows;
 
-        // Build interleaved pixel buffer for JPEG encoder
+        // PS3.3 C.7.6.3.1.1: SamplesPerPixel is 1 or 3. Anything else fell
+        // through to the monochrome branch below, so a two-sample image was
+        // encoded as a JPEG with the samples silently reinterpreted as Luma.
+        if pixels.samples_per_pixel != 1 && pixels.samples_per_pixel != 3 {
+            return Err(CodecError::EncodeFailed(format!(
+                "JPEG Baseline: SamplesPerPixel must be 1 or 3, got {}",
+                pixels.samples_per_pixel
+            )));
+        }
+
+        // Build interleaved pixel buffer for JPEG encoder.
+        // PS3.3 C.7.6.3.1.3: with SamplesPerPixel 3 the value holds three
+        // whole-image planes - rows * columns bytes each. `planar_to_
+        // interleaved` indexes all three, so a short buffer is a panic on
+        // input rather than an error the caller can handle.
+        let pixel_count = pixels.rows as usize * pixels.columns as usize;
         let interleaved = if pixels.samples_per_pixel == 3 {
+            let needed = pixel_count
+                .checked_mul(3)
+                .ok_or_else(|| CodecError::EncodeFailed("pixel count overflow".into()))?;
+            if pixels.data.len() < needed {
+                return Err(CodecError::EncodeFailed(format!(
+                    "JPEG Baseline: colour buffer holds {} bytes, {} rows x {} columns x 3 \
+                     samples need {}",
+                    pixels.data.len(),
+                    pixels.rows,
+                    pixels.columns,
+                    needed
+                )));
+            }
             planar_to_interleaved(&pixels.data, pixels.rows as usize, pixels.columns as usize)
         } else {
+            if pixels.data.len() < pixel_count {
+                return Err(CodecError::EncodeFailed(format!(
+                    "JPEG Baseline: monochrome buffer holds {} bytes, {} rows x {} columns \
+                     need {}",
+                    pixels.data.len(),
+                    pixels.rows,
+                    pixels.columns,
+                    pixel_count
+                )));
+            }
             pixels.data.clone()
         };
 
@@ -176,11 +232,98 @@ impl DicomCodec for JpegBaselineCodec {
         meta: &DicomMeta,
     ) -> Result<Vec<u8>, CodecError> {
         let compressed = self.encode(pixels, meta)?;
-        Ok(crate::codec::build_encapsulated_pixeldata(
-            &compressed,
-            false,
-        ))
+        Ok(crate::codec::build_encapsulated_pixeldata(&compressed))
     }
+}
+
+/// Group the fragments of an encapsulated Pixel Data value into frames.
+///
+/// PS3.5 A.4: a non-empty Basic Offset Table holds one offset per frame, in
+/// bytes from the first fragment's Item tag to the Item tag of the first
+/// fragment of that frame. Two fragments between consecutive offsets are one
+/// frame split in two, and must be joined before the JPEG decoder sees them.
+/// An empty table says nothing about frame boundaries, so a single-frame
+/// image is the only case where joining everything is correct.
+fn group_fragments_by_frame(
+    fragments: Vec<Vec<u8>>,
+    bot: Vec<u32>,
+    frames: usize,
+) -> Result<Vec<Vec<u8>>, CodecError> {
+    if bot.len() < 2 {
+        // No usable table. The reading left is the one `dicom_rs::frame` states
+        // for the same situation: with fewer entries than frames, the last
+        // named frame runs to the END of the item stream, so trailing fragments
+        // belong to it. That is also the only reading that decodes a frame split
+        // across fragments when the table is empty - an encoder that emits an
+        // empty table and splits frame 0 over two Items is legal, and refusing
+        // it made a perfectly decodable instance unreadable.
+        if frames <= 1 {
+            return Ok(vec![fragments.into_iter().flatten().collect()]);
+        }
+        if fragments.len() < frames {
+            return Err(CodecError::DecodeFailed(format!(
+                "JPEG Baseline: {} fragments for {} frames with an empty Basic Offset Table",
+                fragments.len(),
+                frames
+            )));
+        }
+        // One frame per fragment up to the declared count; the remainder (which
+        // is the trailing fragments of the LAST frame) joins it.
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(frames);
+        let mut it = fragments.into_iter();
+        for _ in 0..frames - 1 {
+            match it.next() {
+                Some(frag) => out.push(frag),
+                None => {
+                    return Err(CodecError::DecodeFailed(
+                        "JPEG Baseline: fewer fragments than frames".into(),
+                    ));
+                }
+            }
+        }
+        let mut last = Vec::new();
+        for frag in it {
+            last.extend_from_slice(&frag);
+        }
+        out.push(last);
+        return Ok(out);
+    }
+    if bot.len() != frames {
+        return Err(CodecError::DecodeFailed(format!(
+            "JPEG Baseline: Basic Offset Table holds {} entries for {} frames",
+            bot.len(),
+            frames
+        )));
+    }
+
+    // PS3.5 A.4: an offset is the distance from the first byte of the first
+    // fragment's Item tag to the first byte of the target frame's Item tag.
+    // Fragment k therefore starts at the sum of the Item headers and values
+    // before it - the value of fragment 0 being padded to even length.
+    let mut lengths = Vec::with_capacity(fragments.len());
+    let mut starts = Vec::with_capacity(fragments.len());
+    let mut at = 0u32;
+    for frag in &fragments {
+        starts.push(at);
+        let padding = if frag.len().is_multiple_of(2) { 0 } else { 1 };
+        at = at
+            .checked_add(8 + frag.len() as u32 + padding)
+            .ok_or_else(|| CodecError::DecodeFailed("fragment offsets overflow".into()))?;
+        lengths.push(frag);
+    }
+
+    let mut grouped = Vec::with_capacity(frames);
+    let mut current: Vec<u8> = Vec::new();
+    let mut frame = 0usize;
+    for (frag, start) in lengths.into_iter().zip(starts) {
+        while frame + 1 < bot.len() && start >= bot[frame + 1] {
+            grouped.push(std::mem::take(&mut current));
+            frame += 1;
+        }
+        current.extend_from_slice(frag);
+    }
+    grouped.push(current);
+    Ok(grouped)
 }
 
 // ===========================================================================
@@ -333,12 +476,12 @@ fn read_explicit_val(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
     if *pos + 4 > data.len() {
         return None;
     }
-    let vr = std::str::from_utf8(&data[*pos..*pos + 2]).ok()?;
+    // PS3.5 6.2 Table 6.2-1 via `vr_widths`: the list that used to be written
+    // out here omitted SV and UV, so those elements took the short branch and
+    // the walk resumed inside their header.
+    let vr = data.get(*pos..*pos + 2)?;
+    let extended = super::vr_widths::is_long_form_vr(vr);
     *pos += 2;
-    let extended = matches!(
-        vr,
-        "OB" | "OD" | "OF" | "OL" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT"
-    );
     let len: usize = if extended {
         if *pos + 6 > data.len() {
             return None;
@@ -407,15 +550,12 @@ fn skip_explicit(data: &[u8], pos: &mut usize) -> bool {
     if *pos + 4 > data.len() {
         return false;
     }
-    let vr = match std::str::from_utf8(&data[*pos..*pos + 2]) {
-        Ok(v) => v,
-        Err(_) => return false,
+    // PS3.5 6.2 Table 6.2-1 via `vr_widths`; see `read_explicit_val`.
+    let Some(vr_bytes) = data.get(*pos..*pos + 2) else {
+        return false;
     };
+    let extended = super::vr_widths::is_long_form_vr(vr_bytes);
     *pos += 2;
-    let extended = matches!(
-        vr,
-        "OB" | "OD" | "OF" | "OL" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT"
-    );
     let len: usize = if extended {
         if *pos + 6 > data.len() {
             return false;
@@ -481,54 +621,26 @@ fn skip_undefined_sequence(data: &[u8], pos: &mut usize) -> bool {
                 if *pos + 2 > data.len() {
                     return false;
                 }
-                let vr_ok = std::str::from_utf8(&data[*pos..*pos + 2])
-                    .map(|s| {
-                        matches!(
-                            s,
-                            "AE" | "AS"
-                                | "AT"
-                                | "CS"
-                                | "DA"
-                                | "DS"
-                                | "DT"
-                                | "FD"
-                                | "FL"
-                                | "IS"
-                                | "LO"
-                                | "LT"
-                                | "OB"
-                                | "OD"
-                                | "OF"
-                                | "OL"
-                                | "OW"
-                                | "PN"
-                                | "SH"
-                                | "SL"
-                                | "SQ"
-                                | "SS"
-                                | "ST"
-                                | "TM"
-                                | "UC"
-                                | "UI"
-                                | "UL"
-                                | "UN"
-                                | "UR"
-                                | "US"
-                                | "UT"
-                                | "UV"
-                        )
-                    })
+                // PS3.5 6.2 Table 6.2-1: the width class is a property of the
+                // VR, and `vr_widths` is the one place this table is stated. The
+                // hand-written `matches!` here listed thirteen VRs for the long
+                // form and omitted OV and SV, so an Other-64-bit-Very-Long or
+                // Signed-64-bit-Very-Long element inside the item was stepped
+                // over with the SHORT form and every following element was read
+                // from inside its header.
+                let vr_pair = &data[*pos..*pos + 2];
+                let extended = super::vr_widths::is_long_form_vr(vr_pair);
+                // A pair that is not two VR letters is not an Explicit VR
+                // element; fall through to the implicit branch below rather
+                // than guessing.
+                let is_vr = std::str::from_utf8(vr_pair)
+                    .map(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase()))
                     .unwrap_or(false);
-                if vr_ok {
+                if is_vr {
                     if *pos + 6 > data.len() {
                         return false;
                     }
-                    let vr = std::str::from_utf8(&data[*pos..*pos + 2]).unwrap_or("");
                     *pos += 2;
-                    let extended = matches!(
-                        vr,
-                        "OB" | "OD" | "OF" | "OL" | "OW" | "SQ" | "UC" | "UN" | "UR" | "UT" | "UV"
-                    );
                     let len: usize = if extended {
                         *pos += 2;
                         u32_from_slice(&data[*pos..*pos + 4]) as usize
@@ -543,10 +655,10 @@ fn skip_undefined_sequence(data: &[u8], pos: &mut usize) -> bool {
                     if *pos + len > data.len() {
                         return false;
                     }
+                    // PS3.5 6.2: the declared length already contains the pad,
+                    // so adding it again skipped a byte past every odd-length
+                    // element and desynchronised the rest of the item.
                     *pos += len;
-                    if !len.is_multiple_of(2) {
-                        *pos += 1; // PS3.5 7.1 pad byte
-                    }
                 } else {
                     // Implicit VR fallback (conformant compressed-TS
                     // datasets encode item contents implicitly).
@@ -916,12 +1028,17 @@ mod tests {
         out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
         out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let ui1 = b"1.2.840.10008.5.1.4.1.1.3.1";
+        // PS3.5 6.2: the declared Value Length is the even, padded length, so a
+        // 27-character UID declares 28 and the NUL is its last byte. Declaring
+        // 27 and appending the pad outside wrote an element one byte longer
+        // than it declared, which desynchronised the walk that follows it.
+        let ui1_len = ui1.len() + usize::from(!ui1.len().is_multiple_of(2));
         out.extend_from_slice(&0x0008u16.to_le_bytes());
         out.extend_from_slice(&0x1150u16.to_le_bytes());
         out.extend_from_slice(b"UI");
-        out.extend_from_slice(&(ui1.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(ui1_len as u16).to_le_bytes());
         out.extend_from_slice(ui1);
-        if !ui1.len().is_multiple_of(2) {
+        if ui1_len != ui1.len() {
             out.push(0x00);
         }
         out.extend_from_slice(&[0xFE, 0xFF, 0x0D, 0xE0]); // Item Delimitation
@@ -1034,5 +1151,382 @@ mod tests {
         let avg1 = pixels.data[64..].iter().map(|&b| b as u32).sum::<u32>() / 64;
         assert!(avg0 < 30, "frame 0 not dark: {}", avg0);
         assert!(avg1 > 170, "frame 1 not bright: {}", avg1);
+    }
+
+    fn monochrome_meta(rows: u16, columns: u16, frames: u32) -> DicomMeta {
+        DicomMeta {
+            rows,
+            columns,
+            samples_per_pixel: 1,
+            bits_allocated: 8,
+            bits_stored: 8,
+            photometric_interpretation: "MONOCHROME2".into(),
+            planar_configuration: None,
+            pixel_representation: 0,
+            frames,
+        }
+    }
+
+    fn encode_frame(v: u8, rows: u16, columns: u16) -> Vec<u8> {
+        let pixels = DecodedPixels {
+            data: vec![v; rows as usize * columns as usize],
+            rows,
+            columns,
+            samples_per_pixel: 1,
+            bits_allocated: 8,
+            photometric_interpretation: "MONOCHROME2".into(),
+        };
+        JpegBaselineCodec
+            .encode(&pixels, &monochrome_meta(rows, columns, 1))
+            .unwrap()
+    }
+
+    /// Build an explicit-VR instance whose encapsulated Pixel Data carries
+    /// `frames` frames described by `bot`, with `fragments` in Item order.
+    fn build_instance(
+        rows: u16,
+        columns: u16,
+        frames: u32,
+        bot: &[u32],
+        fragments: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut enc = Vec::new();
+        enc.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        enc.extend_from_slice(&0x0010u16.to_le_bytes());
+        enc.extend_from_slice(b"OB");
+        enc.extend_from_slice(&[0, 0]);
+        enc.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        enc.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        enc.extend_from_slice(&((bot.len() * 4) as u32).to_le_bytes());
+        for offset in bot {
+            enc.extend_from_slice(&offset.to_le_bytes());
+        }
+        for frag in fragments {
+            enc.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            // PS3.5 A.4 with 6.2: an Item's Value is padded to an even length
+            // and the pad counts in the declared length. Declaring the raw
+            // length and appending the pad outside it wrote an Item that
+            // occupied one byte more than it declared.
+            let frag_len = frag.len() + usize::from(!frag.len().is_multiple_of(2));
+            enc.extend_from_slice(&(frag_len as u32).to_le_bytes());
+            enc.extend_from_slice(frag);
+            if frag_len != frag.len() {
+                enc.push(0);
+            }
+        }
+        enc.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        enc.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0u8; 128]);
+        d.extend_from_slice(b"DICM");
+        let ts = b"1.2.840.10008.1.2.4.50";
+        let ts_len = ts.len() + usize::from(!ts.len().is_multiple_of(2));
+        d.extend_from_slice(&0x0002u16.to_le_bytes());
+        d.extend_from_slice(&0x0010u16.to_le_bytes());
+        d.extend_from_slice(b"UI");
+        d.extend_from_slice(&(ts_len as u16).to_le_bytes());
+        d.extend_from_slice(ts);
+        if ts_len != ts.len() {
+            d.push(0);
+        }
+        let us = |d: &mut Vec<u8>, tag: (u16, u16), v: u16| {
+            d.extend_from_slice(&tag.0.to_le_bytes());
+            d.extend_from_slice(&tag.1.to_le_bytes());
+            d.extend_from_slice(b"US");
+            d.extend_from_slice(&2u16.to_le_bytes());
+            d.extend_from_slice(&v.to_le_bytes());
+        };
+        us(&mut d, (0x0028, 0x0010), rows);
+        us(&mut d, (0x0028, 0x0011), columns);
+        us(&mut d, (0x0028, 0x0002), 1);
+        us(&mut d, (0x0028, 0x0100), 8);
+        if frames > 1 {
+            d.extend_from_slice(&0x0028u16.to_le_bytes());
+            d.extend_from_slice(&0x0008u16.to_le_bytes());
+            d.extend_from_slice(b"IS");
+            let text = frames.to_string();
+            let len = if text.len().is_multiple_of(2) {
+                text.len()
+            } else {
+                text.len() + 1
+            };
+            d.extend_from_slice(&(len as u16).to_le_bytes());
+            d.extend_from_slice(text.as_bytes());
+            if !text.len().is_multiple_of(2) {
+                d.push(b' ');
+            }
+        }
+        let pi = b"MONOCHROME2 ";
+        d.extend_from_slice(&0x0028u16.to_le_bytes());
+        d.extend_from_slice(&0x0004u16.to_le_bytes());
+        d.extend_from_slice(b"CS");
+        d.extend_from_slice(&(pi.len() as u16).to_le_bytes());
+        d.extend_from_slice(pi);
+        d.extend_from_slice(&enc);
+        d
+    }
+
+    /// PS3.5 A.4: two fragments between consecutive Basic Offset Table
+    /// entries are ONE frame split in two, not two frames. Counting fragments
+    /// instead of reading the table rejected a conformant 2-frame file whose
+    /// first frame arrived in two fragments (3 fragments != 2 frames).
+    #[test]
+    fn a_frame_split_by_the_basic_offset_table_is_joined() {
+        let (rows, columns) = (8u16, 8u16);
+        let frame0 = encode_frame(20, rows, columns);
+        let frame1 = encode_frame(220, rows, columns);
+        // PS3.5 A.4: a fragment value is even-length, so cut on an even
+        // boundary (frame0 is even, but do not rely on it).
+        let cut = (frame0.len() / 2) & !1;
+        assert!(cut > 0 && cut < frame0.len());
+
+        // Offsets count bytes from the first fragment's Item tag: fragment 0
+        // starts at 0, fragment 1 at 8 + cut, and frame 1 after fragment 1's
+        // Item header plus its value.
+        let second = (8 + cut) as u32;
+        let rest = (frame0.len() - cut) as u32;
+        let third = second + 8 + rest;
+        let bot = vec![0u32, third];
+        let fragments = vec![
+            frame0[..cut].to_vec(),
+            frame0[cut..].to_vec(),
+            frame1.clone(),
+        ];
+
+        let dicom = build_instance(rows, columns, 2, &bot, &fragments);
+        let pixels = JpegBaselineCodec
+            .decode(&dicom)
+            .expect("the offset table says the first two fragments are one frame");
+        assert_eq!(pixels.data.len(), 128);
+        let avg0 = pixels.data[..64].iter().map(|&b| b as u32).sum::<u32>() / 64;
+        let avg1 = pixels.data[64..].iter().map(|&b| b as u32).sum::<u32>() / 64;
+        assert!(avg0 < 60, "frame 0 not dark: {avg0}");
+        assert!(avg1 > 170, "frame 1 not bright: {avg1}");
+    }
+
+    /// A colour buffer shorter than rows x columns x 3 is refused.
+    ///
+    /// `planar_to_interleaved` reads three whole planes, so the missing bytes
+    /// were an index panic on input the caller can fix.
+    #[test]
+    fn a_short_colour_buffer_is_refused_not_indexed() {
+        let pixels = DecodedPixels {
+            data: vec![0u8; 100],
+            rows: 10,
+            columns: 10,
+            samples_per_pixel: 3,
+            bits_allocated: 8,
+            photometric_interpretation: "RGB".into(),
+        };
+        let meta = DicomMeta {
+            samples_per_pixel: 3,
+            ..monochrome_meta(10, 10, 1)
+        };
+        let err = JpegBaselineCodec
+            .encode(&pixels, &meta)
+            .expect_err("the buffer is one plane short");
+        let CodecError::EncodeFailed(msg) = err else {
+            panic!("expected EncodeFailed");
+        };
+        assert!(msg.contains("300"), "message should name the need: {msg}");
+    }
+
+    /// PS3.5 6.2 Table 6.2-1: SV and UV are long-form, so an element carrying
+    /// one sits in an 8-byte header. A walker that reads them as short-form
+    /// resumes four bytes inside the header.
+    #[test]
+    fn the_walker_treats_sv_and_uv_as_long_form() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 128]);
+        out.extend_from_slice(b"DICM");
+        out.extend_from_slice(&0x0002u16.to_le_bytes());
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(b"UI");
+        let ts = b"1.2.840.10008.1.2.4.50";
+        out.extend_from_slice(&(ts.len() as u16).to_le_bytes());
+        out.extend_from_slice(ts);
+
+        // (0018,1234) UV before the target: 2 values of 8 bytes.
+        out.extend_from_slice(&0x0018u16.to_le_bytes());
+        out.extend_from_slice(&0x1234u16.to_le_bytes());
+        out.extend_from_slice(b"UV");
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&[0x5A; 16]);
+
+        out.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(b"OB");
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&[0xAA; 4]);
+
+        assert_eq!(find_tag_bytes(&out, TAG_PIXEL_DATA), Some(vec![0xAA; 4]));
+    }
+
+    /// PS3.3 C.7.6.3.1.1: SamplesPerPixel describes the value that is stored,
+    /// so it must agree with the component count the codestream actually has.
+    ///
+    /// They were never compared, and a three-component codestream declared as
+    /// one sample decoded as colour behind metadata that says monochrome.
+    #[test]
+    fn a_component_count_that_contradicts_samples_per_pixel_is_refused() {
+        let frame = {
+            let pixels = DecodedPixels {
+                data: vec![7u8; 3 * 16],
+                rows: 1,
+                columns: 16,
+                samples_per_pixel: 3,
+                bits_allocated: 8,
+                photometric_interpretation: "RGB".into(),
+            };
+            let meta = DicomMeta {
+                rows: 1,
+                columns: 16,
+                samples_per_pixel: 3,
+                bits_allocated: 8,
+                bits_stored: 8,
+                photometric_interpretation: "RGB".into(),
+                planar_configuration: Some(0),
+                pixel_representation: 0,
+                frames: 1,
+            };
+            JpegBaselineCodec
+                .encode(&pixels, &meta)
+                .expect("colour encodes")
+        };
+
+        // One fragment, declared as ONE sample although it is a colour stream.
+        let mut dicom = Vec::new();
+        dicom.extend_from_slice(&[0u8; 128]);
+        dicom.extend_from_slice(b"DICM");
+        let us_tag = |d: &mut Vec<u8>, tag: (u16, u16), v: u16| {
+            d.extend_from_slice(&tag.0.to_le_bytes());
+            d.extend_from_slice(&tag.1.to_le_bytes());
+            d.extend_from_slice(b"US");
+            d.extend_from_slice(&2u16.to_le_bytes());
+            d.extend_from_slice(&v.to_le_bytes());
+        };
+        us_tag(&mut dicom, (0x0028, 0x0010), 1);
+        us_tag(&mut dicom, (0x0028, 0x0011), 16);
+        us_tag(&mut dicom, (0x0028, 0x0002), 1); // LIE: the stream has 3
+        us_tag(&mut dicom, (0x0028, 0x0100), 8);
+        dicom.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        dicom.extend_from_slice(&0x0010u16.to_le_bytes());
+        dicom.extend_from_slice(b"OB");
+        dicom.extend_from_slice(&[0, 0]);
+        dicom.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        dicom.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        dicom.extend_from_slice(&0u32.to_le_bytes()); // empty BOT
+        dicom.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        dicom.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        dicom.extend_from_slice(&frame);
+        dicom.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        dicom.extend_from_slice(&0u32.to_le_bytes());
+
+        let err = JpegBaselineCodec
+            .decode(&dicom)
+            .expect_err("a 3-component stream declared as 1 sample is a contradiction");
+        assert!(
+            err.to_string().contains("SamplesPerPixel"),
+            "the reason names the attribute, got: {err}"
+        );
+    }
+
+    /// PS3.3 C.7.6.3.1.1: SamplesPerPixel is 1 or 3. Anything else fell through
+    /// to the monochrome branch and was encoded as Luma.
+    #[test]
+    fn an_unsupported_encoder_sample_count_is_refused() {
+        let pixels = DecodedPixels {
+            data: vec![0u8; 4],
+            rows: 1,
+            columns: 2,
+            samples_per_pixel: 2,
+            bits_allocated: 8,
+            photometric_interpretation: "MONOCHROME2".into(),
+        };
+        let meta = DicomMeta {
+            rows: 1,
+            columns: 2,
+            samples_per_pixel: 2,
+            bits_allocated: 8,
+            bits_stored: 8,
+            photometric_interpretation: "MONOCHROME2".into(),
+            planar_configuration: None,
+            pixel_representation: 0,
+            frames: 1,
+        };
+        let err = JpegBaselineCodec
+            .encode(&pixels, &meta)
+            .expect_err("two samples per pixel is not encodable here");
+        assert!(
+            err.to_string().contains("SamplesPerPixel must be 1 or 3"),
+            "got: {err}"
+        );
+    }
+
+    /// PS3.5 A.4: a frame may span SEVERAL fragments even when the Basic Offset
+    /// Table is empty. The last declared frame runs to the end of the item
+    /// stream, so its trailing fragments belong to it.
+    ///
+    /// The old code refused any fragment count that was not exactly the frame
+    /// count, so a split codestream with no table was called unreadable.
+    #[test]
+    fn an_empty_offset_table_lets_the_last_frame_absorb_trailing_fragments() {
+        // Three fragments for two declared frames: fragment 2 belongs to frame 1.
+        let out = group_fragments_by_frame(
+            vec![vec![1u8, 2], vec![3u8, 4], vec![5u8, 6]],
+            Vec::new(),
+            2,
+        )
+        .expect("a legal split");
+        assert_eq!(out.len(), 2, "two frames");
+        assert_eq!(out[0], vec![1u8, 2], "frame 0 is its own fragment");
+        assert_eq!(out[1], vec![3u8, 4, 5, 6], "frame 1 absorbs the remainder");
+
+        // Fewer fragments than frames is still unreadable.
+        assert!(group_fragments_by_frame(vec![vec![1u8, 2]], Vec::new(), 2).is_err());
+    }
+
+    /// PS3.5 6.2 Table 6.2-1: an SV element inside an item must not be read
+    /// with the short header. The hand-written list here omitted SV and OV.
+    #[test]
+    fn an_sv_element_inside_a_sequence_is_stepped_correctly() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 128]);
+        out.extend_from_slice(b"DICM");
+        // (0008,1190) SQ undefined length, one undefined item, then an SV.
+        out.extend_from_slice(&0x0008u16.to_le_bytes());
+        out.extend_from_slice(&0x1190u16.to_le_bytes());
+        out.extend_from_slice(b"SQ");
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // An SV element: 8-byte header value.
+        out.extend_from_slice(&0x0088u16.to_le_bytes());
+        out.extend_from_slice(&0x0200u16.to_le_bytes());
+        out.extend_from_slice(b"SV");
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&8u32.to_le_bytes());
+        out.extend_from_slice(&[1u8; 8]);
+        out.extend_from_slice(&[0xFE, 0xFF, 0x0D, 0xE0]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        // The payload must still be reachable after the sequence.
+        out.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        out.extend_from_slice(&0x0010u16.to_le_bytes());
+        out.extend_from_slice(b"OB");
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&[0xAA; 4]);
+
+        assert_eq!(
+            find_tag_bytes(&out, TAG_PIXEL_DATA),
+            Some(vec![0xAA; 4]),
+            "an SV inside the item must not desynchronise the walk"
+        );
     }
 }

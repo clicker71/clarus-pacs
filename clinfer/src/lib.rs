@@ -24,6 +24,7 @@ pub mod inspect;
 pub mod json;
 pub mod matcher;
 pub mod measurements_writer;
+pub mod models;
 pub mod notify;
 pub mod pidfile;
 pub mod pixels;

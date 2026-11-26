@@ -13,6 +13,7 @@
 
 pub mod access_agg;
 pub mod access_log;
+pub mod audit_codes;
 pub mod audit_copies;
 pub mod audit_log;
 pub mod cas_audit_worker;
@@ -27,6 +28,8 @@ pub mod erase_worker;
 pub mod ffi;
 pub mod handlers;
 pub mod idx_fixer;
+#[cfg(test)]
+pub mod io_fault;
 pub mod log_writer;
 pub mod metrics;
 pub mod migration_worker;

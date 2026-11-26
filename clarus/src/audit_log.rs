@@ -539,7 +539,7 @@ fn sync_dir_entry_after_append(dir: &Path) -> std::io::Result<()> {
             Ok(h) => h,
             Err(_) => return Ok(()),
         };
-        return handle.sync_all();
+        handle.sync_all()
     }
     #[cfg(not(unix))]
     {

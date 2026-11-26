@@ -315,6 +315,11 @@ fn w32tm_status() -> Option<(bool, f64, String)> {
 ///
 /// Field labels are matched case-insensitively, so a build that pads or renames
 /// them cannot silently reintroduce the substring dependence this replaces.
+///
+/// Gated to Windows and tests: on Unix `w32tm` is never RUN, so the non-test
+/// Unix build would otherwise carry the parser as dead code (mirrors
+/// `parse_chronyc_tracking`, which is unix + test).
+#[cfg(any(target_os = "windows", test))]
 fn parse_w32tm_status(text: &str) -> (bool, f64, String) {
     // Unknown until a Leap Indicator line is seen. Reporting "synced" on the
     // absence of evidence would be the same optimistic default this parser

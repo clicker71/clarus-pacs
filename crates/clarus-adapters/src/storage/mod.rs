@@ -1005,7 +1005,7 @@ fn sync_dir_entry(dir: &std::path::Path) -> std::io::Result<()> {
             Ok(f) => f,
             Err(_) => return Ok(()),
         };
-        return sync_barrier(&handle);
+        sync_barrier(&handle)
     }
     #[cfg(not(unix))]
     {

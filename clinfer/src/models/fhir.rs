@@ -29,7 +29,7 @@
 //! shape instead of collapsing to text at parse time.
 
 use crate::models::Models;
-use crate::models::schema::{Model, Parameter, ParameterType, Value};
+use crate::models::schema::{Choice, Model, Parameter, ParameterType, Value};
 
 /// The file names of the extension StructureDefinitions, resolved against the
 /// configured extension base URL (`fhir.extension_base` in the configuration;
@@ -203,9 +203,10 @@ fn push_item(out: &mut String, parameter: &Parameter) {
     push_string(out, parameter.text.as_deref().unwrap_or(&parameter.code));
     // `required` is true for every parameter: a parameter the model reads is
     // a parameter the requester has to state, or the model's own default
-    // applies - and the default IS stated in `initial` below, so the item is
-    // never left unanswered by a consumer that honours `initial`.
-    out.push_str(",\"required\":false");
+    // applies - and the default IS stated below (in `initial`, or on the
+    // matching `answerOption` as `initialSelected`), so the item is never
+    // left unanswered by a consumer that honours it.
+    out.push_str(",\"required\":true");
     out.push_str(",\"repeats\":");
     out.push_str(if parameter.repeats { "true" } else { "false" });
     out.push_str(",\"code\":[");
@@ -228,11 +229,23 @@ fn push_item(out: &mut String, parameter: &Parameter) {
                 out.push_str(",\"display\":");
                 push_string(out, display);
             }
-            out.push_str("}}");
+            out.push('}');
+            // que-11: a choice default is the matching option's
+            // `initialSelected`, never a separate `initial`.
+            if let Some(default) = &parameter.default
+                && option_is_default(option, default)
+            {
+                out.push_str(",\"initialSelected\":true");
+            }
+            out.push('}');
         }
         out.push(']');
     }
-    if let Some(default) = &parameter.default {
+    // que-11: `initial` is absent when `answerOption` is present; a choice
+    // default was written as `initialSelected` above.
+    if let Some(default) = &parameter.default
+        && parameter.options.is_empty()
+    {
         // `initial` is a list of items, one per answer; a list default is
         // one entry per value, which is what `repeats: true` means.
         out.push_str(",\"initial\":[");
@@ -250,6 +263,19 @@ fn push_item(out: &mut String, parameter: &Parameter) {
         out.push(']');
     }
     out.push('}');
+}
+
+/// Whether the option carries the parameter's default: the answerOption to
+/// mark `initialSelected` (que-11 replaces a separate `initial` with it).
+fn option_is_default(option: &Choice, default: &Value) -> bool {
+    let code = &option.value;
+    match default {
+        Value::Text(value) => value == code,
+        Value::List(items) => items
+            .iter()
+            .any(|item| matches!(item, Value::Text(value) if value == code)),
+        _ => false,
+    }
 }
 
 /// One answer in `initial`: the value property is named after the item type,
@@ -409,4 +435,61 @@ fn push_string(out: &mut String, value: &str) {
         }
     }
     out.push('"');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conf::Match;
+    use crate::models::schema::{Choice, InputRequirements, OutputCapabilities};
+
+    #[test]
+    fn a_choice_default_is_initial_selected_not_initial() {
+        let model = Model {
+            id: "proc".to_string(),
+            enabled: true,
+            title: None,
+            description: None,
+            provider: None,
+            procedure_code: None,
+            input_requirements: InputRequirements::default(),
+            output_capabilities: OutputCapabilities::default(),
+            parameters: vec![Parameter {
+                code: "ALGORITHM".to_string(),
+                r#type: ParameterType::Choice,
+                default: Some(Value::Text("clahe".to_string())),
+                min: None,
+                max: None,
+                options: vec![
+                    Choice {
+                        value: "clahe".to_string(),
+                        display: Some("CLAHE".to_string()),
+                    },
+                    Choice {
+                        value: "none".to_string(),
+                        display: None,
+                    },
+                ],
+                repeats: false,
+                text: None,
+            }],
+            r#match: Match::default(),
+            runtime: None,
+            outputs: vec![],
+        };
+        let json = questionnaire(&model, "http://example.org/fhir");
+        assert!(
+            json.contains("\"initialSelected\":true"),
+            "the matching answerOption is marked initialSelected: {json}"
+        );
+        assert!(
+            !json.contains("\"initial\":"),
+            "que-11: no separate initial when answerOption is present: {json}"
+        );
+        assert!(json.contains("\"required\":true"), "an item is required: {json}");
+        assert!(
+            !json.contains("\"required\":false"),
+            "no item may claim it is not required: {json}"
+        );
+    }
 }

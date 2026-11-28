@@ -749,9 +749,15 @@ pub fn ups_update(
     // Transaction UID does not change on a successful update (PS3.18 Table
     // 11.6-1), so it alone cannot tell two read-modify-write cycles apart.
     let observed_revision;
+    // `minted_by` is a STORE-record property with no wire shape: the
+    // `WorkItem` model drops it (a value arriving over the wire cannot claim
+    // to have been minted here). A state change must still carry the STORED
+    // value forward, or the provenance marker is lost.
+    let existing_minted_by;
     let existing = match store.find_by_uid(workitem_uid) {
         Ok(Some(rec)) => {
             observed_revision = rec.revision;
+            existing_minted_by = rec.minted_by.clone();
             record_to_workitem(&rec)
         }
         Ok(None) => {
@@ -919,6 +925,10 @@ pub fn ups_update(
     // Declare the state this handler merged from, so a write that landed
     // between the read above and this call is reported as a conflict.
     record.revision = observed_revision;
+    // Restore the provenance the wire shape could not carry (see the read
+    // above): the readiness sweeper only promotes workitems marked as its
+    // own.
+    record.minted_by = existing_minted_by;
 
     match store.cas_update(&record, cas_tuid.as_deref(), Some(observed_revision)) {
         Ok(()) => {
@@ -1283,9 +1293,17 @@ pub fn ups_update_attributes(
     // cycles apart - the revision is what turns a stale second write into a
     // conflict instead of a silent overwrite.
     let observed_revision;
+    // `minted_by` is a STORE-record property with no wire shape: the
+    // `WorkItem` model drops it (a value arriving over the wire cannot claim
+    // to have been minted here). An Update must still carry the STORED value
+    // forward, or an attribute edit of a workitem this server minted would
+    // erase the provenance and the readiness sweeper could no longer tell
+    // which workitems it owes a READY promotion to.
+    let existing_minted_by;
     let existing = match store.find_by_uid(workitem_uid) {
         Ok(Some(rec)) => {
             observed_revision = rec.revision;
+            existing_minted_by = rec.minted_by.clone();
             record_to_workitem(&rec)
         }
         Ok(None) => {
@@ -1579,6 +1597,11 @@ pub fn ups_update_attributes(
     // Declare the state this handler merged from, so a write that landed
     // between the read above and this call is reported as a conflict.
     record.revision = observed_revision;
+    // Restore the provenance the wire shape could not carry (see the read
+    // above): the readiness sweeper only promotes workitems marked as its
+    // own, and dropping the marker here would strand a minted workitem in
+    // INCOMPLETE after the first requester edit.
+    record.minted_by = existing_minted_by;
 
     // Test seam: lets a concurrency test park an in-flight Update between its
     // read and this CAS write, so two Updates observe one revision before

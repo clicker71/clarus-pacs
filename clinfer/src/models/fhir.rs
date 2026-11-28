@@ -11,10 +11,13 @@
 //!
 //! # What is NOT in the document
 //!
-//! `match`, `runtime` and `outputs` are clinfer-only and never appear. That
-//! is a rule rather than an omission: the served document is the model's
-//! declaration to the WORLD, and a workdir path or a Python interpreter in it
-//! is deployment detail leaking into a capability statement.
+//! `match` and `runtime` are clinfer-only and never appear. That is a rule
+//! rather than an omission: the served document is the model's declaration
+//! to the WORLD, and a workdir path or a Python interpreter in it is
+//! deployment detail leaking into a capability statement. `outputs` is
+//! different: `series_description` is capability - the "description of the
+//! result content" a consumer asks for - and IS served as the result-content
+//! extension, while the rest of an output stays internal.
 //!
 //! # Written by hand
 //!
@@ -39,6 +42,7 @@ use crate::models::schema::{Choice, Model, Parameter, ParameterType, Value};
 /// the base is a deployment setting rather than a constant.
 const ANATOMY_DEFINITION: &str = "clinfer-input-anatomy.json";
 const OUTPUT_DEFINITION: &str = "clinfer-output-sop-classes.json";
+const RESULT_CONTENT_DEFINITION: &str = "clinfer-output-result-content.json";
 const PROVIDER_DEFINITION: &str = "clinfer-provider.json";
 
 /// The absolute canonical URL of one extension definition.
@@ -159,6 +163,22 @@ fn push_extensions(out: &mut String, model: &Model, extension_base: &str) {
         push_string(&mut value, uid);
         value.push('}');
         extensions.push(value);
+    }
+    // The result-content description is what an AISPro consumer reads as the
+    // "description of the result content": one extension per output, each
+    // carrying the series description as `valueString`. `kind` is not served:
+    // it names an encoder, and a single valueString carries one value, so the
+    // description alone is the smallest retrievable shape.
+    for output in &model.outputs {
+        if let Some(series_description) = &output.series_description {
+            let result_url = extension_url(extension_base, RESULT_CONTENT_DEFINITION);
+            let mut value = String::from("{\"url\":");
+            push_string(&mut value, &result_url);
+            value.push_str(",\"valueString\":");
+            push_string(&mut value, series_description);
+            value.push('}');
+            extensions.push(value);
+        }
     }
     if extensions.is_empty() {
         return;
@@ -441,7 +461,7 @@ fn push_string(out: &mut String, value: &str) {
 mod tests {
     use super::*;
     use crate::conf::Match;
-    use crate::models::schema::{Choice, InputRequirements, OutputCapabilities};
+    use crate::models::schema::{Choice, InputRequirements, Output, OutputCapabilities};
 
     #[test]
     fn a_choice_default_is_initial_selected_not_initial() {
@@ -486,10 +506,67 @@ mod tests {
             !json.contains("\"initial\":"),
             "que-11: no separate initial when answerOption is present: {json}"
         );
-        assert!(json.contains("\"required\":true"), "an item is required: {json}");
+        assert!(
+            json.contains("\"required\":true"),
+            "an item is required: {json}"
+        );
         assert!(
             !json.contains("\"required\":false"),
             "no item may claim it is not required: {json}"
+        );
+    }
+
+    #[test]
+    fn an_output_series_description_is_served_as_result_content() {
+        let model = Model {
+            id: "proc".to_string(),
+            enabled: true,
+            title: None,
+            description: None,
+            provider: None,
+            procedure_code: None,
+            input_requirements: InputRequirements::default(),
+            output_capabilities: OutputCapabilities::default(),
+            parameters: vec![],
+            r#match: Match::default(),
+            runtime: None,
+            outputs: vec![Output {
+                kind: "derived".to_string(),
+                series_description: Some("CLAHE".to_string()),
+                profile_version: 1,
+            }],
+        };
+        let json = questionnaire(&model, "http://example.org/fhir");
+        assert!(
+            json.contains("\"url\":\"http://example.org/fhir/clinfer-output-result-content.json\""),
+            "the result-content extension is emitted: {json}"
+        );
+        assert!(
+            json.contains("\"valueString\":\"CLAHE\""),
+            "the series description is carried as valueString: {json}"
+        );
+    }
+
+    #[test]
+    fn an_output_without_series_description_has_no_result_content() {
+        let model = Model {
+            id: "proc".to_string(),
+            enabled: true,
+            title: None,
+            description: None,
+            provider: None,
+            procedure_code: None,
+            input_requirements: InputRequirements::default(),
+            output_capabilities: OutputCapabilities::default(),
+            parameters: vec![],
+            r#match: Match::default(),
+            runtime: None,
+            outputs: vec![],
+        };
+        let json = questionnaire(&model, "http://example.org/fhir");
+        assert!(
+            !json.contains("clinfer-output-result-content"),
+            "no result-content extension when there is no output: {json}"
         );
     }
 }

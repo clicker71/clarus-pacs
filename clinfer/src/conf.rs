@@ -1026,7 +1026,7 @@ mod tests {
                 profile_version: 1,
             }],
         };
-        let rules = derive_rules(&[clahe.clone()]);
+        let rules = derive_rules(std::slice::from_ref(&clahe));
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].r#match.code, vec!["IMG-CLAHE".to_string()]);
 

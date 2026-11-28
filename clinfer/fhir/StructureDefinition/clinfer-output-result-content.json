@@ -1,0 +1,37 @@
+{
+  "resourceType": "StructureDefinition",
+  "id": "clinfer-output-result-content",
+  "url": "https://github.com/clicker71/clarus-pacs/blob/main/clinfer/fhir/StructureDefinition/clinfer-output-result-content.json",
+  "name": "ClinferOutputResultContent",
+  "title": "clinfer output result content",
+  "status": "draft",
+  "publisher": "Clarus",
+  "kind": "complex-type",
+  "abstract": false,
+  "context": [{ "type": "element", "expression": "Questionnaire" }],
+  "type": "Extension",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+  "derivation": "constraint",
+  "differential": {
+    "element": [
+      {
+        "id": "Extension",
+        "path": "Extension",
+        "short": "clinfer output result content",
+        "definition": "The series description of an object a clinfer model produces. Interim local shape until AISPro defines the shared capability record.",
+        "max": "1"
+      },
+      {
+        "id": "Extension.url",
+        "path": "Extension.url",
+        "fixedUri": "https://github.com/clicker71/clarus-pacs/blob/main/clinfer/fhir/StructureDefinition/clinfer-output-result-content.json"
+      },
+      {
+        "id": "Extension.value[x]",
+        "path": "Extension.value[x]",
+        "min": 1,
+        "type": [{ "code": "string" }]
+      }
+    ]
+  }
+}

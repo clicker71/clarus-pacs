@@ -56,7 +56,9 @@ power-loss protection (PLP) and build with `--target-cpu=native`.
 - **clbridge** — universal DIMSE ↔ DICOMweb gateway.
   [DIMSE bridge conformance statement](docs/dimse-bridge-conformance-statement.md)
 - **clinfer** — universal IHE AIW-I Task Performer.
-  [IHE AIW-I conformance statement](docs/aiw-i-conformance-statement.md)
+  [IHE AIW-I conformance statement](docs/aiw-i-conformance-statement.md).
+  [AISPro loop demo](docs/demo-aispro-loop.md) - the discovery-to-result
+  loop on one study, with the recorded run.
 
 ## Principles
 

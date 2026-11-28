@@ -1572,12 +1572,9 @@ mod tests {
             body.contains("\"resourceType\":\"Questionnaire\""),
             "{body}"
         );
-        // Coding.system is a URI: the parameter codes use the local URN, and
-        // the private DICOM scheme maps to a URN rather than a bare designator.
-        assert!(
-            body.contains("\"system\":\"urn:clarus:codes:parameter\""),
-            "{body}"
-        );
+        // Coding.system is a URI: the parameter codes share the procedure's
+        // scheme, so the private DICOM designator maps to a URN rather than
+        // appearing bare.
         assert!(
             body.contains("\"system\":\"urn:clarus:scheme:99clarus\""),
             "{body}"

@@ -93,12 +93,22 @@ pub fn questionnaire(model: &Model, extension_base: &str) -> String {
         out.push(']');
     }
     push_extensions(&mut out, model, extension_base);
+    // A parameter's Concept Name carries the procedure's coding scheme, not a
+    // local constant: the DICOM wire (0074,1210) writes the designator from
+    // `procedure_code`, so the FHIR item code must map that SAME scheme for
+    // the scheme to round-trip. A model with no procedure code has no wire
+    // scheme to echo and falls back to the local parameter URN.
+    let parameter_system = model
+        .procedure_code
+        .as_ref()
+        .map(|code| coding_system(&code.scheme))
+        .unwrap_or_else(|| LOCAL_PARAMETER_SCHEME.to_string());
     out.push_str(",\"item\":[");
     for (index, parameter) in model.parameters.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
-        push_item(&mut out, parameter);
+        push_item(&mut out, parameter, &parameter_system);
     }
     out.push_str("]}");
     out
@@ -213,7 +223,7 @@ fn push_codeable(out: &mut String, system: &str, code: &str, display: Option<&st
 }
 
 /// One `Questionnaire.item`.
-fn push_item(out: &mut String, parameter: &Parameter) {
+fn push_item(out: &mut String, parameter: &Parameter, system: &str) {
     out.push_str("{\"linkId\":");
     push_string(out, &parameter.code);
     out.push_str(",\"type\":");
@@ -232,12 +242,7 @@ fn push_item(out: &mut String, parameter: &Parameter) {
     out.push_str(",\"repeats\":");
     out.push_str(if parameter.repeats { "true" } else { "false" });
     out.push_str(",\"code\":[");
-    push_codeable(
-        out,
-        LOCAL_PARAMETER_SCHEME,
-        &parameter.code,
-        parameter.text.as_deref(),
-    );
+    push_codeable(out, system, &parameter.code, parameter.text.as_deref());
     out.push(']');
     if !parameter.options.is_empty() {
         out.push_str(",\"answerOption\":[");
@@ -362,12 +367,16 @@ impl Value {
     }
 }
 
-/// The `Coding.system` the model files' own parameter Code Values live in.
+/// The `Coding.system` a parameter item falls back to when the model has no
+/// procedure code.
 ///
 /// A local parameter code (`CLIP_LIMIT`) is not a SNOMED concept, so the
 /// served item code names a URN namespace this deployment owns rather than
 /// pretending it is one. A URN is an identifier, not an address: it does not
-/// resolve and an administrator never has to configure DNS for it.
+/// resolve and an administrator never has to configure DNS for it. When the
+/// model HAS a procedure code, the item shares that code's scheme mapped
+/// through [`coding_system`], so a consumer can round-trip it to the DICOM
+/// designator; this constant is then only the no-procedure-code fallback.
 pub const LOCAL_PARAMETER_SCHEME: &str = "urn:clarus:codes:parameter";
 
 /// A `Bundle` of Questionnaires: the answer `GET {base}/Questionnaire` gives.
@@ -463,7 +472,7 @@ fn push_string(out: &mut String, value: &str) {
 mod tests {
     use super::*;
     use crate::conf::Match;
-    use crate::models::schema::{Choice, InputRequirements, Output, OutputCapabilities};
+    use crate::models::schema::{Choice, Code, InputRequirements, Output, OutputCapabilities};
 
     #[test]
     fn a_choice_default_is_initial_selected_not_initial() {
@@ -515,6 +524,46 @@ mod tests {
         assert!(
             !json.contains("\"required\":false"),
             "no item may claim it is not required: {json}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_item_code_shares_the_procedure_codes_scheme() {
+        let model = Model {
+            id: "proc".to_string(),
+            enabled: true,
+            title: None,
+            description: None,
+            provider: None,
+            procedure_code: Some(Code {
+                value: "IMG-CLAHE".to_string(),
+                scheme: "99CLARUS".to_string(),
+                meaning: None,
+            }),
+            input_requirements: InputRequirements::default(),
+            output_capabilities: OutputCapabilities::default(),
+            parameters: vec![Parameter {
+                code: "CLIP_LIMIT".to_string(),
+                r#type: ParameterType::Decimal,
+                default: None,
+                min: None,
+                max: None,
+                options: vec![],
+                repeats: false,
+                text: None,
+            }],
+            r#match: Match::default(),
+            runtime: None,
+            outputs: vec![],
+        };
+        let json = questionnaire(&model, "http://example.org/fhir");
+        assert!(
+            json.contains("\"system\":\"urn:clarus:scheme:99clarus\""),
+            "the parameter item maps the procedure scheme to a URN: {json}"
+        );
+        assert!(
+            !json.contains("\"system\":\"urn:clarus:codes:parameter\""),
+            "the local parameter URN is only the no-procedure-code fallback: {json}"
         );
     }
 

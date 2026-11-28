@@ -19,7 +19,7 @@
         "path": "Extension",
         "short": "clinfer output result content",
         "definition": "The series description of an object a clinfer model produces. Interim local shape until AISPro defines the shared capability record.",
-        "max": "1"
+        "max": "*"
       },
       {
         "id": "Extension.url",

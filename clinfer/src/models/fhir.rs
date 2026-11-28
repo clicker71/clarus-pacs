@@ -170,7 +170,9 @@ fn push_extensions(out: &mut String, model: &Model, extension_base: &str) {
     // it names an encoder, and a single valueString carries one value, so the
     // description alone is the smallest retrievable shape.
     for output in &model.outputs {
-        if let Some(series_description) = &output.series_description {
+        if let Some(series_description) = &output.series_description
+            && !series_description.is_empty()
+        {
             let result_url = extension_url(extension_base, RESULT_CONTENT_DEFINITION);
             let mut value = String::from("{\"url\":");
             push_string(&mut value, &result_url);
@@ -567,6 +569,33 @@ mod tests {
         assert!(
             !json.contains("clinfer-output-result-content"),
             "no result-content extension when there is no output: {json}"
+        );
+    }
+
+    #[test]
+    fn an_empty_series_description_has_no_result_content() {
+        let model = Model {
+            id: "proc".to_string(),
+            enabled: true,
+            title: None,
+            description: None,
+            provider: None,
+            procedure_code: None,
+            input_requirements: InputRequirements::default(),
+            output_capabilities: OutputCapabilities::default(),
+            parameters: vec![],
+            r#match: Match::default(),
+            runtime: None,
+            outputs: vec![Output {
+                kind: "derived".to_string(),
+                series_description: Some(String::new()),
+                profile_version: 1,
+            }],
+        };
+        let json = questionnaire(&model, "http://example.org/fhir");
+        assert!(
+            !json.contains("clinfer-output-result-content"),
+            "an empty series description is not served: {json}"
         );
     }
 }

@@ -17,12 +17,13 @@
 //!   RAD) settled on FHIR Questionnaire as the encoding, and
 //!   `procedure_code` / `parameters` are the UPS attributes (0040,4018) and
 //!   (0074,1210) the same service declares;
-//! - `match`, `runtime` and `outputs` are what THIS sidecar needs and no
-//!   other tool has a use for: which study a model is for, how to run it,
-//!   and what objects the run produces.
+//! - `match` and `runtime` are what THIS sidecar needs and no other tool
+//!   has a use for: which study a model is for and how to run it. `outputs`
+//!   is both: `series_description` is capability, served as the result-content
+//!   extension, while `kind` and `profile_version` stay internal.
 //!
-//! Only the first half is ever served, which is why the split is a rule and
-//! not a convention.
+//! Only capability is ever served, which is why the split is a rule and not
+//! a convention.
 //!
 //! # Why a directory
 //!

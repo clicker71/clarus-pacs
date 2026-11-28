@@ -53,6 +53,8 @@ const INPUT_ANATOMY_DEFINITION: &str =
     include_str!("../fhir/StructureDefinition/clinfer-input-anatomy.json");
 const OUTPUT_SOP_CLASSES_DEFINITION: &str =
     include_str!("../fhir/StructureDefinition/clinfer-output-sop-classes.json");
+const RESULT_CONTENT_DEFINITION: &str =
+    include_str!("../fhir/StructureDefinition/clinfer-output-result-content.json");
 
 /// Depth of the queue between the listener and the worker.
 ///
@@ -859,6 +861,9 @@ fn structure_definition(path: &str) -> Option<(&'static str, &'static str)> {
         "/fhir/StructureDefinition/clinfer-output-sop-classes.json" => {
             Some(("application/fhir+json", OUTPUT_SOP_CLASSES_DEFINITION))
         }
+        "/fhir/StructureDefinition/clinfer-output-result-content.json" => {
+            Some(("application/fhir+json", RESULT_CONTENT_DEFINITION))
+        }
         _ => None,
     }
 }
@@ -1183,6 +1188,10 @@ mod tests {
             (
                 "/fhir/StructureDefinition/clinfer-output-sop-classes.json",
                 "clinfer-output-sop-classes.json",
+            ),
+            (
+                "/fhir/StructureDefinition/clinfer-output-result-content.json",
+                "clinfer-output-result-content.json",
             ),
         ];
         for (path, file) in expect {
